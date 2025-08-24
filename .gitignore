@@ -1,1 +1,19 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (common names)
+.venv/
+venv/
+ENV/
+
+# Packaging artifacts (safe to ignore)
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# OS-generated files
+.DS_Store
 __pycache__/*
