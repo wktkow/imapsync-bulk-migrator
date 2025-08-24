@@ -1,0 +1,12 @@
+{
+  "server": {
+    "host": "imap.serverA.com",
+    "port": 993,
+    "ssl": true,
+    "starttls": false
+  },
+  "accounts": [
+    { "email": "sales@c23.com", "password": "123" },
+    { "email": "support@c23.com", "password": "123" }
+  ]
+}
