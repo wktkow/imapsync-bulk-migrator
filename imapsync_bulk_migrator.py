@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import imaplib
+import urllib.parse
 
 
 # -------- Logging setup --------
@@ -193,6 +194,174 @@ def run_imapsync_justconnect(host: str, port: int, ssl_enabled: bool, starttls: 
     except Exception as exc:
         return False, f"Exception: {exc}"
 
+
+# -------- Optional: DirectAdmin API client for auto-provisioning --------
+
+try:  # Optional dependency, used only when auto-provisioning is enabled
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - optional path
+    requests = None  # type: ignore
+
+
+class DirectAdminClient:
+    """
+    Minimal client for DirectAdmin-compatible API to list and create POP/IMAP mailboxes.
+
+    Authentication: basic auth with username/password (or login key as password).
+    """
+
+    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout_sec: int = 20) -> None:
+        if requests is None:  # type: ignore
+            raise RuntimeError(
+                "DirectAdmin auto-provisioning requires the 'requests' package. "
+                "Install it via: pip install -r requirements.txt"
+            )
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()  # type: ignore
+        self.session.auth = (username, password)
+        self.session.verify = verify_ssl
+        self.timeout_sec = timeout_sec
+
+    def _endpoint(self, path: str) -> str:
+        if path.startswith("/"):
+            return f"{self.base_url}{path}"
+        return f"{self.base_url}/{path}"
+
+    def _get(self, path: str, params: Optional[Dict[str, str]] = None) -> Tuple[Optional[dict], Optional[Dict[str, List[str]]]]:
+        params = dict(params or {})
+        params.setdefault("json", "yes")
+        url = self._endpoint(path)
+        resp = self.session.get(url, params=params, timeout=self.timeout_sec)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "json" in ctype:
+            try:
+                return resp.json(), None
+            except Exception:
+                pass
+        text = resp.text.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return resp.json(), None
+            except Exception:
+                pass
+        parsed = urllib.parse.parse_qs(text, keep_blank_values=True, strict_parsing=False)
+        return None, parsed
+
+    def _post(self, path: str, data: Dict[str, str]) -> Tuple[Optional[dict], Optional[Dict[str, List[str]]]]:
+        url = self._endpoint(path)
+        resp = self.session.post(url, data=data, timeout=self.timeout_sec)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "json" in ctype:
+            try:
+                return resp.json(), None
+            except Exception:
+                pass
+        text = resp.text.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return resp.json(), None
+            except Exception:
+                pass
+        parsed = urllib.parse.parse_qs(text, keep_blank_values=True, strict_parsing=False)
+        return None, parsed
+
+    def list_pop_accounts(self, domain: str) -> List[str]:
+        json_obj, kv = self._get("CMD_API_POP", params={"domain": domain, "action": "list"})
+        if json_obj is not None:
+            if isinstance(json_obj, dict):
+                if "list" in json_obj and isinstance(json_obj["list"], list):
+                    return [str(u) for u in json_obj["list"]]
+                if "users" in json_obj and isinstance(json_obj["users"], list):
+                    return [str(u) for u in json_obj["users"]]
+            # Some installs place names under index keys like list0=user
+            dynamic = [v for k, v in json_obj.items() if isinstance(k, str) and k.startswith("list")]
+            if dynamic:
+                return [str(u) for u in dynamic]
+        if kv is not None:
+            items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users") or []
+            return [str(u) for u in items]
+        return []
+
+    def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0) -> None:
+        data = {
+            "action": "create",
+            "domain": domain,
+            "user": local_part,
+            "passwd": password,
+            "passwd2": password,
+            # 0 = unlimited in most DA installs
+            "quota": str(int(quota_mb) if quota_mb >= 0 else 0),
+        }
+        json_obj, kv = self._post("CMD_API_POP", data=data)
+        # Success heuristics: error == 0 or no error field
+        def _kv_get_one(mapobj: Dict[str, List[str]], key: str) -> Optional[str]:
+            vals = mapobj.get(key)
+            return (vals[0] if (vals and len(vals) > 0) else None) if mapobj is not None else None
+
+        if json_obj is not None and isinstance(json_obj, dict):
+            err = str(json_obj.get("error", "0"))
+            if err in {"0", "false", "False"}:
+                return
+            msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
+            # treat already exists as success
+            if "exist" in msg.lower():
+                return
+            raise RuntimeError(msg)
+        if kv is not None:
+            err = _kv_get_one(kv, "error") or "0"
+            msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or ""
+            if err in {"0", "false", "False"} or (msg and "exist" in msg.lower()):
+                return
+            raise RuntimeError(msg or f"DirectAdmin returned error= {err}")
+        # Unknown format: assume success if we got HTTP 200 and no explicit error
+        return
+
+
+def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+    """
+    Ensure all accounts from config exist on the DirectAdmin server.
+    Groups by domain to minimize API calls.
+    """
+    # domain -> Account list
+    per_domain: Dict[str, List[Account]] = {}
+    for acc in config.accounts:
+        if "@" not in acc.email:
+            logging.warning("[da] Skipping invalid email (no domain): %s", acc.email)
+            continue
+        local, domain = acc.email.split("@", 1)
+        if not local or not domain:
+            logging.warning("[da] Skipping invalid email: %s", acc.email)
+            continue
+        per_domain.setdefault(domain.lower(), []).append(acc)
+
+    for domain, accounts in per_domain.items():
+        try:
+            existing_locals = set(client.list_pop_accounts(domain))
+        except Exception as exc:
+            logging.error("[da] Failed to list accounts for domain %s: %s", domain, exc)
+            if not ignore_errors and not dry_run:
+                raise
+            else:
+                continue
+
+        for acc in accounts:
+            local = acc.email.split("@", 1)[0]
+            if local in existing_locals:
+                logging.info("[da] Exists: %s", acc.email)
+                continue
+            if dry_run:
+                logging.info("[da][dry-run] Would create mailbox: %s", acc.email)
+                continue
+            try:
+                client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb)
+                existing_locals.add(local)
+                logging.info("[da] Created mailbox: %s", acc.email)
+            except Exception as exc:
+                logging.error("[da] Failed to create %s: %s", acc.email, exc)
+                if not ignore_errors:
+                    raise
 
 @contextlib.contextmanager
 def imap_connection(server: ServerConfig, account: Account) -> Iterable[imaplib.IMAP4]:
@@ -363,60 +532,84 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: completed", account.email)
 
 
-def import_account(account: Account, server: ServerConfig, in_root: Path, ignore_errors: bool) -> None:
+def import_account(account: Account, server: ServerConfig, in_root: Path, ignore_errors: bool, da_client: Optional["DirectAdminClient"] = None) -> None:
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
     logging.info("[import] %s: starting", account.email)
-    with imap_connection(server, account) as imap:
-        # Map of folder name to list of (eml_path, flags, internaldate)
-        per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
-        for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
-            folder = folder_dir.name
-            entries: List[Tuple[Path, str, Optional[str]]] = []
-            for eml_path in sorted(folder_dir.glob("*.eml")):
-                meta_path = eml_path.with_suffix(".json")
-                flags = ""
-                internaldate = None
-                if meta_path.exists():
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                        flags = str(meta.get("flags", ""))
-                        internaldate = meta.get("internaldate") or None
-                entries.append((eml_path, flags, internaldate))
-            per_folder[folder] = entries
+    # Attempt login; if it fails and DirectAdmin client is provided, try to create the mailbox and retry once.
+    try:
+        with imap_connection(server, account) as imap:
+            # Map of folder name to list of (eml_path, flags, internaldate)
+            per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
+            for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+                folder = folder_dir.name
+                entries: List[Tuple[Path, str, Optional[str]]] = []
+                for eml_path in sorted(folder_dir.glob("*.eml")):
+                    meta_path = eml_path.with_suffix(".json")
+                    flags = ""
+                    internaldate = None
+                    if meta_path.exists():
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                            flags = str(meta.get("flags", ""))
+                            internaldate = meta.get("internaldate") or None
+                    entries.append((eml_path, flags, internaldate))
+                per_folder[folder] = entries
 
-        for folder, entries in per_folder.items():
-            mailbox = folder
-            try:
-                # Ensure mailbox exists
-                status, _ = imap.select(mailbox)
-                if status != "OK":
-                    with contextlib.suppress(Exception):
-                        imap.create(mailbox)
+            for folder, entries in per_folder.items():
+                mailbox = folder
+                try:
+                    # Ensure mailbox exists
                     status, _ = imap.select(mailbox)
                     if status != "OK":
-                        raise RuntimeError(f"cannot select or create mailbox {mailbox}")
-                # Append messages
-                logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
-                for eml_path, flags, internaldate in entries:
-                    with open(eml_path, "rb") as f:
-                        data = f.read()
-                    flags_tuple = None
-                    if flags:
-                        # Flags string like: "\\Seen \\Answered"
-                        # Normalize to parenthesized list, imaplib accepts None or string
-                        flags_norm = "(" + " ".join(flag.strip() for flag in flags.split() if flag.strip()) + ")"
-                        flags_tuple = flags_norm
-                    date_time = internaldate
-                    # Append into currently selected mailbox
-                    status, _ = imap.append(mailbox, flags_tuple, date_time, data)
+                        with contextlib.suppress(Exception):
+                            imap.create(mailbox)
+                        status, _ = imap.select(mailbox)
+                        if status != "OK":
+                            raise RuntimeError(f"cannot select or create mailbox {mailbox}")
+                    # Append messages
+                    logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
+                    for eml_path, flags, internaldate in entries:
+                        with open(eml_path, "rb") as f:
+                            data = f.read()
+                        flags_tuple = None
+                        if flags:
+                            # Flags string like: "\\Seen \\Answered"
+                            # Normalize to parenthesized list, imaplib accepts None or string
+                            flags_norm = "(" + " ".join(flag.strip() for flag in flags.split() if flag.strip()) + ")"
+                            flags_tuple = flags_norm
+                        date_time = internaldate
+                        # Append into currently selected mailbox
+                        status, _ = imap.append(mailbox, flags_tuple, date_time, data)
+                        if status != "OK":
+                            raise RuntimeError(f"append failed for {eml_path}")
+                except Exception as exc:
+                    logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
+                    if not ignore_errors:
+                        raise
+    except Exception as login_exc:
+        # Try lazy auto-provision if configured
+        if da_client is None:
+            raise
+        try:
+            if "@" in account.email:
+                local, domain = account.email.split("@", 1)
+                logging.warning("[da] Login failed for %s, attempting to auto-create via DirectAdmin...", account.email)
+                da_client.create_pop_account(domain, local, account.password, quota_mb=0)
+                # Retry once
+                with imap_connection(server, account) as imap:
+                    # No-op select to confirm
+                    status, _ = imap.select("INBOX")
                     if status != "OK":
-                        raise RuntimeError(f"append failed for {eml_path}")
-            except Exception as exc:
-                logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
-                if not ignore_errors:
-                    raise
+                        raise RuntimeError("login after auto-provision seems unsuccessful")
+            else:
+                raise RuntimeError("Invalid email, cannot auto-provision")
+        except Exception as prov_exc:
+            logging.error("[da] Auto-provisioning failed for %s: %s (original login error: %s)", account.email, prov_exc, login_exc)
+            raise
+        # If provisioning succeeded, call recursively once to perform the import
+        return import_account(account, server, in_root, ignore_errors, da_client)
     logging.info("[import] %s: completed", account.email)
 
 
@@ -558,6 +751,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-free-gb", type=float, default=1.0, help="Fail-fast if free disk space is lower")
     parser.add_argument("--resync-missing", action="store_true", help="In validate mode, attempt to re-import missing messages")
 
+    # Optional: DirectAdmin auto-provisioning for import mode
+    parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
+    parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
+    parser.add_argument("--da-username", required=False, help="DirectAdmin API username")
+    parser.add_argument("--da-password", required=False, help="DirectAdmin API password or login key")
+    parser.add_argument("--da-no-verify-ssl", action="store_true", help="Disable TLS certificate verification for DirectAdmin API")
+    parser.add_argument("--da-dry-run", action="store_true", help="Show what would be created without making changes")
+    parser.add_argument("--da-quota-mb", type=int, default=0, help="New mailbox quota in MiB (0 = unlimited)")
+
     args = parser.parse_args(argv)
 
     log_file = setup_logging(Path(args.log_dir))
@@ -588,6 +790,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         logging.error("Invalid config: %s", exc)
         return 2
+
+    # If requested and in import mode, auto-provision missing accounts via DirectAdmin before tests
+    if args.mode == "import" and bool(getattr(args, "auto_provision_da", False)):
+        missing = [n for n in ("da_url", "da_username", "da_password") if not getattr(args, n)]
+        if missing:
+            logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, --da-password (missing: %s)", ", ".join(missing))
+            return 2
+        if requests is None:
+            logging.error("DirectAdmin auto-provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
+            return 2
+        try:
+            logging.info("[da] Auto-provisioning missing mailboxes before import...")
+            da_client = DirectAdminClient(
+                base_url=str(args.da_url),
+                username=str(args.da_username),
+                password=str(args.da_password),
+                verify_ssl=not bool(args.da_no_verify_ssl),
+            )
+            ensure_accounts_exist_directadmin(
+                config,
+                da_client,
+                dry_run=bool(args.da_dry_run),
+                ignore_errors=bool(args.ignore_errors),
+                quota_mb=int(args.da_quota_mb),
+            )
+            logging.info("[da] Auto-provisioning step completed")
+        except Exception as exc:
+            logging.error("[da] Auto-provisioning failed: %s", exc)
+            if not args.ignore_errors:
+                return 3
 
     # Pre-test connectivity for import/export as required by prompt
     try:
@@ -637,7 +869,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
                     return
-                import_account(acc, config.server, in_root, ignore_errors=bool(args.ignore_errors))
+                da_client_inst = None
+                if bool(getattr(args, "auto_provision_da", False)) and requests is not None and getattr(args, "da_url", None) and getattr(args, "da_username", None) and getattr(args, "da_password", None):
+                    try:
+                        da_client_inst = DirectAdminClient(
+                            base_url=str(args.da_url),
+                            username=str(args.da_username),
+                            password=str(args.da_password),
+                            verify_ssl=not bool(args.da_no_verify_ssl),
+                        )
+                    except Exception:
+                        da_client_inst = None
+                import_account(acc, config.server, in_root, ignore_errors=bool(args.ignore_errors), da_client=da_client_inst)
 
             parallel_process_accounts("import", do_import, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             logging.info("Import finished into server %s", config.server.host)
