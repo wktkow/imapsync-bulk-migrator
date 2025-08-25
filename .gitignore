@@ -17,3 +17,28 @@ dist/
 # OS-generated files
 .DS_Store
 __pycache__/*
+
+# Project artifacts and local data (prevent accidental commits)
+# Exported mail data and logs
+exported/
+logs/
+
+# Migrator config files (and their common backup variants)
+# Canonical names
+export.pass.config.json*
+import.pass.config.json*
+
+# Common permutations
+*.pass.config.json*
+*.pass.config*.json*
+export.*.config.json*
+import.*.config.json*
+*export*config*.json*
+*import*config*.json*
+
+# Editor/OS backups for JSON configs
+*.json.bak
+*.json.backup
+*.json.orig
+*.json.old
+*.json.tmp
