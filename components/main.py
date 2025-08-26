@@ -108,6 +108,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--imap-timeout", type=float, default=60.0, help="Default IMAP socket timeout in seconds")
 
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
+    parser.add_argument("--reset", action="store_true", help="Import mode only: delete and recreate each mailbox on the panel before importing")
     parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
     parser.add_argument("--da-username", required=False, help="DirectAdmin API username")
     parser.add_argument("--da-password", required=False, help="DirectAdmin API password or login key")
@@ -154,7 +155,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     da_client: Optional[DirectAdminClient] = None
-    if args.mode == "import" and bool(getattr(args, "auto_provision_da", False)):
+    if args.mode == "import" and (bool(getattr(args, "auto_provision_da", False)) or bool(getattr(args, "reset", False))):
         missing = [n for n in ("da_url", "da_username", "da_password") if not getattr(args, n)]
         if missing:
             logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, --da-password (missing: %s)", ", ".join(missing))
@@ -167,13 +168,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                 password=str(args.da_password),
                 verify_ssl=not bool(args.da_no_verify_ssl),
             )
-            ensure_accounts_exist_directadmin(
-                config,
-                da_client,
-                dry_run=bool(args.da_dry_run),
-                ignore_errors=bool(args.ignore_errors),
-                quota_mb=int(args.da_quota_mb),
-            )
+            if bool(getattr(args, "reset", False)):
+                from .da_ensure import reset_accounts_directadmin
+                logging.info("[da] Reset requested: deleting and recreating mailboxes before import...")
+                reset_accounts_directadmin(
+                    config,
+                    da_client,
+                    dry_run=bool(args.da_dry_run),
+                    ignore_errors=bool(args.ignore_errors),
+                    quota_mb=int(args.da_quota_mb),
+                )
+            else:
+                ensure_accounts_exist_directadmin(
+                    config,
+                    da_client,
+                    dry_run=bool(args.da_dry_run),
+                    ignore_errors=bool(args.ignore_errors),
+                    quota_mb=int(args.da_quota_mb),
+                )
             logging.info("[da] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[da] Auto-provisioning failed: %s", exc)

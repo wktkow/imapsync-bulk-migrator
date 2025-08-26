@@ -112,4 +112,28 @@ class DirectAdminClient:
                 return
             raise RuntimeError(msg or f"DirectAdmin returned error= {err}")
 
+    def delete_pop_account(self, domain: str, local_part: str) -> None:
+        """Delete a POP/IMAP mailbox; tolerate not-found responses."""
+        data = {
+            "action": "delete",
+            "domain": domain,
+            "user": local_part,
+        }
+        json_obj, kv = self._post("CMD_API_POP", data=data)
+        def _kv_get_one(mapobj, key: str):
+            vals = mapobj.get(key)
+            return (vals[0] if (vals and len(vals) > 0) else None) if mapobj is not None else None
+        if isinstance(json_obj, dict):
+            err = str(json_obj.get("error", "0"))
+            msg = str(json_obj.get("text") or json_obj.get("message") or "")
+            if err in {"0", "false", "False"} or "not exist" in msg.lower() or "deleted" in msg.lower():
+                return
+            raise RuntimeError(msg or "DirectAdmin returned error on delete")
+        if kv is not None:
+            err = _kv_get_one(kv, "error") or "0"
+            msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or ""
+            if err in {"0", "false", "False"} or (msg and ("not exist" in msg.lower() or "deleted" in msg.lower())):
+                return
+            raise RuntimeError(msg or f"DirectAdmin returned error= {err}")
+
 

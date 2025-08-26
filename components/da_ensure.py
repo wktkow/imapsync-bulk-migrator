@@ -44,3 +44,37 @@ def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClien
                     raise
 
 
+def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+    """Delete then recreate each account in the config via DirectAdmin.
+
+    Intended for use prior to import when a clean mailbox is desired.
+    """
+    per_domain: Dict[str, List[Account]] = {}
+    for acc in config.accounts:
+        if "@" not in acc.email:
+            logging.warning("[da] Skipping invalid email (no domain): %s", acc.email)
+            continue
+        local, domain = acc.email.split("@", 1)
+        if not local or not domain:
+            logging.warning("[da] Skipping invalid email: %s", acc.email)
+            continue
+        per_domain.setdefault(domain.lower(), []).append(acc)
+
+    for domain, accounts in per_domain.items():
+        for acc in accounts:
+            local = acc.email.split("@", 1)[0]
+            if dry_run:
+                logging.info("[da][dry-run] Would reset mailbox: %s (delete+create)", acc.email)
+                continue
+            try:
+                with logging.LoggerAdapter(logging.getLogger(), {}):
+                    with contextlib.suppress(Exception):
+                        client.delete_pop_account(domain, local)
+                    client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb)
+                    logging.info("[da] Reset mailbox: %s", acc.email)
+            except Exception as exc:
+                logging.error("[da] Failed to reset %s: %s", acc.email, exc)
+                if not ignore_errors:
+                    raise
+
+

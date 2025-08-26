@@ -58,12 +58,14 @@ Key arguments (see `--help` for all):
 
 DirectAdmin (import mode):
 - `--auto-provision-da`, `--da-url`, `--da-username`, `--da-password`
+- `--reset` (delete and recreate each mailbox before import)
 - `--da-no-verify-ssl`, `--da-dry-run`, `--da-quota-mb`
 
 ## Modes
 
 - export: Download all folders/messages to `./exported/<email>/<folder>/` with `.eml` + `.json` metadata.
 - import: Restore messages using original mailbox names in metadata; creates folders if missing.
+  - Optional DirectAdmin steps before import: `--reset` deletes then recreates each mailbox; otherwise `--auto-provision-da` only creates missing ones.
 - test: Env + connectivity checks (`imaplib` + `imapsync --justconnect`).
 - validate: Compare local counts to server; optional `--resync-missing`.
 - audit: Thorough export check; optional remote counts unless `--audit-offline`.
