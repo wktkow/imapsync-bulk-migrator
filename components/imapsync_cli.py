@@ -6,6 +6,7 @@ from .utils import ensure_imapsync_available
 
 
 def run_imapsync_justconnect(host: str, port: int, ssl_enabled: bool, starttls: bool, user: str, password: str, timeout_sec: int = 30) -> Tuple[bool, str]:
+    """Run `imapsync --justconnect` to validate credentials/connectivity."""
     ensure_imapsync_available()
     args = [
         "imapsync",

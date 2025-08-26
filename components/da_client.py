@@ -22,6 +22,7 @@ class DirectAdminClient:
         return f"{self.base_url}/{path}"
 
     def _get(self, path: str, params=None):
+        """GET wrapper that returns either a JSON object or parsed key-values."""
         params = dict(params or {})
         params.setdefault("json", "yes")
         url = self._endpoint(path)
@@ -43,6 +44,7 @@ class DirectAdminClient:
         return None, parsed
 
     def _post(self, path: str, data):
+        """POST wrapper that returns either a JSON object or parsed key-values."""
         url = self._endpoint(path)
         resp = self.session.post(url, data=data, timeout=self.timeout_sec)
         resp.raise_for_status()
@@ -62,6 +64,7 @@ class DirectAdminClient:
         return None, parsed
 
     def list_pop_accounts(self, domain: str):
+        """Return list of local-part usernames for a domain's POP/IMAP accounts."""
         json_obj, kv = self._get("CMD_API_POP", params={"domain": domain, "action": "list"})
         if json_obj is not None:
             if isinstance(json_obj, dict):
@@ -78,6 +81,7 @@ class DirectAdminClient:
         return []
 
     def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0) -> None:
+        """Create a POP/IMAP mailbox; tolerate already-exists responses."""
         data = {
             "action": "create",
             "domain": domain,

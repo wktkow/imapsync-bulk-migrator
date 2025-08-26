@@ -17,6 +17,10 @@ from .utils import sanitize_for_path
 
 @contextlib.contextmanager
 def imap_connection(server: ServerConfig, account: Account) -> Iterable[imaplib.IMAP4]:
+    """Context-managed IMAP connection.
+
+    Handles SSL/STARTTLS negotiation and ensures logout on exit.
+    """
     if server.ssl:
         imap = imaplib.IMAP4_SSL(host=server.host, port=server.port)
     else:
@@ -32,6 +36,11 @@ def imap_connection(server: ServerConfig, account: Account) -> Iterable[imaplib.
 
 
 def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
+    """Return a stable, de-duplicated, sorted list of mailbox names.
+
+    Prefers a quoted name at the end of LIST lines; falls back to the last atom.
+    INBOX is sorted first.
+    """
     status, data = imap.list()
     if status != "OK":
         raise RuntimeError("Failed to list mailboxes")
@@ -59,6 +68,7 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
 
 
 def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
+    """Select a mailbox and return all message UIDs in ascending order."""
     status, _ = imap.select(mailbox, readonly=True)
     if status != "OK":
         raise RuntimeError(f"Failed to select mailbox {mailbox}")
@@ -78,6 +88,10 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
 
 
 def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Parse a FETCH response into payload bytes and metadata.
+
+    Returns (msg_bytes, flags, internaldate). Any of them can be None.
+    """
     if not fetch_response:
         return None, None, None
     msg_bytes: Optional[bytes] = None
@@ -112,6 +126,10 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
 
 
 def export_account(account: Account, server: ServerConfig, out_root: Path, ignore_errors: bool, *, stop_event: Optional[object] = None) -> None:
+    """Export all messages for an account into `out_root/<email>/<folder>/`.
+
+    Writes one .eml per message and a .json with mailbox/uid/flags/internaldate.
+    """
     account_dir = out_root / sanitize_for_path(account.email)
     account_dir.mkdir(parents=True, exist_ok=True)
     logging.info("[export] %s: starting", account.email)
@@ -183,6 +201,11 @@ def import_account(
     stop_event: Optional[object] = None,
     da_context: Optional[Tuple[object, int]] = None,
 ) -> None:
+    """Import all messages for an account from `in_root/<email>/...`.
+
+    If `da_context=(client, quota_mb)` is provided and initial login fails,
+    a one-time lazy POP account creation is attempted before retrying login.
+    """
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")

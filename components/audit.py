@@ -11,6 +11,7 @@ from .utils import sanitize_for_path
 
 
 def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
+    """Perform lightweight sanity checks on a single exported .eml file."""
     issues: List[str] = []
     try:
         data = eml_path.read_bytes()
@@ -44,6 +45,7 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
 
 
 def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig], check_remote: bool = True) -> Tuple[str, List[str]]:
+    """Audit a single account directory and optionally compare to remote counts."""
     issues: List[str] = []
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
@@ -104,6 +106,10 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
 
 
 def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: bool = True) -> Tuple[bool, List[str]]:
+    """Audit all accounts concurrently and aggregate issues.
+
+    Returns (ok, issues) where `ok` is True when no issues were found.
+    """
     issues_accum: List[str] = []
 
     def worker(acc: Account) -> List[str]:

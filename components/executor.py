@@ -6,6 +6,13 @@ from typing import List
 from .models import Account
 
 
+"""Simple thread-pool executor for per-account functions.
+
+Each account is processed once by `func`. Errors are collected and either
+stop the pool immediately (stop_on_error=True) or are summarized at the end.
+"""
+
+
 def parallel_process_accounts(
     label: str,
     func,

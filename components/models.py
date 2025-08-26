@@ -27,6 +27,7 @@ class Config:
 
     @staticmethod
     def from_json_file(path: Path) -> "Config":
+        """Load `Config` from a JSON file with keys: server, accounts[]."""
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
 

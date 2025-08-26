@@ -19,6 +19,7 @@ from .utils import check_environment, sanitize_for_path
 
 
 def setup_logging(log_directory: Path) -> Path:
+    """Initialize root logger with file + stdout handlers and return log path."""
     log_directory.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
     import logging
