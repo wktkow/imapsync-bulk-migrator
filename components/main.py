@@ -271,9 +271,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if status != "OK":
                                 raise RuntimeError(f"search failed: {mailbox}")
                             num = len((data[0] or b"").split()) if data else 0
-                            remote_counts[mailbox] = num
+                            remote_counts[sanitize_for_path(mailbox)] = num
                         except Exception:
-                            remote_counts[mailbox] = -1
+                            remote_counts[sanitize_for_path(mailbox)] = -1
                 for folder, local_count in local_counts.items():
                     remote = remote_counts.get(folder, -1)
                     if local_count != remote:
