@@ -6,7 +6,7 @@ import os
 import signal
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from .audit import audit_export
 from .da_client import DirectAdminClient
@@ -52,30 +52,14 @@ def setup_logging(log_directory: Path) -> Path:
 def test_accounts(config: Config, max_workers: int) -> None:
     import concurrent.futures
     import queue
-    import imaplib
-    import contextlib
     errors: queue.Queue[str] = queue.Queue()
-
-    def imap_connection(server, account):
-        import ssl
-        if server.ssl:
-            imap = imaplib.IMAP4_SSL(host=server.host, port=server.port)
-        else:
-            imap = imaplib.IMAP4(host=server.host, port=server.port)
-        try:
-            if (not server.ssl) and server.starttls:
-                imap.starttls(ssl_context=ssl.create_default_context())
-            imap.login(account.email, account.password)
-            return imap
-        except Exception:
-            with contextlib.suppress(Exception):
-                imap.logout()
-            raise
+    from .imap_ops import imap_connection
 
     def worker(acc: Account) -> None:
         try:
-            with contextlib.ExitStack() as stack:
-                imap = stack.enter_context(contextlib.closing(imap_connection(config.server, acc)))
+            # Properly open and logout via the context manager
+            with imap_connection(config.server, acc):
+                pass
             ok, out = run_imapsync_justconnect(
                 host=config.server.host,
                 port=config.server.port,
