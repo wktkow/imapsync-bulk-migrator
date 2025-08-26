@@ -17,6 +17,7 @@ from .imap_ops import export_account, import_account
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config
 from .utils import check_environment, sanitize_for_path
+from .utils import check_free_space_for_path
 
 
 def setup_logging(log_directory: Path) -> Path:
@@ -202,6 +203,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.mode == "export":
             out_root = Path(args.output_dir)
             out_root.mkdir(parents=True, exist_ok=True)
+            # Ensure destination filesystem has enough free space
+            with contextlib.suppress(Exception):
+                check_free_space_for_path(out_root, float(args.min_free_gb))
             try:
                 from .models import Config as _Cfg
                 payload_path = config_path.parent / "import.pass.config.json"
@@ -248,6 +252,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
+            with contextlib.suppress(Exception):
+                check_free_space_for_path(in_root, float(args.min_free_gb))
 
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
@@ -273,6 +279,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
+            with contextlib.suppress(Exception):
+                check_free_space_for_path(in_root, float(args.min_free_gb))
             mismatches: List[Tuple[str, str, int, int]] = []
             mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
@@ -327,6 +335,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
+            with contextlib.suppress(Exception):
+                check_free_space_for_path(in_root, float(args.min_free_gb))
             try:
                 logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
                 ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))

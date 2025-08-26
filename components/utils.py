@@ -35,3 +35,17 @@ def check_environment(min_free_gb: float = 1.0) -> None:
         )
 
 
+def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
+    """Check free space on the filesystem backing `target_path`.
+
+    Uses the path if it exists, otherwise its parent directory.
+    """
+    probe = target_path if target_path.exists() else target_path.parent
+    total, used, free = shutil.disk_usage(probe)
+    free_gb = free / (1024 ** 3)
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"Insufficient free disk space at {probe}: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
+        )
+
+
