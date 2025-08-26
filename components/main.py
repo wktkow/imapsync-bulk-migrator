@@ -194,7 +194,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             out_root.mkdir(parents=True, exist_ok=True)
             try:
                 from .models import Config as _Cfg
-                payload_path = Path("import.pass.config.json")
+                payload_path = config_path.parent / "import.pass.config.json"
                 if not payload_path.exists():
                     with payload_path.open("w", encoding="utf-8") as f:
                         import json
