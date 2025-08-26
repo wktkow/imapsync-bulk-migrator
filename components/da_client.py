@@ -98,6 +98,7 @@ class DirectAdminClient:
             "passwd": password,
             "passwd2": password,
             "quota": str(int(quota_mb) if quota_mb >= 0 else 0),
+            "json": "yes",
         }
         json_obj, kv = self._post("CMD_API_POP", data=data)
         def _kv_get_one(mapobj, key: str):
