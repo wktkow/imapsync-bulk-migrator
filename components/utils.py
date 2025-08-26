@@ -40,8 +40,15 @@ def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
 
     Uses the path if it exists, otherwise its parent directory.
     """
-    probe = target_path if target_path.exists() else target_path.parent
-    total, used, free = shutil.disk_usage(probe)
+    probe = target_path
+    # Climb to an existing ancestor (fallback to CWD as a last resort).
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            probe = Path.cwd()
+            break
+        probe = parent
+    _, _, free = shutil.disk_usage(probe)
     free_gb = free / (1024 ** 3)
     if free_gb < min_free_gb:
         raise RuntimeError(
