@@ -735,9 +735,10 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     if not data:
         issues.append(f"{eml_path}: empty file")
         return issues
-    # Parse as RFC822
+    # Parse as RFC822 (lenient policy to avoid exceptions on malformed headers)
     try:
-        msg = BytesParser(policy=default_policy).parsebytes(data)
+        from email.policy import compat32 as compat32_policy  # local import to avoid top-level change
+        msg = BytesParser(policy=compat32_policy).parsebytes(data)
     except Exception as exc:
         issues.append(f"{eml_path}: failed to parse RFC822: {exc}")
         msg = None
@@ -746,10 +747,17 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     if b"FLAGS (" in data or b"INTERNALDATE \"" in data:
         issues.append(f"{eml_path}: suspicious raw IMAP metadata present in payload (possible concatenation)")
 
-    # Optional: verify headers presence as a sanity signal
+    # Optional: verify headers presence as a sanity signal (lenient to reduce false positives)
     if msg is not None:
-        if not (msg.get("From") and (msg.get("Date") or msg.get("Message-Id"))):
-            issues.append(f"{eml_path}: missing common headers (From/Date/Message-Id)")
+        header_keys = ["From", "To", "Subject", "Date", "Message-Id", "MIME-Version", "Content-Type", "Received"]
+        def _safe_get(h: str) -> bool:
+            try:
+                return bool(msg.get(h))
+            except Exception:
+                return False
+        present = sum(1 for k in header_keys if _safe_get(k))
+        if present < 2:
+            issues.append(f"{eml_path}: sparse headers (found {present}/8 common headers)")
         # If multipart, ensure subparts exist
         if msg.is_multipart():
             parts = [p for p in msg.walk()]
@@ -895,6 +903,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "import": "import.pass.config.json",
         "test": "export.pass.config.json",
         "validate": "import.pass.config.json",
+        "audit": "export.pass.config.json",
     }[args.mode]
     config_path = Path(args.config or default_config)
     if not config_path.exists():
