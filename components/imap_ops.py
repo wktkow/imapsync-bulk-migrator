@@ -290,7 +290,14 @@ def import_account(
                     if flags:
                         flags_norm = "(" + " ".join(flag.strip() for flag in flags.split() if flag.strip()) + ")"
                         flags_tuple = flags_norm
-                    date_time = internaldate
+                    # Build IMAP INTERNALDATE value. If missing, use current time.
+                    if isinstance(internaldate, str) and internaldate.strip():
+                        dt_str = internaldate.strip()
+                        if not (dt_str.startswith("\"") and dt_str.endswith("\"")):
+                            dt_str = f'"{dt_str}"'
+                        date_time = dt_str
+                    else:
+                        date_time = time.time()
                     status, _ = imap.append(mailbox, flags_tuple, date_time, data)
                     if status != "OK":
                         raise RuntimeError(f"append failed for {eml_path}")
