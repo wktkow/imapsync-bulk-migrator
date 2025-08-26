@@ -1,7 +1,8 @@
+from __future__ import annotations
 import concurrent.futures
 import logging
 import queue
-from typing import List
+from typing import Callable, List
 
 from .models import Account
 
@@ -15,11 +16,13 @@ stop the pool immediately (stop_on_error=True) or are summarized at the end.
 
 def parallel_process_accounts(
     label: str,
-    func,
+    func: Callable[[Account], None],
     accounts: List[Account],
     max_workers: int,
     stop_on_error: bool,
 ) -> None:
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
     errors: queue.Queue[str] = queue.Queue()
 
     def wrapped(acc: Account) -> None:
