@@ -99,6 +99,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-free-gb", type=float, default=1.0, help="Fail-fast if free disk space is lower")
     parser.add_argument("--resync-missing", action="store_true", help="In validate mode, attempt to re-import missing messages")
     parser.add_argument("--no-audit-after-export", action="store_true", help="Do not run audit automatically after export")
+    parser.add_argument("--no-connectivity-test", action="store_true", help="Skip preflight connectivity tests (imaplib + imapsync --justconnect)")
+    parser.add_argument("--audit-offline", action="store_true", help="Do not contact IMAP server during audit; perform local-only checks")
 
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
     parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
@@ -115,8 +117,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         check_environment(min_free_gb=float(args.min_free_gb))
-        from .utils import ensure_imapsync_available
-        ensure_imapsync_available()
+        if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
+            from .utils import ensure_imapsync_available
+            ensure_imapsync_available()
     except Exception as exc:
         logging.error("Environment/dependency check failed: %s", exc)
         return 2
@@ -164,13 +167,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not args.ignore_errors:
                 return 3
 
-    try:
-        logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
-        test_accounts(config, max_workers=int(args.max_workers))
-        logging.info("Connectivity tests passed for all accounts")
-    except Exception as exc:
-        logging.error("Connectivity tests failed: %s", exc)
-        return 3
+    if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
+        try:
+            logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
+            test_accounts(config, max_workers=int(args.max_workers))
+            logging.info("Connectivity tests passed for all accounts")
+        except Exception as exc:
+            logging.error("Connectivity tests failed: %s", exc)
+            return 3
+    elif args.mode in {"export", "import", "test", "validate"}:
+        logging.info("Skipping connectivity tests due to --no-connectivity-test")
 
     stop_event = threading.Event()
 
@@ -214,8 +220,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             if not bool(getattr(args, "no_audit_after_export", False)):
                 try:
-                    logging.info("Running export audit (local + remote counts)...")
-                    ok, audit_issues = audit_export(out_root, config, int(args.max_workers), check_remote=True)
+                    logging.info("Running export audit (%s)...", "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
+                    ok, audit_issues = audit_export(out_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
                     if ok:
                         logging.info("Audit passed: exported data looks consistent for all accounts")
                     else:
@@ -301,8 +307,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
             try:
-                logging.info("Running audit on %s ...", in_root)
-                ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=True)
+                logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
+                ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
                 if ok:
                     logging.info("Audit passed: exported data looks consistent for all accounts")
                     return 0
