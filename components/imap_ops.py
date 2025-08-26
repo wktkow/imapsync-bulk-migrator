@@ -72,6 +72,8 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
                 uids.append(int(tok))
             except ValueError:
                 continue
+    # Ensure stable ascending order
+    uids.sort()
     return uids
 
 
@@ -140,7 +142,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             continue
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
-                        base = f"u{uid}"
+                        # Zero-pad UID so lexicographic order matches numeric order
+                        base = f"u{int(uid):010d}"
                         eml_path = folder_dir / f"{base}.eml"
                         meta_path = folder_dir / f"{base}.json"
                         with open(eml_path, "wb") as f:
