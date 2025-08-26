@@ -17,6 +17,7 @@ dist/
 # OS-generated files
 .DS_Store
 __pycache__/*
+LOG_imapsync/*
 
 # Project artifacts and local data (prevent accidental commits)
 # Exported mail data and logs
@@ -35,6 +36,7 @@ export.*.config.json*
 import.*.config.json*
 *export*config*.json*
 *import*config*.json*
+*_accounts_config.json
 
 # Editor/OS backups for JSON configs
 *.json.bak
