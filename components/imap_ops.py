@@ -48,15 +48,16 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
     for raw in data or []:
         if raw is None:
             continue
-        line = raw.decode(errors="ignore")
-        m = re.findall(r'"([^"]+)"$', line)
+        line = raw.decode(errors="ignore").strip()
+        m = re.findall(r'"([^"]+)"\s*$', line)
         if m:
             mailboxes.append(m[0])
         else:
-            parts = line.split(" ")
+            parts = line.rsplit(" ", 1)
             if parts:
-                candidate = parts[-1].strip('"')
-                mailboxes.append(candidate)
+                candidate = parts[-1].strip().strip('"')
+                if candidate:
+                    mailboxes.append(candidate)
     unique = []
     seen = set()
     for mb in mailboxes:
@@ -232,9 +233,13 @@ def import_account(
                         mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
+    # Choose IMAP context manager (injected or default)
+    def _imap_ctx():
+        return imap_factory(server, account) if callable(imap_factory) else imap_connection(server, account)
+
     # Try login; if it fails and DA context is provided, create mailbox and retry once
     def _try_login_only() -> None:
-        with imap_connection(server, account):
+        with _imap_ctx():
             pass
 
     login_ok = False
@@ -254,9 +259,9 @@ def import_account(
                 logging.info("[da][lazy] Created mailbox: %s, retrying login", account.email)
                 _try_login_only()
                 login_ok = True
-            except Exception:
-                # Propagate original login failure if provisioning/retry fails
-                raise first_exc
+            except Exception as retry_exc:
+                # Propagate original login failure, preserving retry context
+                raise first_exc from retry_exc
         else:
             raise
 
@@ -264,7 +269,7 @@ def import_account(
         raise RuntimeError("login failed and no retry attempted")
 
     # Proceed with actual import work under a fresh connection
-    with imap_connection(server, account) as imap:
+    with _imap_ctx() as imap:
         for folder, entries in per_folder.items():
             if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                 logging.info("[import] %s: stop requested before processing folder %s, exiting", account.email, folder)
@@ -294,14 +299,15 @@ def import_account(
                         if filtered_tokens:
                             flags_norm = "(" + " ".join(filtered_tokens) + ")"
                             flags_tuple = flags_norm
-                    # Build IMAP INTERNALDATE value. If missing, use current time.
+                    # Build IMAP INTERNALDATE value. If missing, use current time (RFC3501 format).
                     if isinstance(internaldate, str) and internaldate.strip():
                         dt_str = internaldate.strip()
                         if not (dt_str.startswith("\"") and dt_str.endswith("\"")):
                             dt_str = f'"{dt_str}"'
                         date_time = dt_str
                     else:
-                        date_time = time.time()
+                        import imaplib as _imaplib
+                        date_time = _imaplib.Time2Internaldate(time.time())
                     status, _ = imap.append(mailbox, flags_tuple, date_time, data)
                     if status != "OK":
                         raise RuntimeError(f"append failed for {eml_path}")
