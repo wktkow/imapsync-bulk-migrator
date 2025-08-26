@@ -726,12 +726,137 @@ def generate_import_config_template_from_export(export_config: Config, output_pa
     logging.info("Generated import config template at: %s", output_path)
 
 
+def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
+    issues: List[str] = []
+    try:
+        data = eml_path.read_bytes()
+    except Exception as exc:
+        return [f"{eml_path}: failed to read: {exc}"]
+    if not data:
+        issues.append(f"{eml_path}: empty file")
+        return issues
+    # Parse as RFC822
+    try:
+        msg = BytesParser(policy=default_policy).parsebytes(data)
+    except Exception as exc:
+        issues.append(f"{eml_path}: failed to parse RFC822: {exc}")
+        msg = None
+
+    # Heuristic: content should not include raw IMAP metadata indicating concatenation
+    if b"FLAGS (" in data or b"INTERNALDATE \"" in data:
+        issues.append(f"{eml_path}: suspicious raw IMAP metadata present in payload (possible concatenation)")
+
+    # Optional: verify headers presence as a sanity signal
+    if msg is not None:
+        if not (msg.get("From") and (msg.get("Date") or msg.get("Message-Id"))):
+            issues.append(f"{eml_path}: missing common headers (From/Date/Message-Id)")
+        # If multipart, ensure subparts exist
+        if msg.is_multipart():
+            parts = [p for p in msg.walk()]
+            if len(parts) <= 1:
+                issues.append(f"{eml_path}: declared multipart but no parts found")
+    return issues
+
+
+def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig], check_remote: bool = True) -> Tuple[str, List[str]]:
+    """
+    Audit exported data for a single account. Optionally compare counts against remote server.
+    Returns (email, issues).
+    """
+    issues: List[str] = []
+    account_dir = in_root / sanitize_for_path(account.email)
+    if not account_dir.exists():
+        issues.append(f"account directory missing: {account_dir}")
+        return account.email, issues
+
+    # Local per-folder checks
+    for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+        folder = folder_dir.name
+        emls = sorted(folder_dir.glob("*.eml"))
+        jsons = sorted(folder_dir.glob("*.json"))
+        if not emls:
+            issues.append(f"{account.email}:{folder}: no .eml files found")
+        # Pairing check
+        eml_stems = {p.stem for p in emls}
+        json_stems = {p.stem for p in jsons}
+        missing_meta = eml_stems - json_stems
+        missing_eml = json_stems - eml_stems
+        if missing_meta:
+            issues.append(f"{account.email}:{folder}: {len(missing_meta)} message(s) missing .json metadata")
+        if missing_eml:
+            issues.append(f"{account.email}:{folder}: {len(missing_eml)} metadata file(s) without .eml counterpart")
+
+        # File-level checks
+        for eml_path in emls:
+            issues.extend(_audit_eml_file(eml_path, folder))
+            # UID filename consistency
+            stem = eml_path.stem
+            if stem.startswith("u") and stem[1:].isdigit():
+                uid_in_name = int(stem[1:])
+                meta_path = eml_path.with_suffix(".json")
+                with contextlib.suppress(Exception):
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    uid_meta = meta.get("uid")
+                    if isinstance(uid_meta, int) and uid_meta != uid_in_name:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
+
+    # Remote count comparison (source server), if requested
+    if check_remote and server is not None:
+        try:
+            with imap_connection(server, account) as imap:
+                remote_mailboxes = list_all_mailboxes(imap)
+                remote_counts: Dict[str, int] = {}
+                for mbox in remote_mailboxes:
+                    status, _ = imap.select(mbox, readonly=True)
+                    if status != "OK":
+                        continue
+                    status, data = imap.uid("search", None, "ALL")
+                    if status != "OK":
+                        continue
+                    num = len((data[0] or b"").split()) if data else 0
+                    remote_counts[sanitize_for_path(mbox)] = num
+        except Exception as exc:
+            issues.append(f"remote check failed: {exc}")
+            remote_counts = {}
+
+        # Compare local vs remote
+        for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+            folder = folder_dir.name
+            local_count = len(list(folder_dir.glob("*.eml")))
+            remote_count = remote_counts.get(folder, -1)
+            if remote_count >= 0 and local_count != remote_count:
+                issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
+        # Folders missing locally
+        for folder_name, rcount in remote_counts.items():
+            if not (account_dir / folder_name).exists() and rcount > 0:
+                issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
+
+    return account.email, issues
+
+
+def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: bool = True) -> Tuple[bool, List[str]]:
+    """
+    Audit the exported dataset under in_root using accounts in the provided config.
+    Returns (ok, issues).
+    """
+    issues_accum: List[str] = []
+
+    def worker(acc: Account) -> None:
+        _, issues = audit_account(acc, in_root, config.server if check_remote else None, check_remote=check_remote)
+        if issues:
+            issues_accum.extend([f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="audit") as ex:
+        list(ex.map(worker, config.accounts))
+
+    ok = len(issues_accum) == 0
+    return ok, issues_accum
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with prechecks via imapsync.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--mode", required=True, choices=["export", "import", "test", "validate"], help="Operation mode")
+    parser.add_argument("--mode", required=True, choices=["export", "import", "test", "validate", "audit"], help="Operation mode")
     parser.add_argument("--config", required=False, help="Path to JSON config file with server and accounts")
     parser.add_argument("--output-dir", default=str(Path.cwd() / "exported"), help="Directory to write exported data")
     parser.add_argument("--input-dir", default=str(Path.cwd() / "exported"), help="Directory to read exported data for import/validate")
@@ -740,6 +865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--log-dir", default=str(Path.cwd() / "logs"), help="Directory to store log files")
     parser.add_argument("--min-free-gb", type=float, default=1.0, help="Fail-fast if free disk space is lower")
     parser.add_argument("--resync-missing", action="store_true", help="In validate mode, attempt to re-import missing messages")
+    parser.add_argument("--no-audit-after-export", action="store_true", help="Do not run audit automatically after export")
 
     # Optional: DirectAdmin auto-provisioning for import mode
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
@@ -850,6 +976,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             logging.info("Export finished. Data stored under: %s", out_root)
+
+            # Run audit automatically unless disabled
+            if not bool(getattr(args, "no_audit_after_export", False)):
+                try:
+                    logging.info("Running export audit (local + remote counts)...")
+                    ok, audit_issues = audit_export(out_root, config, int(args.max_workers), check_remote=True)
+                    if ok:
+                        logging.info("Audit passed: exported data looks consistent for all accounts")
+                    else:
+                        logging.error("Audit found %d issue(s):", len(audit_issues))
+                        for line in audit_issues:
+                            logging.error("[audit] %s", line)
+                        return 4
+                except Exception as exc:
+                    logging.error("Audit failed to complete: %s", exc)
+                    return 4
         elif args.mode == "import":
             in_root = Path(args.input_dir)
             if not in_root.exists():
@@ -908,6 +1050,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                     parallel_process_accounts("resync", do_resync, [a for a in config.accounts if a.email in affected], int(args.max_workers), stop_on_error=False)
             else:
                 logging.info("Validation successful: local export matches remote counts for all accounts.")
+        elif args.mode == "audit":
+            in_root = Path(args.input_dir)
+            if not in_root.exists():
+                logging.error("Input directory does not exist: %s", in_root)
+                return 2
+            try:
+                logging.info("Running audit on %s ...", in_root)
+                ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=True)
+                if ok:
+                    logging.info("Audit passed: exported data looks consistent for all accounts")
+                    return 0
+                logging.error("Audit found %d issue(s):", len(audit_issues))
+                for line in audit_issues:
+                    logging.error("[audit] %s", line)
+                return 4
+            except Exception as exc:
+                logging.exception("Fatal audit error: %s", exc)
+                return 4
         else:
             logging.error("Unknown mode: %s", args.mode)
             return 2

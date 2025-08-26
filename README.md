@@ -52,6 +52,7 @@ Key arguments:
 - `--log-dir PATH`: Log directory (default: `./logs`).
 - `--min-free-gb FLOAT`: Fail if free disk is below this threshold.
 - `--resync-missing`: In `validate` mode, try re-importing mismatched folders.
+- `--no-audit-after-export`: Skip the automatic audit that runs after `export`.
 
 Optional DirectAdmin auto‑provisioning flags (import mode):
 - `--auto-provision-da`: Enable account auto‑creation for missing mailboxes.
@@ -64,10 +65,11 @@ Optional DirectAdmin auto‑provisioning flags (import mode):
 
 ## Modes
 
-- **export**: Connects to Server A and for each account downloads all folders/messages locally. Non-destructive.
+- **export**: Connects to Server A and for each account downloads all folders/messages locally. Non-destructive. After export completes, an automatic audit runs (unless `--no-audit-after-export` is provided) to ensure the export is sane.
 - **import**: Connects to Server B and imports all previously exported messages/folders.
 - **test**: Performs deep env checks: Python version, disk space, `imapsync` availability, IMAP login via `imaplib`, and `imapsync --justconnect` for each account.
 - **validate**: Compares local export counts to Server B counts. Optionally resyncs missing messages with `--resync-missing`.
+- **audit**: Performs a thorough audit of an existing export directory. It checks that each folder has one `.eml` per message, pairs `.eml` with `.json` metadata, parses each message to ensure it’s valid RFC822, flags suspicious raw IMAP metadata (indicative of concatenation), and compares local counts versus the source server for each account.
 
 During `export`, a template `import.pass.config.json` is auto-generated (if missing) using the same accounts, so teams can update the target server host later and perform the import when ready.
 
