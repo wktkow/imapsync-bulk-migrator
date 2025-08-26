@@ -37,6 +37,13 @@ def parallel_process_accounts(
             fut.result()
 
     if not errors.empty() and not stop_on_error:
-        logging.warning("[%s] Completed with errors (%d accounts). See logs.", label, errors.qsize())
+        count = errors.qsize()
+        logging.warning("[%s] Completed with errors (%d accounts). Details follow:", label, count)
+        # Drain the queue for operator visibility
+        while not errors.empty():
+            try:
+                logging.warning("[%s] %s", label, errors.get_nowait())
+            except Exception:
+                break
 
 
