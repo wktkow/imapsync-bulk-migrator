@@ -484,42 +484,31 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 folder_dir = account_dir / sanitize_for_path(mailbox)
                 folder_dir.mkdir(parents=True, exist_ok=True)
 
-                # Chunk fetch to keep memory bounded
+                # Fetch one message per UID to avoid response grouping ambiguities
+                # Still chunk the iteration to keep logs readable
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
                     batch = uids[i : i + batch_size]
-                    uid_set = ",".join(str(u) for u in batch)
-                    status, data = imap.uid("fetch", uid_set, "(RFC822 FLAGS INTERNALDATE)")
-                    if status != "OK":
-                        raise RuntimeError(f"fetch failed in {mailbox}")
-                    # data is a list; group it per message heuristically
-                    # We iterate pairs and collect until we encounter a closing b')'
-                    cursor = 0
-                    while cursor < len(data):
-                        # Accumulate parts until next tuple boundary
-                        parts: List[bytes] = []
-                        while cursor < len(data) and data[cursor] is not None:
-                            parts.append(data[cursor])
-                            cursor += 1
-                            # Heuristic stop when we see b')' in a bytes item
-                            if isinstance(parts[-1], (bytes, bytearray)) and parts[-1].strip().endswith(b")"):
-                                break
-                        cursor += 1  # Skip None or move to next
-                        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(parts)
+                    for uid in batch:
+                        status, data = imap.uid("fetch", str(uid), "(RFC822 FLAGS INTERNALDATE)")
+                        if status != "OK":
+                            raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
+                        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []))
                         if not msg_bytes:
+                            # Some servers may return empty for deleted/expunged UIDs
                             continue
-                        # Parse minimal to ensure it's a valid email
+                        # Minimal parse to ensure it's a valid email
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
-                        # Build filename using time and an index to avoid collisions
-                        uid_hint = str(int(time.time() * 1000))
-                        base = f"{uid_hint}-{abs(hash(msg_bytes)) & 0xFFFFFFFF:08x}"
+                        # Use UID-based filenames for determinism and one-file-per-message
+                        base = f"u{uid}"
                         eml_path = folder_dir / f"{base}.eml"
                         meta_path = folder_dir / f"{base}.json"
                         with open(eml_path, "wb") as f:
                             f.write(msg_bytes)
                         meta = {
                             "mailbox": mailbox,
+                            "uid": int(uid),
                             "flags": flags or "",
                             "internaldate": internaldate or "",
                         }
@@ -581,6 +570,7 @@ def import_account(account: Account, server: ServerConfig, in_root: Path, ignore
                             flags_tuple = flags_norm
                         date_time = internaldate
                         # Append into currently selected mailbox
+                        # imaplib: date_time can be None or an IMAP INTERNALDATE string
                         status, _ = imap.append(mailbox, flags_tuple, date_time, data)
                         if status != "OK":
                             raise RuntimeError(f"append failed for {eml_path}")
