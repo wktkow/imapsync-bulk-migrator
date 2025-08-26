@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import socket
 import os
 import signal
 import threading
@@ -102,6 +103,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-audit-after-export", action="store_true", help="Do not run audit automatically after export")
     parser.add_argument("--no-connectivity-test", action="store_true", help="Skip preflight connectivity tests (imaplib + imapsync --justconnect)")
     parser.add_argument("--audit-offline", action="store_true", help="Do not contact IMAP server during audit; perform local-only checks")
+    parser.add_argument("--imap-timeout", type=float, default=60.0, help="Default IMAP socket timeout in seconds")
 
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
     parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
@@ -115,6 +117,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log_file = setup_logging(Path(args.log_dir))
     logging.info("Starting imapsync-bulk-migrator | mode=%s", args.mode)
+
+    # Apply default IMAP socket timeout early so all imaplib ops inherit it
+    try:
+        socket.setdefaulttimeout(float(args.imap_timeout))
+        logging.info("IMAP default socket timeout set to %.1f sec", float(args.imap_timeout))
+    except Exception as _exc:
+        logging.warning("Failed to set default socket timeout: %s", _exc)
 
     try:
         check_environment(min_free_gb=float(args.min_free_gb))
