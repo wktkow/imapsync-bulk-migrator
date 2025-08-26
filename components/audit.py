@@ -106,14 +106,18 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
 def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: bool = True) -> Tuple[bool, List[str]]:
     issues_accum: List[str] = []
 
-    def worker(acc: Account) -> None:
-        _, issues = audit_account(acc, in_root, config.server if check_remote else None, check_remote=check_remote)
-        if issues:
-            issues_accum.extend([f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues])
+    def worker(acc: Account) -> List[str]:
+        _email, issues = audit_account(acc, in_root, config.server if check_remote else None, check_remote=check_remote)
+        if not issues:
+            return []
+        return [f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues]
 
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="audit") as ex:
-        list(ex.map(worker, config.accounts))
+        results = list(ex.map(worker, config.accounts))
+    for lst in results:
+        if lst:
+            issues_accum.extend(lst)
     ok = len(issues_accum) == 0
     return ok, issues_accum
 

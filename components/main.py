@@ -247,6 +247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
             mismatches: List[Tuple[str, str, int, int]] = []
+            mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
                 from .imap_ops import imap_connection, list_all_mailboxes
                 from .imap_ops import fetch_all_uids
@@ -277,7 +278,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for folder, local_count in local_counts.items():
                     remote = remote_counts.get(folder, -1)
                     if local_count != remote:
-                        mismatches.append((email, folder, local_count, remote))
+                        with mismatches_lock:
+                            mismatches.append((email, folder, local_count, remote))
             parallel_process_accounts("validate", do_validate, config.accounts, int(args.max_workers), stop_on_error=False)
             if mismatches:
                 logging.warning("Validation mismatches found:")
