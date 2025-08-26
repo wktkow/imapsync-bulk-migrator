@@ -25,8 +25,18 @@ def run_imapsync_justconnect(host: str, port: int, ssl_enabled: bool, starttls: 
         args.append("--tls1")
 
     logging.debug("Running imapsync justconnect: %s", " ".join(["***" if a in {password} else a for a in args]))
-    res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, text=True)
-    ok = res.returncode == 0
-    return ok, res.stdout
+    try:
+        res = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+            timeout=timeout_sec + 10,
+        )
+        ok = res.returncode == 0
+        return ok, res.stdout
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
 
 
