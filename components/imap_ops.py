@@ -111,13 +111,16 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
     return msg_bytes, flags, internaldate
 
 
-def export_account(account: Account, server: ServerConfig, out_root: Path, ignore_errors: bool) -> None:
+def export_account(account: Account, server: ServerConfig, out_root: Path, ignore_errors: bool, *, stop_event: Optional[object] = None) -> None:
     account_dir = out_root / sanitize_for_path(account.email)
     account_dir.mkdir(parents=True, exist_ok=True)
     logging.info("[export] %s: starting", account.email)
     with imap_connection(server, account) as imap:
         mailboxes = list_all_mailboxes(imap)
         for mailbox in mailboxes:
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                logging.info("[export] %s: stop requested, exiting", account.email)
+                return
             try:
                 status, _ = imap.select(mailbox, readonly=True)
                 if status != "OK":
@@ -132,8 +135,14 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        logging.info("[export] %s: stop requested during UID batching, exiting", account.email)
+                        return
                     batch = uids[i : i + batch_size]
                     for uid in batch:
+                        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                            logging.info("[export] %s: stop requested during UID loop, exiting", account.email)
+                            return
                         status, data = imap.uid("fetch", str(uid), "(RFC822 FLAGS INTERNALDATE)")
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
@@ -163,7 +172,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: completed", account.email)
 
 
-def import_account(account: Account, server: ServerConfig, in_root: Path, ignore_errors: bool, *, create_folder: bool = True, imap_factory=None) -> None:
+def import_account(account: Account, server: ServerConfig, in_root: Path, ignore_errors: bool, *, create_folder: bool = True, imap_factory=None, stop_event: Optional[object] = None) -> None:
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
@@ -171,6 +180,9 @@ def import_account(account: Account, server: ServerConfig, in_root: Path, ignore
     with imap_connection(server, account) as imap:
         per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
         for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                logging.info("[import] %s: stop requested while scanning folders, exiting", account.email)
+                return
             for eml_path in sorted(folder_dir.glob("*.eml")):
                 meta_path = eml_path.with_suffix(".json")
                 flags = ""
@@ -187,6 +199,9 @@ def import_account(account: Account, server: ServerConfig, in_root: Path, ignore
                 per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
         for folder, entries in per_folder.items():
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                logging.info("[import] %s: stop requested before processing folder %s, exiting", account.email, folder)
+                return
             mailbox = folder
             try:
                 status, _ = imap.select(mailbox)
@@ -199,6 +214,9 @@ def import_account(account: Account, server: ServerConfig, in_root: Path, ignore
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
                 for eml_path, flags, internaldate in entries:
+                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                        logging.info("[import] %s: stop requested during message loop, exiting", account.email)
+                        return
                     with open(eml_path, "rb") as f:
                         data = f.read()
                     flags_tuple = None

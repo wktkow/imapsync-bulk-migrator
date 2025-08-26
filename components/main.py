@@ -213,7 +213,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_export(acc: Account) -> None:
                 if stop_event.is_set():
                     return
-                export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors))
+                export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
             parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             logging.info("Export finished. Data stored under: %s", out_root)
@@ -241,7 +241,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
                     return
-                import_account(acc, config.server, in_root, ignore_errors=bool(args.ignore_errors))
+                import_account(acc, config.server, in_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
             parallel_process_accounts("import", do_import, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             logging.info("Import finished into server %s", config.server.host)
