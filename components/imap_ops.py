@@ -288,8 +288,12 @@ def import_account(
                         data = f.read()
                     flags_tuple = None
                     if flags:
-                        flags_norm = "(" + " ".join(flag.strip() for flag in flags.split() if flag.strip()) + ")"
-                        flags_tuple = flags_norm
+                        raw_tokens = [tok for tok in (flags.split()) if tok and tok.strip()]
+                        # \RECENT is a read-only system flag; servers reject setting it on APPEND
+                        filtered_tokens = [t for t in raw_tokens if t.strip().upper() != "\\RECENT"]
+                        if filtered_tokens:
+                            flags_norm = "(" + " ".join(filtered_tokens) + ")"
+                            flags_tuple = flags_norm
                     # Build IMAP INTERNALDATE value. If missing, use current time.
                     if isinstance(internaldate, str) and internaldate.strip():
                         dt_str = internaldate.strip()
