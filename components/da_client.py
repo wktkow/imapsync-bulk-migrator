@@ -72,9 +72,15 @@ class DirectAdminClient:
                     return [str(u) for u in json_obj["list"]]
                 if "users" in json_obj and isinstance(json_obj["users"], list):
                     return [str(u) for u in json_obj["users"]]
-                dynamic = [v for k, v in json_obj.items() if isinstance(k, str) and k.startswith("list")]
-                if dynamic:
-                    return [str(u) for u in dynamic]
+                dynamic_values = []
+                for k, v in json_obj.items():
+                    if isinstance(k, str) and k.startswith("list"):
+                        if isinstance(v, list):
+                            dynamic_values.extend(v)
+                        else:
+                            dynamic_values.append(v)
+                if dynamic_values:
+                    return [str(u) for u in dynamic_values]
             elif isinstance(json_obj, list):
                 # Some DA variants return a plain JSON array
                 return [str(u) for u in json_obj]
