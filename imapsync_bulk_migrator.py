@@ -529,22 +529,24 @@ def import_account(account: Account, server: ServerConfig, in_root: Path, ignore
     # Attempt login; if it fails and DirectAdmin client is provided, try to create the mailbox and retry once.
     try:
         with imap_connection(server, account) as imap:
-            # Map of folder name to list of (eml_path, flags, internaldate)
+            # Map of ORIGINAL mailbox name to list of (eml_path, flags, internaldate)
+            # Use per-message metadata "mailbox" rather than sanitized folder_dir.name
             per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
             for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
-                folder = folder_dir.name
-                entries: List[Tuple[Path, str, Optional[str]]] = []
                 for eml_path in sorted(folder_dir.glob("*.eml")):
                     meta_path = eml_path.with_suffix(".json")
                     flags = ""
                     internaldate = None
+                    mailbox_meta = folder_dir.name
                     if meta_path.exists():
                         with open(meta_path, "r", encoding="utf-8") as f:
                             meta = json.load(f)
                             flags = str(meta.get("flags", ""))
                             internaldate = meta.get("internaldate") or None
-                    entries.append((eml_path, flags, internaldate))
-                per_folder[folder] = entries
+                            mbox = meta.get("mailbox")
+                            if isinstance(mbox, str) and mbox.strip():
+                                mailbox_meta = mbox
+                    per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
             for folder, entries in per_folder.items():
                 mailbox = folder

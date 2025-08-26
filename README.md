@@ -65,8 +65,9 @@ Optional DirectAdmin auto‑provisioning flags (import mode):
 
 ## Modes
 
-- **export**: Connects to Server A and for each account downloads all folders/messages locally. Non-destructive. After export completes, an automatic audit runs (unless `--no-audit-after-export` is provided) to ensure the export is sane.
+- **export**: Connects to Server A and for each account downloads all folders/messages locally. Non-destructive. Exports one `.eml` per message using UID-based filenames (e.g., `u123.eml`) plus a `.json` per message with `mailbox`, `uid`, `flags`, `internaldate`. After export completes, an automatic audit runs (unless `--no-audit-after-export` is provided) to ensure the export is sane.
 - **import**: Connects to Server B and imports all previously exported messages/folders.
+  - Import restores messages into the ORIGINAL IMAP mailbox names recorded in the per-message metadata (not just the sanitized folder name on disk). If a folder does not exist it will be created.
 - **test**: Performs deep env checks: Python version, disk space, `imapsync` availability, IMAP login via `imaplib`, and `imapsync --justconnect` for each account.
 - **validate**: Compares local export counts to Server B counts. Optionally resyncs missing messages with `--resync-missing`.
 - **audit**: Performs a thorough audit of an existing export directory. It checks that each folder has one `.eml` per message, pairs `.eml` with `.json` metadata, parses each message to ensure it’s valid RFC822, flags suspicious raw IMAP metadata (indicative of concatenation), and compares local counts versus the source server for each account.
@@ -163,6 +164,11 @@ Example workflow:
 python imapsync_bulk_migrator.py --mode export --config export.pass.config.json
 ```
 
+Run audit independently or after export:
+```bash
+python imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
+```
+
 ## JSON Config Schema
 
 Shared structure for both `export.pass.config.json` and `import.pass.config.json`:
@@ -224,10 +230,17 @@ After export, a template is written automatically. Update the `server.host` (and
 
 ## Data layout
 
-Exported data is written to `./exported/<email>/<folder>/...` as `.eml` files and minimal metadata `.json` per message (flags, internaldate). Logs are written under `./logs/` with timestamped filenames.
+Exported data is written to `./exported/<email>/<sanitized-folder>/...` as `.eml` files (one message per file) and metadata `.json` per message containing:
+
+```
+{ "mailbox": "<original IMAP folder name>", "uid": <UID-int>, "flags": "\\Seen ...", "internaldate": "DD-Mon-YYYY HH:MM:SS +ZZZZ" }
+```
+
+Logs are written under `./logs/` with timestamped filenames.
 
 ## Safety and error handling
 
 - Fail-fast on environment issues (Python version, disk space, missing `imapsync`).
 - On any error the default is to stop. Use `--ignore-errors` to continue with other accounts.
 - Thorough connectivity checks via IMAP login and `imapsync --justconnect` before any export/import work.
+- Automatic audit after export verifies structure and source-vs-local counts by default. Use `--no-audit-after-export` to disable.
