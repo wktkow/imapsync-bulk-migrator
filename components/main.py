@@ -141,6 +141,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Invalid config: %s", exc)
         return 2
 
+    da_client: Optional[DirectAdminClient] = None
     if args.mode == "import" and bool(getattr(args, "auto_provision_da", False)):
         missing = [n for n in ("da_url", "da_username", "da_password") if not getattr(args, n)]
         if missing:
@@ -241,7 +242,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
                     return
-                import_account(acc, config.server, in_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
+                da_ctx = None
+                if bool(getattr(args, "auto_provision_da", False)) and da_client is not None:
+                    da_ctx = (da_client, int(args.da_quota_mb))
+                import_account(
+                    acc,
+                    config.server,
+                    in_root,
+                    ignore_errors=bool(args.ignore_errors),
+                    stop_event=stop_event,
+                    da_context=da_ctx,
+                )
 
             parallel_process_accounts("import", do_import, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             logging.info("Import finished into server %s", config.server.host)

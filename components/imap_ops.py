@@ -172,32 +172,76 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: completed", account.email)
 
 
-def import_account(account: Account, server: ServerConfig, in_root: Path, ignore_errors: bool, *, create_folder: bool = True, imap_factory=None, stop_event: Optional[object] = None) -> None:
+def import_account(
+    account: Account,
+    server: ServerConfig,
+    in_root: Path,
+    ignore_errors: bool,
+    *,
+    create_folder: bool = True,
+    imap_factory=None,
+    stop_event: Optional[object] = None,
+    da_context: Optional[Tuple[object, int]] = None,
+) -> None:
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
     logging.info("[import] %s: starting", account.email)
-    with imap_connection(server, account) as imap:
-        per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
-        for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
-            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                logging.info("[import] %s: stop requested while scanning folders, exiting", account.email)
-                return
-            for eml_path in sorted(folder_dir.glob("*.eml")):
-                meta_path = eml_path.with_suffix(".json")
-                flags = ""
-                internaldate = None
-                mailbox_meta = folder_dir.name
-                if meta_path.exists():
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                        flags = str(meta.get("flags", ""))
-                        internaldate = meta.get("internaldate") or None
-                        mbox = meta.get("mailbox")
-                        if isinstance(mbox, str) and mbox.strip():
-                            mailbox_meta = mbox
-                per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
+    # Build worklist before opening IMAP connection
+    per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
+    for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+            logging.info("[import] %s: stop requested while scanning folders, exiting", account.email)
+            return
+        for eml_path in sorted(folder_dir.glob("*.eml")):
+            meta_path = eml_path.with_suffix(".json")
+            flags = ""
+            internaldate = None
+            mailbox_meta = folder_dir.name
+            if meta_path.exists():
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                    flags = str(meta.get("flags", ""))
+                    internaldate = meta.get("internaldate") or None
+                    mbox = meta.get("mailbox")
+                    if isinstance(mbox, str) and mbox.strip():
+                        mailbox_meta = mbox
+            per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
+
+    # Try login; if it fails and DA context is provided, create mailbox and retry once
+    def _try_login_only() -> None:
+        with imap_connection(server, account):
+            pass
+
+    login_ok = False
+    try:
+        _try_login_only()
+        login_ok = True
+    except Exception as first_exc:
+        if da_context is not None:
+            client, quota_mb = da_context
+            try:
+                if "@" in account.email:
+                    local, domain = account.email.split("@", 1)
+                else:
+                    raise ValueError("invalid email address for DA provisioning")
+                # Create mailbox then retry login
+                client.create_pop_account(domain, local, account.password, quota_mb=quota_mb)  # type: ignore[attr-defined]
+                logging.info("[da][lazy] Created mailbox: %s, retrying login", account.email)
+                _try_login_only()
+                login_ok = True
+            except Exception:
+                # Propagate original login failure if provisioning/retry fails
+                raise first_exc
+        else:
+            raise
+
+    if not login_ok:
+        raise RuntimeError("login failed and no retry attempted")
+
+    # Proceed with actual import work under a fresh connection
+    with imap_connection(server, account) as imap:
         for folder, entries in per_folder.items():
             if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                 logging.info("[import] %s: stop requested before processing folder %s, exiting", account.email, folder)
