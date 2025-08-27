@@ -17,7 +17,7 @@ dist/
 # OS-generated files
 .DS_Store
 __pycache__/*
-LOG_imapsync/*
+LOG_imapsync/
 
 # Project artifacts and local data (prevent accidental commits)
 # Exported mail data and logs
@@ -44,3 +44,8 @@ import.*.config.json*
 *.json.orig
 *.json.old
 *.json.tmp
+
+
+# charm.com.pl
+*charm*
+charm.media.pl dns config
