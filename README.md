@@ -32,200 +32,68 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## CLI Usage
+## Quick start
 
 ```bash
-python imapsync_bulk_migrator.py --help
+# Export from source
+python imapsync_bulk_migrator.py --mode export --config export.pass.config.json
+
+# Import into target (with optional DirectAdmin pre-provision)
+python imapsync_bulk_migrator.py --mode import --config import.pass.config.json \
+  --auto-provision-da --da-url https://panel:2222 --da-username user --da-password key
+
+# Audit an existing export
+python imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
 ```
 
-Key arguments:
-- `--mode {export,import,test,validate}`: Operation mode.
-- `--config PATH`: JSON config with `server` and `accounts`. Defaults per mode:
-  - export -> `export.pass.config.json`
-  - import -> `import.pass.config.json`
-  - test -> `export.pass.config.json`
-  - validate -> `import.pass.config.json`
-- `--output-dir PATH`: Directory for exported data (default: `./exported`).
-- `--input-dir PATH`: Directory to read for import/validate (default: `./exported`).
-- `--max-workers N`: Parallel accounts (default: CPU cores or 4).
-- `--ignore-errors`: Continue with other accounts on errors.
-- `--log-dir PATH`: Log directory (default: `./logs`).
-- `--min-free-gb FLOAT`: Fail if free disk is below this threshold.
-- `--resync-missing`: In `validate` mode, try re-importing mismatched folders.
+## CLI
 
-Optional DirectAdmin auto‑provisioning flags (import mode):
-- `--auto-provision-da`: Enable account auto‑creation for missing mailboxes.
-- `--da-url URL`: DirectAdmin base URL, e.g. `https://panel.example.com:2222`.
-- `--da-username USER`: DirectAdmin API username (user, reseller, or admin depending on scope).
-- `--da-password PASS`: DirectAdmin API password or login key.
-- `--da-no-verify-ssl`: Skip TLS certificate verification for the panel (use only if you understand the risks).
-- `--da-dry-run`: Show what would be created without doing it.
-- `--da-quota-mb N`: Quota for new mailboxes (0 = unlimited; default 0).
+Key arguments (see `--help` for all):
+- `--mode {export,import,test,validate,audit}`
+- `--config PATH` (defaults per mode)
+- `--output-dir` / `--input-dir`
+- `--max-workers N`, `--ignore-errors`, `--log-dir`, `--min-free-gb`
+- `--no-connectivity-test`, `--no-audit-after-export`, `--audit-offline`
+- `--imap-timeout SECONDS` (default 60)
+
+DirectAdmin (import mode):
+- `--auto-provision-da`, `--da-url`, `--da-username`, `--da-password`
+- `--reset` (delete and recreate each mailbox before import)
+- `--da-no-verify-ssl`, `--da-dry-run`, `--da-quota-mb`
 
 ## Modes
 
-- **export**: Connects to Server A and for each account downloads all folders/messages locally. Non-destructive.
-- **import**: Connects to Server B and imports all previously exported messages/folders.
-- **test**: Performs deep env checks: Python version, disk space, `imapsync` availability, IMAP login via `imaplib`, and `imapsync --justconnect` for each account.
-- **validate**: Compares local export counts to Server B counts. Optionally resyncs missing messages with `--resync-missing`.
+- export: Download all folders/messages to `./exported/<email>/<folder>/` with `.eml` + `.json` metadata.
+- import: Restore messages using original mailbox names in metadata; creates folders if missing.
+  - Optional DirectAdmin steps before import: `--reset` deletes then recreates each mailbox; otherwise `--auto-provision-da` only creates missing ones.
+- test: Env + connectivity checks (`imaplib` + `imapsync --justconnect`).
+- validate: Compare local counts to server; optional `--resync-missing`.
+- audit: Thorough export check; optional remote counts unless `--audit-offline`.
 
-During `export`, a template `import.pass.config.json` is auto-generated (if missing) using the same accounts, so teams can update the target server host later and perform the import when ready.
+A template `import.pass.config.json` is auto-generated during export (if missing) next to your `--config`.
 
-## Optional: Auto‑provision missing mailboxes on DirectAdmin
-
-When importing into a DirectAdmin‑managed server, you can let the tool create any missing POP/IMAP mailboxes automatically with the same login and password as specified in your JSON config. This keeps the workflow simple and reduces manual pre‑staging.
-
-What happens when enabled:
-- Before connectivity tests in `import` mode, the tool queries the panel and creates any accounts that don’t exist yet.
-- Additionally, if a login still fails during import, a one‑time “lazy” retry will auto‑create the mailbox and retry the login.
-- New accounts are created with the password in your config; quota is set to `--da-quota-mb` (default 0 = unlimited).
-
-Requirements:
-- DirectAdmin URL, user, and password/login key with permission to create POP accounts for the target domains.
-- The `requests` package (`pip install -r requirements.txt`).
-
-Recommended setup (good UX):
-1. Create a DirectAdmin Login Key (scoped, time‑limited, minimal privileges) rather than using a full password.
-2. Ensure the API user can create POP accounts for the domains in scope.
-3. Test with `--da-dry-run` first to see what would be created.
-
-Example (pre‑provision + import):
-```bash
-python imapsync_bulk_migrator.py \
-  --mode import \
-  --config import.pass.config.json \
-  --auto-provision-da \
-  --da-url https://panel.example.com:2222 \
-  --da-username apiuser \
-  --da-password apikey_or_password \
-  --da-quota-mb 0
-```
-
-Dry run first:
-```bash
-python imapsync_bulk_migrator.py --mode import --config import.pass.config.json \
-  --auto-provision-da --da-url https://panel.example.com:2222 \
-  --da-username apiuser --da-password apikey_or_password \
-  --da-dry-run
-```
-
-Security notes:
-- Treat `--da-password` like a secret. Prefer login keys with limited scope.
-- Use `--da-no-verify-ssl` only in controlled environments.
-- The tool creates only mailboxes that are missing; it does not delete or modify existing ones.
-
-Troubleshooting tips:
-- If pre‑provisioning fails, the tool will stop unless `--ignore-errors` is set. Fix credentials/permissions and retry.
-- If login fails for a mailbox during import, the lazy auto‑provision will attempt a single create‑and‑retry. Check logs for `[da]` entries.
-
-## Optional: Index domains and mailboxes from a control panel API
-
-For environments where a control panel API is available (DirectAdmin-compatible), you can generate `export.pass.config.json` automatically by listing domains, selecting which domains are in scope, and enumerating all POP/IMAP mailboxes for those domains.
-
-Script: `directadmin_indexer.py`
-
-Requirements:
-- Python 3.9+
-- `requests` library (install via `pip install -r requirements.txt`)
-
-Usage:
-
-```bash
-python directadmin_indexer.py \
-  --url https://panel.example.com:2222 \
-  --username apiuser \
-  --password apikey_or_password \
-  --imap-host imap.example.com \
-  --imap-port 993 \
-  --out export.pass.config.json
-```
-
-What it does:
-- Authenticates to the API with basic auth.
-- Lists all domains available to the authenticated user.
-- Presents an interactive TUI to select the domains you want to include.
-- Lists POP/IMAP mailboxes for the selected domains and builds a config with those addresses.
-- Writes an `export.pass.config.json` compatible with this tool. You can provide a `--default-password` value to prefill passwords or leave them blank to fill later.
-
-Flags:
-- `--no-verify-ssl`: if the API uses a self-signed certificate.
-- `--no-imap-ssl` and `--imap-starttls`: control IMAP connection parameters written to the JSON.
-- `--overwrite`: allow overwriting an existing output file.
-
-Example workflow:
-1. Run `directadmin_indexer.py` and select affected domains.
-2. Optionally edit `export.pass.config.json` to set or update passwords.
-3. Run the migrator in export mode:
-
-```bash
-python imapsync_bulk_migrator.py --mode export --config export.pass.config.json
-```
-
-## JSON Config Schema
-
-Shared structure for both `export.pass.config.json` and `import.pass.config.json`:
+## JSON config
 
 ```json
 {
-  "server": {
-    "host": "imap.example.com",
-    "port": 993,
-    "ssl": true,
-    "starttls": false
-  },
-  "accounts": [
-    { "email": "user1@example.com", "password": "secret" },
-    { "email": "user2@example.com", "password": "secret" }
-  ]
+  "server": { "host": "imap.example.com", "port": 993, "ssl": true, "starttls": false },
+  "accounts": [ { "email": "user@example.com", "password": "secret" } ]
 }
 ```
 
-### Example: export.pass.config.json (Server A)
+## Tips
 
-```json
-{
-  "server": {
-    "host": "imap.serverA.com",
-    "port": 993,
-    "ssl": true
-  },
-  "accounts": [
-    { "email": "sales@c23.com", "password": "123" },
-    { "email": "support@c23.com", "password": "123" }
-  ]
-}
+- Start with `--ignore-errors` off to fail fast; enable after you trust the environment.
+- For DirectAdmin, try `--da-dry-run` first; lazy create-and-retry happens automatically during import when enabled.
+- Use `--imap-timeout` to avoid hanging network calls.
+- Ensure sufficient free space on the target filesystem (tool checks your paths).
+
+## Indexer (optional)
+
+Generate `export.pass.config.json` from a DirectAdmin-compatible API:
+
+```bash
+python directadmin_indexer.py --url https://panel:2222 --username user --password key \
+  --imap-host imap.example.com --imap-port 993 --out export.pass.config.json
 ```
 
-### Example: import.pass.config.json (Server B)
-
-After export, a template is written automatically. Update the `server.host` (and other fields if needed) to point to Server B:
-
-```json
-{
-  "server": {
-    "host": "imap.serverB.com",
-    "port": 993,
-    "ssl": true
-  },
-  "accounts": [
-    { "email": "sales@c23.com", "password": "123" },
-    { "email": "support@c23.com", "password": "123" }
-  ]
-}
-```
-
-## Case study
-
-- Exported from `user:sales@c23.com|password:123`.
-- The tool auto-generates `import.pass.config.json` with the same account credentials.
-- Import is not run automatically. The other team can change DNS or swap providers and later run the import when ready.
-
-## Data layout
-
-Exported data is written to `./exported/<email>/<folder>/...` as `.eml` files and minimal metadata `.json` per message (flags, internaldate). Logs are written under `./logs/` with timestamped filenames.
-
-## Safety and error handling
-
-- Fail-fast on environment issues (Python version, disk space, missing `imapsync`).
-- On any error the default is to stop. Use `--ignore-errors` to continue with other accounts.
-- Thorough connectivity checks via IMAP login and `imapsync --justconnect` before any export/import work.
