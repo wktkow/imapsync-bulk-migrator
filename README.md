@@ -1,13 +1,25 @@
-# imapsync-bulk-migrator
+# Why This Tool?
 
-Bulk export/import/validate IMAP mailboxes at scale with safety checks. This tool wraps Python's `imaplib` for exporting/importing messages locally and performs connectivity prechecks using the `imapsync` binary (`--justconnect`). It aims to be simple (KISS) and safe for large batches (thousands of mailboxes).
+This project addresses a **very specific use case** with enterprise-grade requirements:
+
+## 🎯 **Perfect For:**
+1. **Large-scale migrations** requiring reliability and performance
+2. **Server decommissioning workflows** - safely shut down source servers after export
+3. **Filesystem-based operations** with full data control and portability
+4. **Enterprise simplicity** - Map multiple domains, users, passwords, folders, emails, and states 1:1 from source → export → target in just **3 CLI commands**
+
+> **Not just another imapsync wrapper** - this is a complete migration ecosystem with safety checks, validation, and automation.
+
+## imapsync-bulk-migrator
+
+Bulk export/import/validate IMAP mailboxes at scale with safety checks. It is safe for large batches (thousands of mailboxes).
 
 Core features require no third-party Python packages. You need Python 3.9+ and `imapsync` installed. Optional integrations (DirectAdmin auto‑provisioning and the indexer) use the `requests` package.
 
 ### Who is this for
 - **Admins and migration teams** needing to back up or migrate many inboxes across domains and providers.
 - **Scenario**: Backup everything from Server A first (non-destructive), later import into Server B when ready.
- - **DirectAdmin environments**: When importing into a server managed by a DirectAdmin‑compatible panel, missing mailboxes can be auto‑created with the same usernames/passwords as specified in the config for a frictionless cutover.
+ - **DirectAdmin environments**: When importing into a server managed by a DirectAdmin‑compatible panel, ***missing mailboxes can be auto‑created*** with the same usernames/passwords as specified in the config for a frictionless cutover.
 
 ### Assumptions
 - This script is strictly for server+domain to server+domain migrations. The same account (`email` + `password`) present in `export.pass.config.json` is assumed to be used in `import.pass.config.json`. You can generate the import template automatically during export. In DirectAdmin mode, if an account is missing, it can be auto‑created with the same password before import.
