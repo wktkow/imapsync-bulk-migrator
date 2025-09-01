@@ -109,3 +109,8 @@ python directadmin_indexer.py --url https://panel:2222 --username user --passwor
   --imap-host imap.example.com --imap-port 993 --out export.pass.config.json
 ```
 
+## Features TODO:
+- DirectAdmin full integration ✅
+- Proper multithreading ✅
+- cPanel full integration ❌
+- cPanel<->DirectAdmin bidirectional translation layer ❌
