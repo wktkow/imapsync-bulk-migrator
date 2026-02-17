@@ -4,10 +4,11 @@ import logging
 import re
 import ssl
 import time
+from contextlib import AbstractContextManager
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import imaplib
 
@@ -48,6 +49,8 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
     for raw in data or []:
         if raw is None:
             continue
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
         line = raw.decode(errors="ignore").strip()
         m = re.findall(r'"([^"]+)"\s*$', line)
         if m:
@@ -73,7 +76,7 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     status, _ = imap.select(mailbox, readonly=True)
     if status != "OK":
         raise RuntimeError(f"Failed to select mailbox {mailbox}")
-    status, data = imap.uid("search", None, "ALL")
+    status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"Failed to search UIDs in {mailbox}")
     uids: List[int] = []
@@ -210,7 +213,7 @@ def import_account(
     ignore_errors: bool,
     *,
     create_folder: bool = True,
-    imap_factory=None,
+    imap_factory: Optional[Callable[[ServerConfig, Account], AbstractContextManager[imaplib.IMAP4]]] = None,
     stop_event: Optional[object] = None,
     da_context: Optional[Tuple[object, int]] = None,
 ) -> None:
@@ -246,8 +249,10 @@ def import_account(
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
     # Choose IMAP context manager (injected or default)
-    def _imap_ctx():
-        return imap_factory(server, account) if callable(imap_factory) else imap_connection(server, account)
+    def _imap_ctx() -> AbstractContextManager[imaplib.IMAP4]:
+        if imap_factory is not None:
+            return imap_factory(server, account)
+        return imap_connection(server, account)
 
     # Try login; if it fails and DA context is provided, create mailbox and retry once
     def _try_login_only() -> None:
@@ -305,14 +310,13 @@ def import_account(
                         return
                     with open(eml_path, "rb") as f:
                         data = f.read()
-                    flags_tuple = None
+                    flags_str = ""
                     if flags:
                         raw_tokens = [tok for tok in (flags.split()) if tok and tok.strip()]
                         # \RECENT is a read-only system flag; servers reject setting it on APPEND
                         filtered_tokens = [t for t in raw_tokens if t.strip().upper() != "\\RECENT"]
                         if filtered_tokens:
-                            flags_norm = "(" + " ".join(filtered_tokens) + ")"
-                            flags_tuple = flags_norm
+                            flags_str = "(" + " ".join(filtered_tokens) + ")"
                     # Build IMAP INTERNALDATE value. If missing, use current time (RFC3501 format).
                     if isinstance(internaldate, str) and internaldate.strip():
                         dt_str = internaldate.strip()
@@ -322,7 +326,7 @@ def import_account(
                     else:
                         import imaplib as _imaplib
                         date_time = _imaplib.Time2Internaldate(time.time())
-                    status, _ = imap.append(mailbox, flags_tuple, date_time, data)
+                    status, _ = imap.append(mailbox, flags_str, date_time, data)
                     if status != "OK":
                         raise RuntimeError(f"append failed for {eml_path}")
             except Exception as exc:
