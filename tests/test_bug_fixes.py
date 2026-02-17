@@ -392,3 +392,29 @@ class TestBug10MultiMessageDetection:
 
         assert error is None
         assert analysis["multiple_messages_detected"] is False
+
+    def test_lf_only_forwarded_email_no_false_positive(self, tmp_path: Path) -> None:
+        """LF-only (no CR) email with forwarded headers in body must not false-positive."""
+        from verify_export import analyze_message
+
+        eml_content = (
+            b"Return-Path: <sender@example.com>\n"
+            b"Message-ID: <abc@example.com>\n"
+            b"From: sender@example.com\n"
+            b"Subject: Fwd: test\n"
+            b"\n"
+            b"---------- Forwarded ----------\n"
+            b"Return-Path: <other@example.com>\n"
+            b"Message-ID: <def@example.com>\n"
+        )
+        eml_path = tmp_path / "test.eml"
+        eml_path.write_bytes(eml_content)
+        json_path = tmp_path / "test.json"
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert error is None
+        assert analysis is not None
+        assert analysis["multiple_messages_detected"] is False, (
+            "LF-only email with forwarded headers should NOT be flagged"
+        )

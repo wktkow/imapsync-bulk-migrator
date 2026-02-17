@@ -303,7 +303,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
                 from .imap_ops import imap_connection, list_all_mailboxes
-                from .imap_ops import fetch_all_uids
                 email = acc.email
                 account_dir = in_root / sanitize_for_path(acc.email)
                 if not account_dir.exists():
@@ -313,7 +312,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     count = len(list(folder_dir.glob("*.eml")))
                     local_counts[folder_dir.name] = count
                 remote_counts: Dict[str, int] = {}
-                import imaplib
                 with imap_connection(config.server, acc) as imap:
                     mailboxes = list_all_mailboxes(imap)
                     for mailbox in mailboxes:
