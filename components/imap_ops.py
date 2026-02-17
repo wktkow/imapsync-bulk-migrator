@@ -7,7 +7,7 @@ import time
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import imaplib
 
@@ -16,7 +16,7 @@ from .utils import sanitize_for_path
 
 
 @contextlib.contextmanager
-def imap_connection(server: ServerConfig, account: Account) -> Iterable[imaplib.IMAP4]:
+def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.IMAP4]:
     """Context-managed IMAP connection.
 
     Handles SSL/STARTTLS negotiation and ensures logout on exit.
@@ -136,14 +136,26 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: starting", account.email)
     with imap_connection(server, account) as imap:
         mailboxes = list_all_mailboxes(imap)
+
+        # Detect sanitize_for_path collisions before writing any data.
+        # Two distinct mailbox names that map to the same directory would
+        # silently overwrite each other's messages.
+        seen_paths: Dict[str, str] = {}  # sanitized_name -> original mailbox
+        for mb in mailboxes:
+            key = sanitize_for_path(mb)
+            if key in seen_paths and seen_paths[key] != mb:
+                raise RuntimeError(
+                    f"Mailbox name collision for account {account.email}: "
+                    f"'{seen_paths[key]}' and '{mb}' both map to directory '{key}'. "
+                    f"Cannot export without data loss."
+                )
+            seen_paths[key] = mb
+
         for mailbox in mailboxes:
             if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                 logging.info("[export] %s: stop requested, exiting", account.email)
                 return
             try:
-                status, _ = imap.select(mailbox, readonly=True)
-                if status != "OK":
-                    raise RuntimeError(f"select failed: {mailbox}")
                 uids = fetch_all_uids(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
@@ -279,8 +291,10 @@ def import_account(
                 status, _ = imap.select(mailbox)
                 if status != "OK":
                     if create_folder:
-                        with contextlib.suppress(Exception):
+                        try:
                             imap.create(mailbox)
+                        except Exception as create_exc:
+                            logging.warning("[import] %s: failed to create mailbox %s: %s", account.email, mailbox, create_exc)
                         status, _ = imap.select(mailbox)
                     if status != "OK":
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")

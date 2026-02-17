@@ -3,6 +3,7 @@
 This project addresses a **very specific use case** with enterprise-grade requirements:
 
 ## 🎯 **Perfect For:**
+
 1. **Large-scale migrations** requiring reliability and performance
 2. **Server decommissioning workflows** - safely shut down source servers after export
 3. **Filesystem-based operations** with full data control and portability
@@ -17,11 +18,13 @@ Bulk export/import/validate IMAP mailboxes at scale with safety checks. It is sa
 Core features require no third-party Python packages. You need Python 3.9+ and `imapsync` installed. Optional integrations (DirectAdmin auto‑provisioning and the indexer) use the `requests` package.
 
 ### Who is this for
+
 - **Admins and migration teams** needing to back up or migrate many inboxes across domains and providers.
 - **Scenario**: Backup everything from Server A first (non-destructive), later import into Server B when ready.
- - **DirectAdmin environments**: When importing into a server managed by a DirectAdmin‑compatible panel, ***missing mailboxes can be auto‑created*** with the same usernames/passwords as specified in the config for a frictionless cutover.
+- **DirectAdmin environments**: When importing into a server managed by a DirectAdmin‑compatible panel, **_missing mailboxes can be auto‑created_** with the same usernames/passwords as specified in the config for a frictionless cutover.
 
 ### Assumptions
+
 - This script is strictly for server+domain to server+domain migrations. The same account (`email` + `password`) present in `export.pass.config.json` is assumed to be used in `import.pass.config.json`. You can generate the import template automatically during export. In DirectAdmin mode, if an account is missing, it can be auto‑created with the same password before import.
 - No local IMAP server. All data is written to the filesystem.
 - Export is non-destructive. Import creates missing folders if needed.
@@ -32,11 +35,12 @@ Core features require no third-party Python packages. You need Python 3.9+ and `
 - Flags are preserved best-effort using IMAP APPEND; server-specific flags may vary.
 - Message UIDs are not preserved; a deterministic filename is stored with metadata instead.
 - Special folders naming can differ across servers; the script creates folders as needed during import.
+- Export will abort if two distinct mailbox names on the server sanitize to the same directory name (e.g., `Sent/Items` and `Sent|Items` both become `Sent_Items`). This prevents silent data loss.
 
 ## Installation
 
-1) Ensure `imapsync` is installed and available in `PATH`.
-2) Use Python 3.9+.
+1. Ensure `imapsync` is installed and available in `PATH`.
+2. Use Python 3.9+.
 
 ```bash
 python3 -m venv .venv
@@ -61,6 +65,7 @@ python imapsync_bulk_migrator.py --mode audit --config export.pass.config.json -
 ## CLI
 
 Key arguments (see `--help` for all):
+
 - `--mode {export,import,test,validate,audit}`
 - `--config PATH` (defaults per mode)
 - `--output-dir` / `--input-dir`
@@ -69,6 +74,7 @@ Key arguments (see `--help` for all):
 - `--imap-timeout SECONDS` (default 60)
 
 DirectAdmin (import mode):
+
 - `--auto-provision-da`, `--da-url`, `--da-username`, `--da-password`
 - `--reset` (delete and recreate each mailbox before import)
 - `--da-no-verify-ssl`, `--da-dry-run`, `--da-quota-mb`
@@ -82,14 +88,19 @@ DirectAdmin (import mode):
 - validate: Compare local counts to server; optional `--resync-missing`.
 - audit: Thorough export check; optional remote counts unless `--audit-offline`.
 
-A template `import.pass.config.json` is auto-generated during export (if missing) next to your `--config`.
+A template `import.pass.config.json` is auto-generated during export (if missing) next to your `--config`. **The template uses a placeholder server host (`CHANGE_ME.example.com`) — you must edit it to point to the destination server before running import.**
 
 ## JSON config
 
 ```json
 {
-  "server": { "host": "imap.example.com", "port": 993, "ssl": true, "starttls": false },
-  "accounts": [ { "email": "user@example.com", "password": "secret" } ]
+  "server": {
+    "host": "imap.example.com",
+    "port": 993,
+    "ssl": true,
+    "starttls": false
+  },
+  "accounts": [{ "email": "user@example.com", "password": "secret" }]
 }
 ```
 
@@ -110,6 +121,7 @@ python directadmin_indexer.py --url https://panel:2222 --username user --passwor
 ```
 
 ## Features TODO:
+
 - DirectAdmin full integration ✅
 - Proper multithreading ✅
 - cPanel full integration ❌
