@@ -34,19 +34,31 @@ def parallel_process_accounts(
             if stop_on_error:
                 raise
 
+    first_exc: BaseException | None = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=label) as ex:
         futures = [ex.submit(wrapped, acc) for acc in accounts]
         for fut in concurrent.futures.as_completed(futures):
-            fut.result()
+            try:
+                fut.result()
+            except Exception as exc:
+                if stop_on_error and first_exc is None:
+                    first_exc = exc
+                # In stop_on_error mode, we still iterate remaining futures
+                # so their exceptions are collected, but we don't re-raise
+                # until we've logged everything below.
 
-    if not errors.empty() and not stop_on_error:
+    # Always drain and log collected errors for operator visibility
+    if not errors.empty():
         count = errors.qsize()
         logging.warning("[%s] Completed with errors (%d accounts). Details follow:", label, count)
-        # Drain the queue for operator visibility
         while not errors.empty():
             try:
                 logging.warning("[%s] %s", label, errors.get_nowait())
             except Exception:
                 break
+
+    # Re-raise the first exception if stop_on_error was requested
+    if first_exc is not None:
+        raise first_exc
 
 

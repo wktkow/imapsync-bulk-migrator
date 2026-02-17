@@ -4,10 +4,11 @@ import logging
 import re
 import ssl
 import time
+from contextlib import AbstractContextManager
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import imaplib
 
@@ -16,7 +17,7 @@ from .utils import sanitize_for_path
 
 
 @contextlib.contextmanager
-def imap_connection(server: ServerConfig, account: Account) -> Iterable[imaplib.IMAP4]:
+def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.IMAP4]:
     """Context-managed IMAP connection.
 
     Handles SSL/STARTTLS negotiation and ensures logout on exit.
@@ -48,6 +49,8 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
     for raw in data or []:
         if raw is None:
             continue
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
         line = raw.decode(errors="ignore").strip()
         m = re.findall(r'"([^"]+)"\s*$', line)
         if m:
@@ -73,7 +76,7 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     status, _ = imap.select(mailbox, readonly=True)
     if status != "OK":
         raise RuntimeError(f"Failed to select mailbox {mailbox}")
-    status, data = imap.uid("search", None, "ALL")
+    status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"Failed to search UIDs in {mailbox}")
     uids: List[int] = []
@@ -136,14 +139,26 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: starting", account.email)
     with imap_connection(server, account) as imap:
         mailboxes = list_all_mailboxes(imap)
+
+        # Detect sanitize_for_path collisions before writing any data.
+        # Two distinct mailbox names that map to the same directory would
+        # silently overwrite each other's messages.
+        seen_paths: Dict[str, str] = {}  # sanitized_name -> original mailbox
+        for mb in mailboxes:
+            key = sanitize_for_path(mb)
+            if key in seen_paths and seen_paths[key] != mb:
+                raise RuntimeError(
+                    f"Mailbox name collision for account {account.email}: "
+                    f"'{seen_paths[key]}' and '{mb}' both map to directory '{key}'. "
+                    f"Cannot export without data loss."
+                )
+            seen_paths[key] = mb
+
         for mailbox in mailboxes:
             if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                 logging.info("[export] %s: stop requested, exiting", account.email)
                 return
             try:
-                status, _ = imap.select(mailbox, readonly=True)
-                if status != "OK":
-                    raise RuntimeError(f"select failed: {mailbox}")
                 uids = fetch_all_uids(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
@@ -198,7 +213,7 @@ def import_account(
     ignore_errors: bool,
     *,
     create_folder: bool = True,
-    imap_factory=None,
+    imap_factory: Optional[Callable[[ServerConfig, Account], AbstractContextManager[imaplib.IMAP4]]] = None,
     stop_event: Optional[object] = None,
     da_context: Optional[Tuple[object, int]] = None,
 ) -> None:
@@ -234,8 +249,10 @@ def import_account(
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
 
     # Choose IMAP context manager (injected or default)
-    def _imap_ctx():
-        return imap_factory(server, account) if callable(imap_factory) else imap_connection(server, account)
+    def _imap_ctx() -> AbstractContextManager[imaplib.IMAP4]:
+        if imap_factory is not None:
+            return imap_factory(server, account)
+        return imap_connection(server, account)
 
     # Try login; if it fails and DA context is provided, create mailbox and retry once
     def _try_login_only() -> None:
@@ -279,8 +296,10 @@ def import_account(
                 status, _ = imap.select(mailbox)
                 if status != "OK":
                     if create_folder:
-                        with contextlib.suppress(Exception):
+                        try:
                             imap.create(mailbox)
+                        except Exception as create_exc:
+                            logging.warning("[import] %s: failed to create mailbox %s: %s", account.email, mailbox, create_exc)
                         status, _ = imap.select(mailbox)
                     if status != "OK":
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
@@ -291,14 +310,13 @@ def import_account(
                         return
                     with open(eml_path, "rb") as f:
                         data = f.read()
-                    flags_tuple = None
+                    flags_str = ""
                     if flags:
                         raw_tokens = [tok for tok in (flags.split()) if tok and tok.strip()]
                         # \RECENT is a read-only system flag; servers reject setting it on APPEND
                         filtered_tokens = [t for t in raw_tokens if t.strip().upper() != "\\RECENT"]
                         if filtered_tokens:
-                            flags_norm = "(" + " ".join(filtered_tokens) + ")"
-                            flags_tuple = flags_norm
+                            flags_str = "(" + " ".join(filtered_tokens) + ")"
                     # Build IMAP INTERNALDATE value. If missing, use current time (RFC3501 format).
                     if isinstance(internaldate, str) and internaldate.strip():
                         dt_str = internaldate.strip()
@@ -308,7 +326,7 @@ def import_account(
                     else:
                         import imaplib as _imaplib
                         date_time = _imaplib.Time2Internaldate(time.time())
-                    status, _ = imap.append(mailbox, flags_tuple, date_time, data)
+                    status, _ = imap.append(mailbox, flags_str, date_time, data)
                     if status != "OK":
                         raise RuntimeError(f"append failed for {eml_path}")
             except Exception as exc:

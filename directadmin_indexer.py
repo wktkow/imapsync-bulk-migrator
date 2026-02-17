@@ -21,7 +21,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import urllib.parse
 
@@ -185,7 +185,7 @@ def prompt_select_from_list(options: List[str], title: str) -> List[int]:
     return deduped
 
 
-def build_config(server: ServerSettings, emails: List[str], default_password: str) -> Dict[str, object]:
+def build_config(server: ServerSettings, emails: List[str], default_password: str) -> Dict[str, Any]:
     return {
         "server": {
             "host": server.host,
@@ -199,7 +199,7 @@ def build_config(server: ServerSettings, emails: List[str], default_password: st
     }
 
 
-def write_json(payload: Dict[str, object], out_path: str, overwrite: bool) -> None:
+def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     path_exists = os.path.exists(out_path)
     if path_exists and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)")

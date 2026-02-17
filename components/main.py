@@ -84,8 +84,13 @@ def test_accounts(config: Config, max_workers: int) -> None:
         list(ex.map(worker, config.accounts))
 
     if not errors.empty():
-        reasons = "\n".join(list(errors.queue))
-        raise RuntimeError(f"Connectivity test failed for some accounts:\n{reasons}")
+        reason_lines: List[str] = []
+        while not errors.empty():
+            try:
+                reason_lines.append(errors.get_nowait())
+            except Exception:
+                break
+        raise RuntimeError(f"Connectivity test failed for some accounts:\n" + "\n".join(reason_lines))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -209,8 +214,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.warning("Received signal %s, requesting stop...", signum)
         stop_event.set()
 
-    signal.signal(signal.SIGINT, handle_sig)
-    signal.signal(signal.SIGTERM, handle_sig)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, handle_sig)
+        signal.signal(signal.SIGTERM, handle_sig)
 
     try:
         if args.mode == "export":
@@ -220,21 +226,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             with contextlib.suppress(Exception):
                 check_free_space_for_path(out_root, float(args.min_free_gb))
             try:
-                from .models import Config as _Cfg
                 payload_path = config_path.parent / "import.pass.config.json"
                 if not payload_path.exists():
                     with payload_path.open("w", encoding="utf-8") as f:
                         import json
                         json.dump({
                             "server": {
-                                "host": config.server.host,
-                                "port": config.server.port,
-                                "ssl": config.server.ssl,
-                                "starttls": config.server.starttls,
+                                "host": "CHANGE_ME.example.com",
+                                "port": 993,
+                                "ssl": True,
+                                "starttls": False,
                             },
                             "accounts": [ {"email": a.email, "password": a.password} for a in config.accounts ],
                         }, f, ensure_ascii=False, indent=2)
-                    logging.info("Generated import config template at: %s", payload_path)
+                    logging.warning("Generated import config TEMPLATE at: %s — you MUST edit server.host before importing!", payload_path)
             except Exception as exc:
                 logging.warning("Failed to generate import config template: %s", exc)
 
@@ -298,7 +303,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
                 from .imap_ops import imap_connection, list_all_mailboxes
-                from .imap_ops import fetch_all_uids
                 email = acc.email
                 account_dir = in_root / sanitize_for_path(acc.email)
                 if not account_dir.exists():
@@ -308,7 +312,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     count = len(list(folder_dir.glob("*.eml")))
                     local_counts[folder_dir.name] = count
                 remote_counts: Dict[str, int] = {}
-                import imaplib
                 with imap_connection(config.server, acc) as imap:
                     mailboxes = list_all_mailboxes(imap)
                     for mailbox in mailboxes:

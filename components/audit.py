@@ -85,7 +85,7 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
                     status, _ = imap.select(mbox, readonly=True)
                     if status != "OK":
                         continue
-                    status, data = imap.uid("search", None, "ALL")
+                    status, data = imap.uid("search", "ALL")
                     if status != "OK":
                         continue
                     num = len((data[0] or b"").split()) if data else 0

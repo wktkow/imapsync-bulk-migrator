@@ -19,10 +19,13 @@ def analyze_message(eml_path, json_path):
         with open(eml_path, 'rb') as f:
             msg_bytes = f.read()
         
-        # Check for multiple messages concatenated (look for multiple RFC822 headers)
-        msg_text = msg_bytes.decode('utf-8', errors='ignore')
-        return_path_count = msg_text.count('Return-Path:')
-        message_id_count = msg_text.count('Message-ID:')
+        # Check for multiple messages concatenated (look for multiple RFC822 headers).
+        # Only count headers in the top-level header block (before the first blank line)
+        # to avoid false positives from forwarded/attached messages in the body.
+        msg_text = msg_bytes.decode('utf-8', errors='ignore').replace('\r\n', '\n')
+        header_section = msg_text.split('\n\n', 1)[0] if '\n\n' in msg_text else msg_text
+        return_path_count = header_section.count('Return-Path:')
+        message_id_count = header_section.count('Message-ID:')
         
         # Parse the email
         msg = BytesParser(policy=default_policy).parsebytes(msg_bytes)
