@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import shutil
@@ -12,6 +13,62 @@ def sanitize_for_path(name: str) -> str:
     name = name.strip().replace(os.sep, "_").replace("/", "_")
     name = SANITIZE_PATTERN.sub("_", name)
     return name[:200] if len(name) > 200 else name
+
+
+def encode_imap_utf7(value: str) -> str:
+    """Encode a mailbox name using IMAP modified UTF-7."""
+    result: list[str] = []
+    pending: list[str] = []
+
+    def flush_pending() -> None:
+        if not pending:
+            return
+        raw = "".join(pending).encode("utf-16-be")
+        encoded = base64.b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+        result.append(f"&{encoded}-")
+        pending.clear()
+
+    for char in value:
+        codepoint = ord(char)
+        if 0x20 <= codepoint <= 0x7E and char != "&":
+            flush_pending()
+            result.append(char)
+        elif char == "&":
+            flush_pending()
+            result.append("&-")
+        else:
+            pending.append(char)
+    flush_pending()
+    return "".join(result)
+
+
+def decode_imap_utf7(value: str) -> str:
+    """Decode a mailbox name encoded with IMAP modified UTF-7."""
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char != "&":
+            result.append(char)
+            index += 1
+            continue
+        end = value.find("-", index + 1)
+        if end < 0:
+            result.append("&")
+            index += 1
+            continue
+        token = value[index + 1 : end]
+        if token == "":
+            result.append("&")
+        else:
+            padded = token.replace(",", "/")
+            padded += "=" * ((4 - len(padded) % 4) % 4)
+            try:
+                result.append(base64.b64decode(padded).decode("utf-16-be"))
+            except Exception:
+                result.append(f"&{token}-")
+        index = end + 1
+    return "".join(result)
 
 
 def ensure_imapsync_available() -> None:
@@ -54,5 +111,4 @@ def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
         raise RuntimeError(
             f"Insufficient free disk space at {probe}: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
         )
-
 

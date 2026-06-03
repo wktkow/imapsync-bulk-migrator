@@ -66,8 +66,15 @@ class DirectAdminClient:
     def list_pop_accounts(self, domain: str):
         """Return list of local-part usernames for a domain's POP/IMAP accounts."""
         json_obj, kv = self._get("CMD_API_POP", params={"domain": domain, "action": "list"})
+        def _kv_get_one(mapobj, key: str):
+            vals = mapobj.get(key)
+            return (vals[0] if (vals and len(vals) > 0) else None) if mapobj is not None else None
         if json_obj is not None:
             if isinstance(json_obj, dict):
+                err = str(json_obj.get("error", "0"))
+                if err not in {"0", "false", "False"}:
+                    msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
+                    raise RuntimeError(msg)
                 if "list" in json_obj and isinstance(json_obj["list"], list):
                     return [str(u) for u in json_obj["list"]]
                 if "users" in json_obj and isinstance(json_obj["users"], list):
@@ -85,12 +92,18 @@ class DirectAdminClient:
                 # Some DA variants return a plain JSON array
                 return [str(u) for u in json_obj]
         if kv is not None:
-            items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users") or []
+            err = _kv_get_one(kv, "error") or "0"
+            if err not in {"0", "false", "False"}:
+                msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
+                raise RuntimeError(msg)
+            items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
+            if items is None:
+                raise RuntimeError("Unable to parse POP account list response from DirectAdmin API")
             return [str(u) for u in items]
-        return []
+        raise RuntimeError("Unable to parse POP account list response from DirectAdmin API")
 
-    def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0) -> None:
-        """Create a POP/IMAP mailbox; tolerate already-exists responses."""
+    def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0, *, allow_existing: bool = True) -> None:
+        """Create a POP/IMAP mailbox; optionally tolerate already-exists responses."""
         data = {
             "action": "create",
             "domain": domain,
@@ -109,13 +122,13 @@ class DirectAdminClient:
             if err in {"0", "false", "False"}:
                 return
             msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
-            if "exist" in msg.lower():
+            if allow_existing and "exist" in msg.lower():
                 return
             raise RuntimeError(msg)
         if kv is not None:
             err = _kv_get_one(kv, "error") or "0"
             msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or ""
-            if err in {"0", "false", "False"} or (msg and "exist" in msg.lower()):
+            if err in {"0", "false", "False"} or (allow_existing and msg and "exist" in msg.lower()):
                 return
             raise RuntimeError(msg or f"DirectAdmin returned error= {err}")
 
@@ -142,5 +155,3 @@ class DirectAdminClient:
             if err in {"0", "false", "False"} or (msg and ("not exist" in msg.lower() or "deleted" in msg.lower())):
                 return
             raise RuntimeError(msg or f"DirectAdmin returned error= {err}")
-
-

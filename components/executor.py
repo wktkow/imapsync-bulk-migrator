@@ -36,16 +36,56 @@ def parallel_process_accounts(
 
     first_exc: BaseException | None = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=label) as ex:
-        futures = [ex.submit(wrapped, acc) for acc in accounts]
-        for fut in concurrent.futures.as_completed(futures):
-            try:
+        if stop_on_error:
+            account_iter = iter(accounts)
+            futures: dict[concurrent.futures.Future[None], Account] = {}
+
+            def submit_next() -> None:
+                try:
+                    acc = next(account_iter)
+                except StopIteration:
+                    return
+                futures[ex.submit(wrapped, acc)] = acc
+
+            for _ in range(min(max_workers, len(accounts))):
+                submit_next()
+
+            while futures:
+                done, _pending = concurrent.futures.wait(
+                    futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                completed_successfully = 0
+                should_stop = False
+                for fut in done:
+                    futures.pop(fut, None)
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        if first_exc is None:
+                            first_exc = exc
+                        should_stop = True
+                    else:
+                        completed_successfully += 1
+                if not should_stop:
+                    for _ in range(completed_successfully):
+                        submit_next()
+                if should_stop:
+                    for pending in futures:
+                        pending.cancel()
+                    for fut in concurrent.futures.as_completed(list(futures)):
+                        try:
+                            fut.result()
+                        except concurrent.futures.CancelledError:
+                            pass
+                        except Exception as exc:
+                            if first_exc is None:
+                                first_exc = exc
+                    futures.clear()
+        else:
+            futures = [ex.submit(wrapped, acc) for acc in accounts]
+            for fut in concurrent.futures.as_completed(futures):
                 fut.result()
-            except Exception as exc:
-                if stop_on_error and first_exc is None:
-                    first_exc = exc
-                # In stop_on_error mode, we still iterate remaining futures
-                # so their exceptions are collected, but we don't re-raise
-                # until we've logged everything below.
 
     # Always drain and log collected errors for operator visibility
     if not errors.empty():
@@ -60,5 +100,3 @@ def parallel_process_accounts(
     # Re-raise the first exception if stop_on_error was requested
     if first_exc is not None:
         raise first_exc
-
-

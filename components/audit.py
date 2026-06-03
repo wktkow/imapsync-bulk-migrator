@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .models import Account, Config, ServerConfig
-from .imap_ops import imap_connection, list_all_mailboxes
+from .imap_ops import imap_connection, list_all_mailboxes, quote_mailbox_name
 from .utils import sanitize_for_path
 
 
@@ -51,7 +51,10 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
     if not account_dir.exists():
         issues.append(f"account directory missing: {account_dir}")
         return account.email, issues
-    for folder_dir in [p for p in account_dir.iterdir() if p.is_dir()]:
+    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+    if not folder_dirs:
+        issues.append(f"{account.email}: no mailbox folders found")
+    for folder_dir in folder_dirs:
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
         jsons = list(folder_dir.glob("*.json"))
@@ -82,7 +85,7 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
                 remote_mailboxes = list_all_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
                 for mbox in remote_mailboxes:
-                    status, _ = imap.select(mbox, readonly=True)
+                    status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
                     if status != "OK":
                         continue
                     status, data = imap.uid("search", "ALL")
@@ -93,11 +96,13 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
         except Exception as exc:
             issues.append(f"remote check failed: {exc}")
             remote_counts = {}
-        for folder_dir in [p for p in account_dir.iterdir() if p.is_dir()]:
+        for folder_dir in folder_dirs:
             folder = folder_dir.name
             local_count = len(list(folder_dir.glob("*.eml")))
             remote_count = remote_counts.get(folder, -1)
-            if remote_count >= 0 and local_count != remote_count:
+            if remote_count < 0 and local_count > 0:
+                issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
+            elif remote_count >= 0 and local_count != remote_count:
                 issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
         for folder_name, rcount in remote_counts.items():
             if not (account_dir / folder_name).exists() and rcount > 0:
@@ -110,6 +115,8 @@ def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: 
 
     Returns (ok, issues) where `ok` is True when no issues were found.
     """
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
     issues_accum: List[str] = []
 
     def worker(acc: Account) -> List[str]:
@@ -126,5 +133,3 @@ def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: 
             issues_accum.extend(lst)
     ok = len(issues_accum) == 0
     return ok, issues_accum
-
-

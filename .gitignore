@@ -23,6 +23,7 @@ LOG_imapsync/
 # Exported mail data and logs
 exported/
 logs/
+opt/
 
 # Migrator config files (and their common backup variants)
 # Canonical names

@@ -1,6 +1,8 @@
 import contextlib
+import hashlib
 import json
 import logging
+import os
 import re
 import ssl
 import time
@@ -13,7 +15,15 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 import imaplib
 
 from .models import Account, ServerConfig
-from .utils import sanitize_for_path
+from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
+
+
+def quote_mailbox_name(mailbox: str) -> str:
+    if mailbox.upper() == "INBOX":
+        return "INBOX"
+    encoded = encode_imap_utf7(mailbox)
+    escaped = encoded.replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
 
 
 @contextlib.contextmanager
@@ -23,7 +33,7 @@ def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.
     Handles SSL/STARTTLS negotiation and ensures logout on exit.
     """
     if server.ssl:
-        imap = imaplib.IMAP4_SSL(host=server.host, port=server.port)
+        imap = imaplib.IMAP4_SSL(host=server.host, port=server.port, ssl_context=ssl.create_default_context())
     else:
         imap = imaplib.IMAP4(host=server.host, port=server.port)
     try:
@@ -49,18 +59,29 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
     for raw in data or []:
         if raw is None:
             continue
+        with contextlib.suppress(Exception):
+            from .provider_ops import is_noselect, parse_list_entry
+
+            info = parse_list_entry(raw)
+            if info is not None:
+                if not is_noselect(info):
+                    mailboxes.append(info.name)
+                continue
         if not isinstance(raw, (bytes, bytearray)):
             continue
         line = raw.decode(errors="ignore").strip()
+        attrs_raw = line[1 : line.find(")")] if line.startswith("(") and ")" in line else ""
+        if any(attr.lower() in {"\\noselect", "\\nonexistent"} for attr in attrs_raw.split()):
+            continue
         m = re.findall(r'"([^"]+)"\s*$', line)
         if m:
-            mailboxes.append(m[0])
+            mailboxes.append(decode_imap_utf7(m[0].replace(r"\"", '"').replace(r"\\", "\\")))
         else:
             parts = line.rsplit(" ", 1)
             if parts:
                 candidate = parts[-1].strip().strip('"')
                 if candidate:
-                    mailboxes.append(candidate)
+                    mailboxes.append(decode_imap_utf7(candidate))
     unique = []
     seen = set()
     for mb in mailboxes:
@@ -73,7 +94,7 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
 
 def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     """Select a mailbox and return all message UIDs in ascending order."""
-    status, _ = imap.select(mailbox, readonly=True)
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         raise RuntimeError(f"Failed to select mailbox {mailbox}")
     status, data = imap.uid("search", "ALL")
@@ -89,6 +110,62 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     # Ensure stable ascending order
     uids.sort()
     return uids
+
+
+def _legacy_import_journal_path(account_dir: Path) -> Path:
+    return account_dir / "import.journal.jsonl"
+
+
+def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: bytes) -> str:
+    rel_path = eml_path.relative_to(account_dir).as_posix()
+    digest = hashlib.sha256(data).hexdigest()
+    seed = f"{mailbox}\0{rel_path}\0{len(data)}\0{digest}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
+    path = _legacy_import_journal_path(account_dir)
+    rows: List[Dict[str, str]] = []
+    if not path.exists():
+        return rows
+    lines = path.read_text(encoding="utf-8").splitlines()
+    needs_rewrite = False
+    for line_no, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if line_no == len(lines):
+                logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
+                needs_rewrite = True
+                break
+            raise
+        if isinstance(row, dict):
+            rows.append({str(k): str(v) for k, v in row.items()})
+    if needs_rewrite:
+        _write_legacy_import_journal(account_dir, rows)
+    return rows
+
+
+def _write_legacy_import_journal(account_dir: Path, rows: List[Dict[str, str]]) -> None:
+    path = _legacy_import_journal_path(account_dir)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for row in rows:
+            json.dump(row, f, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+    tmp.replace(path)
+
+
+def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> None:
+    path = _legacy_import_journal_path(account_dir)
+    with path.open("a", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
@@ -177,12 +254,12 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
                             logging.info("[export] %s: stop requested during UID loop, exiting", account.email)
                             return
-                        status, data = imap.uid("fetch", str(uid), "(RFC822 FLAGS INTERNALDATE)")
+                        status, data = imap.uid("fetch", str(uid), "(BODY.PEEK[] FLAGS INTERNALDATE)")
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
                         msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []))
                         if not msg_bytes:
-                            continue
+                            raise RuntimeError(f"fetch returned no message bytes in {mailbox} for UID {uid}")
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
                         # Zero-pad UID so lexicographic order matches numeric order
@@ -226,6 +303,17 @@ def import_account(
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
     logging.info("[import] %s: starting", account.email)
+    journal_rows = _load_legacy_import_journal(account_dir)
+    committed_keys = {
+        row.get("key", "")
+        for row in journal_rows
+        if row.get("status") == "committed" and row.get("key")
+    }
+    pending_keys = {
+        row.get("key", "")
+        for row in journal_rows
+        if row.get("status") == "pending" and row.get("key")
+    }
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
@@ -293,14 +381,14 @@ def import_account(
                 return
             mailbox = folder
             try:
-                status, _ = imap.select(mailbox)
+                status, _ = imap.select(quote_mailbox_name(mailbox))
                 if status != "OK":
                     if create_folder:
                         try:
-                            imap.create(mailbox)
+                            imap.create(quote_mailbox_name(mailbox))
                         except Exception as create_exc:
                             logging.warning("[import] %s: failed to create mailbox %s: %s", account.email, mailbox, create_exc)
-                        status, _ = imap.select(mailbox)
+                        status, _ = imap.select(quote_mailbox_name(mailbox))
                     if status != "OK":
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
@@ -326,13 +414,37 @@ def import_account(
                     else:
                         import imaplib as _imaplib
                         date_time = _imaplib.Time2Internaldate(time.time())
-                    status, _ = imap.append(mailbox, flags_str, date_time, data)
+                    import_key = _legacy_import_key(account_dir, eml_path, mailbox, data)
+                    if import_key in committed_keys:
+                        logging.info("[import] %s: skipping already committed %s", account.email, eml_path)
+                        continue
+                    if import_key in pending_keys:
+                        raise RuntimeError(
+                            f"legacy import journal has pending append for {eml_path}; "
+                            "target state is uncertain, inspect the mailbox before retrying"
+                        )
+                    rel_path = eml_path.relative_to(account_dir).as_posix()
+                    _append_legacy_import_journal(account_dir, {
+                        "key": import_key,
+                        "status": "pending",
+                        "mailbox": mailbox,
+                        "path": rel_path,
+                        "timestamp": str(int(time.time())),
+                    })
+                    status, _ = imap.append(quote_mailbox_name(mailbox), flags_str, date_time, data)
                     if status != "OK":
                         raise RuntimeError(f"append failed for {eml_path}")
+                    _append_legacy_import_journal(account_dir, {
+                        "key": import_key,
+                        "status": "committed",
+                        "mailbox": mailbox,
+                        "path": rel_path,
+                        "timestamp": str(int(time.time())),
+                    })
+                    pending_keys.discard(import_key)
+                    committed_keys.add(import_key)
             except Exception as exc:
                 logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if not ignore_errors:
                     raise
     logging.info("[import] %s: completed", account.email)
-
-

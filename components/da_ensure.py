@@ -1,5 +1,4 @@
 import logging
-import contextlib
 from typing import Dict, List
 
 from .da_client import DirectAdminClient
@@ -68,13 +67,10 @@ def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, d
                 logging.info("[da][dry-run] Would reset mailbox: %s (delete+create)", acc.email)
                 continue
             try:
-                with contextlib.suppress(Exception):
-                    client.delete_pop_account(domain, local)
-                client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb)
+                client.delete_pop_account(domain, local)
+                client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb, allow_existing=False)
                 logging.info("[da] Reset mailbox: %s", acc.email)
             except Exception as exc:
                 logging.error("[da] Failed to reset %s: %s", acc.email, exc)
                 if not ignore_errors:
                     raise
-
-

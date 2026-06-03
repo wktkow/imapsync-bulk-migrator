@@ -21,6 +21,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import urllib.parse
@@ -92,17 +93,30 @@ class DirectAdminClient:
     def list_domains(self) -> List[str]:
         # User-level domains
         json_obj, kv = self._get("CMD_API_SHOW_DOMAINS")
+        def _kv_get_one(mapobj, key: str):
+            vals = mapobj.get(key)
+            return (vals[0] if (vals and len(vals) > 0) else None) if mapobj is not None else None
         if json_obj is not None:
             # Newer DA returns {"list": ["example.com", ...]}
             if isinstance(json_obj, dict):
+                err = str(json_obj.get("error", "0"))
+                if err not in {"0", "false", "False"}:
+                    msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
+                    raise RuntimeError(msg)
                 if "list" in json_obj and isinstance(json_obj["list"], list):
                     return [str(d) for d in json_obj["list"]]
                 # Some variants nest under "domains"
                 if "domains" in json_obj and isinstance(json_obj["domains"], list):
                     return [str(d) for d in json_obj["domains"]]
         if kv is not None:
+            err = _kv_get_one(kv, "error") or "0"
+            if err not in {"0", "false", "False"}:
+                msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
+                raise RuntimeError(msg)
             # Expect keys like list[]=domain
-            items = kv.get("list[]") or kv.get("list") or []
+            items = kv.get("list[]") or kv.get("list")
+            if items is None:
+                raise RuntimeError("Unable to parse domains response from API")
             return [str(d) for d in items]
         raise RuntimeError("Unable to parse domains response from API")
 
@@ -110,24 +124,37 @@ class DirectAdminClient:
         # POP/IMAP accounts per domain
         # Prefer explicit action=list for compatibility
         json_obj, kv = self._get("CMD_API_POP", params={"domain": domain, "action": "list"})
+        def _kv_get_one(mapobj, key: str):
+            vals = mapobj.get(key)
+            return (vals[0] if (vals and len(vals) > 0) else None) if mapobj is not None else None
         if json_obj is not None:
             # Common shapes:
             # {"list": ["user1", "user2"]}
             # {"users": ["user1", ...]}
             if isinstance(json_obj, dict):
+                err = str(json_obj.get("error", "0"))
+                if err not in {"0", "false", "False"}:
+                    msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
+                    raise RuntimeError(msg)
                 if "list" in json_obj and isinstance(json_obj["list"], list):
                     return [str(u) for u in json_obj["list"]]
                 if "users" in json_obj and isinstance(json_obj["users"], list):
                     return [str(u) for u in json_obj["users"]]
         if kv is not None:
-            items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users") or []
+            err = _kv_get_one(kv, "error") or "0"
+            if err not in {"0", "false", "False"}:
+                msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
+                raise RuntimeError(msg)
+            items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
+            if items is None:
+                raise RuntimeError(f"Unable to parse POP account list response for {domain}")
             return [str(u) for u in items]
         # Some installs place names under index keys like list0=user
         if json_obj and isinstance(json_obj, dict):
             dynamic = [v for k, v in json_obj.items() if k.startswith("list")]
             if dynamic:
                 return [str(u) for u in dynamic]
-        return []
+        raise RuntimeError(f"Unable to parse POP account list response for {domain}")
 
 
 def prompt_select_from_list(options: List[str], title: str) -> List[int]:
@@ -203,8 +230,45 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     path_exists = os.path.exists(out_path)
     if path_exists and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)")
-    with open(out_path, "w", encoding="utf-8") as f:
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if overwrite else os.O_EXCL)
+    fd = os.open(out_path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(out_path, 0o600)
+
+
+def read_secret_file(path: str, *, label: str) -> str:
+    value = Path(path).read_text(encoding="utf-8").strip()
+    if not value:
+        raise ValueError(f"{label} is empty: {path}")
+    return value
+
+
+def resolve_password(args: argparse.Namespace) -> str:
+    sources = [
+        name
+        for name, value in (
+            ("--password", getattr(args, "password", None)),
+            ("--password-file", getattr(args, "password_file", None)),
+            ("--password-env", getattr(args, "password_env", None)),
+        )
+        if value
+    ]
+    if not sources:
+        raise ValueError("DirectAdmin password requires one of: --password-file, --password-env, --password")
+    if len(sources) > 1:
+        raise ValueError("DirectAdmin password must be provided by only one source")
+    if getattr(args, "password_file", None):
+        return read_secret_file(str(args.password_file), label="DirectAdmin password file")
+    if getattr(args, "password_env", None):
+        env_name = str(args.password_env)
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            raise ValueError(f"DirectAdmin password environment variable is unset or empty: {env_name}")
+        return value
+    print("Warning: --password can expose the secret via shell history/process arguments; prefer --password-file or --password-env", file=sys.stderr)
+    return str(args.password)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -214,7 +278,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--url", required=True, help="Base URL to the control panel API, e.g. https://panel.example.com:2222")
     p.add_argument("--username", required=True, help="API username (user-level is sufficient)")
-    p.add_argument("--password", required=True, help="API password or login key")
+    p.add_argument("--password", required=False, help="API password or login key; insecure because process args can expose it")
+    p.add_argument("--password-file", required=False, help="Path to a file containing the API password or login key")
+    p.add_argument("--password-env", required=False, help="Environment variable containing the API password or login key")
     p.add_argument("--no-verify-ssl", action="store_true", help="Disable TLS certificate verification")
 
     p.add_argument("--imap-host", required=True, help="IMAP server hostname to place into generated config")
@@ -234,10 +300,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     try:
+        password = resolve_password(args)
         client = DirectAdminClient(
             base_url=args.url,
             username=args.username,
-            password=args.password,
+            password=password,
             verify_ssl=not args.no_verify_ssl,
         )
         domains = client.list_domains()
@@ -286,5 +353,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
