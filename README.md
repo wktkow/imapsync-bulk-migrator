@@ -15,7 +15,7 @@ This project addresses a **very specific use case** with enterprise-grade requir
 
 Bulk export/import/validate IMAP mailboxes at scale with safety checks. It is safe for large batches (thousands of mailboxes).
 
-Core features require Python 3.9+. Legacy generic IMAP connectivity tests use `imapsync --justconnect` unless skipped; provider-aware Gmail-to-iCloud mode uses Python `imaplib` directly. Optional integrations (DirectAdmin auto-provisioning and the indexer) use the `requests` package.
+Core features require Python 3.9+. Legacy generic IMAP connectivity tests use `imapsync --justconnect` unless skipped; provider-aware staged IMAP mode uses Python `imaplib` directly. Optional integrations (DirectAdmin auto-provisioning and the indexer) use the `requests` package.
 
 ### Who is this for
 
@@ -40,7 +40,7 @@ Core features require Python 3.9+. Legacy generic IMAP connectivity tests use `i
 ## Installation
 
 1. Use Python 3.9+.
-2. Install `imapsync` only if you use the legacy generic IMAP workflow. Provider-aware Gmail-to-iCloud mode does not require it.
+2. Install `imapsync` only if you use the legacy generic IMAP workflow. Provider-aware staged IMAP mode does not require it.
 
 ```bash
 python3 -m venv .venv
@@ -65,7 +65,7 @@ python imapsync_bulk_migrator.py --mode import --config import.pass.config.json 
 python imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
 ```
 
-Provider-aware Gmail-to-iCloud sequence:
+Provider-aware staged sequence:
 
 ```bash
 python imapsync_bulk_migrator.py --mode preflight --config migration.config.json
@@ -102,7 +102,7 @@ DirectAdmin (import mode):
 - test: Env + connectivity checks (`imaplib` plus `imapsync --justconnect` for legacy configs). `--no-connectivity-test` is not valid with `--mode test`.
 - validate: Legacy mode compares local folder counts to server and reports mismatches; it does not prove message identity. Provider mode performs manifest/journal exact validation plus best-effort target checks. Validation does not automatically re-import missing mail because blind APPEND replay can create duplicates.
 - audit: Thorough export check; optional remote counts unless `--audit-offline`.
-- preflight: Provider-config only. Checks source/target auth, lists mailboxes, verifies Gmail capabilities, estimates source bytes, and applies the configured iCloud storage gate.
+- preflight: Provider-config only. Checks source/target auth, lists mailboxes, verifies Gmail capabilities when Gmail is the source, estimates source bytes, and applies the configured target storage gate.
 
 A template `import.pass.config.json` is auto-generated during export (if missing) next to your `--config` with file mode `0600`. **The template uses a placeholder server host (`CHANGE_ME.example.com`) — you must edit it to point to the destination server before running import.**
 
@@ -122,7 +122,7 @@ Legacy generic IMAP config:
 }
 ```
 
-Provider-aware Gmail-to-iCloud config:
+Provider-aware staged config:
 
 ```json
 {
@@ -186,18 +186,23 @@ Provider mode keeps the filesystem staging model but changes the exported layout
 with multiple labels are imported once by default; extra labels remain in metadata.
 `target_mode: "empty"` requires target folders for uncommitted messages to be empty;
 resumed runs allow messages already recorded in the import journal. Use
-`target_mode: "merge"` for existing iCloud mailboxes.
-Provider mode enforces the documented Gmail/iCloud IMAP endpoints: Gmail source must
-use `imap.gmail.com:993` over SSL; iCloud target must use `imap.mail.me.com:993` over
-SSL with an app-specific password. Workspace Gmail should use `xoauth2`; personal Gmail
-can use app passwords where the account supports them. Workspace OAuth token
-acquisition/refresh is external to this tool. The tool consumes the configured token
-file for IMAP XOAUTH2.
+`target_mode: "merge"` for existing target mailboxes.
+Provider mode supports `provider: "gmail"`, `provider: "icloud"`, and generic
+`provider: "imap"` on either side. That covers iCloud -> generic IMAP, Gmail -> generic
+IMAP, and generic IMAP -> Gmail in the same staged export/import/validate flow; normal
+INBOX messages stay mapped to target `INBOX`. Gmail endpoints are fixed to `imap.gmail.com:993`
+over SSL; iCloud endpoints are fixed to `imap.mail.me.com:993` over SSL with an
+app-specific password. Generic IMAP endpoints can use password/app-password/XOAUTH2
+with SSL or STARTTLS. Workspace Gmail should use `xoauth2`; personal Gmail can use app
+passwords where the account supports them. Workspace OAuth token acquisition/refresh is
+external to this tool. The tool consumes the configured token file for IMAP XOAUTH2.
 Provider export is limited to messages and labels visible through Gmail IMAP for the
 authenticated account. For Workspace domain-wide migrations, use an OAuth setup/scope
 that exposes all labels/messages to IMAP before trusting a final validation report.
 Gmail messages found in both All Mail and a special folder resolve to the special
 folder first; All Mail is the Archive fallback only when no stronger folder/label wins.
+When Gmail is the target, Archive resolves to Gmail's All Mail mailbox when advertised
+by LIST special-use attributes or common `[Gmail]/All Mail` names.
 
 ## Tips
 

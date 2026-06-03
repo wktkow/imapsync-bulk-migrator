@@ -859,25 +859,28 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo]) -> str:
     if desired.lower() in by_name:
         return by_name[desired.lower()].name
     attr_map = {
-        "sent": "\\Sent",
-        "drafts": "\\Drafts",
-        "deleted messages": "\\Trash",
-        "trash": "\\Trash",
-        "junk": "\\Junk",
-        "spam": "\\Junk",
-        "archive": "\\Archive",
+        "sent": ("\\Sent",),
+        "drafts": ("\\Drafts",),
+        "deleted messages": ("\\Trash",),
+        "trash": ("\\Trash",),
+        "junk": ("\\Junk",),
+        "spam": ("\\Junk",),
+        "archive": ("\\Archive", "\\All"),
     }
     desired_lower = desired.lower()
-    attr = attr_map.get(desired_lower)
-    if attr:
+    attrs = attr_map.get(desired_lower)
+    if attrs:
         for mailbox in mailboxes:
-            if any(a.lower() == attr.lower() for a in mailbox.attributes):
+            if any(a.lower() in {attr.lower() for attr in attrs} for a in mailbox.attributes):
                 return mailbox.name
     candidates = {
-        "sent": ["Sent", "Sent Messages"],
-        "deleted messages": ["Deleted Messages", "Trash"],
-        "junk": ["Junk", "Spam"],
-        "archive": ["Archive", "All Mail"],
+        "sent": ["Sent", "Sent Messages", "[Gmail]/Sent Mail", "[GoogleMail]/Sent Mail"],
+        "drafts": ["Drafts", "[Gmail]/Drafts", "[GoogleMail]/Drafts"],
+        "deleted messages": ["Deleted Messages", "Trash", "[Gmail]/Trash", "[GoogleMail]/Trash"],
+        "trash": ["Trash", "Deleted Messages", "[Gmail]/Trash", "[GoogleMail]/Trash"],
+        "junk": ["Junk", "Spam", "[Gmail]/Spam", "[GoogleMail]/Spam"],
+        "spam": ["Spam", "Junk", "[Gmail]/Spam", "[GoogleMail]/Spam"],
+        "archive": ["Archive", "All Mail", "[Gmail]/All Mail", "[GoogleMail]/All Mail"],
     }.get(desired_lower, [desired])
     for candidate in candidates:
         if candidate.lower() in by_name:

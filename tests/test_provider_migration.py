@@ -18,6 +18,7 @@ from components.models import (
     load_config_file,
 )
 from components.provider_ops import (
+    MailboxInfo,
     build_xoauth2_payload,
     list_mailboxes,
     load_import_journal,
@@ -31,6 +32,7 @@ from components.provider_ops import (
     quote_mailbox_name,
     resolve_secret,
     resolve_primary_mailbox,
+    resolve_target_mailbox,
     target_has_message,
     xoauth2_authenticator,
 )
@@ -83,7 +85,7 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
 
     wrong_provider = tmp_path / "wrong-provider.json"
     wrong_provider.write_text(json.dumps({
-        "source": {"provider": "imap", "host": "example.com", "auth": {"method": "password", "password": "x"}},
+        "source": {"provider": "exchange", "host": "example.com", "auth": {"method": "password", "password": "x"}},
         "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "password": "x"}},
         "accounts": [{"source_email": "source@example.com", "target_email": "target@icloud.com"}],
     }))
@@ -189,6 +191,44 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
         load_config_file(invalid_target_override)
 
 
+def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
+    cases = {
+        "icloud-to-imap": {
+            "source": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "password": "icloud-secret"}},
+            "target": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "imap-secret"}},
+            "accounts": [{"source_email": "user@icloud.com", "target_email": "user@example.com"}],
+        },
+        "gmail-to-imap": {
+            "source": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "gmail-token"}},
+            "target": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "imap-secret"}},
+            "accounts": [{"source_email": "user@gmail.com", "target_email": "user@example.com"}],
+        },
+        "imap-to-gmail": {
+            "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "imap-secret"}},
+            "target": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "gmail-token"}},
+            "accounts": [{"source_email": "user@example.com", "target_email": "user@gmail.com"}],
+        },
+    }
+    for name, payload in cases.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload))
+
+        parsed = load_config_file(path)
+
+        assert isinstance(parsed, ProviderMigrationConfig)
+        assert parsed.accounts[0].source_email == payload["accounts"][0]["source_email"]
+        assert parsed.accounts[0].target_email == payload["accounts"][0]["target_email"]
+
+    bad_imap_tls = tmp_path / "bad-imap-tls.json"
+    bad_imap_tls.write_text(json.dumps({
+        "source": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "password": "icloud-secret"}},
+        "target": {"provider": "imap", "host": "mail.example.com", "ssl": True, "starttls": True, "auth": {"method": "password", "password": "imap-secret"}},
+        "accounts": [{"source_email": "user@icloud.com", "target_email": "user@example.com"}],
+    }))
+    with pytest.raises(ValueError, match="target.ssl.*target.starttls"):
+        load_config_file(bad_imap_tls)
+
+
 def test_xoauth2_payload_generation() -> None:
     payload = build_xoauth2_payload("user@gmail.com", "access-token").decode("utf-8")
     assert payload == "user=user@gmail.com\x01auth=Bearer access-token\x01\x01"
@@ -289,6 +329,22 @@ def test_primary_folder_resolution_is_deterministic() -> None:
     assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Spam"], [], folder_map) == "Junk"
 
 
+def test_gmail_target_folder_resolution_uses_special_use_and_gmail_names() -> None:
+    gmail_mailboxes = [
+        MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="[Gmail]/All Mail", delimiter="/", attributes=("\\HasNoChildren", "\\All")),
+        MailboxInfo(name="[Gmail]/Sent Mail", delimiter="/", attributes=("\\HasNoChildren", "\\Sent")),
+        MailboxInfo(name="[Gmail]/Trash", delimiter="/", attributes=("\\HasNoChildren", "\\Trash")),
+        MailboxInfo(name="[Gmail]/Spam", delimiter="/", attributes=("\\HasNoChildren", "\\Junk")),
+    ]
+
+    assert resolve_target_mailbox("INBOX", gmail_mailboxes) == "INBOX"
+    assert resolve_target_mailbox("Archive", gmail_mailboxes) == "[Gmail]/All Mail"
+    assert resolve_target_mailbox("Sent", gmail_mailboxes) == "[Gmail]/Sent Mail"
+    assert resolve_target_mailbox("Deleted Messages", gmail_mailboxes) == "[Gmail]/Trash"
+    assert resolve_target_mailbox("Junk", gmail_mailboxes) == "[Gmail]/Spam"
+
+
 class FakeSourceImap:
     def __init__(self) -> None:
         self.selected = ""
@@ -333,6 +389,34 @@ class FakeSourceImap:
         return "OK", []
 
 
+class FakeIcloudInboxSourceImap:
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+    def select(self, mailbox: str, readonly: bool = False):
+        return "OK", [b"1"]
+
+    def response(self, name: str):
+        return "OK", [b"555"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = args[-1]
+            meta = b'1 (UID 1 RFC822.SIZE 40 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + b" BODY[] {40}", b"Message-ID: <icloud@example.com>\r\n\r\nbody")]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
 @contextlib.contextmanager
 def _fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
     yield FakeSourceImap()
@@ -355,11 +439,45 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert len(manifest) == 1
     row = manifest[0]
     assert row["canonical_id"] == "gmail-123"
+    assert row["primary_mailbox"] == "INBOX"
     assert row["source_mailboxes"] == ["INBOX", "[Gmail]/All Mail"]
     assert row["gmail_labels"] == ["Project A", "\\Inbox"]
     assert (account_dir / row["eml_path"]).exists()
     assert (account_dir / row["metadata_path"]).exists()
     assert fake.body_fetches == 1
+
+
+def test_provider_export_icloud_inbox_to_generic_imap_layout(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="source", password="icloud-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@icloud.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeIcloudInboxSourceImap]:
+        yield FakeIcloudInboxSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@icloud.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 1
+    assert manifest[0]["source_provider"] == "icloud"
+    assert manifest[0]["primary_mailbox"] == "INBOX"
+    assert manifest[0]["source_mailboxes"] == ["INBOX"]
+    assert manifest[0]["gmail_msgid"] == ""
 
 
 class FakeSourceNoBodyImap(FakeSourceImap):
@@ -488,6 +606,15 @@ class FakeTargetImap:
         return "OK", []
 
 
+class FakeGmailTargetImap(FakeTargetImap):
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+            b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+        ]
+
+
 def _write_manifest_fixture(root: Path) -> Path:
     account_dir = root / "source@example.com"
     (account_dir / "messages").mkdir(parents=True)
@@ -526,6 +653,72 @@ def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="source", password="icloud-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@example.com"
+    row["primary_mailbox"] = "INBOX"
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    fake = FakeTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["INBOX"]
+
+
+def test_provider_import_imap_archive_to_gmail_all_mail(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Archive"
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["[Gmail]/All Mail"]
 
 
 def test_provider_import_rejects_manifest_paths_outside_export_dir(tmp_path: Path) -> None:

@@ -84,9 +84,8 @@ class ProviderEndpoint:
         if not provider or not isinstance(provider, str):
             raise ValueError(f"{context}.provider must be a non-empty string")
         provider = provider.strip().lower()
-        allowed_provider = {"source": "gmail", "target": "icloud"}.get(context)
-        if allowed_provider and provider != allowed_provider:
-            raise ValueError(f"{context}.provider must be {allowed_provider!r}")
+        if provider not in {"gmail", "icloud", "imap"}:
+            raise ValueError(f"{context}.provider must be one of: gmail, icloud, imap")
         host = raw.get("host")
         if not host or not isinstance(host, str):
             raise ValueError(f"{context}.host must be a non-empty string")
@@ -112,8 +111,11 @@ class ProviderEndpoint:
 
     def validate_provider_contract(self, *, context: str) -> None:
         expected_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
-        if self.provider not in expected_hosts:
-            raise ValueError(f"{context}.provider must be one of: gmail, icloud")
+        if self.provider == "imap":
+            if self.ssl and self.starttls:
+                raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")
+            self.validate_auth_method(self.auth, context=f"{context}.auth")
+            return
         if self.host.strip().lower() != expected_hosts[self.provider]:
             raise ValueError(f"{context}.host must be {expected_hosts[self.provider]!r} for provider {self.provider!r}")
         if self.port != 993:
@@ -128,6 +130,7 @@ class ProviderEndpoint:
         allowed_methods = {
             "gmail": {"xoauth2", "app_password"},
             "icloud": {"app_password"},
+            "imap": {"password", "app_password", "xoauth2"},
         }[self.provider]
         if auth.method not in allowed_methods:
             methods = ", ".join(sorted(allowed_methods))
@@ -265,10 +268,6 @@ class ProviderMigrationConfig:
         return config
 
     def validate_auth(self) -> None:
-        if self.source.provider != "gmail":
-            raise ValueError("source.provider must be 'gmail'")
-        if self.target.provider != "icloud":
-            raise ValueError("target.provider must be 'icloud'")
         self.source.validate_provider_contract(context="source")
         self.target.validate_provider_contract(context="target")
         seen_sources: Dict[str, int] = {}
