@@ -604,14 +604,54 @@ def load_manifest(account_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def require_complete_export_state(account_dir: Path) -> None:
+def provider_export_state_issues(
+    account_dir: Path,
+    *,
+    account: Optional[MigrationAccount] = None,
+    manifest_rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
     state_path = account_dir / "export-state.json"
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise RuntimeError(f"export-state missing or invalid: {exc}") from exc
+        return [f"export-state missing or invalid: {exc}"]
+    issues: List[str] = []
     if not isinstance(state, dict) or state.get("complete") is not True:
-        raise RuntimeError(f"export-state is not complete: {state_path}")
+        issues.append(f"export-state is not complete: {state_path}")
+        return issues
+    if account is not None:
+        source_account = state.get("source_account")
+        target_account = state.get("target_account")
+        if source_account != account.source_email:
+            issues.append(
+                f"export-state source_account does not match config source_email "
+                f"{account.source_email}: {source_account or '<missing>'}"
+            )
+        if target_account != account.target_email:
+            issues.append(
+                f"export-state target_account does not match config target_email "
+                f"{account.target_email}: {target_account or '<missing>'}"
+            )
+    if manifest_rows is not None:
+        expected_count = len(manifest_rows)
+        actual_count = state.get("canonical_messages")
+        if type(actual_count) is not int or actual_count != expected_count:
+            issues.append(
+                f"export-state canonical_messages does not match manifest row count: "
+                f"{actual_count if actual_count is not None else '<missing>'} != {expected_count}"
+            )
+    return issues
+
+
+def require_complete_export_state(
+    account_dir: Path,
+    *,
+    account: Optional[MigrationAccount] = None,
+    manifest_rows: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    issues = provider_export_state_issues(account_dir, account=account, manifest_rows=manifest_rows)
+    if issues:
+        raise RuntimeError("; ".join(issues))
 
 
 def manifest_identity_issues(rows: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, int]]:
@@ -1447,11 +1487,11 @@ def provider_import_account(
     limiter: Optional[RateLimiter] = None,
 ) -> None:
     account_dir = account_export_dir(in_root, account)
-    require_complete_export_state(account_dir)
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_target_account(manifest_rows, account)
     require_manifest_integrity_metadata(manifest_rows)
+    require_complete_export_state(account_dir, account=account, manifest_rows=manifest_rows)
     journal_rows = load_import_journal(account_dir, account)
     require_valid_import_journal(journal_rows, account)
     committed = {
@@ -1582,13 +1622,10 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     if not account_dir.exists():
         return account.email, [f"account export directory missing: {account_dir}"]
     try:
-        require_complete_export_state(account_dir)
-    except Exception as exc:
-        issues.append(str(exc))
-    try:
         rows = load_manifest(account_dir)
     except Exception as exc:
         return account.email, [f"manifest load failed: {exc}"]
+    issues.extend(provider_export_state_issues(account_dir, account=account, manifest_rows=rows))
     identities = set()
     issues.extend(manifest_integrity_issues(rows))
     for row in rows:
@@ -1676,12 +1713,13 @@ def provider_validate_account(
         "ok": False,
     }
     try:
-        require_complete_export_state(account_dir)
-        manifest_rows = load_manifest(account_dir)
         journal_rows = load_import_journal(account_dir, account)
+        manifest_rows = load_manifest(account_dir)
     except Exception as exc:
         report["failed"].append(str(exc))
         return account.email, report
+
+    report["failed"].extend(provider_export_state_issues(account_dir, account=account, manifest_rows=manifest_rows))
 
     try:
         require_manifest_target_account(manifest_rows, account)
@@ -1768,17 +1806,13 @@ def provider_validate_account(
         try:
             with imap_connection(config.target, account, role="target") as imap:
                 target_mailboxes = list_mailboxes(imap)
+                target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+                    manifest_rows,
+                    target_mailboxes,
+                    target_provider=config.target.provider,
+                )
                 expected_target_by_id = {
-                    identity: resolve_target_mailbox(
-                        translate_source_mailbox_for_target(
-                            row,
-                            str(row.get("primary_mailbox") or "Archive"),
-                            target_mailboxes,
-                            target_provider=config.target.provider,
-                        ),
-                        target_mailboxes,
-                        target_provider=config.target.provider,
-                    )
+                    identity: target_mailbox_by_identity[identity]
                     for identity, row in by_id.items()
                 }
                 committed_by_id, target_by_id, failures = evaluate_journal(expected_target_by_id)

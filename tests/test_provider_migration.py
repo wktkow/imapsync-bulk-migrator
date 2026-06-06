@@ -1237,12 +1237,24 @@ def _write_manifest_fixture(root: Path) -> Path:
     }
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
-    (account_dir / "export-state.json").write_text(json.dumps({
-        "source_account": "source@example.com",
-        "target_account": "target@icloud.com",
-        "complete": True,
-    }))
+    _write_provider_export_state(account_dir)
     return account_dir
+
+
+def _write_provider_export_state(
+    account_dir: Path,
+    *,
+    source: str = "source@example.com",
+    target: str = "target@icloud.com",
+    canonical_messages: int = 1,
+    complete: bool = True,
+) -> None:
+    account_dir.joinpath("export-state.json").write_text(json.dumps({
+        "source_account": source,
+        "target_account": target,
+        "complete": complete,
+        "canonical_messages": canonical_messages,
+    }))
 
 
 def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
@@ -1283,6 +1295,7 @@ def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) 
     row["target_account"] = "target@example.com"
     row["primary_mailbox"] = "INBOX"
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@example.com")
     fake = FakeTargetImap()
 
     @contextlib.contextmanager
@@ -1326,6 +1339,7 @@ def test_provider_import_translates_custom_folder_delimiter_to_target(tmp_path: 
     row["source_mailbox_paths"] = {"Projects/2024": ["Projects", "2024"]}
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@example.com")
     fake = DotDelimiterTarget()
 
     @contextlib.contextmanager
@@ -1380,6 +1394,7 @@ def test_provider_import_rejects_ambiguous_translated_folder_collision(tmp_path:
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
     (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
     (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    _write_provider_export_state(account_dir, target="target@example.com", canonical_messages=2)
     fake = SlashDelimiterTarget()
 
     @contextlib.contextmanager
@@ -1433,6 +1448,7 @@ def test_provider_import_rejects_gmail_collision_before_label_mutation(tmp_path:
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
     (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
     (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com", canonical_messages=2)
     fake = FakeGmailTargetImap()
 
     @contextlib.contextmanager
@@ -1483,6 +1499,7 @@ def test_provider_import_allows_repeated_rows_from_same_translated_source_folder
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
     (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
     (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    _write_provider_export_state(account_dir, target="target@example.com", canonical_messages=2)
     fake = StoredMessageTarget()
 
     @contextlib.contextmanager
@@ -1516,6 +1533,7 @@ def test_provider_import_imap_archive_to_gmail_all_mail(tmp_path: Path) -> None:
     row["target_account"] = "target@gmail.com"
     row["primary_mailbox"] = "Archive"
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     fake = FakeGmailTargetImap()
 
     @contextlib.contextmanager
@@ -1559,6 +1577,7 @@ def test_provider_import_to_gmail_restores_custom_labels(tmp_path: Path) -> None
     row["gmail_labels"] = ["\\Inbox", "Project A", "Team/Blue", "[Gmail]/All Mail"]
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     fake = FakeGmailTargetImap()
 
     @contextlib.contextmanager
@@ -1597,6 +1616,7 @@ def test_provider_import_to_gmail_restores_important_without_moving_from_inbox(t
     row["gmail_labels"] = ["\\Inbox", "Important"]
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     fake = FakeGmailTargetImap()
 
     @contextlib.contextmanager
@@ -1633,6 +1653,7 @@ def test_provider_import_to_gmail_restores_starred_as_flag_not_plain_label(tmp_p
     row["gmail_labels"] = ["\\Inbox", "\\Starred", "Starred", "Project A"]
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     fake = FakeGmailTargetImap()
 
     @contextlib.contextmanager
@@ -1745,6 +1766,30 @@ def test_provider_import_rejects_incomplete_export_state(tmp_path: Path) -> None
         provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_rejects_mismatched_export_state_before_target_connect(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    _write_provider_export_state(account_dir, target="other@icloud.com")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="export-state target_account"):
+            provider_import_account(config, account, tmp_path)
+
+    _write_provider_export_state(account_dir, canonical_messages=2)
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="export-state canonical_messages"):
+            provider_import_account(config, account, tmp_path)
+
+    _write_provider_export_state(account_dir)
+    state = json.loads((account_dir / "export-state.json").read_text())
+    state["canonical_messages"] = True
+    (account_dir / "export-state.json").write_text(json.dumps(state))
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="export-state canonical_messages"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_import_rejects_corrupt_staged_payload_before_append(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -1799,6 +1844,7 @@ def test_provider_import_merge_mode_consumes_existing_matches_by_occurrence(tmp_
     (account_dir / "messages" / "physical-duplicate.eml").write_bytes(body)
     (account_dir / "metadata" / "physical-duplicate.json").write_text(json.dumps(duplicate))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(duplicate) + "\n")
+    _write_provider_export_state(account_dir, canonical_messages=2)
     fake = StoredMessageTarget({"Archive": [body]})
 
     @contextlib.contextmanager
@@ -1826,6 +1872,7 @@ def test_provider_import_merge_mode_marks_appended_matches_used(tmp_path: Path) 
     (account_dir / "messages" / "physical-duplicate.eml").write_bytes((account_dir / "messages" / "gmail-123.eml").read_bytes())
     (account_dir / "metadata" / "physical-duplicate.json").write_text(json.dumps(duplicate))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(duplicate) + "\n")
+    _write_provider_export_state(account_dir, canonical_messages=2)
     fake = StoredMessageTarget()
 
     @contextlib.contextmanager
@@ -1877,6 +1924,7 @@ def test_provider_import_empty_mode_resumes_with_journaled_target_messages(tmp_p
     (account_dir / "messages" / "gmail-456.eml").write_bytes(second_body)
     (account_dir / "metadata" / "gmail-456.json").write_text(json.dumps(second))
     (account_dir / "manifest.jsonl").write_text("\n".join(json.dumps(row) for row in rows + [second]) + "\n")
+    _write_provider_export_state(account_dir, canonical_messages=2)
     (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps({
         "canonical_id": "gmail-123",
         "target_account": "target@icloud.com",
@@ -1917,6 +1965,7 @@ def test_provider_import_empty_mode_permits_journaled_gmail_all_mail_message(tmp
     row["primary_mailbox"] = "Archive"
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
@@ -1987,6 +2036,7 @@ def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_pat
     row["flags"] = "\\Seen \\Flagged"
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
@@ -2057,6 +2107,7 @@ def test_provider_import_empty_mode_permits_journaled_gmail_important_view_plain
     row["gmail_labels"] = ["Important"]
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
@@ -2280,6 +2331,71 @@ def test_provider_validation_rejects_wrong_target_mailbox_commit(tmp_path: Path)
     assert any("wrong target mailbox" in item for item in report["failed"])
 
 
+def test_provider_validation_rejects_translated_folder_collision(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    first = json.loads((account_dir / "manifest.jsonl").read_text())
+    first["target_account"] = "target@example.com"
+    first["canonical_id"] = "first"
+    first["primary_mailbox"] = "A/B.C"
+    first["source_mailboxes"] = ["A/B.C"]
+    first["source_mailbox_paths"] = {"A/B.C": ["A/B", "C"]}
+    first["eml_path"] = "messages/first.eml"
+    first["metadata_path"] = "metadata/first.json"
+    second = dict(first)
+    second["canonical_id"] = "second"
+    second["primary_mailbox"] = "A.B/C"
+    second["source_mailboxes"] = ["A.B/C"]
+    second["source_mailbox_paths"] = {"A.B/C": ["A", "B/C"]}
+    second["eml_path"] = "messages/second.eml"
+    second["metadata_path"] = "metadata/second.json"
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    (account_dir / "messages" / "first.eml").write_bytes(body)
+    (account_dir / "messages" / "second.eml").write_bytes(body)
+    (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
+    (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    _write_provider_export_state(account_dir, target="target@example.com", canonical_messages=2)
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(
+        json.dumps({
+            "canonical_id": "first",
+            "target_account": "target@example.com",
+            "target_mailbox": "A/B/C",
+            "status": "committed",
+        }) + "\n" + json.dumps({
+            "canonical_id": "second",
+            "target_account": "target@example.com",
+            "target_mailbox": "A/B/C",
+            "status": "committed",
+        }) + "\n"
+    )
+    fake = FakeTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("target mailbox translation collision" in item for item in report["failed"])
+
+
 def test_provider_validation_checks_target_occurrences_not_only_boolean_match(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -2292,6 +2408,7 @@ def test_provider_validation_checks_target_occurrences_not_only_boolean_match(tm
     (account_dir / "messages" / "physical-duplicate.eml").write_bytes((account_dir / "messages" / "gmail-123.eml").read_bytes())
     (account_dir / "metadata" / "physical-duplicate.json").write_text(json.dumps(duplicate))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(duplicate) + "\n")
+    _write_provider_export_state(account_dir, canonical_messages=2)
     (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
         json.dumps({
             "canonical_id": "gmail-123",
@@ -2341,11 +2458,7 @@ def test_provider_validation_checks_gmail_target_labels(tmp_path: Path) -> None:
     row["gmail_labels"] = ["\\Inbox", "Important", "Project A"]
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
-    (account_dir / "export-state.json").write_text(json.dumps({
-        "source_account": "source@example.com",
-        "target_account": "target@gmail.com",
-        "complete": True,
-    }))
+    _write_provider_export_state(account_dir, target="target@gmail.com")
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
@@ -2448,6 +2561,22 @@ def test_provider_audit_rejects_incomplete_export_state(tmp_path: Path) -> None:
     _name, issues = provider_audit_account(config, account, tmp_path)
 
     assert any("export-state is not complete" in issue for issue in issues)
+
+
+def test_provider_audit_and_validation_reject_mismatched_export_state(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    _write_provider_export_state(account_dir, source="other@example.com", canonical_messages=2)
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("export-state source_account" in issue for issue in issues)
+    assert any("export-state canonical_messages" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("export-state source_account" in issue for issue in report["failed"])
+    assert any("export-state canonical_messages" in issue for issue in report["failed"])
 
 
 def test_load_import_journal_recovers_incomplete_trailing_row(tmp_path: Path) -> None:

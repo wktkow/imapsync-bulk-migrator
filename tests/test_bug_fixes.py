@@ -691,6 +691,61 @@ class TestLegacyImportJournal:
         assert list(account_dir.glob("import.journal.reset-*.jsonl"))
         import_mock.assert_called_once()
 
+    def test_reset_archives_committed_journal_before_connectivity_failure(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        key = _legacy_import_key(account_dir, eml, "INBOX", eml.read_bytes())
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "committed",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
+            mock.patch("components.main.test_accounts", side_effect=RuntimeError("connectivity failed")), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 3
+        assert not (account_dir / "import.journal.jsonl").exists()
+        assert list(account_dir.glob("import.journal.reset-*.jsonl"))
+        import_mock.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # BUG #8 — Context manager type hint
@@ -1595,6 +1650,62 @@ class TestDirectAdminIndexerHardening:
         assert rc == 3
         assert imported == ["ok@example.com"]
 
+    def test_import_connectivity_skips_reset_failed_accounts_under_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            inbox = input_dir / email / "INBOX"
+            _write_legacy_message_fixture(inbox)
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        tested: List[List[str]] = []
+        imported: List[str] = []
+
+        def fake_test_accounts(config, *_args, **_kwargs) -> None:
+            tested.append([acc.email for acc in config.accounts])
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value={"skip@example.com"}), \
+            mock.patch("components.main.test_accounts", fake_test_accounts), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 3
+        assert tested == [["ok@example.com"]]
+        assert imported == ["ok@example.com"]
+
     def test_import_skips_all_accounts_when_reset_setup_fails_under_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -1847,6 +1958,79 @@ class TestCPanelProvisioning:
 
         assert rc == 3
         assert imported == ["ok@example.com"]
+
+    def test_cpanel_reset_archives_journal_and_skips_failed_connectivity_account(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        config_path = tmp_path / "import.pass.config.json"
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            inbox = input_dir / email / "INBOX"
+            _write_legacy_message_fixture(inbox)
+
+        ok_account = Account(email="ok@example.com", password="secret")
+        ok_account_dir = input_dir / "ok@example.com"
+        ok_eml = ok_account_dir / "INBOX" / "u0000000001.eml"
+        ok_key = _legacy_import_key(ok_account_dir, ok_eml, "INBOX", ok_eml.read_bytes())
+        (ok_account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": ok_key,
+            "status": "committed",
+            "target": _legacy_import_target_id(server, ok_account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        tested: List[List[str]] = []
+        imported: List[str] = []
+
+        def fake_test_accounts(config, *_args, **_kwargs) -> None:
+            tested.append([acc.email for acc in config.accounts])
+            assert not (ok_account_dir / "import.journal.jsonl").exists()
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"skip@example.com"}), \
+            mock.patch("components.main.test_accounts", fake_test_accounts), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 3
+        assert tested == [["ok@example.com"]]
+        assert imported == ["ok@example.com"]
+        assert list(ok_account_dir.glob("import.journal.reset-*.jsonl"))
 
     def test_reset_requires_confirmation_before_panel_calls(self, tmp_path: Path) -> None:
         from components.main import main

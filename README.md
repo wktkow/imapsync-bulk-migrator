@@ -141,7 +141,14 @@ real folders.
 For custom nested folders, provider mode stores source hierarchy segments and
 translates them to the target server's advertised hierarchy delimiter during
 import. If the target has no hierarchy delimiter, the source mailbox name is kept
-literal.
+literal. If two different source folder hierarchies would collapse into the
+same translated target mailbox, import and target validation fail before
+claiming the migration is safe.
+
+Provider export writes an account-level `export-state.json` with the source
+account, target account, completion flag, and canonical message count. Import,
+audit, and validation require that state to match the manifest before trusting
+the staged data.
 
 ## Legacy Generic IMAP Workflow
 
@@ -237,7 +244,13 @@ Reset safeguards:
 - The staged legacy export must include a completed account-level
   `export-state.json` written by a successful legacy export; hand-shaped or
   partial export directories are rejected before destructive reset.
+- After a successful reset, stale legacy import journals for that account are
+  archived before connectivity tests or import begin, so an old committed journal
+  cannot make a freshly reset mailbox look imported.
 - Failed panel resets cause the affected accounts to be skipped during import.
+- When `--ignore-errors` is used with reset, connectivity tests and import run
+  only for accounts whose panel reset succeeded; the command still exits
+  non-zero if any account was skipped.
 - Dry-run mode must be able to list panel mailboxes for each domain.
 
 Use `--da-dry-run` or `--cpanel-dry-run` before destructive runs:
@@ -315,11 +328,14 @@ Log files are created with mode `0600`.
 
 Provider mode validation is manifest/journal based. It checks:
 
-- Complete `export-state.json`.
+- Complete `export-state.json` matching the source account, target account, and
+  manifest message count.
 - Unique manifest identities.
 - Manifest target account consistency.
 - Required manifest integrity metadata.
 - Import journal consistency.
+- Target folder mapping consistency, including translated hierarchy collision
+  checks when target validation is enabled.
 - Target message presence by `Message-ID` plus content hash/size where target
   validation is enabled.
 - Expected Gmail labels when Gmail is the target.

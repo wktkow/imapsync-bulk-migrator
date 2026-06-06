@@ -545,6 +545,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info("[panel][dry-run] Skipping connectivity tests and IMAP import because panel dry-run was requested")
         return 0
 
+    if (not is_provider_config) and args.mode == "import" and bool(getattr(args, "reset", False)):
+        assert isinstance(config, Config)
+        reset_input_root = Path(args.input_dir)
+        for acc in config.accounts:
+            if acc.email in panel_reset_failed_accounts:
+                continue
+            archive_path = archive_legacy_import_journal_for_reset(reset_input_root / sanitize_for_path(acc.email))
+            if archive_path is not None:
+                logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
+
     if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
         try:
             if is_provider_config:
@@ -559,7 +569,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
                 assert isinstance(config, Config)
-                test_accounts(config, max_workers=int(args.max_workers))
+                connectivity_config = config
+                if args.mode == "import" and bool(getattr(args, "reset", False)) and panel_reset_failed_accounts:
+                    active_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
+                    skipped = len(config.accounts) - len(active_accounts)
+                    logging.info(
+                        "[panel] Skipping connectivity tests for %d account(s) whose control-panel reset failed",
+                        skipped,
+                    )
+                    connectivity_config = Config(server=config.server, accounts=active_accounts)
+                test_accounts(connectivity_config, max_workers=int(args.max_workers))
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
             logging.error("Connectivity tests failed: %s", exc)
@@ -714,13 +733,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             check_free_space_for_path(in_root, min_free_gb)
             panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
-            if bool(getattr(args, "reset", False)) and not panel_dry_run:
-                for acc in config.accounts:
-                    if acc.email in panel_reset_failed_accounts:
-                        continue
-                    archive_path = archive_legacy_import_journal_for_reset(in_root / sanitize_for_path(acc.email))
-                    if archive_path is not None:
-                        logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
 
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
@@ -749,7 +761,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     provision_context=provision_ctx,
                 )
 
-            parallel_process_accounts("import", do_import, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            import_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
+            parallel_process_accounts("import", do_import, import_accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
             if panel_reset_failed_accounts:
                 logging.error(
                     "[panel] Import skipped %d account(s) because control-panel reset failed: %s",
