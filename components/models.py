@@ -89,6 +89,7 @@ class ProviderEndpoint:
     starttls: bool = False
     auth: AuthConfig = dataclasses.field(default_factory=lambda: AuthConfig(method="password"))
     available_bytes: Optional[int] = None
+    gmail_full_visibility_verified: bool = False
 
     @staticmethod
     def from_dict(raw: Dict[str, Any], *, context: str, base_dir: Optional[Path] = None) -> "ProviderEndpoint":
@@ -111,6 +112,10 @@ class ProviderEndpoint:
         available_bytes = raw.get("available_bytes")
         if available_bytes is not None:
             available_bytes = _int_value(available_bytes, f"{context}.available_bytes", min_value=0)
+        gmail_full_visibility_verified = _bool_value(
+            raw.get("gmail_full_visibility_verified", False),
+            f"{context}.gmail_full_visibility_verified",
+        )
         endpoint = ProviderEndpoint(
             provider=provider,
             host=host,
@@ -119,12 +124,15 @@ class ProviderEndpoint:
             starttls=starttls,
             auth=auth,
             available_bytes=available_bytes,
+            gmail_full_visibility_verified=gmail_full_visibility_verified,
         )
         endpoint.validate_provider_contract(context=context)
         return endpoint
 
     def validate_provider_contract(self, *, context: str) -> None:
         expected_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
+        if self.provider != "gmail" and self.gmail_full_visibility_verified:
+            raise ValueError(f"{context}.gmail_full_visibility_verified is only valid for provider 'gmail'")
         if self.provider == "imap":
             if self.ssl and self.starttls:
                 raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")

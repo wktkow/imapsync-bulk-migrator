@@ -1158,7 +1158,52 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
-    def test_legacy_validate_fails_when_remote_has_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+    def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        inbox = input_dir / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+
+        class EmptyRemoteFolderImap:
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren) "/" "Projects"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[EmptyRemoteFolderImap]:
+            yield EmptyRemoteFolderImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+
+    def test_legacy_validate_fails_when_account_export_dir_is_missing_even_if_remote_empty(self, tmp_path: Path) -> None:
         from components.main import main
 
         config_path = tmp_path / "import.pass.config.json"
@@ -1171,7 +1216,7 @@ class TestCliAndConfigHardening:
 
         class EmptyRemoteFolderImap:
             def list(self):
-                return "OK", [b'(\\HasNoChildren) "/" "Projects"']
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
 
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"0"]
@@ -1197,6 +1242,53 @@ class TestCliAndConfigHardening:
             ])
 
         assert rc == 4
+
+    def test_legacy_audit_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        account = Account(email="a@example.com", password="secret")
+        account_dir = tmp_path / "a@example.com"
+        inbox = account_dir / "INBOX"
+        data = b"Message-ID: <local@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        _write_legacy_message_fixture(inbox, data=data)
+
+        class EmptyRemoteFolderImap:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren) "/" "Projects"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"0"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b"1" if self.selected == "INBOX" else b""]
+
+            def search(self, charset, *criteria):
+                if self.selected == "INBOX":
+                    return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE 39 BODY[] {39}", data)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[EmptyRemoteFolderImap]:
+            yield EmptyRemoteFolderImap()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(account, tmp_path, ServerConfig(host="imap.example.com"), check_remote=True)
+
+        assert issues == []
 
     def test_legacy_resync_missing_does_not_replay_import(self, tmp_path: Path) -> None:
         from components.main import main

@@ -284,6 +284,16 @@ def gmail_source_readiness_issues(capabilities: List[str], mailboxes: List[Mailb
     return issues
 
 
+def gmail_source_decommission_issues(endpoint: ProviderEndpoint) -> List[str]:
+    if endpoint.provider != "gmail" or endpoint.gmail_full_visibility_verified:
+        return []
+    return [
+        "Gmail source full IMAP visibility is not attested; before server decommissioning, "
+        "set source.gmail_full_visibility_verified=true only after verifying Workspace "
+        "gmail.imap_admin access or Gmail IMAP settings with no folder-size limit and required labels visible in IMAP"
+    ]
+
+
 def quote_mailbox_name(mailbox: str) -> str:
     if mailbox.upper() == "INBOX":
         return "INBOX"
@@ -608,6 +618,19 @@ def provider_manifest_digest(rows: List[Dict[str, Any]]) -> str:
     canonical_rows = sorted(rows, key=lambda row: str(row.get("canonical_id") or ""))
     payload = json.dumps(canonical_rows, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def latest_committed_journal_rows(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        if row.get("status") != "committed":
+            continue
+        identity = str(row.get("canonical_id") or "")
+        target_mailbox = str(row.get("target_mailbox") or "")
+        if not identity or not target_mailbox:
+            continue
+        latest[(identity, target_mailbox)] = row
+    return latest
 
 
 def provider_export_state_issues(
@@ -1366,6 +1389,17 @@ def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str
     return bool(target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing))
 
 
+def _target_gmail_msgid(imap: imaplib.IMAP4, num: bytes) -> str:
+    status, fetched = imap.fetch(num, "(X-GM-MSGID)")
+    if status != "OK":
+        raise RuntimeError(f"failed to fetch Gmail message id for target message {num!r}")
+    parsed = parse_provider_fetch_response(fetched or [])
+    gmail_msgid = str(parsed.get("gmail_msgid") or "")
+    if not gmail_msgid:
+        raise RuntimeError(f"target Gmail did not return X-GM-MSGID for message {num!r}")
+    return gmail_msgid
+
+
 def consume_target_match_num(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -1373,11 +1407,18 @@ def consume_target_match_num(
     used_by_mailbox: Dict[str, set[bytes]],
     *,
     create_if_missing: bool = True,
+    used_gmail_msgids: Optional[set[str]] = None,
 ) -> Optional[bytes]:
     mailbox_key = mailbox.lower()
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
         if num not in used:
+            if used_gmail_msgids is not None:
+                gmail_msgid = _target_gmail_msgid(imap, num)
+                if gmail_msgid and gmail_msgid in used_gmail_msgids:
+                    continue
+                if gmail_msgid:
+                    used_gmail_msgids.add(gmail_msgid)
             used.add(num)
             return num
     return None
@@ -1390,6 +1431,7 @@ def consume_target_match(
     used_by_mailbox: Dict[str, set[bytes]],
     *,
     create_if_missing: bool = True,
+    used_gmail_msgids: Optional[set[str]] = None,
 ) -> bool:
     return consume_target_match_num(
         imap,
@@ -1397,6 +1439,7 @@ def consume_target_match(
         manifest_row,
         used_by_mailbox,
         create_if_missing=create_if_missing,
+        used_gmail_msgids=used_gmail_msgids,
     ) is not None
 
 
@@ -1417,12 +1460,19 @@ def consume_target_match_with_gmail_labels(
     used_by_mailbox: Dict[str, set[bytes]],
     *,
     create_if_missing: bool = True,
+    used_gmail_msgids: Optional[set[str]] = None,
 ) -> Optional[set[str]]:
     mailbox_key = mailbox.lower()
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
         if num in used:
             continue
+        if used_gmail_msgids is not None:
+            gmail_msgid = _target_gmail_msgid(imap, num)
+            if gmail_msgid and gmail_msgid in used_gmail_msgids:
+                continue
+            if gmail_msgid:
+                used_gmail_msgids.add(gmail_msgid)
         used.add(num)
         return _target_gmail_label_keys(imap, num)
     return None
@@ -1560,13 +1610,12 @@ def provider_import_account(
     require_manifest_accounts(manifest_rows, account)
     require_manifest_integrity_metadata(manifest_rows)
     require_complete_export_state(account_dir, account=account, manifest_rows=manifest_rows)
+    metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
+    if metadata_issues:
+        raise RuntimeError("metadata does not match manifest: " + "; ".join(metadata_issues))
     journal_rows = load_import_journal(account_dir, account)
     require_valid_import_journal(journal_rows, account)
-    committed = {
-        (str(row.get("canonical_id")), str(row.get("target_mailbox")))
-        for row in journal_rows
-        if row.get("status") == "committed"
-    }
+    committed = set(latest_committed_journal_rows(journal_rows))
     pending = {
         (str(row.get("canonical_id")), str(row.get("target_mailbox")))
         for row in journal_rows
@@ -1574,6 +1623,7 @@ def provider_import_account(
     }
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
     used_target_nums: Dict[str, set[bytes]] = {}
+    used_target_gmail_msgids: set[str] = set()
 
     with imap_connection(config.target, account, role="target") as imap:
         target_mailboxes = list_mailboxes(imap)
@@ -1604,18 +1654,36 @@ def provider_import_account(
                 target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = (identity, target_mailbox)
             if key in committed:
-                if config.migration.target_mode == "empty" and not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
+                committed_num = consume_target_match_num(
+                    imap,
+                    target_mailbox,
+                    row,
+                    used_target_nums,
+                    create_if_missing=False,
+                    used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+                )
+                if committed_num is None and config.migration.target_mode == "empty":
                     raise RuntimeError(
                         f"journal says {identity} is committed to {target_mailbox!r}, "
                         "but the target message was not found"
                     )
-                continue
+                if committed_num is not None:
+                    if config.target.provider == "gmail":
+                        restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num)
+                        restore_gmail_starred_flag(imap, target_mailbox, row, target_num=committed_num)
+                    continue
             eml_path = _manifest_path(account_dir, row, "eml_path")
             if not eml_path.exists():
                 raise RuntimeError(f"message file missing for {identity}: {eml_path}")
             matched_num = None
             if config.migration.target_mode == "merge" or key in pending:
-                matched_num = consume_target_match_num(imap, target_mailbox, row, used_target_nums)
+                matched_num = consume_target_match_num(
+                    imap,
+                    target_mailbox,
+                    row,
+                    used_target_nums,
+                    used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+                )
             if matched_num is not None:
                 if config.target.provider == "gmail":
                     restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num)
@@ -1637,7 +1705,14 @@ def provider_import_account(
             )
             if status != "OK":
                 raise RuntimeError(f"append failed for {identity}: {response}")
-            appended_num = consume_target_match_num(imap, target_mailbox, row, used_target_nums, create_if_missing=False)
+            appended_num = consume_target_match_num(
+                imap,
+                target_mailbox,
+                row,
+                used_target_nums,
+                create_if_missing=False,
+                used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+            )
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
             if config.target.provider == "gmail":
@@ -1788,11 +1863,7 @@ def provider_validate_account(
 
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
-    committed_journal_keys = {
-        (str(row.get("canonical_id") or ""), str(row.get("target_mailbox") or ""))
-        for row in journal_rows
-        if row.get("status") == "committed"
-    }
+    committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
     for row in journal_rows:
         if row.get("status") != "pending":
             continue
@@ -1822,9 +1893,8 @@ def provider_validate_account(
         committed_by_id: Dict[str, int] = {}
         target_by_id: Dict[str, str] = {}
         failures: List[str] = []
-        for row in journal_rows:
-            if row.get("status") != "committed":
-                continue
+        effective_committed = latest_committed_journal_rows(journal_rows)
+        for row in effective_committed.values():
             identity = str(row.get("canonical_id") or "")
             if not identity:
                 failures.append("journal committed row missing canonical_id")
@@ -1879,6 +1949,7 @@ def provider_validate_account(
                 apply_counts(committed_by_id)
                 if not report["missing"]:
                     used_target_nums: Dict[str, set[bytes]] = {}
+                    used_target_gmail_msgids: set[str] = set()
                     for identity, row in by_id.items():
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
@@ -1891,6 +1962,7 @@ def provider_validate_account(
                                 row,
                                 used_target_nums,
                                 create_if_missing=False,
+                                used_gmail_msgids=used_target_gmail_msgids,
                             )
                             if actual_labels is None:
                                 report["remote_missing"].append(identity)
@@ -1978,6 +2050,7 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                 source_mailboxes = list_mailboxes(source_imap)
                 if config.source.provider == "gmail":
                     account_issues.extend(gmail_source_readiness_issues(capabilities, source_mailboxes))
+                    account_issues.extend(gmail_source_decommission_issues(config.source))
                 for mailbox in source_mailboxes:
                     if is_noselect(mailbox) or is_virtual_source_mailbox(config.source.provider, mailbox):
                         continue

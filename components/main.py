@@ -790,16 +790,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
-                    if account_dir.exists():
-                        current_target = _legacy_import_target_id(config.server, acc)
-                        pending_rows = [
-                            row
-                            for row in _load_legacy_import_journal(account_dir)
-                            if row.get("status") == "pending" and row.get("target") == current_target
-                        ]
-                        if pending_rows:
-                            with mismatches_lock:
-                                validation_errors.append((email, f"import journal has {len(pending_rows)} pending append(s); target state is uncertain"))
+                    if not account_dir.exists():
+                        with mismatches_lock:
+                            validation_errors.append((email, f"account directory missing: {account_dir}"))
+                        return
+                    current_target = _legacy_import_target_id(config.server, acc)
+                    pending_rows = [
+                        row
+                        for row in _load_legacy_import_journal(account_dir)
+                        if row.get("status") == "pending" and row.get("target") == current_target
+                    ]
+                    if pending_rows:
+                        with mismatches_lock:
+                            validation_errors.append((email, f"import journal has {len(pending_rows)} pending append(s); target state is uncertain"))
 
                     def marker_mailbox(folder_dir: Path) -> str:
                         marker_path = folder_dir / ".mailbox.json"
@@ -812,28 +815,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
                         return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
 
-                    if account_dir.exists():
-                        for folder_dir in [p for p in account_dir.iterdir() if p.is_dir()]:
-                            default_mailbox = marker_mailbox(folder_dir)
-                            eml_paths = sorted(folder_dir.glob("*.eml"))
-                            if not eml_paths:
-                                local_counts.setdefault(sanitize_for_path(default_mailbox), 0)
-                                local_messages.setdefault(default_mailbox, [])
-                                continue
-                            for eml_path in eml_paths:
-                                mailbox = default_mailbox
-                                metadata_path = eml_path.with_suffix(".json")
-                                if metadata_path.exists():
-                                    try:
-                                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                                    except Exception as exc:
-                                        raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
-                                    metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
-                                    if isinstance(metadata_mailbox, str) and metadata_mailbox:
-                                        mailbox = metadata_mailbox
-                                key = sanitize_for_path(mailbox)
-                                local_counts[key] = local_counts.get(key, 0) + 1
-                                local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
+                    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+                    if not folder_dirs:
+                        with mismatches_lock:
+                            validation_errors.append((email, "no mailbox folders found"))
+                        return
+                    for folder_dir in folder_dirs:
+                        default_mailbox = marker_mailbox(folder_dir)
+                        eml_paths = sorted(folder_dir.glob("*.eml"))
+                        if not eml_paths:
+                            local_counts.setdefault(sanitize_for_path(default_mailbox), 0)
+                            local_messages.setdefault(default_mailbox, [])
+                            continue
+                        for eml_path in eml_paths:
+                            mailbox = default_mailbox
+                            metadata_path = eml_path.with_suffix(".json")
+                            if metadata_path.exists():
+                                try:
+                                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                                except Exception as exc:
+                                    raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
+                                metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
+                                if isinstance(metadata_mailbox, str) and metadata_mailbox:
+                                    mailbox = metadata_mailbox
+                            key = sanitize_for_path(mailbox)
+                            local_counts[key] = local_counts.get(key, 0) + 1
+                            local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     with imap_connection(config.server, acc) as imap:
@@ -864,7 +871,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 with mismatches_lock:
                                     mismatches.append((email, folder, local_count, remote))
                         for folder, remote_count in remote_counts.items():
-                            if folder not in local_counts and remote_count >= 0:
+                            if folder not in local_counts and remote_count > 0:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     mismatches.append((email, folder, 0, remote_count))

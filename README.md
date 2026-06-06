@@ -83,6 +83,7 @@ Minimal provider config:
   "source": {
     "provider": "gmail",
     "host": "imap.gmail.com",
+    "gmail_full_visibility_verified": false,
     "auth": {
       "method": "xoauth2"
     }
@@ -128,9 +129,17 @@ account override. Shared endpoint-level usernames or secrets are rejected to
 avoid accidentally migrating multiple accounts with one login.
 
 Gmail source migrations require `X-GM-EXT-1` and a visible All Mail view. Gmail
-labels are captured in metadata. When Gmail is the target, non-system Gmail
-labels are restored with `+X-GM-LABELS`; Gmail `Starred` and `Important` are
-handled as special/system labels rather than normal custom labels.
+labels are captured in metadata. Provider preflight also requires
+`source.gmail_full_visibility_verified=true` for Gmail sources. Set that flag
+only after verifying the account is not hiding messages from IMAP, for example
+by using Workspace XOAUTH2 with the `gmail.imap_admin` scope or by confirming
+Gmail IMAP settings use no folder-size limit and required labels are visible in
+IMAP. Without that, an IMAP scan can be internally consistent but still not be a
+complete decommissioning proof.
+
+When Gmail is the target, non-system Gmail labels are restored with
+`+X-GM-LABELS`; Gmail `Starred` and `Important` are handled as special/system
+labels rather than normal custom labels.
 
 iCloud and generic IMAP do not expose Gmail's cross-label identity. Physical
 copies in different folders are preserved as separate messages. iCloud `VIP` and
@@ -276,6 +285,9 @@ Do not decommission a source server until all of this is true:
 - Import completed without unresolved pending journal rows.
 - Provider validation passed, or legacy validation matched expected counts and
   message identity probes.
+- For Gmail sources, full IMAP visibility was verified before preflight by
+  Workspace `gmail.imap_admin` access or Gmail IMAP settings that expose all
+  required messages and labels.
 - Representative mailbox spot checks confirm folders, flags, message bodies,
   dates, and Gmail labels where applicable.
 - MX/DNS cutover, final delta policy, and rollback plan are documented outside
@@ -340,6 +352,9 @@ Provider mode validation is manifest/journal based. It checks:
 - Target message presence by `Message-ID` plus content hash/size where target
   validation is enabled.
 - Expected Gmail labels when Gmail is the target.
+- Gmail target `X-GM-MSGID` uniqueness across matched rows, so one Gmail message
+  visible through multiple labels cannot satisfy multiple physical source
+  messages.
 
 Legacy validation checks folder counts and best-effort message identity by
 `Message-ID` or content hash/size, consuming each remote match once so duplicate
@@ -353,6 +368,9 @@ and completed account-level legacy export state.
   guarantee a provider will accept every operation.
 - Gmail Workspace migrations should use XOAUTH2. Workspace domain-wide IMAP
   migrations need OAuth setup outside this tool.
+- Normal Gmail IMAP cannot prove that users disabled folder-size limits or label
+  hiding. Treat Gmail source decommissioning as ready only after verifying
+  Workspace `gmail.imap_admin` access or Gmail IMAP settings externally.
 - Gmail app passwords are a personal-account fallback where Google still allows
   them. They are not a reliable Workspace migration strategy.
 - Gmail IMAP has documented daily transfer limits. Large Gmail-target imports may
@@ -373,6 +391,7 @@ and completed account-level legacy export state.
 - Gmail IMAP/SMTP: https://developers.google.com/workspace/gmail/imap/imap-smtp
 - Gmail XOAUTH2: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
 - Gmail IMAP extensions: https://developers.google.com/workspace/gmail/imap/imap-extensions
+- Gmail API IMAP settings: https://developers.google.com/workspace/gmail/api/reference/rest/v1/ImapSettings
 - Gmail sending/receiving limits: https://support.google.com/a/answer/1071518
 - iCloud Mail settings: https://support.apple.com/en-us/102525
 - Apple app-specific passwords: https://support.apple.com/en-us/102654

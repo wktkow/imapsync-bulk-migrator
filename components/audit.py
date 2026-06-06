@@ -283,7 +283,7 @@ def audit_account(
                         for eml_path in sorted(folder_dir.glob("*.eml")):
                             identity_candidates.append((eml_path, folder, mailbox))
                 for folder_name, rcount in remote_counts.items():
-                    if not (account_dir / folder_name).exists():
+                    if rcount > 0 and not (account_dir / folder_name).exists():
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
                 used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}

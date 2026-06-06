@@ -135,6 +135,20 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="target.auth.method"):
         load_config_file(icloud_xoauth)
 
+    misplaced_visibility = tmp_path / "misplaced-gmail-visibility.json"
+    misplaced_visibility.write_text(json.dumps({
+        "source": {
+            "provider": "imap",
+            "host": "mail.example.com",
+            "gmail_full_visibility_verified": True,
+            "auth": {"method": "password", "password": "x"},
+        },
+        "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "password": "x"}},
+        "accounts": [{"source_email": "source@example.com", "target_email": "target@icloud.com"}],
+    }))
+    with pytest.raises(ValueError, match="gmail_full_visibility_verified"):
+        load_config_file(misplaced_visibility)
+
     shared_secret = tmp_path / "shared-secret.json"
     shared_secret.write_text(json.dumps({
         "source": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "same-token"}},
@@ -196,6 +210,17 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
     }))
     with pytest.raises(ValueError, match=r"accounts\[0\]\.target_auth\.method"):
         load_config_file(invalid_target_override)
+
+
+def test_readme_minimal_provider_config_does_not_preverify_gmail_visibility() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    marker = "Minimal provider config:"
+    start = readme.index(marker)
+    code_start = readme.index("```json", start) + len("```json")
+    code_end = readme.index("```", code_start)
+    sample = json.loads(readme[code_start:code_end])
+
+    assert sample["source"]["gmail_full_visibility_verified"] is False
 
 
 def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
@@ -1145,6 +1170,7 @@ class FakeGmailTargetImap(FakeTargetImap):
     def __init__(self, **kwargs) -> None:
         self.gmail_labels = list(kwargs.pop("gmail_labels", []))
         self.gmail_flags = str(kwargs.pop("gmail_flags", ""))
+        self.gmail_msgid = str(kwargs.pop("gmail_msgid", "9001"))
         super().__init__(**kwargs)
         self.stored_labels: List[tuple[bytes, str, str]] = []
 
@@ -1160,6 +1186,8 @@ class FakeGmailTargetImap(FakeTargetImap):
         return "OK", [b""]
 
     def fetch(self, num: bytes, query: str):
+        if "X-GM-MSGID" in query:
+            return "OK", [f"{num.decode('ascii', errors='ignore')} (X-GM-MSGID {self.gmail_msgid})".encode("ascii")]
         if "X-GM-LABELS" in query:
             labels = []
             for label in self.gmail_labels:
@@ -1268,6 +1296,11 @@ def _write_provider_export_state(
     }))
 
 
+def _write_single_manifest_row(account_dir: Path, row: dict) -> None:
+    (account_dir / str(row["metadata_path"])).write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+
+
 def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -1305,7 +1338,7 @@ def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) 
     row = json.loads((account_dir / "manifest.jsonl").read_text())
     row["target_account"] = "target@example.com"
     row["primary_mailbox"] = "INBOX"
-    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@example.com")
     fake = FakeTargetImap()
 
@@ -1543,7 +1576,7 @@ def test_provider_import_imap_archive_to_gmail_all_mail(tmp_path: Path) -> None:
     row = json.loads((account_dir / "manifest.jsonl").read_text())
     row["target_account"] = "target@gmail.com"
     row["primary_mailbox"] = "Archive"
-    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
     fake = FakeGmailTargetImap()
 
@@ -1742,7 +1775,7 @@ def test_provider_import_rejects_manifest_paths_outside_export_dir(tmp_path: Pat
     row = json.loads((account_dir / "manifest.jsonl").read_text())
     row["eml_path"] = "../secret.eml"
     (tmp_path / "secret.eml").write_bytes(b"Message-ID: <leak@example.com>\r\n\r\nsecret")
-    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir)
     fake = FakeTargetImap()
 
@@ -2201,6 +2234,34 @@ def test_provider_import_rejects_committed_journal_missing_target_message(tmp_pa
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_merge_mode_reimports_stale_committed_journal_row(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps({
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }) + "\n")
+    fake = FakeTargetImap(has_existing=False)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert fake.appended == ["Archive"]
+    journal = (account_dir / "import-target@icloud.com.journal.jsonl").read_text()
+    assert '"action": "appended"' in journal
+    assert report["ok"]
+    assert report["duplicates"] == []
+    assert report["committed"] == 1
+
+
 def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -2302,6 +2363,20 @@ def test_provider_import_audit_and_validation_reject_source_account_mismatch(tmp
     _name, report = provider_validate_account(config, account, tmp_path)
     assert not report["ok"]
     assert any("source_account" in item for item in report["failed"])
+
+
+def test_provider_import_rejects_metadata_mismatch_before_target_connect(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    metadata_path = account_dir / "metadata" / "gmail-123.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["target_account"] = "other@icloud.com"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="metadata target_account differs from manifest"):
+            provider_import_account(config, account, tmp_path)
 
 
 def test_provider_import_and_validation_reject_journal_target_account_mismatch(tmp_path: Path) -> None:
@@ -2482,6 +2557,109 @@ def test_provider_validation_checks_target_occurrences_not_only_boolean_match(tm
 
     assert not report["ok"]
     assert report["remote_missing"] == ["physical-duplicate"]
+
+
+def test_provider_validation_rejects_single_gmail_message_for_two_physical_source_rows(tmp_path: Path) -> None:
+    class OneGmailMessageInTwoLabels(FakeGmailTargetImap):
+        def __init__(self, body: bytes) -> None:
+            super().__init__(messages_by_mailbox={"Folder A": 1, "Folder B": 1}, gmail_msgid="9001")
+            self.body = body
+
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren) "/" "Folder A"',
+                b'(\\HasNoChildren) "/" "Folder B"',
+            ]
+
+        def search(self, charset: Optional[str], *criteria):
+            self.search_queries.append(criteria)
+            if criteria == ("ALL",):
+                count = self._message_count(self.selected_mailbox)
+                return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, count + 1))]
+            if criteria == ("HEADER", "Message-ID", "<m1@example.com>") and self.selected_mailbox in {"Folder A", "Folder B"}:
+                return "OK", [b"1"]
+            return "OK", [b""]
+
+        def fetch(self, num: bytes, query: str):
+            self.fetch_queries.append(query)
+            if "X-GM-MSGID" in query:
+                return "OK", [b"1 (X-GM-MSGID 9001)"]
+            if "X-GM-LABELS" in query:
+                return "OK", [b"1 (FLAGS (\\Seen) X-GM-LABELS ())"]
+            return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", self.body)]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="source", password="icloud-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    first = json.loads((account_dir / "manifest.jsonl").read_text())
+    first.update({
+        "canonical_id": "physical-a",
+        "source_provider": "icloud",
+        "target_account": "target@gmail.com",
+        "primary_mailbox": "Folder A",
+        "source_mailboxes": ["Folder A"],
+        "source_mailbox_paths": {"Folder A": ["Folder A"]},
+        "eml_path": "messages/physical-a.eml",
+        "metadata_path": "metadata/physical-a.json",
+        "gmail_msgid": "",
+        "gmail_thrid": "",
+        "gmail_labels": [],
+    })
+    second = dict(first)
+    second.update({
+        "canonical_id": "physical-b",
+        "primary_mailbox": "Folder B",
+        "source_mailboxes": ["Folder B"],
+        "source_mailbox_paths": {"Folder B": ["Folder B"]},
+        "eml_path": "messages/physical-b.eml",
+        "metadata_path": "metadata/physical-b.json",
+    })
+    (account_dir / "messages" / "physical-a.eml").write_bytes(body)
+    (account_dir / "messages" / "physical-b.eml").write_bytes(body)
+    (account_dir / "metadata" / "physical-a.json").write_text(json.dumps(first))
+    (account_dir / "metadata" / "physical-b.json").write_text(json.dumps(second))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    _write_provider_export_state(account_dir, target="target@gmail.com", canonical_messages=2)
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(
+        json.dumps({
+            "canonical_id": "physical-a",
+            "target_account": "target@gmail.com",
+            "target_mailbox": "Folder A",
+            "status": "committed",
+        }) + "\n" + json.dumps({
+            "canonical_id": "physical-b",
+            "target_account": "target@gmail.com",
+            "target_mailbox": "Folder B",
+            "status": "committed",
+        }) + "\n"
+    )
+    fake = OneGmailMessageInTwoLabels(body)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[OneGmailMessageInTwoLabels]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert report["remote_missing"] == ["physical-b"]
 
 
 def test_provider_validation_checks_gmail_target_labels(tmp_path: Path) -> None:
@@ -2814,6 +2992,35 @@ def test_provider_preflight_requires_gmail_all_mail_visibility(tmp_path: Path) -
 
     assert not ok
     assert any("All Mail is not visible" in issue for issue in issues)
+
+
+def test_provider_preflight_requires_gmail_full_visibility_attestation(tmp_path: Path) -> None:
+    config = _provider_config()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakeSourceImap() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("full IMAP visibility is not attested" in issue for issue in issues)
+
+
+def test_provider_preflight_accepts_attested_gmail_full_visibility(tmp_path: Path) -> None:
+    config = _provider_config()
+    config.source.gmail_full_visibility_verified = True
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakeSourceImap() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert ok
+    assert issues == []
 
 
 def _write_provider_config_file(tmp_path: Path) -> Path:
