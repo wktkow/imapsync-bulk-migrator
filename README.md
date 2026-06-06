@@ -331,7 +331,7 @@ Provider mode validation is manifest/journal based. It checks:
 - Complete `export-state.json` matching the source account, target account,
   manifest message count, and manifest digest.
 - Unique manifest identities.
-- Manifest target account consistency.
+- Manifest source and target account consistency.
 - Required manifest integrity metadata.
 - Import journal consistency.
 - Target folder mapping consistency, including translated hierarchy collision
@@ -361,6 +361,9 @@ and completed account-level legacy export state.
   the username, or the full address if local-part login fails.
 - IMAP UIDs are not preserved. Message identity is staged through content,
   metadata, Gmail IDs where available, and import journals.
+- Provider staged exports created by older versions may need to be rerun if they
+  lack account-bound manifest rows or the current `export-state.json` manifest
+  digest.
 - DirectAdmin/cPanel reset deletes target mailbox contents. Use dry-run, verify
   staged data, and keep independent backups before destructive operations.
 

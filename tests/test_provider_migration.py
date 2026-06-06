@@ -1229,6 +1229,7 @@ def _write_manifest_fixture(root: Path) -> Path:
     eml.write_bytes(b"Message-ID: <m1@example.com>\r\n\r\nbody")
     row = {
         "canonical_id": "gmail-123",
+        "source_account": "source@example.com",
         "target_account": "target@icloud.com",
         "primary_mailbox": "Archive",
         "message_id_header": "<m1@example.com>",
@@ -2273,6 +2274,7 @@ def test_provider_import_and_validation_reject_target_account_mismatch(tmp_path:
     row = json.loads((account_dir / "manifest.jsonl").read_text())
     row["target_account"] = "other@icloud.com"
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir)
 
     with pytest.raises(RuntimeError, match="target_account"):
         provider_import_account(config, account, tmp_path)
@@ -2280,6 +2282,26 @@ def test_provider_import_and_validation_reject_target_account_mismatch(tmp_path:
     _name, report = provider_validate_account(config, account, tmp_path)
     assert not report["ok"]
     assert any("target_account" in item for item in report["failed"])
+
+
+def test_provider_import_audit_and_validation_reject_source_account_mismatch(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_account"] = "other@example.com"
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir)
+
+    with pytest.raises(RuntimeError, match="source_account"):
+        provider_import_account(config, account, tmp_path)
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("source_account" in item for item in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("source_account" in item for item in report["failed"])
 
 
 def test_provider_import_and_validation_reject_journal_target_account_mismatch(tmp_path: Path) -> None:

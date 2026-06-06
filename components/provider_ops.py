@@ -690,17 +690,35 @@ def require_unique_manifest_identities(rows: List[Dict[str, Any]]) -> None:
         raise RuntimeError("invalid manifest identities: " + "; ".join(issues))
 
 
-def require_manifest_target_account(rows: List[Dict[str, Any]], account: MigrationAccount) -> None:
-    mismatches = [
+def manifest_account_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
+    source_mismatches = [
+        str(row.get("canonical_id") or f"row {idx}")
+        for idx, row in enumerate(rows, 1)
+        if str(row.get("source_account") or "") != account.source_email
+    ]
+    target_mismatches = [
         str(row.get("canonical_id") or f"row {idx}")
         for idx, row in enumerate(rows, 1)
         if str(row.get("target_account") or "") != account.target_email
     ]
-    if mismatches:
-        raise RuntimeError(
-            f"manifest target_account does not match config target_email {account.target_email}: "
-            + ", ".join(mismatches)
+    issues: List[str] = []
+    if source_mismatches:
+        issues.append(
+            f"manifest source_account does not match config source_email {account.source_email}: "
+            + ", ".join(source_mismatches)
         )
+    if target_mismatches:
+        issues.append(
+            f"manifest target_account does not match config target_email {account.target_email}: "
+            + ", ".join(target_mismatches)
+        )
+    return issues
+
+
+def require_manifest_accounts(rows: List[Dict[str, Any]], account: MigrationAccount) -> None:
+    issues = manifest_account_issues(rows, account)
+    if issues:
+        raise RuntimeError("; ".join(issues))
 
 
 def manifest_integrity_issues(rows: List[Dict[str, Any]]) -> List[str]:
@@ -864,7 +882,7 @@ def provider_export_account(
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
         require_unique_manifest_identities(existing_rows)
-        require_manifest_target_account(existing_rows, account)
+        require_manifest_accounts(existing_rows, account)
         for row in existing_rows:
             _manifest_path(account_dir, row, "eml_path")
             _manifest_path(account_dir, row, "metadata_path")
@@ -1506,7 +1524,7 @@ def provider_import_account(
     account_dir = account_export_dir(in_root, account)
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
-    require_manifest_target_account(manifest_rows, account)
+    require_manifest_accounts(manifest_rows, account)
     require_manifest_integrity_metadata(manifest_rows)
     require_complete_export_state(account_dir, account=account, manifest_rows=manifest_rows)
     journal_rows = load_import_journal(account_dir, account)
@@ -1644,6 +1662,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         return account.email, [f"manifest load failed: {exc}"]
     issues.extend(provider_export_state_issues(account_dir, account=account, manifest_rows=rows))
     identities = set()
+    issues.extend(manifest_account_issues(rows, account))
     issues.extend(manifest_integrity_issues(rows))
     for row in rows:
         identity = str(row.get("canonical_id") or "")
@@ -1739,7 +1758,7 @@ def provider_validate_account(
     report["failed"].extend(provider_export_state_issues(account_dir, account=account, manifest_rows=manifest_rows))
 
     try:
-        require_manifest_target_account(manifest_rows, account)
+        require_manifest_accounts(manifest_rows, account)
     except Exception as exc:
         report["failed"].append(str(exc))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
