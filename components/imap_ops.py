@@ -26,6 +26,22 @@ def quote_mailbox_name(mailbox: str) -> str:
     return f'"{escaped}"'
 
 
+def subscribe_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
+    subscribe = getattr(imap, "subscribe", None)
+    if not callable(subscribe):
+        return
+    try:
+        result = subscribe(quote_mailbox_name(mailbox))
+    except Exception as exc:
+        logging.warning("[import] failed to subscribe mailbox %s: %s", mailbox, exc)
+        return
+    status = result[0] if isinstance(result, (tuple, list)) and result else result
+    if isinstance(status, bytes):
+        status = status.decode("ascii", errors="ignore")
+    if isinstance(status, str) and status.upper() != "OK":
+        logging.warning("[import] failed to subscribe mailbox %s: %s", mailbox, result)
+
+
 @contextlib.contextmanager
 def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.IMAP4]:
     """Context-managed IMAP connection.
@@ -155,6 +171,51 @@ def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: by
     digest = hashlib.sha256(data).hexdigest()
     seed = f"{mailbox}\0{rel_path}\0{len(data)}\0{digest}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _message_id_header(data: bytes) -> str:
+    with contextlib.suppress(Exception):
+        msg = BytesParser(policy=default_policy).parsebytes(data)
+        return str(msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+    return ""
+
+
+def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, used_nums: set[bytes]) -> bool:
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    message_id = _message_id_header(data)
+    if message_id:
+        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+    else:
+        status, search_data = imap.search(None, "ALL")
+    if status != "OK" or not search_data or not search_data[0]:
+        return False
+    expected_hash = hashlib.sha256(data).hexdigest()
+    expected_size = len(data)
+    for num in search_data[0].split():
+        if num in used_nums:
+            continue
+        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            continue
+        for part in fetched or []:
+            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            body = bytes(part[1])
+            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                used_nums.add(num)
+                return True
+    return False
+
+
+def _latest_legacy_committed_keys(rows: List[Dict[str, str]], target_id: str) -> set[str]:
+    latest: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        key = row.get("key", "")
+        if row.get("status") == "committed" and key and row.get("target") == target_id:
+            latest[key] = row
+    return set(latest)
 
 
 def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
@@ -389,11 +450,7 @@ def import_account(
     logging.info("[import] %s: starting", account.email)
     target_id = _legacy_import_target_id(server, account)
     journal_rows = _load_legacy_import_journal(account_dir)
-    committed_keys = {
-        row.get("key", "")
-        for row in journal_rows
-        if row.get("status") == "committed" and row.get("key") and row.get("target") == target_id
-    }
+    committed_keys = _latest_legacy_committed_keys(journal_rows, target_id)
     pending_keys = {
         row.get("key", "")
         for row in journal_rows
@@ -428,6 +485,10 @@ def import_account(
                     if isinstance(mbox, str) and mbox.strip():
                         mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
+    if not per_folder:
+        raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
+    if not any(entries for entries in per_folder.values()):
+        raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
 
     # Choose IMAP context manager (injected or default)
     def _imap_ctx() -> AbstractContextManager[imaplib.IMAP4]:
@@ -470,6 +531,7 @@ def import_account(
 
     # Proceed with actual import work under a fresh connection
     folder_errors: List[str] = []
+    used_remote_nums_by_folder: Dict[str, set[bytes]] = {}
     with _imap_ctx() as imap:
         for folder, entries in per_folder.items():
             _raise_if_stopped(stop_event, f"legacy import {account.email}")
@@ -485,6 +547,7 @@ def import_account(
                         status, _ = imap.select(quote_mailbox_name(mailbox))
                     if status != "OK":
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
+                subscribe_mailbox(imap, mailbox)
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
                 for eml_path, flags, internaldate in entries:
                     _raise_if_stopped(stop_event, f"legacy import {account.email}")
@@ -508,8 +571,15 @@ def import_account(
                         date_time = _imaplib.Time2Internaldate(time.time())
                     import_key = _legacy_import_key(account_dir, eml_path, mailbox, data)
                     if import_key in committed_keys:
-                        logging.info("[import] %s: skipping already committed %s", account.email, eml_path)
-                        continue
+                        used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
+                        if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
+                            logging.info("[import] %s: skipping verified committed %s", account.email, eml_path)
+                            continue
+                        logging.warning(
+                            "[import] %s: committed journal row is stale for %s; re-appending",
+                            account.email,
+                            eml_path,
+                        )
                     if import_key in pending_keys:
                         raise RuntimeError(
                             f"legacy import journal has pending append for {eml_path}; "

@@ -310,6 +310,22 @@ def create_mailbox(imap: imaplib.IMAP4, mailbox: str) -> Tuple[str, List[bytes]]
     return imap.create(quote_mailbox_name(mailbox))
 
 
+def subscribe_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
+    subscribe = getattr(imap, "subscribe", None)
+    if not callable(subscribe):
+        return
+    try:
+        result = subscribe(quote_mailbox_name(mailbox))
+    except Exception as exc:
+        logging.warning("[provider-import] failed to subscribe target mailbox %s: %s", mailbox, exc)
+        return
+    status = result[0] if isinstance(result, (tuple, list)) and result else result
+    if isinstance(status, bytes):
+        status = status.decode("ascii", errors="ignore")
+    if isinstance(status, str) and status.upper() != "OK":
+        logging.warning("[provider-import] failed to subscribe target mailbox %s: %s", mailbox, result)
+
+
 def append_message(imap: imaplib.IMAP4, mailbox: str, flags: str, date_time: str, data: bytes) -> Tuple[str, List[bytes]]:
     return imap.append(quote_mailbox_name(mailbox), flags, date_time, data)
 
@@ -1222,6 +1238,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
 def ensure_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
     status, _ = select_mailbox(imap, mailbox)
     if status == "OK":
+        subscribe_mailbox(imap, mailbox)
         return
     try:
         create_mailbox(imap, mailbox)
@@ -1230,6 +1247,7 @@ def ensure_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
     status, _ = select_mailbox(imap, mailbox)
     if status != "OK":
         raise RuntimeError(f"cannot select or create target mailbox {mailbox}")
+    subscribe_mailbox(imap, mailbox)
 
 
 def _flags_for_append(flags: str) -> str:
@@ -1258,7 +1276,7 @@ def _gmail_label_key(label: str) -> str:
     lower = str(label).strip().lower()
     if lower in {"\\important", "important", "[gmail]/important", "[googlemail]/important"}:
         return "important"
-    if lower in {"\\starred", "\\flagged", "[gmail]/starred", "[googlemail]/starred"}:
+    if lower in {"\\starred", "\\flagged", "starred", "[gmail]/starred", "[googlemail]/starred"}:
         return "starred"
     return f"label:{lower}"
 
@@ -1668,6 +1686,7 @@ def provider_import_account(
                         "but the target message was not found"
                     )
                 if committed_num is not None:
+                    subscribe_mailbox(imap, target_mailbox)
                     if config.target.provider == "gmail":
                         restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num)
                         restore_gmail_starred_flag(imap, target_mailbox, row, target_num=committed_num)
@@ -1685,6 +1704,7 @@ def provider_import_account(
                     used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
                 )
             if matched_num is not None:
+                subscribe_mailbox(imap, target_mailbox)
                 if config.target.provider == "gmail":
                     restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num)
                     restore_gmail_starred_flag(imap, target_mailbox, row, target_num=matched_num)

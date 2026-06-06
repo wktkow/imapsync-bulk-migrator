@@ -512,9 +512,32 @@ class TestLegacyImportJournal:
         in_root = self._make_export(tmp_path)
         account = Account(email="user@example.com", password="pass")
         server = ServerConfig(host="dummy", port=993, ssl=True)
-        fake_imap = mock.MagicMock()
-        fake_imap.select.return_value = ("OK", [b""])
-        fake_imap.append.return_value = ("OK", [b""])
+
+        class MatchingImportImap:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.has_message = False
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1" if self.has_message else b"0"]
+
+            def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+                self.append_count += 1
+                self.has_message = True
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                if self.has_message:
+                    return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE 77 BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = MatchingImportImap()
 
         @contextlib.contextmanager
         def fake_factory(*_args, **_kwargs) -> Iterator:
@@ -523,7 +546,31 @@ class TestLegacyImportJournal:
         import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
         import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
 
-        assert fake_imap.append.call_count == 1
+        assert fake_imap.append_count == 1
+
+    def test_import_rejects_empty_staged_account_directory(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        (tmp_path / "user@example.com").mkdir()
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        with pytest.raises(RuntimeError, match="no mailbox folders"):
+            import_account(account, server, tmp_path, ignore_errors=False)
+
+    def test_import_rejects_staged_account_with_no_eml_files(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        with pytest.raises(RuntimeError, match="no staged \\.eml files"):
+            import_account(account, server, tmp_path, ignore_errors=False)
 
     def test_import_rejects_pending_journal_entry(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
@@ -636,6 +683,113 @@ class TestLegacyImportJournal:
         import_account(account, new_server, in_root, ignore_errors=False, imap_factory=fake_factory)
 
         assert fake_imap.append.call_count == 1
+
+    def test_import_repairs_stale_committed_journal_for_current_target(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        data = eml.read_bytes()
+        key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="target.example.com", port=993, ssl=True)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "committed",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        class EmptyThenAppendedImap:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.has_message = False
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1" if self.has_message else b"0"]
+
+            def search(self, charset, *criteria):
+                if self.has_message:
+                    return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE 77 BODY[] {77}", data)]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.append_count += 1
+                self.has_message = True
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = EmptyThenAppendedImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[EmptyThenAppendedImap]:
+            yield fake_imap
+
+        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.append_count == 1
+        journal = (account_dir / "import.journal.jsonl").read_text()
+        assert journal.count('"status": "committed"') == 2
+
+    def test_import_subscribes_migrated_folder_for_roundcube_visibility(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "Projects"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="Projects",
+            data=b"Message-ID: <project@example.com>\r\n\r\nbody",
+        )
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        class SubscribeImportImap:
+            def __init__(self) -> None:
+                self.created: List[str] = []
+                self.subscribed: List[str] = []
+
+            def _normalize(self, mailbox: str) -> str:
+                return mailbox.strip('"').replace(r"\"", '"').replace(r"\\", "\\")
+
+            def select(self, mailbox: str, readonly: bool = False):
+                selected = self._normalize(mailbox)
+                if selected == "Projects" and selected not in self.created:
+                    return "NO", [b"missing"]
+                return "OK", [b"0"]
+
+            def create(self, mailbox: str):
+                self.created.append(self._normalize(mailbox))
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                self.subscribed.append(self._normalize(mailbox))
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = SubscribeImportImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[SubscribeImportImap]:
+            yield fake_imap
+
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.created == ["Projects"]
+        assert fake_imap.subscribed == ["Projects"]
 
     def test_reset_archives_committed_journal_for_same_target_before_import(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
@@ -1692,6 +1846,55 @@ class TestDirectAdminIndexerHardening:
         with pytest.raises(RuntimeError, match="permission denied"):
             client.delete_pop_account("example.com", "a")
 
+    def test_directadmin_create_delete_send_documented_parameters(self) -> None:
+        from components.da_client import DirectAdminClient
+
+        client = object.__new__(DirectAdminClient)
+        get_calls = []
+        post_calls = []
+
+        def fake_get(path, params=None):
+            get_calls.append((path, dict(params or {})))
+            return {"error": "0", "list": ["a", "b"]}, None
+
+        def fake_post(path, data=None):
+            post_calls.append((path, dict(data or {})))
+            return {"error": "0"}, None
+
+        client._get = fake_get
+        client._post = fake_post
+
+        assert client.list_pop_accounts("example.com") == ["a", "b"]
+        client.create_pop_account("example.com", "a", "secret", quota_mb=512)
+        client.delete_pop_account("example.com", "a")
+
+        assert get_calls == [
+            ("CMD_API_POP", {"domain": "example.com", "action": "list"}),
+        ]
+        assert post_calls == [
+            (
+                "CMD_API_POP",
+                {
+                    "action": "create",
+                    "domain": "example.com",
+                    "user": "a",
+                    "passwd": "secret",
+                    "passwd2": "secret",
+                    "quota": "512",
+                    "json": "yes",
+                },
+            ),
+            (
+                "CMD_API_POP",
+                {
+                    "action": "delete",
+                    "domain": "example.com",
+                    "user": "a",
+                    "json": "yes",
+                },
+            ),
+        ]
+
     def test_import_returns_failure_when_reset_skip_occurs_under_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -2352,6 +2555,80 @@ class TestCPanelProvisioning:
         ensure_mock.assert_called_once()
         import_mock.assert_not_called()
 
+    def test_directadmin_dry_run_exits_before_imap_import(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.main.ensure_accounts_exist_directadmin") as ensure_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--da-dry-run",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 0
+        ensure_mock.assert_called_once()
+        assert ensure_mock.call_args.kwargs["dry_run"] is True
+        import_mock.assert_not_called()
+
+    def test_directadmin_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=RuntimeError("imapsync missing")) as imapsync_mock, \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.main.ensure_accounts_exist_directadmin") as ensure_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-da",
+                "--da-dry-run",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 0
+        imapsync_mock.assert_not_called()
+        ensure_mock.assert_called_once()
+        import_mock.assert_not_called()
+
     def test_cpanel_dry_run_failure_is_fatal_even_with_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -2632,6 +2909,22 @@ class TestBug10MultiMessageDetection:
         assert error is None
         assert analysis is not None
         assert analysis["multiple_messages_detected"] is True
+
+    def test_verify_export_exits_nonzero_for_genuine_concatenation(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main
+
+        inbox = tmp_path / "exported" / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / "u0000000001.eml").write_bytes(
+            b"Message-ID: <one@example.com>\r\n"
+            b"Message-ID: <two@example.com>\r\n"
+            b"From: a@example.com\r\n"
+            b"\r\n"
+            b"body\r\n"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        assert main() == 1
 
     def test_single_clean_email_not_flagged(self, tmp_path: Path) -> None:
         """A normal single email with exactly one Return-Path and one Message-ID."""
