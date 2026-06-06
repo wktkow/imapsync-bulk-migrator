@@ -222,7 +222,51 @@ def is_noselect(mailbox: MailboxInfo) -> bool:
 
 
 def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
-    return provider.lower() == "icloud" and mailbox.name.lower() == "vip"
+    provider_key = provider.lower()
+    attr_lowers = {attr.lower() for attr in mailbox.attributes}
+    if provider_key == "gmail":
+        return False
+    if provider_key == "icloud" and mailbox.name.lower() == "vip":
+        return True
+    return bool(attr_lowers & {"\\all", "\\flagged"})
+
+
+def mailbox_path_segments(mailbox_name: str, delimiter: str) -> List[str]:
+    if delimiter and delimiter in mailbox_name:
+        return [segment for segment in mailbox_name.split(delimiter) if segment]
+    return [mailbox_name]
+
+
+def target_hierarchy_delimiter(mailboxes: List[MailboxInfo]) -> str:
+    for mailbox in mailboxes:
+        if mailbox.delimiter:
+            return mailbox.delimiter
+    return ""
+
+
+def translate_source_mailbox_for_target(
+    row: Dict[str, Any],
+    desired: str,
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> str:
+    special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important", "starred", "inbox"}
+    if desired.lower() in special_desired:
+        return desired
+    source_paths = row.get("source_mailbox_paths")
+    if not isinstance(source_paths, dict):
+        return desired
+    raw_segments = source_paths.get(desired)
+    if not isinstance(raw_segments, list) or not raw_segments:
+        return desired
+    segments = [str(segment) for segment in raw_segments if str(segment)]
+    if len(segments) <= 1:
+        return desired
+    delimiter = target_hierarchy_delimiter(target_mailboxes)
+    if not delimiter:
+        return desired
+    return delimiter.join(segments)
 
 
 def gmail_source_readiness_issues(capabilities: List[str], mailboxes: List[MailboxInfo]) -> List[str]:
@@ -780,11 +824,15 @@ def provider_export_account(
         record = messages[identity]
         record.setdefault("source_mailboxes", [])
         record.setdefault("source_mailbox_attributes", {})
+        record.setdefault("source_mailbox_delimiters", {})
+        record.setdefault("source_mailbox_paths", {})
         record.setdefault("gmail_labels", [])
         record.setdefault("uid_by_mailbox", {})
         record.setdefault("uidvalidity_by_mailbox", {})
         _append_unique(record["source_mailboxes"], mailbox.name)
         record["source_mailbox_attributes"][mailbox.name] = list(mailbox.attributes)
+        record["source_mailbox_delimiters"][mailbox.name] = mailbox.delimiter
+        record["source_mailbox_paths"][mailbox.name] = mailbox_path_segments(mailbox.name, mailbox.delimiter)
         for label in parsed.get("gmail_labels") or []:
             _append_unique(record["gmail_labels"], str(label))
         record["uid_by_mailbox"][mailbox.name] = int(uid)
@@ -1320,7 +1368,12 @@ def enforce_empty_target(
     ]
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
-        desired = str(row.get("primary_mailbox") or "Archive")
+        desired = translate_source_mailbox_for_target(
+            row,
+            str(row.get("primary_mailbox") or "Archive"),
+            target_mailboxes,
+            target_provider=target_provider,
+        )
         target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
         key = (identity, target_mailbox)
         if key in journaled:
@@ -1350,6 +1403,39 @@ def enforce_empty_target(
                 f"target_mode=empty but target mailbox {mailbox.name!r} contains "
                 f"{count} message(s), only {verified} matching journaled message(s) from this migration"
             )
+
+
+def translated_target_mailboxes_for_rows(
+    rows: List[Dict[str, Any]],
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> Dict[str, str]:
+    translated_sources_by_target: Dict[str, Tuple[str, ...]] = {}
+    result: Dict[str, str] = {}
+    for row in rows:
+        identity = str(row.get("canonical_id") or "")
+        source_desired = str(row.get("primary_mailbox") or "Archive")
+        desired = translate_source_mailbox_for_target(
+            row,
+            source_desired,
+            target_mailboxes,
+            target_provider=target_provider,
+        )
+        target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
+        source_paths = row.get("source_mailbox_paths")
+        source_key = (source_desired,)
+        if isinstance(source_paths, dict) and isinstance(source_paths.get(source_desired), list):
+            source_key = tuple(str(segment) for segment in source_paths[source_desired])
+        previous_source = translated_sources_by_target.setdefault(target_mailbox.lower(), source_key)
+        if previous_source != source_key:
+            raise RuntimeError(
+                f"target mailbox translation collision for {target_mailbox!r}: "
+                f"{previous_source!r} and {source_key!r}"
+            )
+        if identity:
+            result[identity] = target_mailbox
+    return result
 
 
 def provider_import_account(
@@ -1383,6 +1469,11 @@ def provider_import_account(
 
     with imap_connection(config.target, account, role="target") as imap:
         target_mailboxes = list_mailboxes(imap)
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider=config.target.provider,
+        )
         if config.migration.target_mode == "empty":
             enforce_empty_target(
                 imap,
@@ -1394,8 +1485,15 @@ def provider_import_account(
         for row in sorted(manifest_rows, key=lambda item: str(item.get("canonical_id", ""))):
             _raise_if_stopped(stop_event, f"provider import {account.target_email}")
             identity = str(row.get("canonical_id") or "")
-            desired = str(row.get("primary_mailbox") or "Archive")
-            target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not target_mailbox:
+                desired = translate_source_mailbox_for_target(
+                    row,
+                    str(row.get("primary_mailbox") or "Archive"),
+                    target_mailboxes,
+                    target_provider=config.target.provider,
+                )
+                target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = (identity, target_mailbox)
             if key in committed:
                 if config.migration.target_mode == "empty" and not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
@@ -1672,7 +1770,12 @@ def provider_validate_account(
                 target_mailboxes = list_mailboxes(imap)
                 expected_target_by_id = {
                     identity: resolve_target_mailbox(
-                        str(row.get("primary_mailbox") or "Archive"),
+                        translate_source_mailbox_for_target(
+                            row,
+                            str(row.get("primary_mailbox") or "Archive"),
+                            target_mailboxes,
+                            target_provider=config.target.provider,
+                        ),
                         target_mailboxes,
                         target_provider=config.target.provider,
                     )

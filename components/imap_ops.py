@@ -248,7 +248,25 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     account_dir = out_root / sanitize_for_path(account.email)
     account_dir.mkdir(parents=True, exist_ok=True)
     logging.info("[export] %s: starting", account.email)
+    state_path = account_dir / "export-state.json"
+    tmp_state = state_path.with_suffix(".json.tmp")
+    with open(tmp_state, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": 1,
+                "account": account.email,
+                "complete": False,
+                "started_at": int(time.time()),
+                "mailboxes": [],
+            },
+            f,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        f.write("\n")
+    tmp_state.replace(state_path)
     mailbox_errors: List[str] = []
+    export_state_mailboxes: List[Dict[str, object]] = []
     with imap_connection(server, account) as imap:
         mailboxes = list_all_mailboxes(imap)
 
@@ -271,6 +289,11 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             try:
                 uids = fetch_all_uids(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
+                export_state_mailboxes.append({
+                    "mailbox": mailbox,
+                    "path": sanitize_for_path(mailbox),
+                    "message_count": len(uids),
+                })
                 if not uids:
                     folder_dir = account_dir / sanitize_for_path(mailbox)
                     folder_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +348,21 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             f"legacy export {account.email} failed for {len(mailbox_errors)} mailbox(es): "
             + "; ".join(mailbox_errors)
         )
+    with open(tmp_state, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": 1,
+                "account": account.email,
+                "complete": True,
+                "completed_at": int(time.time()),
+                "mailboxes": export_state_mailboxes,
+            },
+            f,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        f.write("\n")
+    tmp_state.replace(state_path)
     logging.info("[export] %s: completed", account.email)
 
 

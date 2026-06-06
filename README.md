@@ -133,8 +133,15 @@ labels are restored with `+X-GM-LABELS`; Gmail `Starred` and `Important` are
 handled as special/system labels rather than normal custom labels.
 
 iCloud and generic IMAP do not expose Gmail's cross-label identity. Physical
-copies in different folders are preserved as separate messages. iCloud `VIP` is
-treated as a virtual mailbox and skipped.
+copies in different folders are preserved as separate messages. iCloud `VIP` and
+non-Gmail IMAP `\All` / `\Flagged` special-use views are treated as virtual
+mailboxes and skipped as sources to avoid importing search views as duplicate
+real folders.
+
+For custom nested folders, provider mode stores source hierarchy segments and
+translates them to the target server's advertised hierarchy delimiter during
+import. If the target has no hierarchy delimiter, the source mailbox name is kept
+literal.
 
 ## Legacy Generic IMAP Workflow
 
@@ -227,6 +234,9 @@ Reset safeguards:
   `YES`.
 - The staged legacy export must include per-message `content_sha256` and
   `rfc822_size` metadata matching the `.eml` payloads.
+- The staged legacy export must include a completed account-level
+  `export-state.json` written by a successful legacy export; hand-shaped or
+  partial export directories are rejected before destructive reset.
 - Failed panel resets cause the affected accounts to be skipped during import.
 - Dry-run mode must be able to list panel mailboxes for each domain.
 
@@ -315,8 +325,10 @@ Provider mode validation is manifest/journal based. It checks:
 - Expected Gmail labels when Gmail is the target.
 
 Legacy validation checks folder counts and best-effort message identity by
-`Message-ID` or content hash/size. Legacy audit can run online or offline; the
-pre-reset gate always performs strict local staged integrity checks.
+`Message-ID` or content hash/size, consuming each remote match once so duplicate
+local messages require duplicate remote messages. Legacy audit can run online or
+offline; the pre-reset gate always requires strict local staged integrity checks
+and completed account-level legacy export state.
 
 ## Known Constraints
 

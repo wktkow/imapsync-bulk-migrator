@@ -31,6 +31,25 @@ def _write_legacy_message_fixture(folder: Path, *, uid: int = 1, mailbox: str = 
         "rfc822_size": len(data),
         "content_sha256": hashlib.sha256(data).hexdigest(),
     }))
+    account_dir = folder.parent
+    state_path = account_dir / "export-state.json"
+    state = {
+        "schema_version": 1,
+        "account": account_dir.name,
+        "complete": True,
+        "completed_at": 0,
+        "mailboxes": [],
+    }
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+    mailboxes = [entry for entry in state.get("mailboxes", []) if isinstance(entry, dict) and entry.get("path") != folder.name]
+    mailboxes.append({
+        "mailbox": mailbox,
+        "path": folder.name,
+        "message_count": len(list(folder.glob("*.eml"))),
+    })
+    state["mailboxes"] = mailboxes
+    state_path.write_text(json.dumps(state))
     return eml
 
 # ---------------------------------------------------------------------------
@@ -319,6 +338,9 @@ class TestBug2NoDoubleSelect:
         # select should be called exactly once for "INBOX" (by fetch_all_uids)
         select_calls = [c for c in fake_imap.select.call_args_list if c[0][0] == "INBOX"]
         assert len(select_calls) == 1, f"Expected 1 select call for INBOX, got {len(select_calls)}"
+        state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
+        assert state["complete"] is True
+        assert state["mailboxes"] == [{"mailbox": "INBOX", "message_count": 0, "path": "INBOX"}]
 
 
 class TestLegacyExportCompleteness:
@@ -391,6 +413,69 @@ class TestLegacyExportCompleteness:
                 export_account(account, server, tmp_path, ignore_errors=True)
 
         assert (tmp_path / "user@example.com" / "Archive" / "u0000000001.eml").exists()
+        state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
+        assert state["complete"] is False
+
+    def test_failed_reexport_invalidates_previous_complete_export_state(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+
+        class SuccessfulExportImap:
+            selected = "INBOX"
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        b"Message-ID: <m@example.com>\r\n\r\nbody",
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def successful_connection(*_args, **_kwargs) -> Iterator[SuccessfulExportImap]:
+            yield SuccessfulExportImap()
+
+        with mock.patch("components.imap_ops.imap_connection", successful_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        state_path = tmp_path / "user@example.com" / "export-state.json"
+        assert json.loads(state_path.read_text())["complete"] is True
+
+        class FailedExportImap(SuccessfulExportImap):
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "NO", [b"failed"]
+                raise AssertionError(command)
+
+        @contextlib.contextmanager
+        def failed_connection(*_args, **_kwargs) -> Iterator[FailedExportImap]:
+            yield FailedExportImap()
+
+        with mock.patch("components.imap_ops.imap_connection", failed_connection):
+            with pytest.raises(RuntimeError, match="legacy export user@example.com failed"):
+                export_account(account, server, tmp_path, ignore_errors=True)
+
+        assert json.loads(state_path.read_text())["complete"] is False
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False, require_integrity_metadata=True)
+        assert any("export-state is not complete" in issue for issue in issues)
 
 
 class TestLegacyListParsing:
@@ -903,6 +988,62 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
+    def test_legacy_validate_consumes_remote_identity_matches_for_duplicates(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        mailbox_dir = input_dir / "a@example.com" / "INBOX"
+        mailbox_dir.mkdir(parents=True)
+        duplicate = b"Message-ID: <dup@example.com>\r\n\r\nbody"
+        for uid in (1, 2):
+            eml = mailbox_dir / f"u{uid:010d}.eml"
+            eml.write_bytes(duplicate)
+            eml.with_suffix(".json").write_text(json.dumps({"uid": uid, "mailbox": "INBOX"}))
+        (mailbox_dir / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 2}))
+
+        class DuplicateMismatchRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"2"]
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1 2"]
+                if criteria == ("HEADER", "Message-ID", "<dup@example.com>"):
+                    return "OK", [b"1"]
+                raise AssertionError(criteria)
+
+            def fetch(self, num: bytes, *_args, **_kwargs):
+                if num == b"1":
+                    return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", duplicate)]
+                return "OK", [(b"2 (RFC822.SIZE 37 BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DuplicateMismatchRemote]:
+            yield DuplicateMismatchRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
     def test_legacy_validate_fails_with_pending_current_target_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main
@@ -1204,6 +1345,33 @@ class TestAuditHardening:
         )
 
         assert any("custom.eml" in issue and "failed to parse message metadata" in issue for issue in issues)
+
+    def test_strict_audit_requires_completed_legacy_export_state(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        data = b"From: a\r\nTo: b\r\n\r\nbody"
+        eml = inbox / "u0000000001.eml"
+        eml.write_bytes(data)
+        eml.with_suffix(".json").write_text(json.dumps({
+            "mailbox": "INBOX",
+            "uid": 1,
+            "rfc822_size": len(data),
+            "content_sha256": hashlib.sha256(data).hexdigest(),
+        }))
+
+        _email, issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("export-state missing" in issue for issue in issues)
 
     def test_strict_audit_flags_stale_message_integrity_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_account

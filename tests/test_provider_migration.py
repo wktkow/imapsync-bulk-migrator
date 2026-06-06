@@ -39,6 +39,7 @@ from components.provider_ops import (
     restore_gmail_labels,
     restore_gmail_starred_flag,
     target_has_message,
+    translate_source_mailbox_for_target,
     xoauth2_authenticator,
 )
 from components.utils import encode_imap_utf7
@@ -545,6 +546,49 @@ def test_icloud_target_default_folder_resolution() -> None:
     assert resolve_target_mailbox("Junk", icloud_mailboxes, target_provider="icloud") == "Junk"
 
 
+def test_custom_folder_translation_uses_target_delimiter_and_preserves_flat_targets() -> None:
+    row = {
+        "source_mailbox_paths": {
+            "Projects.2024": ["Projects", "2024"],
+            "Clients/ACME": ["Clients", "ACME"],
+        },
+    }
+    slash_target = [MailboxInfo(name="INBOX", delimiter="/", attributes=())]
+    dot_target = [MailboxInfo(name="INBOX", delimiter=".", attributes=())]
+    flat_target = [MailboxInfo(name="INBOX", delimiter="", attributes=())]
+
+    assert translate_source_mailbox_for_target(
+        row,
+        "Projects.2024",
+        slash_target,
+        target_provider="imap",
+    ) == "Projects/2024"
+    assert translate_source_mailbox_for_target(
+        row,
+        "Clients/ACME",
+        dot_target,
+        target_provider="imap",
+    ) == "Clients.ACME"
+    assert translate_source_mailbox_for_target(
+        row,
+        "Projects.2024",
+        flat_target,
+        target_provider="imap",
+    ) == "Projects.2024"
+    assert translate_source_mailbox_for_target(
+        row,
+        "Projects.2024",
+        slash_target,
+        target_provider="gmail",
+    ) == "Projects/2024"
+    assert translate_source_mailbox_for_target(
+        row,
+        "Archive",
+        slash_target,
+        target_provider="gmail",
+    ) == "Archive"
+
+
 def test_gmail_target_system_folder_resolution_ignores_shadowing_user_labels() -> None:
     mailboxes = [
         MailboxInfo(name="Sent", delimiter="/", attributes=("\\HasNoChildren",)),
@@ -683,6 +727,20 @@ class FakeNonGmailDuplicateSourceImap:
 
     def logout(self):
         return "OK", []
+
+
+class FakeGenericVirtualViewsSourceImap(FakeNonGmailDuplicateSourceImap):
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "All Mail"',
+            b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+        ]
+
+    def uid(self, command: str, *args):
+        if self.selected in {"All Mail", "Flagged"}:
+            raise AssertionError(f"virtual mailbox should be skipped: {self.selected}")
+        return super().uid(command, *args)
 
 
 @contextlib.contextmanager
@@ -829,6 +887,36 @@ def test_provider_export_preserves_non_gmail_physical_copies(tmp_path: Path) -> 
     assert len(manifest) == 2
     assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Projects"}
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
+
+
+def test_provider_export_skips_generic_virtual_all_and_flagged_views(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericVirtualViewsSourceImap]:
+        yield FakeGenericVirtualViewsSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 1
+    assert manifest[0]["source_mailboxes"] == ["INBOX"]
 
 
 def test_provider_uid_search_uses_rfc_valid_signature() -> None:
@@ -1205,6 +1293,206 @@ def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) 
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["INBOX"]
+
+
+def test_provider_import_translates_custom_folder_delimiter_to_target(tmp_path: Path) -> None:
+    class DotDelimiterTarget(FakeTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "." "INBOX"',
+            ]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@example.com"
+    row["primary_mailbox"] = "Projects/2024"
+    row["source_mailboxes"] = ["Projects/2024"]
+    row["source_mailbox_delimiters"] = {"Projects/2024": "/"}
+    row["source_mailbox_paths"] = {"Projects/2024": ["Projects", "2024"]}
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    fake = DotDelimiterTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[DotDelimiterTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Projects.2024"]
+
+
+def test_provider_import_rejects_ambiguous_translated_folder_collision(tmp_path: Path) -> None:
+    class SlashDelimiterTarget(FakeTargetImap):
+        def list(self):
+            return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    first = json.loads((account_dir / "manifest.jsonl").read_text())
+    first["target_account"] = "target@example.com"
+    first["canonical_id"] = "first"
+    first["primary_mailbox"] = "A/B.C"
+    first["source_mailboxes"] = ["A/B.C"]
+    first["source_mailbox_paths"] = {"A/B.C": ["A/B", "C"]}
+    first["eml_path"] = "messages/first.eml"
+    first["metadata_path"] = "metadata/first.json"
+    second = dict(first)
+    second["canonical_id"] = "second"
+    second["primary_mailbox"] = "A.B/C"
+    second["source_mailboxes"] = ["A.B/C"]
+    second["source_mailbox_paths"] = {"A.B/C": ["A", "B/C"]}
+    second["eml_path"] = "messages/second.eml"
+    second["metadata_path"] = "metadata/second.json"
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    (account_dir / "messages" / "first.eml").write_bytes(body)
+    (account_dir / "messages" / "second.eml").write_bytes(body)
+    (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
+    (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    fake = SlashDelimiterTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[SlashDelimiterTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert not (account_dir / "import-target@example.com.journal.jsonl").exists()
+
+
+def test_provider_import_rejects_gmail_collision_before_label_mutation(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    first = json.loads((account_dir / "manifest.jsonl").read_text())
+    first["target_account"] = "target@gmail.com"
+    first["canonical_id"] = "first"
+    first["primary_mailbox"] = "A/B.C"
+    first["source_mailboxes"] = ["A/B.C"]
+    first["source_mailbox_paths"] = {"A/B.C": ["A/B", "C"]}
+    first["gmail_labels"] = ["Project A", "\\Starred"]
+    first["eml_path"] = "messages/first.eml"
+    first["metadata_path"] = "metadata/first.json"
+    second = dict(first)
+    second["canonical_id"] = "second"
+    second["primary_mailbox"] = "A.B/C"
+    second["source_mailboxes"] = ["A.B/C"]
+    second["source_mailbox_paths"] = {"A.B/C": ["A", "B/C"]}
+    second["eml_path"] = "messages/second.eml"
+    second["metadata_path"] = "metadata/second.json"
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    (account_dir / "messages" / "first.eml").write_bytes(body)
+    (account_dir / "messages" / "second.eml").write_bytes(body)
+    (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
+    (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.stored_labels == []
+    assert not (account_dir / "import-target@gmail.com.journal.jsonl").exists()
+
+
+def test_provider_import_allows_repeated_rows_from_same_translated_source_folder(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    first = json.loads((account_dir / "manifest.jsonl").read_text())
+    first["target_account"] = "target@example.com"
+    first["canonical_id"] = "first"
+    first["primary_mailbox"] = "Projects.2024"
+    first["source_mailboxes"] = ["Projects.2024"]
+    first["source_mailbox_paths"] = {"Projects.2024": ["Projects", "2024"]}
+    first["eml_path"] = "messages/first.eml"
+    first["metadata_path"] = "metadata/first.json"
+    second = dict(first)
+    second["canonical_id"] = "second"
+    second["eml_path"] = "messages/second.eml"
+    second["metadata_path"] = "metadata/second.json"
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    (account_dir / "messages" / "first.eml").write_bytes(body)
+    (account_dir / "messages" / "second.eml").write_bytes(body)
+    (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
+    (account_dir / "metadata" / "second.json").write_text(json.dumps(second))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Projects/2024", "Projects/2024"]
 
 
 def test_provider_import_imap_archive_to_gmail_all_mail(tmp_path: Path) -> None:

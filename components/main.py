@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from email.parser import BytesParser
 from email.policy import default as default_policy
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 
 from .audit import audit_export
 from .cpanel_client import CPanelClient
@@ -140,7 +140,7 @@ def _message_id_header(data: bytes) -> str:
         return ""
 
 
-def _legacy_remote_has_message(imap, mailbox: str, data: bytes) -> bool:
+def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
     from .imap_ops import quote_mailbox_name
 
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
@@ -156,6 +156,8 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes) -> bool:
     if status != "OK" or not search_data or not search_data[0]:
         return False
     for num in search_data[0].split():
+        if used_nums is not None and num in used_nums:
+            continue
         status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
         if status != "OK":
             continue
@@ -164,6 +166,8 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes) -> bool:
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                if used_nums is not None:
+                    used_nums.add(num)
                 return True
     return False
 
@@ -856,9 +860,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if key in mismatched_folders or remote_counts.get(key, -1) < 0:
                                 continue
                             remote_mailbox = remote_mailboxes.get(key, mailbox)
+                            used_remote_nums: Set[bytes] = set()
                             for rel_path, data in messages:
                                 try:
-                                    found = _legacy_remote_has_message(imap, remote_mailbox, data)
+                                    found = _legacy_remote_has_message(imap, remote_mailbox, data, used_remote_nums)
                                 except Exception as exc:
                                     with mismatches_lock:
                                         validation_errors.append((email, f"{mailbox}: identity check failed for {rel_path}: {exc}"))

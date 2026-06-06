@@ -6,7 +6,7 @@ from email.parser import BytesParser
 from email.policy import compat32 as compat32_policy
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from .models import Account, Config, ServerConfig
 from .imap_ops import imap_connection, list_all_mailboxes, quote_mailbox_name
@@ -20,7 +20,7 @@ def _message_id_header(data: bytes) -> str:
     return ""
 
 
-def _remote_has_message(imap, mailbox: str, data: bytes) -> bool:
+def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
@@ -34,6 +34,8 @@ def _remote_has_message(imap, mailbox: str, data: bytes) -> bool:
     if status != "OK" or not search_data or not search_data[0]:
         return False
     for num in search_data[0].split():
+        if used_nums is not None and num in used_nums:
+            continue
         status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
         if status != "OK":
             continue
@@ -42,6 +44,8 @@ def _remote_has_message(imap, mailbox: str, data: bytes) -> bool:
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                if used_nums is not None:
+                    used_nums.add(num)
                 return True
     return False
 
@@ -56,6 +60,63 @@ def _folder_mailbox_name(folder_dir: Path) -> str:
         if isinstance(mailbox, str) and mailbox.strip():
             return mailbox
     return folder_dir.name
+
+
+def _legacy_export_state_issues(account: Account, account_dir: Path, folder_dirs: List[Path], *, require_state: bool) -> List[str]:
+    issues: List[str] = []
+    state_path = account_dir / "export-state.json"
+    if not state_path.exists():
+        if require_state:
+            issues.append(f"{account.email}: export-state missing; rerun legacy export before destructive reset")
+        return issues
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"{account.email}: export-state missing or invalid: {exc}"]
+    if not isinstance(state, dict):
+        return [f"{account.email}: export-state is not an object"]
+    if state.get("complete") is not True:
+        issues.append(f"{account.email}: export-state is not complete")
+    if state.get("account") not in {None, account.email}:
+        issues.append(f"{account.email}: export-state account mismatch ({state.get('account')})")
+    raw_mailboxes = state.get("mailboxes")
+    if not isinstance(raw_mailboxes, list):
+        issues.append(f"{account.email}: export-state mailboxes is missing or invalid")
+        return issues
+    staged_by_path = {folder_dir.name: folder_dir for folder_dir in folder_dirs}
+    state_paths: set[str] = set()
+    for idx, raw in enumerate(raw_mailboxes, 1):
+        if not isinstance(raw, dict):
+            issues.append(f"{account.email}: export-state mailbox entry {idx} is not an object")
+            continue
+        mailbox = raw.get("mailbox")
+        path = raw.get("path")
+        message_count = raw.get("message_count")
+        if not isinstance(mailbox, str) or not mailbox:
+            issues.append(f"{account.email}: export-state mailbox entry {idx} missing mailbox")
+            continue
+        expected_path = sanitize_for_path(mailbox)
+        if not isinstance(path, str) or path != expected_path:
+            issues.append(f"{account.email}: export-state mailbox {mailbox!r} path mismatch")
+            path = expected_path
+        if not isinstance(message_count, int) or message_count < 0:
+            issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
+            continue
+        state_paths.add(path)
+        folder_dir = staged_by_path.get(path)
+        if folder_dir is None:
+            issues.append(f"{account.email}: export-state mailbox {mailbox!r} missing staged folder {path}")
+            continue
+        eml_count = len(list(folder_dir.glob("*.eml")))
+        if eml_count != message_count:
+            issues.append(
+                f"{account.email}:{path}: export-state count mismatch "
+                f"(state={message_count} eml={eml_count})"
+            )
+    extra_paths = sorted(set(staged_by_path) - state_paths)
+    for path in extra_paths:
+        issues.append(f"{account.email}:{path}: staged folder missing from export-state")
+    return issues
 
 
 def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
@@ -114,6 +175,7 @@ def audit_account(
     folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
     if not folder_dirs:
         issues.append(f"{account.email}: no mailbox folders found")
+    issues.extend(_legacy_export_state_issues(account, account_dir, folder_dirs, require_state=require_integrity_metadata))
     for folder_dir in folder_dirs:
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
@@ -224,12 +286,14 @@ def audit_account(
                     if not (account_dir / folder_name).exists():
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
+                used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}
                 for eml_path, folder, mailbox in identity_candidates:
                     if folder in count_mismatched:
                         continue
                     try:
                         data = eml_path.read_bytes()
-                        if not _remote_has_message(imap, mailbox, data):
+                        used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
+                        if not _remote_has_message(imap, mailbox, data, used_remote_nums):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
