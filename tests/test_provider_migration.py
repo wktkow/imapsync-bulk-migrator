@@ -2597,6 +2597,59 @@ def test_provider_audit_detects_corrupted_message(tmp_path: Path) -> None:
     assert any("content_sha256 mismatch" in issue or "rfc822_size mismatch" in issue for issue in issues)
 
 
+def test_provider_audit_rejects_metadata_that_differs_from_manifest(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    metadata_path = account_dir / "metadata" / "gmail-123.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["source_account"] = "other@example.com"
+    metadata["target_account"] = "other@icloud.com"
+    metadata_path.write_text(json.dumps(metadata))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+
+    assert any("metadata source_account differs from manifest" in issue for issue in issues)
+    assert any("metadata target_account differs from manifest" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("metadata source_account differs from manifest" in issue for issue in report["failed"])
+    assert any("metadata target_account differs from manifest" in issue for issue in report["failed"])
+
+
+def test_provider_audit_and_validation_reject_metadata_extra_null_key(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    metadata_path = account_dir / "metadata" / "gmail-123.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["extra"] = None
+    metadata_path.write_text(json.dumps(metadata))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("metadata extra absent from manifest" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("metadata extra absent from manifest" in issue for issue in report["failed"])
+
+
+def test_provider_audit_rejects_non_object_metadata_json(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(["not", "an", "object"]))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+
+    assert any("metadata json is not an object" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("metadata json is not an object" in issue for issue in report["failed"])
+
+
 def test_provider_audit_rejects_incomplete_export_state(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

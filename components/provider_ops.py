@@ -755,6 +755,39 @@ def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
         raise RuntimeError(f"{identity}: content_sha256 mismatch")
 
 
+def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, require_present: bool = True) -> List[str]:
+    issues: List[str] = []
+    for row in rows:
+        identity = str(row.get("canonical_id") or "<missing>")
+        try:
+            meta_path = _manifest_path(account_dir, row, "metadata_path")
+        except Exception as exc:
+            if require_present:
+                issues.append(f"{identity}: invalid metadata_path: {exc}")
+            continue
+        if not meta_path.exists():
+            if require_present:
+                issues.append(f"{identity}: missing metadata_path")
+            continue
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            issues.append(f"{identity}: failed to read metadata json: {exc}")
+            continue
+        if not isinstance(metadata, dict):
+            issues.append(f"{identity}: metadata json is not an object")
+            continue
+        keys = sorted(set(metadata) | set(row))
+        for key in keys:
+            if key not in metadata:
+                issues.append(f"{identity}: metadata {key} missing from metadata")
+            elif key not in row:
+                issues.append(f"{identity}: metadata {key} absent from manifest")
+            elif metadata[key] != row[key]:
+                issues.append(f"{identity}: metadata {key} differs from manifest")
+    return issues
+
+
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
     issues: List[str] = []
     for idx, row in enumerate(rows, 1):
@@ -1664,6 +1697,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     identities = set()
     issues.extend(manifest_account_issues(rows, account))
     issues.extend(manifest_integrity_issues(rows))
+    issues.extend(metadata_manifest_issues(account_dir, rows, require_present=False))
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         if not identity:
@@ -1698,18 +1732,6 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
                     issues.append(f"{identity}: failed to parse RFC822: {exc}")
             except Exception as exc:
                 issues.append(f"{identity}: failed to read eml: {exc}")
-        meta_rel = row.get("metadata_path")
-        meta_path: Optional[Path] = None
-        with contextlib.suppress(Exception):
-            meta_path = _manifest_path(account_dir, row, "metadata_path")
-        if meta_rel and meta_path is not None and meta_path.exists():
-            try:
-                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-                for key in ("canonical_id", "content_sha256", "rfc822_size", "primary_mailbox"):
-                    if metadata.get(key) != row.get(key):
-                        issues.append(f"{identity}: metadata {key} differs from manifest")
-            except Exception as exc:
-                issues.append(f"{identity}: failed to read metadata json: {exc}")
     return account.email, issues
 
 
@@ -1762,6 +1784,7 @@ def provider_validate_account(
     except Exception as exc:
         report["failed"].append(str(exc))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
+    report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
 
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)

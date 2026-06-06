@@ -333,6 +333,7 @@ Provider mode validation is manifest/journal based. It checks:
 - Unique manifest identities.
 - Manifest source and target account consistency.
 - Required manifest integrity metadata.
+- Per-message metadata JSON consistency with the manifest.
 - Import journal consistency.
 - Target folder mapping consistency, including translated hierarchy collision
   checks when target validation is enabled.
