@@ -6,6 +6,7 @@ Each test is tagged with the bug number it validates.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import queue
 import signal
@@ -16,6 +17,21 @@ from typing import Iterator, List, Optional, Tuple
 from unittest import mock
 
 import pytest
+
+
+def _write_legacy_message_fixture(folder: Path, *, uid: int = 1, mailbox: str = "INBOX", data: bytes = b"From: a\r\nTo: b\r\n\r\nbody") -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    eml = folder / f"u{uid:010d}.eml"
+    eml.write_bytes(data)
+    eml.with_suffix(".json").write_text(json.dumps({
+        "mailbox": mailbox,
+        "uid": uid,
+        "flags": "\\Seen",
+        "internaldate": "01-Jan-2024 00:00:00 +0000",
+        "rfc822_size": len(data),
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+    }))
+    return eml
 
 # ---------------------------------------------------------------------------
 # BUG #5 — sanitize_for_path collision detection during export
@@ -398,15 +414,10 @@ class TestLegacyImportJournal:
 
     def _make_export(self, tmp_path: Path) -> Path:
         account_dir = tmp_path / "user@example.com" / "INBOX"
-        account_dir.mkdir(parents=True)
-        eml = account_dir / "u0000000001.eml"
-        eml.write_bytes(b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")
-        eml.with_suffix(".json").write_text(json.dumps({
-            "mailbox": "INBOX",
-            "uid": 1,
-            "flags": "\\Seen",
-            "internaldate": "01-Jan-2024 00:00:00 +0000",
-        }))
+        eml = _write_legacy_message_fixture(
+            account_dir,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
         return tmp_path
 
     def test_import_rerun_skips_committed_journal_entry(self, tmp_path: Path) -> None:
@@ -1155,6 +1166,65 @@ class TestAuditHardening:
 
         assert any("mailbox marker count mismatch" in issue for issue in issues)
 
+    def test_strict_audit_flags_corrupt_message_metadata(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        _write_legacy_message_fixture(inbox)
+        (inbox / "u0000000001.json").write_text("{")
+
+        _email, issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("failed to parse message metadata" in issue for issue in issues)
+
+    def test_strict_audit_flags_custom_named_corrupt_message_metadata(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / "custom.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
+        (inbox / "custom.json").write_text("{")
+
+        _email, issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("custom.eml" in issue and "failed to parse message metadata" in issue for issue in issues)
+
+    def test_strict_audit_flags_stale_message_integrity_metadata(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(inbox)
+        eml.write_bytes(b"From: changed\r\nTo: b\r\n\r\nbody")
+
+        _email, issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("content_sha256 mismatch" in issue for issue in issues)
+        assert any("rfc822_size mismatch" in issue for issue in issues)
+
     def test_audit_account_flags_trailing_imap_fetch_wrapper(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
@@ -1321,9 +1391,7 @@ class TestDirectAdminIndexerHardening:
         input_dir = tmp_path / "exported"
         for email in ("skip@example.com", "ok@example.com"):
             inbox = input_dir / email / "INBOX"
-            inbox.mkdir(parents=True)
-            (inbox / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
-            (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+            _write_legacy_message_fixture(inbox)
 
         class DummyDirectAdminClient:
             def __init__(self, *_args, **_kwargs) -> None:
@@ -1368,9 +1436,7 @@ class TestDirectAdminIndexerHardening:
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
         input_dir = tmp_path / "exported" / "a@example.com" / "INBOX"
-        input_dir.mkdir(parents=True)
-        (input_dir / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
-        (input_dir / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+        _write_legacy_message_fixture(input_dir)
 
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
@@ -1578,9 +1644,7 @@ class TestCPanelProvisioning:
         input_dir = tmp_path / "exported"
         for email in ("skip@example.com", "ok@example.com"):
             inbox = input_dir / email / "INBOX"
-            inbox.mkdir(parents=True)
-            (inbox / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
-            (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+            _write_legacy_message_fixture(inbox)
 
         class DummyCPanelClient:
             def __init__(self, *_args, **_kwargs) -> None:
@@ -1806,6 +1870,199 @@ class TestCPanelProvisioning:
         ensure_mock.assert_called_once()
         assert ensure_mock.call_args.kwargs["dry_run"] is True
         import_mock.assert_not_called()
+
+    def test_cpanel_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=RuntimeError("imapsync missing")) as imapsync_mock, \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.main.ensure_accounts_exist_cpanel") as ensure_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-cpanel",
+                "--cpanel-dry-run",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 0
+        imapsync_mock.assert_not_called()
+        ensure_mock.assert_called_once()
+        import_mock.assert_not_called()
+
+    def test_cpanel_dry_run_failure_is_fatal_even_with_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.main.ensure_accounts_exist_cpanel", side_effect=RuntimeError("uapi unavailable")), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--cpanel-dry-run",
+                "--ignore-errors",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 3
+        import_mock.assert_not_called()
+
+    def test_create_missing_audits_staged_input_before_panel_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        inbox = tmp_path / "exported" / "a@example.com" / "INBOX"
+        _write_legacy_message_fixture(inbox)
+        (inbox / "u0000000001.json").write_text("{")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls, \
+            mock.patch("components.main.ensure_accounts_exist_directadmin") as ensure_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 4
+        client_cls.assert_not_called()
+        ensure_mock.assert_not_called()
+
+    def test_panel_workflow_rejects_invalid_account_before_client_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "missing-domain", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls, \
+            mock.patch("components.main.ensure_accounts_exist_directadmin") as ensure_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-da",
+                "--da-dry-run",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+        ensure_mock.assert_not_called()
+
+    def test_directadmin_create_missing_dry_run_requires_successful_panel_listing(self) -> None:
+        from components.da_ensure import ensure_accounts_exist_directadmin
+        from components.models import Account, Config, ServerConfig
+
+        class BrokenDirectAdminClient:
+            def list_pop_accounts(self, domain: str):
+                raise RuntimeError("auth failed")
+
+        config = Config(
+            server=ServerConfig(host="imap.example.com"),
+            accounts=[Account(email="a@example.com", password="secret")],
+        )
+
+        with pytest.raises(RuntimeError, match="auth failed"):
+            ensure_accounts_exist_directadmin(config, BrokenDirectAdminClient(), dry_run=True, ignore_errors=True)
+
+    def test_directadmin_rejects_invalid_panel_account_identifiers(self) -> None:
+        from components.da_ensure import ensure_accounts_exist_directadmin
+        from components.models import Account, Config, ServerConfig
+
+        config = Config(
+            server=ServerConfig(host="imap.example.com"),
+            accounts=[Account(email="missing-domain", password="secret")],
+        )
+
+        with pytest.raises(ValueError, match="local@domain"):
+            ensure_accounts_exist_directadmin(config, mock.Mock(), dry_run=True, ignore_errors=True)
+
+    def test_cpanel_create_missing_dry_run_requires_successful_panel_listing(self) -> None:
+        from components.cpanel_ensure import ensure_accounts_exist_cpanel
+        from components.models import Account, Config, ServerConfig
+
+        class BrokenCPanelClient:
+            def list_pop_accounts(self, domain: str):
+                raise RuntimeError("uapi unavailable")
+
+        config = Config(
+            server=ServerConfig(host="imap.example.com"),
+            accounts=[Account(email="a@example.com", password="secret")],
+        )
+
+        with pytest.raises(RuntimeError, match="uapi unavailable"):
+            ensure_accounts_exist_cpanel(config, BrokenCPanelClient(), dry_run=True, ignore_errors=True)
+
+    def test_cpanel_rejects_invalid_panel_account_identifiers(self) -> None:
+        from components.cpanel_ensure import ensure_accounts_exist_cpanel
+        from components.models import Account, Config, ServerConfig
+
+        config = Config(
+            server=ServerConfig(host="imap.example.com"),
+            accounts=[Account(email="@example.com", password="secret")],
+        )
+
+        with pytest.raises(ValueError, match="local@domain"):
+            ensure_accounts_exist_cpanel(config, mock.Mock(), dry_run=True, ignore_errors=True)
 
     def test_cpanel_indexer_writes_selected_domains(self, tmp_path: Path) -> None:
         import cpanel_indexer

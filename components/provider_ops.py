@@ -462,8 +462,11 @@ def _source_tokens(source_mailboxes: Iterable[str], gmail_labels: Iterable[str])
 
 
 def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Iterable[str], folder_map: Dict[str, str]) -> str:
-    tokens = _source_tokens(source_mailboxes, gmail_labels)
+    source_tokens = [str(value) for value in source_mailboxes if value]
+    label_tokens = [str(value) for value in gmail_labels if value]
+    tokens = _source_tokens(source_tokens, label_tokens)
     lowered = {token.lower(): token for token in tokens}
+    gmail_label_lowers = {token.lower() for token in label_tokens}
 
     def has_any(*names: str) -> bool:
         return any(name.lower() in lowered for name in names)
@@ -486,8 +489,6 @@ def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Itera
         return mapped("Deleted Messages", "[Gmail]/Trash", "[GoogleMail]/Trash", "Trash", "Bin", "\\Trash")
     if has_any("[gmail]/spam", "[googlemail]/spam", "spam", "junk", "\\junk"):
         return mapped("Junk", "[Gmail]/Spam", "[GoogleMail]/Spam", "Spam", "Junk", "\\Junk")
-    if has_any("[gmail]/important", "[googlemail]/important", "important", "\\important"):
-        return mapped("Important", "[Gmail]/Important", "[GoogleMail]/Important", "Important", "\\Important")
     if has_any("inbox", "\\inbox"):
         return mapped("INBOX", "INBOX", "\\Inbox", "\\INBOX")
     for token in tokens:
@@ -496,6 +497,7 @@ def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Itera
             token.upper() == "INBOX"
             or token.startswith("\\")
             or lower in {"all mail"}
+            or (lower in {"important", "starred"} and lower in gmail_label_lowers)
             or lower.startswith("[gmail]/")
             or lower.startswith("[googlemail]/")
         ):
@@ -600,6 +602,40 @@ def require_manifest_target_account(rows: List[Dict[str, Any]], account: Migrati
             f"manifest target_account does not match config target_email {account.target_email}: "
             + ", ".join(mismatches)
         )
+
+
+def manifest_integrity_issues(rows: List[Dict[str, Any]]) -> List[str]:
+    issues: List[str] = []
+    for idx, row in enumerate(rows, 1):
+        identity = str(row.get("canonical_id") or f"row {idx}")
+        expected_hash = row.get("content_sha256")
+        if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+            issues.append(f"{identity}: missing or invalid content_sha256")
+        expected_size = row.get("rfc822_size")
+        if not isinstance(expected_size, int) or expected_size <= 0:
+            issues.append(f"{identity}: missing or invalid rfc822_size")
+    return issues
+
+
+def require_manifest_integrity_metadata(rows: List[Dict[str, Any]]) -> None:
+    issues = manifest_integrity_issues(rows)
+    if issues:
+        raise RuntimeError("invalid manifest integrity metadata: " + "; ".join(issues))
+
+
+def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
+    identity = str(row.get("canonical_id") or "<missing>")
+    expected_size = row.get("rfc822_size")
+    if not isinstance(expected_size, int) or expected_size <= 0:
+        raise RuntimeError(f"{identity}: missing or invalid rfc822_size")
+    if len(data) != expected_size:
+        raise RuntimeError(f"{identity}: rfc822_size mismatch (manifest={expected_size} actual={len(data)})")
+    expected_hash = row.get("content_sha256")
+    if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+        raise RuntimeError(f"{identity}: missing or invalid content_sha256")
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if actual_hash.lower() != expected_hash.lower():
+        raise RuntimeError(f"{identity}: content_sha256 mismatch")
 
 
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
@@ -951,7 +987,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
     by_name = _target_mailboxes_by_name(mailboxes)
     desired_lower = desired.lower()
     provider = (target_provider or "imap").lower()
-    gmail_special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important"}
+    gmail_special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important", "starred"}
     if desired_lower in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
         return by_name[desired.lower()].name
     attr_map = {
@@ -962,6 +998,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         "junk": ("\\Junk",),
         "spam": ("\\Junk",),
         "important": ("\\Important",),
+        "starred": ("\\Flagged",),
     }
     if provider == "gmail":
         attr_map["archive"] = ("\\All", "\\Archive")
@@ -981,6 +1018,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         "spam": ["[Gmail]/Spam", "[GoogleMail]/Spam", "Spam", "Junk"],
         "archive": ["[Gmail]/All Mail", "[GoogleMail]/All Mail", "All Mail", "Archive"],
         "important": ["[Gmail]/Important", "[GoogleMail]/Important", "Important"],
+        "starred": ["[Gmail]/Starred", "[GoogleMail]/Starred", "Starred"],
     }
     generic_candidates = {
         "sent": ["Sent", "Sent Messages"],
@@ -991,6 +1029,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         "spam": ["Spam", "Junk"],
         "archive": ["Archive"],
         "important": ["Important"],
+        "starred": ["Starred"],
     }
     candidates = {
         **(gmail_candidates if provider == "gmail" else generic_candidates),
@@ -1036,9 +1075,31 @@ def _quote_gmail_label(label: str) -> str:
     return f'"{escaped}"'
 
 
+def _gmail_label_key(label: str) -> str:
+    lower = str(label).strip().lower()
+    if lower in {"\\important", "important", "[gmail]/important", "[googlemail]/important"}:
+        return "important"
+    if lower in {"\\starred", "\\flagged", "[gmail]/starred", "[googlemail]/starred"}:
+        return "starred"
+    return f"label:{lower}"
+
+
+def row_has_gmail_important(row: Dict[str, Any]) -> bool:
+    labels = {_gmail_label_key(str(label)) for label in (row.get("gmail_labels") or [])}
+    flags = {_gmail_label_key(token) for token in str(row.get("flags") or "").split()}
+    return "important" in labels or "important" in flags
+
+
+def row_has_gmail_starred(row: Dict[str, Any]) -> bool:
+    labels = {_gmail_label_key(str(label)) for label in (row.get("gmail_labels") or [])}
+    flags = {_gmail_label_key(token) for token in str(row.get("flags") or "").split()}
+    return "starred" in labels or "starred" in flags
+
+
 def gmail_labels_for_restore(row: Dict[str, Any], target_mailbox: str) -> List[str]:
     system_labels = {
         "\\all",
+        "\\allmail",
         "\\archive",
         "\\drafts",
         "\\flagged",
@@ -1067,24 +1128,42 @@ def gmail_labels_for_restore(row: Dict[str, Any], target_mailbox: str) -> List[s
             continue
         if label not in labels:
             labels.append(label)
+    if row_has_gmail_important(row) and target_mailbox.lower() not in {"[gmail]/important", "[googlemail]/important", "important"}:
+        labels.append("Important")
     return sorted(labels, key=str.lower)
 
 
-def restore_gmail_labels(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any]) -> None:
+def _first_target_match_num(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any]) -> bytes:
+    nums = target_matching_message_nums(imap, target_mailbox, row, create_if_missing=False)
+    if not nums:
+        raise RuntimeError(f"cannot find target message for {row.get('canonical_id')} to restore Gmail metadata")
+    return nums[0]
+
+
+def restore_gmail_labels(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any], *, target_num: Optional[bytes] = None) -> None:
     labels = gmail_labels_for_restore(row, target_mailbox)
     if not labels:
         return
-    nums = target_matching_message_nums(imap, target_mailbox, row, create_if_missing=False)
-    if not nums:
-        raise RuntimeError(f"cannot find target message for {row.get('canonical_id')} to restore Gmail labels")
+    num = target_num or _first_target_match_num(imap, target_mailbox, row)
     status, _ = select_mailbox(imap, target_mailbox)
     if status != "OK":
         raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail labels")
     label_list = "(" + " ".join(_quote_gmail_label(label) for label in labels) + ")"
-    for num in nums:
-        status, response = imap.store(num, "+X-GM-LABELS", label_list)
-        if status != "OK":
-            raise RuntimeError(f"failed to restore Gmail labels for {row.get('canonical_id')}: {response}")
+    status, response = imap.store(num, "+X-GM-LABELS", label_list)
+    if status != "OK":
+        raise RuntimeError(f"failed to restore Gmail labels for {row.get('canonical_id')}: {response}")
+
+
+def restore_gmail_starred_flag(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any], *, target_num: Optional[bytes] = None) -> None:
+    if not row_has_gmail_starred(row):
+        return
+    num = target_num or _first_target_match_num(imap, target_mailbox, row)
+    status, _ = select_mailbox(imap, target_mailbox)
+    if status != "OK":
+        raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail starred flag")
+    status, response = imap.store(num, "+FLAGS", "(\\Flagged)")
+    if status != "OK":
+        raise RuntimeError(f"failed to restore Gmail starred flag for {row.get('canonical_id')}: {response}")
 
 
 def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> List[bytes]:
@@ -1131,6 +1210,23 @@ def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str
     return bool(target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing))
 
 
+def consume_target_match_num(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    used_by_mailbox: Dict[str, set[bytes]],
+    *,
+    create_if_missing: bool = True,
+) -> Optional[bytes]:
+    mailbox_key = mailbox.lower()
+    used = used_by_mailbox.setdefault(mailbox_key, set())
+    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+        if num not in used:
+            used.add(num)
+            return num
+    return None
+
+
 def consume_target_match(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -1139,13 +1235,41 @@ def consume_target_match(
     *,
     create_if_missing: bool = True,
 ) -> bool:
+    return consume_target_match_num(
+        imap,
+        mailbox,
+        manifest_row,
+        used_by_mailbox,
+        create_if_missing=create_if_missing,
+    ) is not None
+
+
+def _target_gmail_label_keys(imap: imaplib.IMAP4, num: bytes) -> set[str]:
+    status, fetched = imap.fetch(num, "(X-GM-LABELS FLAGS)")
+    if status != "OK":
+        raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
+    parsed = parse_provider_fetch_response(fetched or [])
+    labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
+    labels.update(_gmail_label_key(token) for token in str(parsed.get("flags") or "").split())
+    return {label for label in labels if label}
+
+
+def consume_target_match_with_gmail_labels(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    used_by_mailbox: Dict[str, set[bytes]],
+    *,
+    create_if_missing: bool = True,
+) -> Optional[set[str]]:
     mailbox_key = mailbox.lower()
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
-        if num not in used:
-            used.add(num)
-            return True
-    return False
+        if num in used:
+            continue
+        used.add(num)
+        return _target_gmail_label_keys(imap, num)
+    return None
 
 
 def target_message_count(imap: imaplib.IMAP4, mailbox: str) -> int:
@@ -1241,6 +1365,7 @@ def provider_import_account(
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_target_account(manifest_rows, account)
+    require_manifest_integrity_metadata(manifest_rows)
     journal_rows = load_import_journal(account_dir, account)
     require_valid_import_journal(journal_rows, account)
     committed = {
@@ -1282,14 +1407,19 @@ def provider_import_account(
             eml_path = _manifest_path(account_dir, row, "eml_path")
             if not eml_path.exists():
                 raise RuntimeError(f"message file missing for {identity}: {eml_path}")
-            if (config.migration.target_mode == "merge" or key in pending) and consume_target_match(imap, target_mailbox, row, used_target_nums):
+            matched_num = None
+            if config.migration.target_mode == "merge" or key in pending:
+                matched_num = consume_target_match_num(imap, target_mailbox, row, used_target_nums)
+            if matched_num is not None:
                 if config.target.provider == "gmail":
-                    restore_gmail_labels(imap, target_mailbox, row)
+                    restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num)
+                    restore_gmail_starred_flag(imap, target_mailbox, row, target_num=matched_num)
                 append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "existing"))
                 committed.add(key)
                 continue
             ensure_mailbox(imap, target_mailbox)
             data = eml_path.read_bytes()
+            require_manifest_payload_matches(row, data)
             limiter.wait_for(len(data))
             append_journal(account_dir, account, _journal_row(row, target_mailbox, "pending", "append-started"))
             status, response = append_message(
@@ -1301,8 +1431,12 @@ def provider_import_account(
             )
             if status != "OK":
                 raise RuntimeError(f"append failed for {identity}: {response}")
+            appended_num = consume_target_match_num(imap, target_mailbox, row, used_target_nums, create_if_missing=False)
+            if appended_num is None:
+                raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
             if config.target.provider == "gmail":
-                restore_gmail_labels(imap, target_mailbox, row)
+                restore_gmail_labels(imap, target_mailbox, row, target_num=appended_num)
+                restore_gmail_starred_flag(imap, target_mailbox, row, target_num=appended_num)
             append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "appended"))
             committed.add(key)
     logging.info("[provider-import] %s -> %s: completed", account.source_email, account.target_email)
@@ -1358,6 +1492,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     except Exception as exc:
         return account.email, [f"manifest load failed: {exc}"]
     identities = set()
+    issues.extend(manifest_integrity_issues(rows))
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         if not identity:
@@ -1382,12 +1517,10 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         if eml_rel and eml_path is not None and eml_path.exists():
             try:
                 data = eml_path.read_bytes()
-                expected_hash = str(row.get("content_sha256") or "")
-                if expected_hash and hashlib.sha256(data).hexdigest() != expected_hash:
-                    issues.append(f"{identity}: content_sha256 mismatch")
-                expected_size = int(row.get("rfc822_size") or 0)
-                if expected_size and len(data) != expected_size:
-                    issues.append(f"{identity}: rfc822_size mismatch (manifest={expected_size} actual={len(data)})")
+                try:
+                    require_manifest_payload_matches(row, data)
+                except Exception as exc:
+                    issues.append(str(exc))
                 try:
                     BytesParser(policy=default_policy).parsebytes(data)
                 except Exception as exc:
@@ -1456,6 +1589,7 @@ def provider_validate_account(
         require_manifest_target_account(manifest_rows, account)
     except Exception as exc:
         report["failed"].append(str(exc))
+    report["failed"].extend(manifest_integrity_issues(manifest_rows))
 
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
@@ -1554,7 +1688,30 @@ def provider_validate_account(
                         if not target_mailbox:
                             continue
                         report["remote_checked"] += 1
-                        if not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
+                        if config.target.provider == "gmail":
+                            actual_labels = consume_target_match_with_gmail_labels(
+                                imap,
+                                target_mailbox,
+                                row,
+                                used_target_nums,
+                                create_if_missing=False,
+                            )
+                            if actual_labels is None:
+                                report["remote_missing"].append(identity)
+                                continue
+                            expected_labels = {
+                                _gmail_label_key(label)
+                                for label in gmail_labels_for_restore(row, target_mailbox)
+                            }
+                            if row_has_gmail_starred(row):
+                                expected_labels.add("starred")
+                            missing_labels = sorted(expected_labels - actual_labels)
+                            if missing_labels:
+                                report["failed"].append(
+                                    f"target Gmail labels missing for {identity} in {target_mailbox}: "
+                                    + ", ".join(missing_labels)
+                                )
+                        elif not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
                             report["remote_missing"].append(identity)
         except Exception as exc:
             committed_by_id, _target_by_id, failures = evaluate_journal()

@@ -244,6 +244,21 @@ def test_accounts(config: Config, max_workers: int) -> None:
         raise RuntimeError(f"Connectivity test failed for some accounts:\n" + "\n".join(reason_lines))
 
 
+def _invalid_panel_account_emails(config: Config) -> List[str]:
+    invalid: List[str] = []
+    for acc in config.accounts:
+        email = acc.email.strip()
+        if (
+            email != acc.email
+            or email.count("@") != 1
+            or not email.split("@", 1)[0]
+            or not email.split("@", 1)[1]
+            or any(ch.isspace() for ch in email)
+        ):
+            invalid.append(acc.email)
+    return invalid
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with legacy and provider-aware workflows.",
@@ -339,6 +354,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Invalid config: %s", exc)
         return 2
     is_provider_config = isinstance(config, ProviderMigrationConfig)
+    use_da_panel = bool(getattr(args, "auto_provision_da", False))
+    use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
+    panel_dry_run_requested = (
+        args.mode == "import"
+        and not is_provider_config
+        and (
+            (use_da_panel and bool(getattr(args, "da_dry_run", False)))
+            or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+        )
+    )
     if (
         args.mode == "import"
         and bool(getattr(args, "reset", False))
@@ -356,6 +381,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             not is_provider_config
             and args.mode in {"export", "import", "test", "validate"}
             and not bool(getattr(args, "no_connectivity_test", False))
+            and not panel_dry_run_requested
         ):
             from .utils import ensure_imapsync_available
             ensure_imapsync_available()
@@ -367,8 +393,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     da_password: Optional[str] = None
     cpanel_client: Optional[CPanelClient] = None
     panel_reset_failed_accounts: set[str] = set()
-    use_da_panel = bool(getattr(args, "auto_provision_da", False))
-    use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
     if use_da_panel and use_cpanel:
         logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
         return 2
@@ -379,10 +403,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
         return 2
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
-        panel_dry_run_requested = (
-            (use_da_panel and bool(getattr(args, "da_dry_run", False)))
-            or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
-        )
+        assert isinstance(config, Config)
+        invalid_panel_accounts = _invalid_panel_account_emails(config)
+        if invalid_panel_accounts:
+            logging.error(
+                "Control-panel provisioning requires mailbox accounts in local@domain form; invalid account(s): %s",
+                ", ".join(invalid_panel_accounts),
+            )
+            return 2
+    if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         if not panel_dry_run_requested:
             staged_root = Path(args.input_dir)
             if not staged_root.exists():
@@ -401,21 +430,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ", ".join(missing_account_dirs),
                 )
                 return 2
-            if bool(getattr(args, "reset", False)):
-                try:
-                    logging.info("[panel] Running local staged export audit before destructive reset...")
-                    ok, reset_audit_issues = audit_export(staged_root, config, int(args.max_workers), check_remote=False)
-                except Exception as exc:
-                    logging.error("[panel] Staged export audit failed before reset: %s", exc)
-                    return 4
-                if not ok:
-                    logging.error(
-                        "[panel] Refusing destructive reset because staged export audit found %d issue(s)",
-                        len(reset_audit_issues),
-                    )
-                    for issue in reset_audit_issues:
-                        logging.error("[panel-reset-audit] %s", issue)
-                    return 4
+            audit_for_reset = bool(getattr(args, "reset", False))
+            try:
+                logging.info(
+                    "[panel] Running local staged export audit before %s...",
+                    "destructive reset" if audit_for_reset else "panel provisioning",
+                )
+                ok, staged_audit_issues = audit_export(
+                    staged_root,
+                    config,
+                    int(args.max_workers),
+                    check_remote=False,
+                    require_integrity_metadata=audit_for_reset,
+                )
+            except Exception as exc:
+                logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
+                return 4
+            if not ok:
+                logging.error(
+                    "[panel] Refusing %s because staged export audit found %d issue(s)",
+                    "destructive reset" if audit_for_reset else "panel provisioning",
+                    len(staged_audit_issues),
+                )
+                for issue in staged_audit_issues:
+                    logging.error("[panel-staged-audit] %s", issue)
+                return 4
     if (not is_provider_config) and args.mode == "import" and use_da_panel:
         missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
         if missing:
@@ -453,7 +492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[da] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if not args.ignore_errors:
+            if bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
                 return 3
     if (not is_provider_config) and args.mode == "import" and use_cpanel:
         missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
@@ -493,7 +532,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[cpanel] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if not args.ignore_errors:
+            if bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
     if args.mode == "import" and (
         (use_da_panel and bool(getattr(args, "da_dry_run", False)))

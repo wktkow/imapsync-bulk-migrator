@@ -308,6 +308,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "uid": int(uid),
                             "flags": flags or "",
                             "internaldate": internaldate or "",
+                            "rfc822_size": len(msg_bytes),
+                            "content_sha256": hashlib.sha256(msg_bytes).hexdigest(),
                         }
                         with open(meta_path, "w", encoding="utf-8") as f:
                             json.dump(meta, f, ensure_ascii=False)

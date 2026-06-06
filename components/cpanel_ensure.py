@@ -9,15 +9,19 @@ from .models import Account, Config
 
 def _accounts_by_domain(config: Config) -> Dict[str, List[Account]]:
     per_domain: Dict[str, List[Account]] = {}
+    invalid: List[str] = []
     for acc in config.accounts:
-        if "@" not in acc.email:
-            logging.warning("[cpanel] Skipping invalid email (no domain): %s", acc.email)
+        email = acc.email.strip()
+        if email != acc.email or email.count("@") != 1 or any(ch.isspace() for ch in email):
+            invalid.append(acc.email)
             continue
-        local, domain = acc.email.split("@", 1)
+        local, domain = email.split("@", 1)
         if not local or not domain:
-            logging.warning("[cpanel] Skipping invalid email: %s", acc.email)
+            invalid.append(acc.email)
             continue
         per_domain.setdefault(domain.lower(), []).append(acc)
+    if invalid:
+        raise ValueError("cPanel provisioning requires mailbox accounts in local@domain form: " + ", ".join(invalid))
     return per_domain
 
 
@@ -34,7 +38,7 @@ def ensure_accounts_exist_cpanel(
             existing_locals = set(client.list_pop_accounts(domain))
         except Exception as exc:
             logging.error("[cpanel] Failed to list accounts for domain %s: %s", domain, exc)
-            if not ignore_errors and not dry_run:
+            if dry_run or not ignore_errors:
                 raise
             continue
         for acc in accounts:
@@ -65,6 +69,13 @@ def reset_accounts_cpanel(
 ) -> Set[str]:
     failed: Set[str] = set()
     for domain, accounts in _accounts_by_domain(config).items():
+        if dry_run:
+            try:
+                existing_locals = set(client.list_pop_accounts(domain))
+            except Exception as exc:
+                logging.error("[cpanel] Failed to list accounts for domain %s: %s", domain, exc)
+                raise
+            logging.info("[cpanel][dry-run] Domain %s has %d existing mailbox(es)", domain, len(existing_locals))
         for acc in accounts:
             local = acc.email.split("@", 1)[0]
             if dry_run:

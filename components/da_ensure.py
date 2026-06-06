@@ -5,27 +5,34 @@ from .da_client import DirectAdminClient
 from .models import Account, Config
 
 
-def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+def _accounts_by_domain(config: Config) -> Dict[str, List[Account]]:
     per_domain: Dict[str, List[Account]] = {}
+    invalid: List[str] = []
     for acc in config.accounts:
-        if "@" not in acc.email:
-            logging.warning("[da] Skipping invalid email (no domain): %s", acc.email)
+        email = acc.email.strip()
+        if email != acc.email or email.count("@") != 1 or any(ch.isspace() for ch in email):
+            invalid.append(acc.email)
             continue
-        local, domain = acc.email.split("@", 1)
+        local, domain = email.split("@", 1)
         if not local or not domain:
-            logging.warning("[da] Skipping invalid email: %s", acc.email)
+            invalid.append(acc.email)
             continue
         per_domain.setdefault(domain.lower(), []).append(acc)
+    if invalid:
+        raise ValueError("DirectAdmin provisioning requires mailbox accounts in local@domain form: " + ", ".join(invalid))
+    return per_domain
 
+
+def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+    per_domain = _accounts_by_domain(config)
     for domain, accounts in per_domain.items():
         try:
             existing_locals = set(client.list_pop_accounts(domain))
         except Exception as exc:
             logging.error("[da] Failed to list accounts for domain %s: %s", domain, exc)
-            if not ignore_errors and not dry_run:
+            if dry_run or not ignore_errors:
                 raise
-            else:
-                continue
+            continue
         for acc in accounts:
             local = acc.email.split("@", 1)[0]
             if local in existing_locals:
@@ -50,18 +57,16 @@ def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, d
     Intended for use prior to import when a clean mailbox is desired.
     """
     failed: Set[str] = set()
-    per_domain: Dict[str, List[Account]] = {}
-    for acc in config.accounts:
-        if "@" not in acc.email:
-            logging.warning("[da] Skipping invalid email (no domain): %s", acc.email)
-            continue
-        local, domain = acc.email.split("@", 1)
-        if not local or not domain:
-            logging.warning("[da] Skipping invalid email: %s", acc.email)
-            continue
-        per_domain.setdefault(domain.lower(), []).append(acc)
+    per_domain = _accounts_by_domain(config)
 
     for domain, accounts in per_domain.items():
+        if dry_run:
+            try:
+                existing_locals = set(client.list_pop_accounts(domain))
+            except Exception as exc:
+                logging.error("[da] Failed to list accounts for domain %s: %s", domain, exc)
+                raise
+            logging.info("[da][dry-run] Domain %s has %d existing mailbox(es)", domain, len(existing_locals))
         for acc in accounts:
             local = acc.email.split("@", 1)[0]
             if dry_run:

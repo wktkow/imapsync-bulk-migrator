@@ -1,65 +1,52 @@
 # imapsync-bulk-migrator
 
-Bulk IMAP export, import, audit, and validation for mailbox migrations where the
-operator wants a filesystem staging copy before touching the target server.
+Staged bulk mailbox migration tooling for IMAP providers and hosting panels.
 
-This is not a live-service test harness. Without real provider credentials it
-cannot prove Gmail, iCloud, DirectAdmin, cPanel, or a hosting provider will accept
-every operation. The code is built around documented IMAP/control-panel behavior,
-local contract tests, journals, and fail-fast checks so an operator can run a
-controlled migration and decide when a source server is safe to decommission.
+The project is built for operators who need to move mailboxes, validate the
+result, and make an evidence-based decision about when an old mail server can be
+decommissioned. It exports mail into a local staging directory, imports into the
+target, records journals for resume/validation, and provides guardrails for
+DirectAdmin/cPanel mailbox reset workflows.
+
+This is not a hosted migration service and it cannot prove provider behavior
+without real credentials. It is designed to make live migrations safer by using
+documented IMAP/control-panel behavior, local audits, explicit journals, and
+fail-fast checks.
 
 ## Supported Routes
 
 Provider staged mode supports every source-target combination of:
 
-- `gmail`: Gmail IMAP at `imap.gmail.com:993` over SSL.
-- `icloud`: iCloud Mail IMAP at `imap.mail.me.com:993` over SSL.
+- `gmail`: Gmail IMAP at `imap.gmail.com:993`.
+- `icloud`: iCloud Mail IMAP at `imap.mail.me.com:993`.
 - `imap`: any generic IMAP server, including mailboxes normally accessed through
-  Roundcube, cPanel webmail, DirectAdmin webmail, or another hosted webmail UI.
+  Roundcube, DirectAdmin webmail, cPanel webmail, or another hosted webmail UI.
 
-That means these route classes are supported through the same staged flow:
+Supported route classes:
 
-- Gmail to Gmail, Gmail to iCloud, Gmail to generic IMAP.
-- iCloud to Gmail, iCloud to iCloud, iCloud to generic IMAP.
-- Generic IMAP to Gmail, generic IMAP to iCloud, generic IMAP to generic IMAP.
+- Gmail to Gmail, iCloud, or generic IMAP.
+- iCloud to Gmail, iCloud, or generic IMAP.
+- Generic IMAP to Gmail, iCloud, or generic IMAP.
 
-Roundcube is treated as generic IMAP because Roundcube is a webmail client, not a
-mail storage API. Use the backing IMAP host, username, and password/app password.
+Roundcube is a webmail client, not a storage API. For Roundcube-backed accounts,
+use the underlying IMAP host and mailbox credentials.
 
-Legacy mode supports generic IMAP export/import for same-address account lists.
-It also supports optional target mailbox provisioning through DirectAdmin or
-cPanel before import.
+Legacy mode supports same-address generic IMAP export/import and can optionally
+create or reset target mailboxes through DirectAdmin or cPanel before import.
 
-## What Gets Preserved
+## Why Staging Exists
 
-Provider staged mode writes:
+A migration is split into explicit stages:
 
-- One `.eml` per canonical message under `messages/`.
-- One metadata file per canonical message under `metadata/`.
-- `manifest.jsonl` for exact exported-message identity.
-- `import-<target>.journal.jsonl` for import resume and validation.
+1. Export every selected source mailbox to local `.eml` files and metadata.
+2. Audit the staged export before touching the target.
+3. Import into the target with resume journals.
+4. Validate staged identities against the target.
+5. Only then decide whether the source server is safe to decommission.
 
-Gmail source messages use `X-GM-MSGID` when Gmail advertises `X-GM-EXT-1`, so
-messages visible through multiple labels are exported once. Gmail labels are
-stored in metadata. When Gmail is the target, non-system Gmail labels are restored
-with `+X-GM-LABELS` after APPEND or when a matching existing message is found by
-`Message-ID` or content hash/size.
-
-For Gmail sources, preflight and export require Gmail to advertise `X-GM-EXT-1`
-and require Gmail's All Mail view to be visible through IMAP. Workspace/domain-wide
-completeness still depends on OAuth scope and Gmail IMAP settings that expose all
-labels/messages; the tool can validate the staged manifest, but it cannot discover
-Gmail messages hidden from IMAP by account or domain settings. Gmail `Starred` and
-`Important` are treated as system/special-use labels, not normal custom labels.
-
-Generic IMAP and iCloud do not expose Gmail's cross-label identity. Physical
-copies in different folders are preserved as separate messages. iCloud `VIP` is
-treated as a virtual folder and skipped as a source mailbox.
-
-Legacy mode writes `./exported/<email>/<folder>/u0000000001.eml` plus JSON
-metadata. Legacy validation checks folder counts and best-effort message identity;
-provider validation is manifest/journal identity-based.
+This makes migrations inspectable and repeatable. It also gives you artifacts to
+review when a provider throttles, disconnects, hides a folder, or returns
+unexpected IMAP metadata.
 
 ## Install
 
@@ -68,24 +55,25 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# For tests
+# Optional, for local tests
 pip install -r requirements-dev.txt
 ```
 
-Python 3.9+ is required. `requests` is used for DirectAdmin/cPanel integration.
-`imapsync` is only used by legacy connectivity checks through `--justconnect`;
-message export/import uses Python `imaplib`.
+Python 3.9+ is required. Message export/import uses Python `imaplib`.
+DirectAdmin/cPanel integration uses `requests`. The `imapsync` binary is used
+only for legacy connectivity checks, not for message copy operations.
 
-## Provider Staged Workflow
+## Provider Migration Workflow
 
-Use this for Gmail, iCloud, and provider-aware generic IMAP migrations.
+Use provider mode for Gmail, iCloud, Gmail-to-Gmail, iCloud-to-Gmail, and generic
+IMAP routes where source and target accounts can differ.
 
 ```bash
 python imapsync_bulk_migrator.py --mode preflight --config migration.config.json
 python imapsync_bulk_migrator.py --mode export --config migration.config.json --output-dir ./exported
+python imapsync_bulk_migrator.py --mode audit --config migration.config.json --input-dir ./exported
 python imapsync_bulk_migrator.py --mode import --config migration.config.json --input-dir ./exported
 python imapsync_bulk_migrator.py --mode validate --config migration.config.json --input-dir ./exported
-python imapsync_bulk_migrator.py --mode audit --config migration.config.json --input-dir ./exported
 ```
 
 Minimal provider config:
@@ -135,23 +123,31 @@ Minimal provider config:
 }
 ```
 
-For multi-account provider configs, put credentials and usernames on each account
-override. The loader rejects shared endpoint secrets and shared endpoint usernames
-that could accidentally migrate multiple accounts with one login.
+For multi-account provider configs, put credentials and usernames on each
+account override. Shared endpoint-level usernames or secrets are rejected to
+avoid accidentally migrating multiple accounts with one login.
+
+Gmail source migrations require `X-GM-EXT-1` and a visible All Mail view. Gmail
+labels are captured in metadata. When Gmail is the target, non-system Gmail
+labels are restored with `+X-GM-LABELS`; Gmail `Starred` and `Important` are
+handled as special/system labels rather than normal custom labels.
+
+iCloud and generic IMAP do not expose Gmail's cross-label identity. Physical
+copies in different folders are preserved as separate messages. iCloud `VIP` is
+treated as a virtual mailbox and skipped.
 
 ## Legacy Generic IMAP Workflow
 
-Use this for straightforward generic IMAP export/import where the same account
-addresses and passwords are known.
+Use legacy mode for straightforward same-address generic IMAP migrations.
 
 ```bash
 python imapsync_bulk_migrator.py --mode export --config export.pass.config.json --output-dir ./exported
+python imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
 python imapsync_bulk_migrator.py --mode import --config import.pass.config.json --input-dir ./exported
 python imapsync_bulk_migrator.py --mode validate --config import.pass.config.json --input-dir ./exported
 ```
 
-Legacy config. Real `*.pass.config.json` files are local operator secrets and are
-ignored by Git.
+Example legacy config:
 
 ```json
 {
@@ -171,12 +167,16 @@ ignored by Git.
 ```
 
 During legacy export, the tool generates `import.pass.config.json` with
-`CHANGE_ME.example.com` as the target host. Edit it before import.
+`CHANGE_ME.example.com` as the target host. Edit that generated config before
+import.
 
-## DirectAdmin And cPanel Provisioning
+## DirectAdmin And cPanel
 
-Provisioning is supported only for legacy generic IMAP imports. Provider configs
-are protocol-level and intentionally do not call control-panel APIs.
+DirectAdmin and cPanel integration is available for legacy generic IMAP imports.
+Provider configs do not call hosting panel APIs.
+
+Every configured account must be a mailbox address in `local@domain` form. Panel
+workflows fail fast for malformed accounts instead of silently skipping them.
 
 DirectAdmin create-missing import:
 
@@ -200,10 +200,15 @@ python imapsync_bulk_migrator.py --mode import --config import.pass.config.json 
   --cpanel-token-file secrets/cpanel-api-token
 ```
 
-Reset deletes and recreates target mailboxes. Non-dry-run reset first runs a
-local staged export audit and aborts before any panel API call if staged data is
-missing or inconsistent. It also requires `--reset-confirm` matching the target
-IMAP host, or `YES`.
+Non-dry-run panel provisioning audits the staged export before any panel API
+call. If the staged data is missing, malformed, or inconsistent, provisioning
+aborts before accounts are created or reset.
+
+## Server Decommissioning Workflows
+
+The destructive reset path is meant for target preparation during server
+replacement or decommissioning projects. It deletes and recreates target
+mailboxes through the panel, then imports the staged mail.
 
 ```bash
 python imapsync_bulk_migrator.py --mode import --config import.pass.config.json \
@@ -215,11 +220,47 @@ python imapsync_bulk_migrator.py --mode import --config import.pass.config.json 
   --cpanel-token-file secrets/cpanel-api-token
 ```
 
-Use `--da-dry-run` or `--cpanel-dry-run` before destructive runs. Panel dry-run
-mode exits after the panel planning/provisioning step and does not run
-connectivity tests or IMAP import.
+Reset safeguards:
+
+- `--reset` requires DirectAdmin or cPanel provisioning.
+- Non-dry-run reset requires `--reset-confirm` matching the target IMAP host, or
+  `YES`.
+- The staged legacy export must include per-message `content_sha256` and
+  `rfc822_size` metadata matching the `.eml` payloads.
+- Failed panel resets cause the affected accounts to be skipped during import.
+- Dry-run mode must be able to list panel mailboxes for each domain.
+
+Use `--da-dry-run` or `--cpanel-dry-run` before destructive runs:
+
+```bash
+python imapsync_bulk_migrator.py --mode import --config import.pass.config.json \
+  --input-dir ./exported \
+  --auto-provision-da \
+  --reset --da-dry-run \
+  --da-url https://panel.example.com:2222 \
+  --da-username admin \
+  --da-password-file secrets/da-login-key
+```
+
+Panel dry-run exits after the panel planning/provisioning step. It does not run
+connectivity tests, does not require the `imapsync` binary, and does not import
+mail.
+
+Do not decommission a source server until all of this is true:
+
+- Export completed without ignored errors.
+- Staged audit passed.
+- Import completed without unresolved pending journal rows.
+- Provider validation passed, or legacy validation matched expected counts and
+  message identity probes.
+- Representative mailbox spot checks confirm folders, flags, message bodies,
+  dates, and Gmail labels where applicable.
+- MX/DNS cutover, final delta policy, and rollback plan are documented outside
+  this tool.
 
 ## Indexers
+
+Indexers can generate legacy account config files from panel account listings.
 
 DirectAdmin:
 
@@ -245,42 +286,55 @@ python cpanel_indexer.py \
 
 Generated config files are written with mode `0600`.
 
-## Decommission Checklist
+## Secret Hygiene
 
-Do not decommission a source server until all of this is true:
+Local config and secret paths are ignored by Git:
 
-- Export completed without ignored errors.
-- Audit passed for the staged export.
-- Import completed without unresolved pending journal rows.
-- Provider validation passed, or legacy validation matched expected counts and
-  message identity probes.
-- A spot-check of representative mailboxes in the target confirms folders,
-  flags, message bodies, and Gmail labels where applicable.
-- DNS/MX cutover and final delta/retry policy are documented outside this tool.
+- `*.pass.config.json*`
+- `migration.config.json*`
+- `migration.*.config.json*`
+- `secrets/`
 
-For provider mode, `validate` checks manifest identities and best-effort target
-presence. For legacy mode, validation checks counts and best-effort identity by
-`Message-ID` or content hash/size. Legacy `audit` performs the same identity
-probe when run online; `--audit-offline` only checks the staged files. Both modes
-should still be paired with representative mailbox spot checks before
-decommissioning.
+Prefer `*_file` or `*_env` options for panel credentials and mailbox secrets.
+Inline password flags work where documented, but they can be exposed through
+shell history or process arguments.
+
+Log files are created with mode `0600`.
+
+## Validation Model
+
+Provider mode validation is manifest/journal based. It checks:
+
+- Complete `export-state.json`.
+- Unique manifest identities.
+- Manifest target account consistency.
+- Required manifest integrity metadata.
+- Import journal consistency.
+- Target message presence by `Message-ID` plus content hash/size where target
+  validation is enabled.
+- Expected Gmail labels when Gmail is the target.
+
+Legacy validation checks folder counts and best-effort message identity by
+`Message-ID` or content hash/size. Legacy audit can run online or offline; the
+pre-reset gate always performs strict local staged integrity checks.
 
 ## Known Constraints
 
+- Live credentials are required for final proof. Local tests and dry-runs cannot
+  guarantee a provider will accept every operation.
 - Gmail Workspace migrations should use XOAUTH2. Workspace domain-wide IMAP
   migrations need OAuth setup outside this tool.
 - Gmail app passwords are a personal-account fallback where Google still allows
   them. They are not a reliable Workspace migration strategy.
 - Gmail IMAP has documented daily transfer limits. Large Gmail-target imports may
   require throttling, batching, or a Google-supported migration service.
-- OAuth tokens are read from files at connection time. Token acquisition and
-  refresh are external to this tool.
-- iCloud requires app-specific passwords. Apple may require the local part as the
-  username, or the full address if local-part login fails.
+- OAuth token acquisition and refresh are external to this tool.
+- iCloud requires app-specific passwords. Apple may require the local part as
+  the username, or the full address if local-part login fails.
 - IMAP UIDs are not preserved. Message identity is staged through content,
   metadata, Gmail IDs where available, and import journals.
-- cPanel mailbox creation sends passwords to cPanel UAPI over HTTPS POST and
-  redacts request errors; log files are created with mode `0600`.
+- DirectAdmin/cPanel reset deletes target mailbox contents. Use dry-run, verify
+  staged data, and keep independent backups before destructive operations.
 
 ## Official Behavior References
 

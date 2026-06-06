@@ -97,7 +97,14 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     return issues
 
 
-def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig], check_remote: bool = True) -> Tuple[str, List[str]]:
+def audit_account(
+    account: Account,
+    in_root: Path,
+    server: Optional[ServerConfig],
+    check_remote: bool = True,
+    *,
+    require_integrity_metadata: bool = False,
+) -> Tuple[str, List[str]]:
     """Audit a single account directory and optionally compare to remote counts."""
     issues: List[str] = []
     account_dir = in_root / sanitize_for_path(account.email)
@@ -136,22 +143,50 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
         for eml_path in emls:
             issues.extend(_audit_eml_file(eml_path, folder))
             stem = eml_path.stem
+            meta_path = eml_path.with_suffix(".json")
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                issues.append(f"{account.email}:{folder}:{eml_path.name}: failed to parse message metadata: {exc}")
+                continue
+            if not isinstance(meta, dict):
+                issues.append(f"{account.email}:{folder}:{eml_path.name}: message metadata is not an object")
+                continue
+            mailbox_meta = meta.get("mailbox")
+            if not isinstance(mailbox_meta, str) or not mailbox_meta.strip():
+                issues.append(f"{account.email}:{folder}:{eml_path.name}: missing mailbox metadata")
+            elif sanitize_for_path(mailbox_meta) != folder:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
+                    f"(folder={folder} meta={mailbox_meta})"
+                )
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
-                meta_path = eml_path.with_suffix(".json")
-                with contextlib.suppress(Exception):
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    mailbox_meta = meta.get("mailbox")
-                    if not isinstance(mailbox_meta, str) or not mailbox_meta.strip():
-                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing mailbox metadata")
-                    elif sanitize_for_path(mailbox_meta) != folder:
-                        issues.append(
-                            f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
-                            f"(folder={folder} meta={mailbox_meta})"
-                        )
-                    uid_meta = meta.get("uid")
-                    if isinstance(uid_meta, int) and uid_meta != uid_in_name:
-                        issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
+                uid_meta = meta.get("uid")
+                if isinstance(uid_meta, int) and uid_meta != uid_in_name:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
+            if require_integrity_metadata:
+                expected_hash = meta.get("content_sha256")
+                expected_size = meta.get("rfc822_size")
+                if not isinstance(expected_hash, str) or not expected_hash:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
+                if not isinstance(expected_size, int):
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
+                if isinstance(expected_hash, str) and expected_hash and isinstance(expected_size, int):
+                    try:
+                        data = eml_path.read_bytes()
+                        actual_hash = hashlib.sha256(data).hexdigest()
+                        if actual_hash != expected_hash:
+                            issues.append(f"{account.email}:{folder}:{eml_path.name}: content_sha256 mismatch")
+                        if len(data) != expected_size:
+                            issues.append(
+                                f"{account.email}:{folder}:{eml_path.name}: rfc822_size mismatch "
+                                f"(metadata={expected_size} actual={len(data)})"
+                            )
+                    except Exception as exc:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: failed integrity read: {exc}")
     if check_remote and server is not None:
         try:
             with imap_connection(server, account) as imap:
@@ -203,7 +238,14 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
     return account.email, issues
 
 
-def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: bool = True) -> Tuple[bool, List[str]]:
+def audit_export(
+    in_root: Path,
+    config: Config,
+    max_workers: int,
+    check_remote: bool = True,
+    *,
+    require_integrity_metadata: bool = False,
+) -> Tuple[bool, List[str]]:
     """Audit all accounts concurrently and aggregate issues.
 
     Returns (ok, issues) where `ok` is True when no issues were found.
@@ -213,7 +255,13 @@ def audit_export(in_root: Path, config: Config, max_workers: int, check_remote: 
     issues_accum: List[str] = []
 
     def worker(acc: Account) -> List[str]:
-        _email, issues = audit_account(acc, in_root, config.server if check_remote else None, check_remote=check_remote)
+        _email, issues = audit_account(
+            acc,
+            in_root,
+            config.server if check_remote else None,
+            check_remote=check_remote,
+            require_integrity_metadata=require_integrity_metadata,
+        )
         if not issues:
             return []
         return [f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues]
