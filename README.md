@@ -146,9 +146,9 @@ same translated target mailbox, import and target validation fail before
 claiming the migration is safe.
 
 Provider export writes an account-level `export-state.json` with the source
-account, target account, completion flag, and canonical message count. Import,
-audit, and validation require that state to match the manifest before trusting
-the staged data.
+account, target account, completion flag, canonical message count, and a digest
+of the manifest. Import, audit, and validation require that state to match the
+manifest before trusting the staged data.
 
 ## Legacy Generic IMAP Workflow
 
@@ -328,8 +328,8 @@ Log files are created with mode `0600`.
 
 Provider mode validation is manifest/journal based. It checks:
 
-- Complete `export-state.json` matching the source account, target account, and
-  manifest message count.
+- Complete `export-state.json` matching the source account, target account,
+  manifest message count, and manifest digest.
 - Unique manifest identities.
 - Manifest target account consistency.
 - Required manifest integrity metadata.

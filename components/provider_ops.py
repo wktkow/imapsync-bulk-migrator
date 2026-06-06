@@ -604,6 +604,12 @@ def load_manifest(account_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def provider_manifest_digest(rows: List[Dict[str, Any]]) -> str:
+    canonical_rows = sorted(rows, key=lambda row: str(row.get("canonical_id") or ""))
+    payload = json.dumps(canonical_rows, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def provider_export_state_issues(
     account_dir: Path,
     *,
@@ -639,6 +645,15 @@ def provider_export_state_issues(
             issues.append(
                 f"export-state canonical_messages does not match manifest row count: "
                 f"{actual_count if actual_count is not None else '<missing>'} != {expected_count}"
+            )
+        expected_digest = provider_manifest_digest(manifest_rows)
+        actual_digest = state.get("manifest_sha256")
+        if not isinstance(actual_digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", actual_digest):
+            issues.append("export-state manifest_sha256 is missing or invalid")
+        elif actual_digest.lower() != expected_digest:
+            issues.append(
+                f"export-state manifest_sha256 does not match manifest: "
+                f"{actual_digest.lower()} != {expected_digest}"
             )
     return issues
 
@@ -1031,13 +1046,15 @@ def provider_export_account(
                 )
 
     persist_export_records(account_dir, messages, config.migration.folder_map)
+    final_manifest_rows = load_manifest(account_dir)
     _atomic_json(
         account_dir / "export-state.json",
         {
             "source_account": account.source_email,
             "target_account": account.target_email,
             "complete": True,
-            "canonical_messages": len(messages),
+            "canonical_messages": len(final_manifest_rows),
+            "manifest_sha256": provider_manifest_digest(final_manifest_rows),
             "completed_at": _utc_now(),
         },
     )

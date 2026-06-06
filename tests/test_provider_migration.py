@@ -30,6 +30,7 @@ from components.provider_ops import (
     provider_audit_account,
     provider_export_account,
     provider_import_account,
+    provider_manifest_digest,
     provider_preflight,
     provider_validate_account,
     quote_mailbox_name,
@@ -770,6 +771,9 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert row["gmail_labels"] == ["Project A", "\\Inbox"]
     assert (account_dir / row["eml_path"]).exists()
     assert (account_dir / row["metadata_path"]).exists()
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["canonical_messages"] == 1
+    assert state["manifest_sha256"] == provider_manifest_digest(manifest)
     assert fake.body_fetches == 1
 
 
@@ -1246,14 +1250,20 @@ def _write_provider_export_state(
     *,
     source: str = "source@example.com",
     target: str = "target@icloud.com",
-    canonical_messages: int = 1,
+    canonical_messages: Optional[int] = None,
     complete: bool = True,
 ) -> None:
+    manifest_rows = [
+        json.loads(line)
+        for line in account_dir.joinpath("manifest.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
     account_dir.joinpath("export-state.json").write_text(json.dumps({
         "source_account": source,
         "target_account": target,
         "complete": complete,
-        "canonical_messages": canonical_messages,
+        "canonical_messages": len(manifest_rows) if canonical_messages is None else canonical_messages,
+        "manifest_sha256": provider_manifest_digest(manifest_rows),
     }))
 
 
@@ -1732,6 +1742,7 @@ def test_provider_import_rejects_manifest_paths_outside_export_dir(tmp_path: Pat
     row["eml_path"] = "../secret.eml"
     (tmp_path / "secret.eml").write_bytes(b"Message-ID: <leak@example.com>\r\n\r\nsecret")
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(account_dir)
     fake = FakeTargetImap()
 
     @contextlib.contextmanager
@@ -1783,10 +1794,26 @@ def test_provider_import_rejects_mismatched_export_state_before_target_connect(t
 
     _write_provider_export_state(account_dir)
     state = json.loads((account_dir / "export-state.json").read_text())
+    state["canonical_messages"] = False
+    (account_dir / "export-state.json").write_text(json.dumps(state))
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="export-state canonical_messages"):
+            provider_import_account(config, account, tmp_path)
+
+    _write_provider_export_state(account_dir)
+    state = json.loads((account_dir / "export-state.json").read_text())
     state["canonical_messages"] = True
     (account_dir / "export-state.json").write_text(json.dumps(state))
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match="export-state canonical_messages"):
+            provider_import_account(config, account, tmp_path)
+
+    _write_provider_export_state(account_dir)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["primary_mailbox"] = "INBOX"
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="export-state manifest_sha256"):
             provider_import_account(config, account, tmp_path)
 
 
@@ -2577,6 +2604,23 @@ def test_provider_audit_and_validation_reject_mismatched_export_state(tmp_path: 
     assert not report["ok"]
     assert any("export-state source_account" in issue for issue in report["failed"])
     assert any("export-state canonical_messages" in issue for issue in report["failed"])
+
+
+def test_provider_audit_and_validation_reject_stale_manifest_digest(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    _write_provider_export_state(account_dir)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["primary_mailbox"] = "INBOX"
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("export-state manifest_sha256" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert any("export-state manifest_sha256" in issue for issue in report["failed"])
 
 
 def test_load_import_journal_recovers_incomplete_trailing_row(tmp_path: Path) -> None:
