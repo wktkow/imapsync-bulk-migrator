@@ -5,11 +5,25 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .utils import sanitize_for_path
+
 
 @dataclasses.dataclass
 class Account:
     email: str
     password: str
+
+
+def _reject_sanitized_path_collisions(values: List[str], *, context: str) -> None:
+    seen: Dict[str, str] = {}
+    for value in values:
+        key = sanitize_for_path(value)
+        previous = seen.get(key)
+        if previous is not None and previous != value:
+            raise ValueError(
+                f"{context} path collision after sanitizing: {previous!r} and {value!r} both map to {key!r}"
+            )
+        seen[key] = value
 
 
 @dataclasses.dataclass
@@ -281,6 +295,8 @@ class ProviderMigrationConfig:
                 raise ValueError(f"accounts[{idx}].target_email duplicates accounts[{seen_targets[target_key]}].target_email")
             seen_sources[source_key] = idx
             seen_targets[target_key] = idx
+        _reject_sanitized_path_collisions([account.source_email for account in self.accounts], context="accounts.source_email")
+        _reject_sanitized_path_collisions([account.target_email for account in self.accounts], context="accounts.target_email")
         multi_account = len(self.accounts) > 1
         for idx, account in enumerate(self.accounts):
             for role, endpoint, override in (
@@ -295,6 +311,11 @@ class ProviderMigrationConfig:
                     raise ValueError(
                         f"accounts[{idx}].{role}_auth must be set in multi-account provider configs; "
                         f"endpoint-level provider secrets would be reused for every account"
+                    )
+                if multi_account and override is not None and endpoint.auth.username and not override.username:
+                    raise ValueError(
+                        f"accounts[{idx}].{role}_auth.username must be set in multi-account provider configs; "
+                        f"endpoint-level provider username would be reused for every account"
                     )
 
 
@@ -328,6 +349,7 @@ class Config:
         if not isinstance(accounts_raw, list) or not accounts_raw:
             raise ValueError("Config must include non-empty 'accounts' array")
         accounts: List[Account] = []
+        seen_accounts: Dict[str, int] = {}
         for idx, item in enumerate(accounts_raw):
             if not isinstance(item, dict):
                 raise ValueError(f"accounts[{idx}] must be an object")
@@ -337,7 +359,12 @@ class Config:
                 raise ValueError(f"accounts[{idx}].email must be a non-empty string")
             if not isinstance(password, str):
                 raise ValueError(f"accounts[{idx}].password must be a string (can be empty)")
+            email_key = email.strip().lower()
+            if email_key in seen_accounts:
+                raise ValueError(f"accounts[{idx}].email duplicates accounts[{seen_accounts[email_key]}].email")
+            seen_accounts[email_key] = idx
             accounts.append(Account(email=email, password=password))
+        _reject_sanitized_path_collisions([account.email for account in accounts], context="accounts.email")
 
         server = ServerConfig(host=host, port=port, ssl=use_ssl, starttls=starttls)
         return Config(server=server, accounts=accounts)

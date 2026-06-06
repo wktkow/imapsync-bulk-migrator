@@ -16,6 +16,7 @@ No changes are made on the server. Read-only, safe by default.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -230,12 +231,25 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     path_exists = os.path.exists(out_path)
     if path_exists and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)")
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if overwrite else os.O_EXCL)
-    fd = os.open(out_path, flags, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.chmod(out_path, 0o600)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(str(tmp), str(out))
+        os.chmod(out, 0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
 
 
 def read_secret_file(path: str, *, label: str) -> str:
@@ -271,6 +285,32 @@ def resolve_password(args: argparse.Namespace) -> str:
     return str(args.password)
 
 
+def resolve_default_password(args: argparse.Namespace) -> str:
+    sources = [
+        name
+        for name, value in (
+            ("--default-password", getattr(args, "default_password", None)),
+            ("--default-password-file", getattr(args, "default_password_file", None)),
+            ("--default-password-env", getattr(args, "default_password_env", None)),
+        )
+        if value
+    ]
+    if len(sources) > 1:
+        raise ValueError("Default mailbox password must be provided by only one source")
+    if getattr(args, "default_password_file", None):
+        return read_secret_file(str(args.default_password_file), label="Default mailbox password file")
+    if getattr(args, "default_password_env", None):
+        env_name = str(args.default_password_env)
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            raise ValueError(f"Default mailbox password environment variable is unset or empty: {env_name}")
+        return value
+    if getattr(args, "default_password", None):
+        print("Warning: --default-password can expose mailbox passwords via shell history/process arguments; prefer --default-password-file or --default-password-env", file=sys.stderr)
+        return str(args.default_password)
+    return ""
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Index domains and mailboxes via DirectAdmin-compatible API and write export.pass.config.json",
@@ -289,7 +329,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-imap-ssl", dest="imap_ssl", action="store_false", help="Disable SSL for IMAP connection")
     p.add_argument("--imap-starttls", action="store_true", default=False, help="Use STARTTLS when SSL is disabled")
 
-    p.add_argument("--default-password", default="", help="Password value to put for each account (leave empty to fill later)")
+    p.add_argument("--default-password", default="", help="Password value to put for each account (leave empty to fill later); insecure because process args can expose it")
+    p.add_argument("--default-password-file", required=False, help="Path to a file containing the default mailbox password")
+    p.add_argument("--default-password-env", required=False, help="Environment variable containing the default mailbox password")
     p.add_argument("--out", default="export.pass.config.json", help="Output JSON path")
     p.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists")
 
@@ -301,6 +343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         password = resolve_password(args)
+        default_password = resolve_default_password(args)
         client = DirectAdminClient(
             base_url=args.url,
             username=args.username,
@@ -337,7 +380,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ssl=bool(args.imap_ssl),
         starttls=bool(args.imap_starttls),
     )
-    payload = build_config(server, all_emails, default_password=args.default_password)
+    payload = build_config(server, all_emails, default_password=default_password)
 
     # Default output: export.pass.config.json (same shape used by migrator)
     # If output exists and no --overwrite, refuse to clobber

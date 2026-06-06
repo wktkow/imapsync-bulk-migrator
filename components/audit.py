@@ -1,13 +1,61 @@
 import contextlib
+import hashlib
 import json
+import re
 from email.parser import BytesParser
 from email.policy import compat32 as compat32_policy
+from email.policy import default as default_policy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .models import Account, Config, ServerConfig
 from .imap_ops import imap_connection, list_all_mailboxes, quote_mailbox_name
 from .utils import sanitize_for_path
+
+
+def _message_id_header(data: bytes) -> str:
+    with contextlib.suppress(Exception):
+        msg = BytesParser(policy=default_policy).parsebytes(data)
+        return str(msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+    return ""
+
+
+def _remote_has_message(imap, mailbox: str, data: bytes) -> bool:
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    message_id = _message_id_header(data)
+    expected_hash = hashlib.sha256(data).hexdigest()
+    expected_size = len(data)
+    if message_id:
+        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+    else:
+        status, search_data = imap.search(None, "ALL")
+    if status != "OK" or not search_data or not search_data[0]:
+        return False
+    for num in search_data[0].split():
+        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            continue
+        for part in fetched or []:
+            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            body = bytes(part[1])
+            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                return True
+    return False
+
+
+def _folder_mailbox_name(folder_dir: Path) -> str:
+    marker_path = folder_dir / ".mailbox.json"
+    if not marker_path.exists():
+        return folder_dir.name
+    with contextlib.suppress(Exception):
+        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
+        if isinstance(mailbox, str) and mailbox.strip():
+            return mailbox
+    return folder_dir.name
 
 
 def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
@@ -25,7 +73,12 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     except Exception as exc:
         issues.append(f"{eml_path}: failed to parse RFC822: {exc}")
         msg = None
-    if b"FLAGS (" in data or b"INTERNALDATE \"" in data:
+    wrapper_regions = data[:512] + b"\n" + data[-512:]
+    if re.search(
+        rb"(?:^|\n)\s*(?:\*+\s+)?\d+\s+\(.*(?:FLAGS \(|INTERNALDATE \")",
+        wrapper_regions,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
         issues.append(f"{eml_path}: suspicious raw IMAP metadata present in payload (possible concatenation)")
     if msg is not None:
         header_keys = ["From", "To", "Subject", "Date", "Message-Id", "MIME-Version", "Content-Type", "Received"]
@@ -57,9 +110,21 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
     for folder_dir in folder_dirs:
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
-        jsons = list(folder_dir.glob("*.json"))
-        if not emls:
+        jsons = [p for p in folder_dir.glob("*.json") if p.name != ".mailbox.json"]
+        mailbox_marker = folder_dir / ".mailbox.json"
+        if not emls and not mailbox_marker.exists():
             issues.append(f"{account.email}:{folder}: no .eml files found")
+        if mailbox_marker.exists():
+            try:
+                marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
+                expected_count = marker.get("message_count") if isinstance(marker, dict) else None
+                if isinstance(expected_count, int) and expected_count != len(emls):
+                    issues.append(f"{account.email}:{folder}: mailbox marker count mismatch (marker={expected_count} eml={len(emls)})")
+                mailbox_name = marker.get("mailbox") if isinstance(marker, dict) else None
+                if isinstance(mailbox_name, str) and mailbox_name and sanitize_for_path(mailbox_name) != folder:
+                    issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
+            except Exception as exc:
+                issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")
         eml_stems = {p.stem for p in emls}
         json_stems = {p.stem for p in jsons}
         missing_meta = eml_stems - json_stems
@@ -76,6 +141,14 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
                 meta_path = eml_path.with_suffix(".json")
                 with contextlib.suppress(Exception):
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    mailbox_meta = meta.get("mailbox")
+                    if not isinstance(mailbox_meta, str) or not mailbox_meta.strip():
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing mailbox metadata")
+                    elif sanitize_for_path(mailbox_meta) != folder:
+                        issues.append(
+                            f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
+                            f"(folder={folder} meta={mailbox_meta})"
+                        )
                     uid_meta = meta.get("uid")
                     if isinstance(uid_meta, int) and uid_meta != uid_in_name:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
@@ -84,6 +157,7 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
             with imap_connection(server, account) as imap:
                 remote_mailboxes = list_all_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
+                remote_mailbox_by_key: Dict[str, str] = {}
                 for mbox in remote_mailboxes:
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
                     if status != "OK":
@@ -92,21 +166,40 @@ def audit_account(account: Account, in_root: Path, server: Optional[ServerConfig
                     if status != "OK":
                         continue
                     num = len((data[0] or b"").split()) if data else 0
-                    remote_counts[sanitize_for_path(mbox)] = num
+                    key = sanitize_for_path(mbox)
+                    remote_counts[key] = num
+                    remote_mailbox_by_key[key] = mbox
+                count_mismatched = set()
+                identity_candidates: List[Tuple[Path, str, str]] = []
+                for folder_dir in folder_dirs:
+                    folder = folder_dir.name
+                    local_count = len(list(folder_dir.glob("*.eml")))
+                    remote_count = remote_counts.get(folder, -1)
+                    if remote_count < 0 and local_count > 0:
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
+                    elif remote_count >= 0 and local_count != remote_count:
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
+                    elif local_count > 0:
+                        mailbox = remote_mailbox_by_key.get(folder, _folder_mailbox_name(folder_dir))
+                        for eml_path in sorted(folder_dir.glob("*.eml")):
+                            identity_candidates.append((eml_path, folder, mailbox))
+                for folder_name, rcount in remote_counts.items():
+                    if not (account_dir / folder_name).exists():
+                        count_mismatched.add(folder_name)
+                        issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
+                for eml_path, folder, mailbox in identity_candidates:
+                    if folder in count_mismatched:
+                        continue
+                    try:
+                        data = eml_path.read_bytes()
+                        if not _remote_has_message(imap, mailbox, data):
+                            issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")
+                    except Exception as exc:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
         except Exception as exc:
             issues.append(f"remote check failed: {exc}")
-            remote_counts = {}
-        for folder_dir in folder_dirs:
-            folder = folder_dir.name
-            local_count = len(list(folder_dir.glob("*.eml")))
-            remote_count = remote_counts.get(folder, -1)
-            if remote_count < 0 and local_count > 0:
-                issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
-            elif remote_count >= 0 and local_count != remote_count:
-                issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
-        for folder_name, rcount in remote_counts.items():
-            if not (account_dir / folder_name).exists() and rcount > 0:
-                issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
     return account.email, issues
 
 

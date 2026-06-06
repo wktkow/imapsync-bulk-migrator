@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -9,13 +10,17 @@ import os
 import signal
 import threading
 from pathlib import Path
+from email.parser import BytesParser
+from email.policy import default as default_policy
 from typing import List, Optional, Tuple, Dict
 
 from .audit import audit_export
+from .cpanel_client import CPanelClient
+from .cpanel_ensure import ensure_accounts_exist_cpanel
 from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
-from .imap_ops import export_account, import_account
+from .imap_ops import archive_legacy_import_journal_for_reset, export_account, import_account
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config, ProviderMigrationConfig, load_config_file
 from .provider_ops import (
@@ -63,6 +68,56 @@ def _resolve_da_password(args: argparse.Namespace) -> str:
     return str(args.da_password)
 
 
+def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    password_sources = [
+        name
+        for name, value in (
+            ("--cpanel-password", getattr(args, "cpanel_password", None)),
+            ("--cpanel-password-file", getattr(args, "cpanel_password_file", None)),
+            ("--cpanel-password-env", getattr(args, "cpanel_password_env", None)),
+        )
+        if value
+    ]
+    token_sources = [
+        name
+        for name, value in (
+            ("--cpanel-token", getattr(args, "cpanel_token", None)),
+            ("--cpanel-token-file", getattr(args, "cpanel_token_file", None)),
+            ("--cpanel-token-env", getattr(args, "cpanel_token_env", None)),
+        )
+        if value
+    ]
+    if len(password_sources) > 1:
+        raise ValueError("cPanel password must be provided by only one source")
+    if len(token_sources) > 1:
+        raise ValueError("cPanel API token must be provided by only one source")
+    if password_sources and token_sources:
+        raise ValueError("cPanel authentication must use either password or API token, not both")
+    if getattr(args, "cpanel_password_file", None):
+        return _read_required_secret_file(str(args.cpanel_password_file), label="cPanel password file"), None
+    if getattr(args, "cpanel_password_env", None):
+        env_name = str(args.cpanel_password_env)
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            raise ValueError(f"cPanel password environment variable is unset or empty: {env_name}")
+        return value, None
+    if getattr(args, "cpanel_password", None):
+        logging.warning("--cpanel-password exposes the cPanel secret via shell history/process arguments; prefer --cpanel-password-file or --cpanel-password-env")
+        return str(args.cpanel_password), None
+    if getattr(args, "cpanel_token_file", None):
+        return None, _read_required_secret_file(str(args.cpanel_token_file), label="cPanel API token file")
+    if getattr(args, "cpanel_token_env", None):
+        env_name = str(args.cpanel_token_env)
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            raise ValueError(f"cPanel API token environment variable is unset or empty: {env_name}")
+        return None, value
+    if getattr(args, "cpanel_token", None):
+        logging.warning("--cpanel-token exposes the cPanel token via shell history/process arguments; prefer --cpanel-token-file or --cpanel-token-env")
+        return None, str(args.cpanel_token)
+    raise ValueError("cPanel provisioning requires one of: --cpanel-token-file, --cpanel-token-env, --cpanel-token, --cpanel-password-file, --cpanel-password-env, --cpanel-password")
+
+
 def _write_secure_json_file(path: Path, payload: Dict) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -75,6 +130,42 @@ def _write_secure_json_file(path: Path, payload: Dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _message_id_header(data: bytes) -> str:
+    try:
+        msg = BytesParser(policy=default_policy).parsebytes(data)
+        return str(msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _legacy_remote_has_message(imap, mailbox: str, data: bytes) -> bool:
+    from .imap_ops import quote_mailbox_name
+
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    message_id = _message_id_header(data)
+    expected_hash = hashlib.sha256(data).hexdigest()
+    expected_size = len(data)
+    if message_id:
+        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+    else:
+        status, search_data = imap.search(None, "ALL")
+    if status != "OK" or not search_data or not search_data[0]:
+        return False
+    for num in search_data[0].split():
+        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            continue
+        for part in fetched or []:
+            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            body = bytes(part[1])
+            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                return True
+    return False
 
 
 def setup_logging(log_directory: Path) -> Path:
@@ -97,7 +188,9 @@ def setup_logging(log_directory: Path) -> Path:
         datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.fchmod(log_fd, 0o600)
+    fh = logging.StreamHandler(os.fdopen(log_fd, "a", encoding="utf-8"))
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
@@ -172,6 +265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
     parser.add_argument("--reset", action="store_true", help="Import mode only: delete and recreate each mailbox on the panel before importing")
+    parser.add_argument("--reset-confirm", required=False, help="Required for non-dry-run --reset; must match the target IMAP host or be YES")
     parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
     parser.add_argument("--da-username", required=False, help="DirectAdmin API username")
     parser.add_argument("--da-password", required=False, help="DirectAdmin API password or login key; insecure because process args can expose it")
@@ -180,6 +274,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--da-no-verify-ssl", action="store_true", help="Disable TLS certificate verification for DirectAdmin API")
     parser.add_argument("--da-dry-run", action="store_true", help="Show what would be created without making changes")
     parser.add_argument("--da-quota-mb", type=int, default=0, help="New mailbox quota in MiB (0 = unlimited)")
+
+    parser.add_argument("--auto-provision-cpanel", action="store_true", help="In import mode, auto-create/reset missing target mailboxes via cPanel UAPI")
+    parser.add_argument("--cpanel-url", required=False, help="cPanel base URL, e.g. https://panel.example.com:2083")
+    parser.add_argument("--cpanel-username", required=False, help="cPanel account username for UAPI")
+    parser.add_argument("--cpanel-password", required=False, help="cPanel password; insecure because process args can expose it")
+    parser.add_argument("--cpanel-password-file", required=False, help="Path to a file containing the cPanel password")
+    parser.add_argument("--cpanel-password-env", required=False, help="Environment variable containing the cPanel password")
+    parser.add_argument("--cpanel-token", required=False, help="cPanel API token; insecure because process args can expose it")
+    parser.add_argument("--cpanel-token-file", required=False, help="Path to a file containing the cPanel API token")
+    parser.add_argument("--cpanel-token-env", required=False, help="Environment variable containing the cPanel API token")
+    parser.add_argument("--cpanel-no-verify-ssl", action="store_true", help="Disable TLS certificate verification for cPanel UAPI")
+    parser.add_argument("--cpanel-dry-run", action="store_true", help="Show cPanel provisioning/reset operations without making changes")
+    parser.add_argument("--cpanel-quota-mb", type=int, default=0, help="New cPanel mailbox quota in MiB (0 = unlimited)")
 
     args = parser.parse_args(argv)
 
@@ -232,6 +339,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Invalid config: %s", exc)
         return 2
     is_provider_config = isinstance(config, ProviderMigrationConfig)
+    if (
+        args.mode == "import"
+        and bool(getattr(args, "reset", False))
+        and not (bool(getattr(args, "auto_provision_da", False)) and bool(getattr(args, "da_dry_run", False)))
+        and not (bool(getattr(args, "auto_provision_cpanel", False)) and bool(getattr(args, "cpanel_dry_run", False)))
+    ):
+        target_host = config.target.host if isinstance(config, ProviderMigrationConfig) else config.server.host
+        reset_confirm = str(getattr(args, "reset_confirm", "") or "")
+        if reset_confirm not in {target_host, "YES"}:
+            logging.error("--reset-confirm must match target IMAP host %r or be YES for non-dry-run --reset", target_host)
+            return 2
 
     try:
         if (
@@ -247,10 +365,58 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     da_client: Optional[DirectAdminClient] = None
     da_password: Optional[str] = None
-    if is_provider_config and (bool(getattr(args, "auto_provision_da", False)) or bool(getattr(args, "reset", False))):
-        logging.error("DirectAdmin auto-provisioning is not supported for provider source/target configs")
+    cpanel_client: Optional[CPanelClient] = None
+    panel_reset_failed_accounts: set[str] = set()
+    use_da_panel = bool(getattr(args, "auto_provision_da", False))
+    use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
+    if use_da_panel and use_cpanel:
+        logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
         return 2
-    if (not is_provider_config) and args.mode == "import" and (bool(getattr(args, "auto_provision_da", False)) or bool(getattr(args, "reset", False))):
+    if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
+        logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
+        return 2
+    if is_provider_config and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False))):
+        logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
+        return 2
+    if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
+        panel_dry_run_requested = (
+            (use_da_panel and bool(getattr(args, "da_dry_run", False)))
+            or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+        )
+        if not panel_dry_run_requested:
+            staged_root = Path(args.input_dir)
+            if not staged_root.exists():
+                logging.error("Input directory does not exist: %s", staged_root)
+                return 2
+            assert isinstance(config, Config)
+            missing_account_dirs = [
+                acc.email
+                for acc in config.accounts
+                if not (staged_root / sanitize_for_path(acc.email)).exists()
+            ]
+            if missing_account_dirs:
+                logging.error(
+                    "Input directory is missing staged data for %d account(s): %s",
+                    len(missing_account_dirs),
+                    ", ".join(missing_account_dirs),
+                )
+                return 2
+            if bool(getattr(args, "reset", False)):
+                try:
+                    logging.info("[panel] Running local staged export audit before destructive reset...")
+                    ok, reset_audit_issues = audit_export(staged_root, config, int(args.max_workers), check_remote=False)
+                except Exception as exc:
+                    logging.error("[panel] Staged export audit failed before reset: %s", exc)
+                    return 4
+                if not ok:
+                    logging.error(
+                        "[panel] Refusing destructive reset because staged export audit found %d issue(s)",
+                        len(reset_audit_issues),
+                    )
+                    for issue in reset_audit_issues:
+                        logging.error("[panel-reset-audit] %s", issue)
+                    return 4
+    if (not is_provider_config) and args.mode == "import" and use_da_panel:
         missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
         if missing:
             logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
@@ -267,7 +433,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if bool(getattr(args, "reset", False)):
                 from .da_ensure import reset_accounts_directadmin
                 logging.info("[da] Reset requested: deleting and recreating mailboxes before import...")
-                reset_accounts_directadmin(
+                panel_reset_failed_accounts = reset_accounts_directadmin(
                     config,
                     da_client,
                     dry_run=bool(args.da_dry_run),
@@ -285,8 +451,56 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.info("[da] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[da] Auto-provisioning failed: %s", exc)
+            if bool(getattr(args, "reset", False)):
+                panel_reset_failed_accounts = {acc.email for acc in config.accounts}
             if not args.ignore_errors:
                 return 3
+    if (not is_provider_config) and args.mode == "import" and use_cpanel:
+        missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
+        if missing:
+            logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
+            return 2
+        try:
+            cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+            logging.info("[cpanel] Auto-provisioning missing mailboxes before import...")
+            cpanel_client = CPanelClient(
+                base_url=str(args.cpanel_url),
+                username=str(args.cpanel_username),
+                password=cpanel_password,
+                token=cpanel_token,
+                verify_ssl=not bool(args.cpanel_no_verify_ssl),
+            )
+            if bool(getattr(args, "reset", False)):
+                from .cpanel_ensure import reset_accounts_cpanel
+                logging.info("[cpanel] Reset requested: deleting and recreating mailboxes before import...")
+                panel_reset_failed_accounts = reset_accounts_cpanel(
+                    config,
+                    cpanel_client,
+                    dry_run=bool(args.cpanel_dry_run),
+                    ignore_errors=bool(args.ignore_errors),
+                    quota_mb=int(args.cpanel_quota_mb),
+                )
+            else:
+                ensure_accounts_exist_cpanel(
+                    config,
+                    cpanel_client,
+                    dry_run=bool(args.cpanel_dry_run),
+                    ignore_errors=bool(args.ignore_errors),
+                    quota_mb=int(args.cpanel_quota_mb),
+                )
+            logging.info("[cpanel] Auto-provisioning step completed")
+        except Exception as exc:
+            logging.error("[cpanel] Auto-provisioning failed: %s", exc)
+            if bool(getattr(args, "reset", False)):
+                panel_reset_failed_accounts = {acc.email for acc in config.accounts}
+            if not args.ignore_errors:
+                return 3
+    if args.mode == "import" and (
+        (use_da_panel and bool(getattr(args, "da_dry_run", False)))
+        or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+    ):
+        logging.info("[panel][dry-run] Skipping connectivity tests and IMAP import because panel dry-run was requested")
+        return 0
 
     if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
         try:
@@ -429,7 +643,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             def do_export(acc: Account) -> None:
                 if stop_event.is_set():
-                    return
+                    raise RuntimeError(f"legacy export {acc.email}: stop requested before completion")
                 export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
             parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
@@ -456,15 +670,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
             check_free_space_for_path(in_root, min_free_gb)
+            panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+            if bool(getattr(args, "reset", False)) and not panel_dry_run:
+                for acc in config.accounts:
+                    if acc.email in panel_reset_failed_accounts:
+                        continue
+                    archive_path = archive_legacy_import_journal_for_reset(in_root / sanitize_for_path(acc.email))
+                    if archive_path is not None:
+                        logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
 
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
+                    raise RuntimeError(f"legacy import {acc.email}: stop requested before completion")
+                if acc.email in panel_reset_failed_accounts:
+                    logging.error("[panel] Skipping import for %s because control-panel reset failed", acc.email)
                     return
                 da_ctx = None
-                if bool(getattr(args, "auto_provision_da", False)) and da_client is not None and not bool(getattr(args, "da_dry_run", False)):
+                provision_ctx = None
+                if use_da_panel and da_client is not None and not bool(getattr(args, "da_dry_run", False)):
                     da_ctx = (da_client, int(args.da_quota_mb))
-                elif bool(getattr(args, "auto_provision_da", False)) and bool(getattr(args, "da_dry_run", False)):
+                    provision_ctx = (da_client, int(args.da_quota_mb), "da")
+                elif use_da_panel and bool(getattr(args, "da_dry_run", False)):
                     logging.info("[da][dry-run] Lazy create-and-retry disabled for %s", acc.email)
+                if use_cpanel and cpanel_client is not None and not bool(getattr(args, "cpanel_dry_run", False)):
+                    provision_ctx = (cpanel_client, int(args.cpanel_quota_mb), "cpanel")
+                elif use_cpanel and bool(getattr(args, "cpanel_dry_run", False)):
+                    logging.info("[cpanel][dry-run] Lazy create-and-retry disabled for %s", acc.email)
                 import_account(
                     acc,
                     config.server,
@@ -472,9 +703,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ignore_errors=bool(args.ignore_errors),
                     stop_event=stop_event,
                     da_context=da_ctx,
+                    provision_context=provision_ctx,
                 )
 
             parallel_process_accounts("import", do_import, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            if panel_reset_failed_accounts:
+                logging.error(
+                    "[panel] Import skipped %d account(s) because control-panel reset failed: %s",
+                    len(panel_reset_failed_accounts),
+                    ", ".join(sorted(panel_reset_failed_accounts)),
+                )
+                return 3
             logging.info("Import finished into server %s", config.server.host)
         elif args.mode == "test":
             logging.info("Test completed successfully.")
@@ -491,14 +730,56 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_validate(acc: Account) -> None:
                 email = acc.email
                 try:
-                    from .imap_ops import imap_connection, list_all_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, imap_connection, list_all_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
+                    local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
+                    if account_dir.exists():
+                        current_target = _legacy_import_target_id(config.server, acc)
+                        pending_rows = [
+                            row
+                            for row in _load_legacy_import_journal(account_dir)
+                            if row.get("status") == "pending" and row.get("target") == current_target
+                        ]
+                        if pending_rows:
+                            with mismatches_lock:
+                                validation_errors.append((email, f"import journal has {len(pending_rows)} pending append(s); target state is uncertain"))
+
+                    def marker_mailbox(folder_dir: Path) -> str:
+                        marker_path = folder_dir / ".mailbox.json"
+                        if not marker_path.exists():
+                            return folder_dir.name
+                        try:
+                            raw = json.loads(marker_path.read_text(encoding="utf-8"))
+                        except Exception as exc:
+                            raise RuntimeError(f"{marker_path}: failed to parse mailbox marker: {exc}") from exc
+                        mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
+                        return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
+
                     if account_dir.exists():
                         for folder_dir in [p for p in account_dir.iterdir() if p.is_dir()]:
-                            count = len(list(folder_dir.glob("*.eml")))
-                            local_counts[folder_dir.name] = count
+                            default_mailbox = marker_mailbox(folder_dir)
+                            eml_paths = sorted(folder_dir.glob("*.eml"))
+                            if not eml_paths:
+                                local_counts.setdefault(sanitize_for_path(default_mailbox), 0)
+                                local_messages.setdefault(default_mailbox, [])
+                                continue
+                            for eml_path in eml_paths:
+                                mailbox = default_mailbox
+                                metadata_path = eml_path.with_suffix(".json")
+                                if metadata_path.exists():
+                                    try:
+                                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                                    except Exception as exc:
+                                        raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
+                                    metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
+                                    if isinstance(metadata_mailbox, str) and metadata_mailbox:
+                                        mailbox = metadata_mailbox
+                                key = sanitize_for_path(mailbox)
+                                local_counts[key] = local_counts.get(key, 0) + 1
+                                local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
                     remote_counts: Dict[str, int] = {}
+                    remote_mailboxes: Dict[str, str] = {}
                     with imap_connection(config.server, acc) as imap:
                         mailboxes = list_all_mailboxes(imap)
                         for mailbox in mailboxes:
@@ -510,18 +791,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if status != "OK":
                                     raise RuntimeError(f"search failed: {mailbox}")
                                 num = len((data[0] or b"").split()) if data else 0
-                                remote_counts[sanitize_for_path(mailbox)] = num
+                                key = sanitize_for_path(mailbox)
+                                if key in remote_mailboxes and remote_mailboxes[key] != mailbox:
+                                    raise RuntimeError(f"Remote mailbox name collision after sanitizing: {remote_mailboxes[key]!r} and {mailbox!r}")
+                                remote_counts[key] = num
+                                remote_mailboxes[key] = mailbox
                             except Exception:
-                                remote_counts[sanitize_for_path(mailbox)] = -1
-                    for folder, local_count in local_counts.items():
-                        remote = remote_counts.get(folder, -1)
-                        if local_count != remote:
-                            with mismatches_lock:
-                                mismatches.append((email, folder, local_count, remote))
-                    for folder, remote_count in remote_counts.items():
-                        if folder not in local_counts and remote_count > 0:
-                            with mismatches_lock:
-                                mismatches.append((email, folder, 0, remote_count))
+                                key = sanitize_for_path(mailbox)
+                                remote_counts[key] = -1
+                                remote_mailboxes.setdefault(key, mailbox)
+                        mismatched_folders = set()
+                        for folder, local_count in local_counts.items():
+                            remote = remote_counts.get(folder, -1)
+                            if local_count != remote:
+                                mismatched_folders.add(folder)
+                                with mismatches_lock:
+                                    mismatches.append((email, folder, local_count, remote))
+                        for folder, remote_count in remote_counts.items():
+                            if folder not in local_counts and remote_count >= 0:
+                                mismatched_folders.add(folder)
+                                with mismatches_lock:
+                                    mismatches.append((email, folder, 0, remote_count))
+                        for mailbox, messages in local_messages.items():
+                            key = sanitize_for_path(mailbox)
+                            if key in mismatched_folders or remote_counts.get(key, -1) < 0:
+                                continue
+                            remote_mailbox = remote_mailboxes.get(key, mailbox)
+                            for rel_path, data in messages:
+                                try:
+                                    found = _legacy_remote_has_message(imap, remote_mailbox, data)
+                                except Exception as exc:
+                                    with mismatches_lock:
+                                        validation_errors.append((email, f"{mailbox}: identity check failed for {rel_path}: {exc}"))
+                                    continue
+                                if not found:
+                                    with mismatches_lock:
+                                        validation_errors.append((email, f"{mailbox}: remote message identity missing for {rel_path}"))
                 except Exception as exc:
                     with mismatches_lock:
                         validation_errors.append((email, str(exc)))
@@ -539,7 +844,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.warning("--resync-missing is disabled for legacy configs; blind APPEND replay can create duplicates")
                 return 4
             else:
-                logging.info("Validation successful: local export matches remote counts for all accounts.")
+                logging.info("Validation successful: local export matches remote counts and message identities for all accounts.")
         elif args.mode == "audit":
             assert isinstance(config, Config)
             in_root = Path(args.input_dir)

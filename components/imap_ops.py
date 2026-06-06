@@ -116,6 +116,40 @@ def _legacy_import_journal_path(account_dir: Path) -> Path:
     return account_dir / "import.journal.jsonl"
 
 
+def _stop_requested(stop_event: Optional[object]) -> bool:
+    return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+
+def _raise_if_stopped(stop_event: Optional[object], label: str) -> None:
+    if _stop_requested(stop_event):
+        raise RuntimeError(f"{label}: stop requested before completion")
+
+
+def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]:
+    path = _legacy_import_journal_path(account_dir)
+    if not path.exists():
+        return None
+    stamp = int(time.time())
+    for idx in range(1000):
+        suffix = f"reset-{stamp}" if idx == 0 else f"reset-{stamp}-{idx}"
+        archive_path = account_dir / f"import.journal.{suffix}.jsonl"
+        if not archive_path.exists():
+            path.replace(archive_path)
+            return archive_path
+    raise RuntimeError(f"unable to archive import journal for reset: {path}")
+
+
+def _legacy_import_target_id(server: ServerConfig, account: Account) -> str:
+    seed = {
+        "host": server.host,
+        "port": server.port,
+        "ssl": server.ssl,
+        "starttls": server.starttls,
+        "account": account.email,
+    }
+    return hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: bytes) -> str:
     rel_path = eml_path.relative_to(account_dir).as_posix()
     digest = hashlib.sha256(data).hexdigest()
@@ -214,6 +248,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     account_dir = out_root / sanitize_for_path(account.email)
     account_dir.mkdir(parents=True, exist_ok=True)
     logging.info("[export] %s: starting", account.email)
+    mailbox_errors: List[str] = []
     with imap_connection(server, account) as imap:
         mailboxes = list_all_mailboxes(imap)
 
@@ -232,28 +267,28 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             seen_paths[key] = mb
 
         for mailbox in mailboxes:
-            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                logging.info("[export] %s: stop requested, exiting", account.email)
-                return
+            _raise_if_stopped(stop_event, f"legacy export {account.email}")
             try:
                 uids = fetch_all_uids(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
+                    folder_dir = account_dir / sanitize_for_path(mailbox)
+                    folder_dir.mkdir(parents=True, exist_ok=True)
+                    with open(folder_dir / ".mailbox.json", "w", encoding="utf-8") as f:
+                        json.dump({"mailbox": mailbox, "message_count": 0}, f, ensure_ascii=False)
                     continue
 
                 folder_dir = account_dir / sanitize_for_path(mailbox)
                 folder_dir.mkdir(parents=True, exist_ok=True)
+                with open(folder_dir / ".mailbox.json", "w", encoding="utf-8") as f:
+                    json.dump({"mailbox": mailbox, "message_count": len(uids)}, f, ensure_ascii=False)
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
-                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        logging.info("[export] %s: stop requested during UID batching, exiting", account.email)
-                        return
+                    _raise_if_stopped(stop_event, f"legacy export {account.email}")
                     batch = uids[i : i + batch_size]
                     for uid in batch:
-                        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                            logging.info("[export] %s: stop requested during UID loop, exiting", account.email)
-                            return
+                        _raise_if_stopped(stop_event, f"legacy export {account.email}")
                         status, data = imap.uid("fetch", str(uid), "(BODY.PEEK[] FLAGS INTERNALDATE)")
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
@@ -278,8 +313,16 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             json.dump(meta, f, ensure_ascii=False)
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
+                if _stop_requested(stop_event):
+                    raise
+                mailbox_errors.append(f"{mailbox}: {exc}")
                 if not ignore_errors:
                     raise
+    if mailbox_errors:
+        raise RuntimeError(
+            f"legacy export {account.email} failed for {len(mailbox_errors)} mailbox(es): "
+            + "; ".join(mailbox_errors)
+        )
     logging.info("[export] %s: completed", account.email)
 
 
@@ -293,39 +336,49 @@ def import_account(
     imap_factory: Optional[Callable[[ServerConfig, Account], AbstractContextManager[imaplib.IMAP4]]] = None,
     stop_event: Optional[object] = None,
     da_context: Optional[Tuple[object, int]] = None,
+    provision_context: Optional[Tuple[object, int, str]] = None,
 ) -> None:
     """Import all messages for an account from `in_root/<email>/...`.
 
-    If `da_context=(client, quota_mb)` is provided and initial login fails,
-    a one-time lazy POP account creation is attempted before retrying login.
+    If a provisioning context is provided and initial login fails, a one-time
+    lazy POP account creation is attempted before retrying login.
     """
     account_dir = in_root / sanitize_for_path(account.email)
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
     logging.info("[import] %s: starting", account.email)
+    target_id = _legacy_import_target_id(server, account)
     journal_rows = _load_legacy_import_journal(account_dir)
     committed_keys = {
         row.get("key", "")
         for row in journal_rows
-        if row.get("status") == "committed" and row.get("key")
+        if row.get("status") == "committed" and row.get("key") and row.get("target") == target_id
     }
     pending_keys = {
         row.get("key", "")
         for row in journal_rows
-        if row.get("status") == "pending" and row.get("key")
+        if row.get("status") == "pending" and row.get("key") and row.get("target") == target_id
     }
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
     for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
-        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-            logging.info("[import] %s: stop requested while scanning folders, exiting", account.email)
-            return
+        _raise_if_stopped(stop_event, f"legacy import {account.email}")
+        mailbox_meta = folder_dir.name
+        marker = folder_dir / ".mailbox.json"
+        if marker.exists():
+            with contextlib.suppress(Exception):
+                marker_meta = json.loads(marker.read_text(encoding="utf-8"))
+                marker_mailbox = marker_meta.get("mailbox")
+                if isinstance(marker_mailbox, str) and marker_mailbox.strip():
+                    mailbox_meta = marker_mailbox
+            per_folder.setdefault(mailbox_meta, [])
+        default_mailbox = mailbox_meta
         for eml_path in sorted(folder_dir.glob("*.eml")):
             meta_path = eml_path.with_suffix(".json")
             flags = ""
             internaldate = None
-            mailbox_meta = folder_dir.name
+            mailbox_meta = default_mailbox
             if meta_path.exists():
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
@@ -348,20 +401,22 @@ def import_account(
             pass
 
     login_ok = False
+    if provision_context is None and da_context is not None:
+        provision_context = (da_context[0], da_context[1], "da")
     try:
         _try_login_only()
         login_ok = True
     except Exception as first_exc:
-        if da_context is not None:
-            client, quota_mb = da_context
+        if provision_context is not None:
+            client, quota_mb, provision_label = provision_context
             try:
                 if "@" in account.email:
                     local, domain = account.email.split("@", 1)
                 else:
-                    raise ValueError("invalid email address for DA provisioning")
+                    raise ValueError("invalid email address for provisioning")
                 # Create mailbox then retry login
                 client.create_pop_account(domain, local, account.password, quota_mb=quota_mb)  # type: ignore[attr-defined]
-                logging.info("[da][lazy] Created mailbox: %s, retrying login", account.email)
+                logging.info("[%s][lazy] Created mailbox: %s, retrying login", provision_label, account.email)
                 _try_login_only()
                 login_ok = True
             except Exception as retry_exc:
@@ -374,11 +429,10 @@ def import_account(
         raise RuntimeError("login failed and no retry attempted")
 
     # Proceed with actual import work under a fresh connection
+    folder_errors: List[str] = []
     with _imap_ctx() as imap:
         for folder, entries in per_folder.items():
-            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                logging.info("[import] %s: stop requested before processing folder %s, exiting", account.email, folder)
-                return
+            _raise_if_stopped(stop_event, f"legacy import {account.email}")
             mailbox = folder
             try:
                 status, _ = imap.select(quote_mailbox_name(mailbox))
@@ -393,9 +447,7 @@ def import_account(
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
                 for eml_path, flags, internaldate in entries:
-                    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                        logging.info("[import] %s: stop requested during message loop, exiting", account.email)
-                        return
+                    _raise_if_stopped(stop_event, f"legacy import {account.email}")
                     with open(eml_path, "rb") as f:
                         data = f.read()
                     flags_str = ""
@@ -427,6 +479,7 @@ def import_account(
                     _append_legacy_import_journal(account_dir, {
                         "key": import_key,
                         "status": "pending",
+                        "target": target_id,
                         "mailbox": mailbox,
                         "path": rel_path,
                         "timestamp": str(int(time.time())),
@@ -437,6 +490,7 @@ def import_account(
                     _append_legacy_import_journal(account_dir, {
                         "key": import_key,
                         "status": "committed",
+                        "target": target_id,
                         "mailbox": mailbox,
                         "path": rel_path,
                         "timestamp": str(int(time.time())),
@@ -445,6 +499,14 @@ def import_account(
                     committed_keys.add(import_key)
             except Exception as exc:
                 logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
+                if _stop_requested(stop_event):
+                    raise
+                folder_errors.append(f"{mailbox}: {exc}")
                 if not ignore_errors:
                     raise
+    if folder_errors:
+        raise RuntimeError(
+            f"legacy import {account.email} failed for {len(folder_errors)} mailbox(es): "
+            + "; ".join(folder_errors)
+        )
     logging.info("[import] %s: completed", account.email)

@@ -20,6 +20,9 @@ from components.models import (
 from components.provider_ops import (
     MailboxInfo,
     build_xoauth2_payload,
+    effective_auth,
+    fetch_all_uids_and_uidvalidity,
+    gmail_labels_for_restore,
     list_mailboxes,
     load_import_journal,
     parse_list_line,
@@ -33,6 +36,7 @@ from components.provider_ops import (
     resolve_secret,
     resolve_primary_mailbox,
     resolve_target_mailbox,
+    restore_gmail_labels,
     target_has_message,
     xoauth2_authenticator,
 )
@@ -208,6 +212,11 @@ def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
             "target": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "gmail-token"}},
             "accounts": [{"source_email": "user@example.com", "target_email": "user@gmail.com"}],
         },
+        "imap-to-icloud": {
+            "source": {"provider": "imap", "host": "mail.example.com", "ssl": False, "starttls": True, "auth": {"method": "password", "username": "imap-login", "password": "imap-secret"}},
+            "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "icloud-login", "password": "icloud-secret"}},
+            "accounts": [{"source_email": "user@example.com", "target_email": "user@icloud.com"}],
+        },
     }
     for name, payload in cases.items():
         path = tmp_path / f"{name}.json"
@@ -218,6 +227,16 @@ def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
         assert isinstance(parsed, ProviderMigrationConfig)
         assert parsed.accounts[0].source_email == payload["accounts"][0]["source_email"]
         assert parsed.accounts[0].target_email == payload["accounts"][0]["target_email"]
+        assert parsed.source.provider == payload["source"]["provider"]
+        assert parsed.target.provider == payload["target"]["provider"]
+        assert parsed.source.host == payload["source"]["host"]
+        assert parsed.target.host == payload["target"]["host"]
+        assert parsed.source.ssl == payload["source"].get("ssl", True)
+        assert parsed.source.starttls == payload["source"].get("starttls", False)
+        assert parsed.target.ssl == payload["target"].get("ssl", True)
+        assert parsed.target.starttls == payload["target"].get("starttls", False)
+        assert parsed.source.auth.method == payload["source"]["auth"]["method"]
+        assert parsed.target.auth.method == payload["target"]["auth"]["method"]
 
     bad_imap_tls = tmp_path / "bad-imap-tls.json"
     bad_imap_tls.write_text(json.dumps({
@@ -227,6 +246,105 @@ def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
     }))
     with pytest.raises(ValueError, match="target.ssl.*target.starttls"):
         load_config_file(bad_imap_tls)
+
+
+def test_provider_config_accepts_full_gmail_icloud_imap_matrix(tmp_path: Path) -> None:
+    endpoint_templates = {
+        "gmail": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "gmail-token"}},
+        "icloud": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "password": "icloud-secret"}},
+        "imap": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "imap-secret"}},
+    }
+    for source_name, source in endpoint_templates.items():
+        for target_name, target in endpoint_templates.items():
+            payload = {
+                "source": source,
+                "target": target,
+                "accounts": [{
+                    "source_email": f"user@{source_name}.example.com",
+                    "target_email": f"user@{target_name}.example.com",
+                }],
+            }
+            path = tmp_path / f"{source_name}-to-{target_name}.json"
+            path.write_text(json.dumps(payload))
+
+            parsed = load_config_file(path)
+
+            assert isinstance(parsed, ProviderMigrationConfig)
+            assert parsed.source.provider == source_name
+            assert parsed.target.provider == target_name
+
+
+def test_provider_config_treats_roundcube_as_generic_imap(tmp_path: Path) -> None:
+    path = tmp_path / "roundcube-to-icloud.json"
+    path.write_text(json.dumps({
+        "source": {
+            "provider": "imap",
+            "host": "mail.roundcube-backed.example.com",
+            "auth": {"method": "password", "username": "user@example.com", "password": "imap-secret"},
+        },
+        "target": {
+            "provider": "icloud",
+            "host": "imap.mail.me.com",
+            "auth": {"method": "app_password", "username": "icloud-user", "password": "icloud-secret"},
+        },
+        "accounts": [{"source_email": "user@example.com", "target_email": "user@icloud.com"}],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.source.provider == "imap"
+    assert parsed.target.provider == "icloud"
+
+
+def test_multi_account_provider_auth_requires_per_account_usernames(tmp_path: Path) -> None:
+    path = tmp_path / "shared-username.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "username": "shared-login"}},
+        "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password"}},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "a@target.example.com",
+                "source_auth": {"method": "password", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "a", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "b@target.example.com",
+                "source_auth": {"method": "password", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "b", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="source_auth.username"):
+        load_config_file(path)
+
+
+def test_provider_config_rejects_sanitized_account_path_collisions(tmp_path: Path) -> None:
+    path = tmp_path / "provider-collision.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password"}},
+        "accounts": [
+            {
+                "source_email": "a/b@example.com",
+                "target_email": "a@target.example.com",
+                "source_auth": {"method": "password", "username": "a/b@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "a", "password": "target-a"},
+            },
+            {
+                "source_email": "a_b@example.com",
+                "target_email": "b@target.example.com",
+                "source_auth": {"method": "password", "username": "a_b@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "b", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="path collision"):
+        load_config_file(path)
 
 
 def test_xoauth2_payload_generation() -> None:
@@ -245,6 +363,38 @@ def test_provider_secret_files_must_not_be_empty(tmp_path: Path) -> None:
         resolve_secret(AuthConfig(method="xoauth2", token_file=str(secret)))
 
 
+def test_account_auth_override_preserves_endpoint_username() -> None:
+    endpoint = ProviderEndpoint(
+        provider="imap",
+        host="mail.example.com",
+        auth=AuthConfig(method="password", username="login-name", password="endpoint-secret"),
+    )
+    account = MigrationAccount(
+        source_email="source@example.com",
+        target_email="target@example.com",
+        source_auth=AuthConfig(method="password", password="account-secret"),
+    )
+
+    username, auth = effective_auth(endpoint, account, role="source")
+
+    assert username == "login-name"
+    assert auth.password == "account-secret"
+
+
+def test_icloud_effective_auth_defaults_to_local_part_username() -> None:
+    endpoint = ProviderEndpoint(
+        provider="icloud",
+        host="imap.mail.me.com",
+        auth=AuthConfig(method="app_password", password="icloud-secret"),
+    )
+    account = MigrationAccount(source_email="person@icloud.com", target_email="target@example.com")
+
+    username, auth = effective_auth(endpoint, account, role="source")
+
+    assert username == "person"
+    assert auth.password == "icloud-secret"
+
+
 def test_list_and_gmail_fetch_parsers() -> None:
     mailbox = parse_list_line(b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"')
     assert mailbox is not None
@@ -256,6 +406,10 @@ def test_list_and_gmail_fetch_parsers() -> None:
     assert utf7_mailbox.delimiter == ""
     assert utf7_mailbox.name == "Föld & Team"
     assert quote_mailbox_name("Föld & Team") == f'"{encode_imap_utf7("Föld & Team")}"'
+
+    utf8_mailbox = parse_list_line(b'(\\HasNoChildren) "/" "F\xc3\xb6lder"')
+    assert utf8_mailbox is not None
+    assert utf8_mailbox.name == "Földer"
 
     parsed = parse_provider_fetch_response([
         (
@@ -310,8 +464,13 @@ def test_primary_folder_resolution_is_deterministic() -> None:
     assert resolve_primary_mailbox(["[Gmail]/Sent Mail", "[Gmail]/All Mail"], [], {}) == "Sent"
     assert resolve_primary_mailbox(["[Gmail]/Trash"], [], {}) == "Deleted Messages"
     assert resolve_primary_mailbox(["[Gmail]/Spam"], [], {}) == "Junk"
+    assert resolve_primary_mailbox(["[Gmail]/Important", "[Gmail]/All Mail"], [], {}) == "Important"
+    assert resolve_primary_mailbox(["[Gmail]/All Mail"], ["Important"], {}) == "Important"
     assert resolve_primary_mailbox(["[Gmail]/All Mail"], [], {}) == "Archive"
+    assert resolve_primary_mailbox(["All Mail"], [], {}) == "Archive"
+    assert resolve_primary_mailbox(["All Mail", "\\All"], [], {}) == "Archive"
     assert resolve_primary_mailbox(["Project A", "[Gmail]/All Mail"], [], {}) == "Project A"
+    assert resolve_primary_mailbox(["All Mail", "Project A"], [], {}) == "Project A"
     assert resolve_primary_mailbox(["Project A"], [], {}) == "Project A"
     assert resolve_primary_mailbox(["[GoogleMail]/All Mail"], [], {}) == "Archive"
     assert resolve_primary_mailbox(["[GoogleMail]/Sent Mail", "[GoogleMail]/All Mail"], [], {}) == "Sent"
@@ -322,11 +481,13 @@ def test_primary_folder_resolution_is_deterministic() -> None:
         "[Gmail]/Drafts": "Drafts",
         "[Gmail]/Trash": "Deleted Messages",
         "[Gmail]/Spam": "Junk",
+        "[Gmail]/Important": "Important",
     }
     assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Sent Mail"], [], folder_map) == "Sent"
     assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Drafts"], [], folder_map) == "Drafts"
     assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Trash"], [], folder_map) == "Deleted Messages"
     assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Spam"], [], folder_map) == "Junk"
+    assert resolve_primary_mailbox(["[Gmail]/All Mail", "[Gmail]/Important"], [], folder_map) == "Important"
 
 
 def test_gmail_target_folder_resolution_uses_special_use_and_gmail_names() -> None:
@@ -336,13 +497,63 @@ def test_gmail_target_folder_resolution_uses_special_use_and_gmail_names() -> No
         MailboxInfo(name="[Gmail]/Sent Mail", delimiter="/", attributes=("\\HasNoChildren", "\\Sent")),
         MailboxInfo(name="[Gmail]/Trash", delimiter="/", attributes=("\\HasNoChildren", "\\Trash")),
         MailboxInfo(name="[Gmail]/Spam", delimiter="/", attributes=("\\HasNoChildren", "\\Junk")),
+        MailboxInfo(name="[Gmail]/Important", delimiter="/", attributes=("\\HasNoChildren", "\\Important")),
     ]
 
-    assert resolve_target_mailbox("INBOX", gmail_mailboxes) == "INBOX"
-    assert resolve_target_mailbox("Archive", gmail_mailboxes) == "[Gmail]/All Mail"
-    assert resolve_target_mailbox("Sent", gmail_mailboxes) == "[Gmail]/Sent Mail"
-    assert resolve_target_mailbox("Deleted Messages", gmail_mailboxes) == "[Gmail]/Trash"
-    assert resolve_target_mailbox("Junk", gmail_mailboxes) == "[Gmail]/Spam"
+    assert resolve_target_mailbox("INBOX", gmail_mailboxes, target_provider="gmail") == "INBOX"
+    assert resolve_target_mailbox("Archive", gmail_mailboxes, target_provider="gmail") == "[Gmail]/All Mail"
+    assert resolve_target_mailbox("Sent", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Sent Mail"
+    assert resolve_target_mailbox("Deleted Messages", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Trash"
+    assert resolve_target_mailbox("Junk", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Spam"
+    assert resolve_target_mailbox("Important", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Important"
+
+
+def test_target_folder_resolution_is_target_provider_aware() -> None:
+    mailboxes = [
+        MailboxInfo(name="Archive", delimiter="/", attributes=("\\HasNoChildren", "\\Archive")),
+        MailboxInfo(name="All Mail", delimiter="/", attributes=("\\HasNoChildren", "\\All")),
+    ]
+    gmail_mailboxes = [
+        MailboxInfo(name="Archive", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="[Gmail]/All Mail", delimiter="/", attributes=("\\HasNoChildren", "\\All")),
+    ]
+
+    assert resolve_target_mailbox("Archive", mailboxes, target_provider="imap") == "Archive"
+    assert resolve_target_mailbox("Archive", mailboxes, target_provider="icloud") == "Archive"
+    assert resolve_target_mailbox("Archive", gmail_mailboxes, target_provider="gmail") == "[Gmail]/All Mail"
+
+
+def test_icloud_target_default_folder_resolution() -> None:
+    icloud_mailboxes = [
+        MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="Archive", delimiter="/", attributes=("\\HasNoChildren", "\\Archive")),
+        MailboxInfo(name="Sent", delimiter="/", attributes=("\\HasNoChildren", "\\Sent")),
+        MailboxInfo(name="Drafts", delimiter="/", attributes=("\\HasNoChildren", "\\Drafts")),
+        MailboxInfo(name="Trash", delimiter="/", attributes=("\\HasNoChildren", "\\Trash")),
+        MailboxInfo(name="Junk", delimiter="/", attributes=("\\HasNoChildren", "\\Junk")),
+        MailboxInfo(name="VIP", delimiter="/", attributes=("\\HasNoChildren",)),
+    ]
+
+    assert resolve_target_mailbox("Archive", icloud_mailboxes, target_provider="icloud") == "Archive"
+    assert resolve_target_mailbox("Sent", icloud_mailboxes, target_provider="icloud") == "Sent"
+    assert resolve_target_mailbox("Drafts", icloud_mailboxes, target_provider="icloud") == "Drafts"
+    assert resolve_target_mailbox("Deleted Messages", icloud_mailboxes, target_provider="icloud") == "Trash"
+    assert resolve_target_mailbox("Junk", icloud_mailboxes, target_provider="icloud") == "Junk"
+
+
+def test_gmail_target_system_folder_resolution_ignores_shadowing_user_labels() -> None:
+    mailboxes = [
+        MailboxInfo(name="Sent", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="Trash", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="Junk", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="[Gmail]/Sent Mail", delimiter="/", attributes=("\\HasNoChildren", "\\Sent")),
+        MailboxInfo(name="[Gmail]/Trash", delimiter="/", attributes=("\\HasNoChildren", "\\Trash")),
+        MailboxInfo(name="[Gmail]/Spam", delimiter="/", attributes=("\\HasNoChildren", "\\Junk")),
+    ]
+
+    assert resolve_target_mailbox("Sent", mailboxes, target_provider="gmail") == "[Gmail]/Sent Mail"
+    assert resolve_target_mailbox("Trash", mailboxes, target_provider="gmail") == "[Gmail]/Trash"
+    assert resolve_target_mailbox("Junk", mailboxes, target_provider="gmail") == "[Gmail]/Spam"
 
 
 class FakeSourceImap:
@@ -389,6 +600,16 @@ class FakeSourceImap:
         return "OK", []
 
 
+class FakeGmailSourceNoExtensions(FakeSourceImap):
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+
+class FakeGmailSourceNoAllMail(FakeSourceImap):
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+
 class FakeIcloudInboxSourceImap:
     def capability(self):
         return "OK", [b"IMAP4rev1"]
@@ -411,6 +632,49 @@ class FakeIcloudInboxSourceImap:
             if "BODY.PEEK[]" not in query:
                 return "OK", [meta]
             return "OK", [(meta + b" BODY[] {40}", b"Message-ID: <icloud@example.com>\r\n\r\nbody")]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
+class FakeIcloudVipOnlySourceImap(FakeIcloudInboxSourceImap):
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "VIP"']
+
+    def uid(self, command: str, *args):
+        raise AssertionError("VIP should be skipped before UID commands")
+
+
+class FakeNonGmailDuplicateSourceImap:
+    def __init__(self) -> None:
+        self.selected = ""
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren) "/" "Projects"',
+        ]
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r"\"", '"')
+        return "OK", [b"1"]
+
+    def response(self, name: str):
+        return "OK", [b"111" if self.selected == "INBOX" else b"222"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = args[-1]
+            meta = b'1 (UID 1 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + b" BODY[] {42}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
         raise AssertionError(command)
 
     def logout(self):
@@ -447,6 +711,29 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert fake.body_fetches == 1
 
 
+@pytest.mark.parametrize(
+    ("fake_cls", "needle"),
+    [
+        (FakeGmailSourceNoExtensions, "X-GM-EXT-1"),
+        (FakeGmailSourceNoAllMail, "All Mail"),
+    ],
+)
+def test_provider_export_rejects_gmail_without_required_imap_readiness(tmp_path: Path, fake_cls, needle: str) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    fake = fake_cls()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs):
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        with pytest.raises(RuntimeError, match=needle):
+            provider_export_account(config, account, tmp_path)
+
+    assert fake.body_fetches == 0
+
+
 def test_provider_export_icloud_inbox_to_generic_imap_layout(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -480,6 +767,87 @@ def test_provider_export_icloud_inbox_to_generic_imap_layout(tmp_path: Path) -> 
     assert manifest[0]["gmail_msgid"] == ""
 
 
+def test_provider_export_skips_icloud_vip_virtual_mailbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="source", password="icloud-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@icloud.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeIcloudVipOnlySourceImap]:
+        yield FakeIcloudVipOnlySourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    manifest_path = tmp_path / "source@icloud.com" / "manifest.jsonl"
+    assert manifest_path.exists()
+    assert manifest_path.read_text() == ""
+
+
+def test_provider_export_preserves_non_gmail_physical_copies(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeNonGmailDuplicateSourceImap]:
+        yield FakeNonGmailDuplicateSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 2
+    assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Projects"}
+    assert all(row["canonical_id"].startswith("physical-") for row in manifest)
+
+
+def test_provider_uid_search_uses_rfc_valid_signature() -> None:
+    class StrictSearchImap(FakeSourceImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.search_args: Optional[tuple] = None
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                self.search_args = args
+                return "OK", [b"1"]
+            return super().uid(command, *args)
+
+    fake = StrictSearchImap()
+
+    uids, uidvalidity = fetch_all_uids_and_uidvalidity(fake, "INBOX")
+
+    assert uids == [1]
+    assert uidvalidity == "777"
+    assert fake.search_args == ("ALL",)
+
+
 class FakeSourceNoBodyImap(FakeSourceImap):
     def uid(self, command: str, *args):
         if command == "search":
@@ -499,7 +867,10 @@ class FakeSourceUidValidityChangedImap(FakeSourceImap):
         self.response_calls = 0
 
     def list(self):
-        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+        ]
 
     def response(self, name: str):
         self.response_calls += 1
@@ -513,7 +884,10 @@ class FakeSourceUidSetChangedImap(FakeSourceImap):
         self.search_calls = 0
 
     def list(self):
-        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+        ]
 
     def uid(self, command: str, *args):
         if command == "search":
@@ -548,6 +922,43 @@ def test_provider_export_fails_when_uidvalidity_changes(tmp_path: Path) -> None:
             provider_export_account(config, account, tmp_path)
 
 
+def test_provider_export_resume_fails_when_uidvalidity_changed_since_previous_run(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="source", password="icloud-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="imap-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@icloud.com", target_email="target@example.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    class ChangedUidValiditySource(FakeIcloudInboxSourceImap):
+        def response(self, name: str):
+            return "OK", [b"999"]
+
+    @contextlib.contextmanager
+    def first_connection(*_args, **_kwargs) -> Iterator[FakeIcloudInboxSourceImap]:
+        yield FakeIcloudInboxSourceImap()
+
+    @contextlib.contextmanager
+    def changed_connection(*_args, **_kwargs) -> Iterator[ChangedUidValiditySource]:
+        yield ChangedUidValiditySource()
+
+    with mock.patch("components.provider_ops.imap_connection", first_connection):
+        provider_export_account(config, account, tmp_path)
+
+    with mock.patch("components.provider_ops.imap_connection", changed_connection):
+        with pytest.raises(RuntimeError, match="UIDVALIDITY changed since previous export"):
+            provider_export_account(config, account, tmp_path)
+
+
 def test_provider_export_fails_when_uid_set_changes(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -562,14 +973,32 @@ def test_provider_export_fails_when_uid_set_changes(tmp_path: Path) -> None:
 
 
 class FakeTargetImap:
-    def __init__(self, *, has_existing: bool = False, existing_message_id: str = "<m1@example.com>") -> None:
+    def __init__(
+        self,
+        *,
+        has_existing: bool = False,
+        existing_message_id: str = "<m1@example.com>",
+        existing_mailbox: str = "Archive",
+        messages_by_mailbox: Optional[dict[str, int]] = None,
+    ) -> None:
         self.appended: List[str] = []
         self.has_existing = has_existing
         self.existing_message_id = existing_message_id
+        self.existing_mailbox = existing_mailbox
         self.messages = 0
+        self.messages_by_mailbox = dict(messages_by_mailbox or {})
+        self.selected_mailbox = ""
         self.fetch_queries: List[str] = []
         self.search_queries: List[tuple] = []
         self.select_readonly: List[bool] = []
+
+    def _normalize_mailbox(self, mailbox: str) -> str:
+        return mailbox.strip('"').replace(r"\"", '"').replace(r"\\", "\\")
+
+    def _message_count(self, mailbox: str) -> int:
+        if mailbox in self.messages_by_mailbox:
+            return self.messages_by_mailbox[mailbox]
+        return self.messages if mailbox == "Archive" else 0
 
     def list(self):
         return "OK", [
@@ -578,23 +1007,33 @@ class FakeTargetImap:
         ]
 
     def select(self, mailbox: str, readonly: bool = False):
+        self.selected_mailbox = self._normalize_mailbox(mailbox)
         self.select_readonly.append(readonly)
-        return "OK", [b"0"]
+        return "OK", [str(self._message_count(self.selected_mailbox)).encode("ascii")]
 
     def create(self, mailbox: str):
+        self.messages_by_mailbox.setdefault(self._normalize_mailbox(mailbox), 0)
         return "OK", [b""]
 
     def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
-        self.appended.append(mailbox.strip('"'))
+        target = self._normalize_mailbox(mailbox)
+        self.appended.append(target)
+        self.messages_by_mailbox[target] = self._message_count(target) + 1
         self.messages += 1
         self.has_existing = True
+        self.existing_mailbox = target
         return "OK", [b""]
 
     def search(self, charset: Optional[str], *criteria):
         self.search_queries.append(criteria)
         if criteria == ("ALL",):
-            return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, self.messages + 1))]
-        if criteria == ("HEADER", "Message-ID", self.existing_message_id) and self.has_existing:
+            count = self._message_count(self.selected_mailbox)
+            return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, count + 1))]
+        if (
+            criteria == ("HEADER", "Message-ID", self.existing_message_id)
+            and self.has_existing
+            and self.selected_mailbox == self.existing_mailbox
+        ):
             return "OK", [b"99"]
         return "OK", [b""]
 
@@ -607,12 +1046,20 @@ class FakeTargetImap:
 
 
 class FakeGmailTargetImap(FakeTargetImap):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.stored_labels: List[tuple[bytes, str, str]] = []
+
     def list(self):
         return "OK", [
             b'(\\HasNoChildren) "/" "INBOX"',
             b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
             b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
         ]
+
+    def store(self, num: bytes, command: str, labels: str):
+        self.stored_labels.append((num, command, labels))
+        return "OK", [b""]
 
 
 def _write_manifest_fixture(root: Path) -> Path:
@@ -635,6 +1082,11 @@ def _write_manifest_fixture(root: Path) -> Path:
     }
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "source_account": "source@example.com",
+        "target_account": "target@icloud.com",
+        "complete": True,
+    }))
     return account_dir
 
 
@@ -721,6 +1173,74 @@ def test_provider_import_imap_archive_to_gmail_all_mail(tmp_path: Path) -> None:
     assert fake.appended == ["[Gmail]/All Mail"]
 
 
+def test_gmail_label_restore_filters_system_labels() -> None:
+    row = {
+        "gmail_labels": ["\\Inbox", "Project A", "[Gmail]/All Mail", "Team Blue", "\\Important", "Important", "Starred", "Project A"],
+    }
+
+    assert gmail_labels_for_restore(row, "INBOX") == ["Project A", "Team Blue"]
+
+
+def test_provider_import_to_gmail_restores_custom_labels(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@gmail.com", password="gmail-token"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["gmail_labels"] = ["\\Inbox", "Project A", "Team/Blue", "[Gmail]/All Mail"]
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["INBOX"]
+    assert fake.stored_labels == [(b"99", "+X-GM-LABELS", '("Project A" "Team/Blue")')]
+    journal = load_import_journal(account_dir, account)
+    assert journal[-1]["status"] == "committed"
+
+
+def test_restore_gmail_labels_can_match_without_message_id() -> None:
+    fake = FakeGmailTargetImap(messages_by_mailbox={"INBOX": 1})
+    row = {
+        "canonical_id": "m",
+        "gmail_labels": ["Project A"],
+        "message_id_header": "",
+        "content_sha256": "995d8eb3156d06d7386db1ff7e5311221731ee1e67235155b521b4e71929c9df",
+        "rfc822_size": 36,
+    }
+
+    restore_gmail_labels(fake, "INBOX", row)
+
+    assert fake.stored_labels == [(b"1", "+X-GM-LABELS", '("Project A")')]
+
+
+def test_restore_gmail_labels_requires_target_match() -> None:
+    fake = FakeGmailTargetImap()
+
+    with pytest.raises(RuntimeError, match="cannot find target message"):
+        restore_gmail_labels(fake, "INBOX", {"canonical_id": "m", "gmail_labels": ["Project A"]})
+
+
 def test_provider_import_rejects_manifest_paths_outside_export_dir(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -753,6 +1273,16 @@ def test_provider_import_rejects_duplicate_manifest_identity(tmp_path: Path) -> 
         provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_rejects_incomplete_export_state(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "export-state.json").write_text(json.dumps({"complete": False}))
+
+    with pytest.raises(RuntimeError, match="export-state is not complete"):
+        provider_import_account(config, account, tmp_path)
+
+
 def test_provider_import_merge_mode_uses_target_probe(tmp_path: Path) -> None:
     config = _provider_config(target_mode="merge")
     account = config.accounts[0]
@@ -772,6 +1302,33 @@ def test_provider_import_merge_mode_uses_target_probe(tmp_path: Path) -> None:
     assert True in fake.select_readonly
     journal = (account_dir / "import-target@icloud.com.journal.jsonl").read_text()
     assert '"action": "existing"' in journal
+
+
+def test_provider_import_merge_mode_consumes_existing_matches_by_occurrence(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    duplicate = dict(row)
+    duplicate["canonical_id"] = "physical-duplicate"
+    duplicate["eml_path"] = "messages/physical-duplicate.eml"
+    duplicate["metadata_path"] = "metadata/physical-duplicate.json"
+    (account_dir / "messages" / "physical-duplicate.eml").write_bytes((account_dir / "messages" / "gmail-123.eml").read_bytes())
+    (account_dir / "metadata" / "physical-duplicate.json").write_text(json.dumps(duplicate))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(duplicate) + "\n")
+    fake = FakeTargetImap(has_existing=True)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    journal = (account_dir / "import-target@icloud.com.journal.jsonl").read_text()
+    assert '"action": "existing"' in journal
+    assert '"action": "appended"' in journal
 
 
 def test_target_probe_can_match_without_message_id(tmp_path: Path) -> None:
@@ -828,6 +1385,190 @@ def test_provider_import_empty_mode_resumes_with_journaled_target_messages(tmp_p
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_empty_mode_permits_journaled_gmail_all_mail_message(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Archive"
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+    }) + "\n")
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="[Gmail]/All Mail",
+        messages_by_mailbox={"[Gmail]/All Mail": 1},
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+
+
+def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_path: Path) -> None:
+    class StarredGmailTarget(FakeGmailTargetImap):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.matching_mailboxes = {"INBOX", "[Gmail]/Starred"}
+
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Flagged) "/" "[Gmail]/Starred"',
+            ]
+
+        def search(self, charset: Optional[str], *criteria):
+            self.search_queries.append(criteria)
+            if criteria == ("ALL",):
+                count = self._message_count(self.selected_mailbox)
+                return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, count + 1))]
+            if (
+                criteria == ("HEADER", "Message-ID", self.existing_message_id)
+                and self.has_existing
+                and self.selected_mailbox in self.matching_mailboxes
+            ):
+                return "OK", [b"99"]
+            return "OK", [b""]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["flags"] = "\\Seen \\Flagged"
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+    }) + "\n")
+    fake = StarredGmailTarget(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1, "[Gmail]/Starred": 1},
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StarredGmailTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+
+
+def test_provider_import_empty_mode_permits_journaled_gmail_important_view_plain_label(tmp_path: Path) -> None:
+    class ImportantGmailTarget(FakeGmailTargetImap):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.matching_mailboxes = {"INBOX", "[Gmail]/Important"}
+
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Important) "/" "[Gmail]/Important"',
+            ]
+
+        def search(self, charset: Optional[str], *criteria):
+            self.search_queries.append(criteria)
+            if criteria == ("ALL",):
+                count = self._message_count(self.selected_mailbox)
+                return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, count + 1))]
+            if (
+                criteria == ("HEADER", "Message-ID", self.existing_message_id)
+                and self.has_existing
+                and self.selected_mailbox in self.matching_mailboxes
+            ):
+                return "OK", [b"99"]
+            return "OK", [b""]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["gmail_labels"] = ["Important"]
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps({
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+    }) + "\n")
+    fake = ImportantGmailTarget(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1, "[Gmail]/Important": 1},
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[ImportantGmailTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
 
 
 def test_provider_import_empty_mode_rejects_stale_pending_unmatched_target(tmp_path: Path) -> None:
@@ -890,6 +1631,18 @@ def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
     _name, report = provider_validate_account(config, account, tmp_path)
     assert report["ok"]
     assert report["committed"] == 1
+
+
+def test_provider_validation_rejects_incomplete_export_state(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "export-state.json").write_text(json.dumps({"complete": False}))
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert not report["ok"]
+    assert any("export-state is not complete" in item for item in report["failed"])
 
 
 def test_provider_validation_rejects_duplicate_manifest_identity(tmp_path: Path) -> None:
@@ -956,6 +1709,23 @@ def test_provider_validation_rejects_journal_missing_target_mailbox(tmp_path: Pa
     assert any("missing target_mailbox" in item for item in report["failed"])
 
 
+def test_provider_validation_rejects_unresolved_pending_journal_row(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps({
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }) + "\n")
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert not report["ok"]
+    assert any("pending identity has no committed resolution" in item for item in report["failed"])
+
+
 def test_provider_validation_rejects_wrong_target_mailbox_commit(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -980,6 +1750,44 @@ def test_provider_validation_rejects_wrong_target_mailbox_commit(tmp_path: Path)
     assert any("wrong target mailbox" in item for item in report["failed"])
 
 
+def test_provider_validation_checks_target_occurrences_not_only_boolean_match(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    duplicate = dict(row)
+    duplicate["canonical_id"] = "physical-duplicate"
+    duplicate["eml_path"] = "messages/physical-duplicate.eml"
+    duplicate["metadata_path"] = "metadata/physical-duplicate.json"
+    (account_dir / "messages" / "physical-duplicate.eml").write_bytes((account_dir / "messages" / "gmail-123.eml").read_bytes())
+    (account_dir / "metadata" / "physical-duplicate.json").write_text(json.dumps(duplicate))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n" + json.dumps(duplicate) + "\n")
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps({
+            "canonical_id": "gmail-123",
+            "target_account": "target@icloud.com",
+            "target_mailbox": "Archive",
+            "status": "committed",
+        }) + "\n" + json.dumps({
+            "canonical_id": "physical-duplicate",
+            "target_account": "target@icloud.com",
+            "target_mailbox": "Archive",
+            "status": "committed",
+        }) + "\n"
+    )
+    fake = FakeTargetImap(has_existing=True)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert report["remote_missing"] == ["physical-duplicate"]
+
+
 def test_provider_import_empty_mode_rejects_populated_target(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -996,6 +1804,29 @@ def test_provider_import_empty_mode_rejects_populated_target(tmp_path: Path) -> 
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_empty_mode_rejects_populated_unrelated_target_folder(tmp_path: Path) -> None:
+    class TargetWithUnrelatedFolder(FakeTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Archive) "/" "Archive"',
+                b'(\\HasNoChildren) "/" "Old Mail"',
+            ]
+
+    config = _provider_config()
+    account = config.accounts[0]
+    _write_manifest_fixture(tmp_path)
+    fake = TargetWithUnrelatedFolder(messages_by_mailbox={"Old Mail": 1})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[TargetWithUnrelatedFolder]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="Old Mail"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_audit_detects_corrupted_message(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -1004,6 +1835,21 @@ def test_provider_audit_detects_corrupted_message(tmp_path: Path) -> None:
 
     _name, issues = provider_audit_account(config, account, tmp_path)
     assert any("content_sha256 mismatch" in issue for issue in issues)
+
+
+def test_provider_audit_rejects_incomplete_export_state(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "source_account": account.source_email,
+        "target_account": account.target_email,
+        "complete": False,
+    }))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+
+    assert any("export-state is not complete" in issue for issue in issues)
 
 
 def test_load_import_journal_recovers_incomplete_trailing_row(tmp_path: Path) -> None:
@@ -1025,7 +1871,10 @@ class FakePreflightSourceFailure:
         return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
 
     def list(self):
-        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+        ]
 
     def select(self, mailbox: str, readonly: bool = False):
         return "OK", [b"1"]
@@ -1054,6 +1903,11 @@ class FakePreflightSourceNoExtensions(FakePreflightSourceFailure):
         if command == "search":
             return "OK", [b""]
         return super().uid(command, *args)
+
+
+class FakePreflightSourceNoAllMail(FakePreflightSourceFailure):
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
 
 
 def test_provider_preflight_reports_metadata_fetch_failures(tmp_path: Path) -> None:
@@ -1100,3 +1954,100 @@ def test_provider_preflight_reports_missing_gmail_extensions(tmp_path: Path) -> 
 
     assert not ok
     assert any("X-GM-EXT-1" in issue for issue in issues)
+
+
+def test_provider_preflight_requires_gmail_all_mail_visibility(tmp_path: Path) -> None:
+    config = _provider_config()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakePreflightSourceNoAllMail() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("All Mail is not visible" in issue for issue in issues)
+
+
+def _write_provider_config_file(tmp_path: Path) -> Path:
+    path = tmp_path / "migration.config.json"
+    path.write_text(json.dumps({
+        "source": {
+            "provider": "gmail",
+            "host": "imap.gmail.com",
+            "auth": {"method": "xoauth2", "password": "token"},
+        },
+        "target": {
+            "provider": "icloud",
+            "host": "imap.mail.me.com",
+            "auth": {"method": "app_password", "password": "secret"},
+        },
+        "accounts": [{"source_email": "source@example.com", "target_email": "target@icloud.com"}],
+    }))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_roles"),
+    [
+        ("export", ("source",)),
+        ("import", ("target",)),
+        ("validate", ("target",)),
+        ("test", ("source", "target")),
+    ],
+)
+def test_main_routes_provider_modes_with_expected_connectivity_roles(
+    tmp_path: Path,
+    mode: str,
+    expected_roles: tuple[str, ...],
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    output_dir = tmp_path / "exported"
+    input_dir = tmp_path / "exported"
+    input_dir.mkdir()
+    roles_seen: List[tuple[str, ...]] = []
+
+    def record_test_accounts(*_args, **kwargs):
+        roles_seen.append(tuple(kwargs["roles"]))
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.provider_test_accounts", record_test_accounts), \
+        mock.patch("components.main.provider_export_all"), \
+        mock.patch("components.main.provider_import_all"), \
+        mock.patch("components.main.provider_validate_all", return_value=(True, [])):
+        args = [
+            "--mode", mode,
+            "--config", str(config_path),
+            "--output-dir", str(output_dir),
+            "--input-dir", str(input_dir),
+            "--log-dir", str(tmp_path / "logs"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+            "--no-audit-after-export",
+        ]
+        assert main(args) == 0
+
+    assert roles_seen == [expected_roles]
+
+
+def test_main_routes_provider_preflight(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_preflight", return_value=(True, [])) as preflight:
+        rc = main([
+            "--mode", "preflight",
+            "--config", str(config_path),
+            "--log-dir", str(tmp_path / "logs"),
+            "--max-workers", "1",
+            "--min-free-gb", "0",
+        ])
+
+    assert rc == 0
+    preflight.assert_called_once()

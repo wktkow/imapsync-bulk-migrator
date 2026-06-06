@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from .da_client import DirectAdminClient
 from .models import Account, Config
@@ -44,11 +44,12 @@ def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClien
                     raise
 
 
-def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> Set[str]:
     """Delete then recreate each account in the config via DirectAdmin.
 
     Intended for use prior to import when a clean mailbox is desired.
     """
+    failed: Set[str] = set()
     per_domain: Dict[str, List[Account]] = {}
     for acc in config.accounts:
         if "@" not in acc.email:
@@ -71,6 +72,8 @@ def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, d
                 client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb, allow_existing=False)
                 logging.info("[da] Reset mailbox: %s", acc.email)
             except Exception as exc:
+                failed.add(acc.email)
                 logging.error("[da] Failed to reset %s: %s", acc.email, exc)
                 if not ignore_errors:
                     raise
+    return failed

@@ -75,6 +75,37 @@ class TestBug5SanitizeCollisionDetection:
 class TestBug7ImportConfigPlaceholder:
     """Generated import.pass.config.json must use placeholder server, not source."""
 
+    def test_export_mode_generates_import_config_template_with_placeholder(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "real-export-server.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        import_path = tmp_path / "import.pass.config.json"
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.export_account"):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--no-audit-after-export",
+            ])
+
+        assert rc == 0
+        result = json.loads(import_path.read_text())
+        assert result["server"]["host"] == "CHANGE_ME.example.com"
+        assert result["server"]["host"] != "real-export-server.example.com"
+        assert result["accounts"][0]["email"] == "a@example.com"
+        assert import_path.stat().st_mode & 0o777 == 0o600
+
     def test_generated_config_has_placeholder_host_and_private_permissions(self, tmp_path: Path) -> None:
         config_data = {
             "server": {"host": "real-export-server.example.com", "port": 993, "ssl": True, "starttls": False},
@@ -154,8 +185,8 @@ class TestBug1ExecutorErrorDraining:
             raise RuntimeError(f"fail-{acc.email}")
 
         with mock.patch("components.executor.logging") as mock_log:
-            # Should NOT raise when stop_on_error=False
-            parallel_process_accounts("test", always_fail, accounts, max_workers=3, stop_on_error=False)
+            with pytest.raises(RuntimeError, match=r"test failed for 3 account\(s\)"):
+                parallel_process_accounts("test", always_fail, accounts, max_workers=3, stop_on_error=False)
 
             warning_calls = [str(c) for c in mock_log.warning.call_args_list]
             warning_text = " ".join(warning_calls)
@@ -185,6 +216,42 @@ class TestBug1ExecutorErrorDraining:
 
 class TestBug12SignalThreadGuard:
     """signal.signal must not be called from a non-main thread."""
+
+    def test_main_skips_signal_registration_from_worker_thread(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        input_dir.mkdir()
+        results: "queue.Queue[int]" = queue.Queue()
+
+        def guarded_signal(*_args) -> None:
+            if threading.current_thread() is not threading.main_thread():
+                raise AssertionError("signal.signal called from worker thread")
+
+        def run_main() -> None:
+            with mock.patch("components.main.check_environment"), \
+                mock.patch("components.main.check_free_space_for_path"), \
+                mock.patch("components.main.audit_export", return_value=(True, [])), \
+                mock.patch("components.main.signal.signal", guarded_signal):
+                results.put(main([
+                    "--mode", "audit",
+                    "--config", str(config_path),
+                    "--input-dir", str(input_dir),
+                    "--log-dir", str(tmp_path / "logs"),
+                    "--min-free-gb", "0",
+                    "--max-workers", "1",
+                    "--audit-offline",
+                ]))
+
+        t = threading.Thread(target=run_main)
+        t.start()
+        t.join()
+        assert results.get_nowait() == 0
 
     def test_main_does_not_crash_from_worker_thread(self) -> None:
         """Verify the guard works by checking the condition directly."""
@@ -263,6 +330,52 @@ class TestLegacyExportCompleteness:
             with pytest.raises(RuntimeError, match="no message bytes"):
                 export_account(account, server, tmp_path, ignore_errors=False)
 
+    def test_export_ignore_errors_continues_but_raises_aggregate(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+
+        class PartialExportImap:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren) "/" "Archive"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch" and self.selected == "INBOX":
+                    return "NO", [b"fetch failed"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        b"Message-ID: <archive@example.com>\r\n\r\nbody",
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[PartialExportImap]:
+            yield PartialExportImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="legacy export user@example.com failed"):
+                export_account(account, server, tmp_path, ignore_errors=True)
+
+        assert (tmp_path / "user@example.com" / "Archive" / "u0000000001.eml").exists()
+
 
 class TestLegacyListParsing:
     """Legacy mailbox discovery should handle RFC-valid literal LIST responses."""
@@ -287,7 +400,7 @@ class TestLegacyImportJournal:
         account_dir = tmp_path / "user@example.com" / "INBOX"
         account_dir.mkdir(parents=True)
         eml = account_dir / "u0000000001.eml"
-        eml.write_bytes(b"Message-ID: <m@example.com>\r\n\r\nbody")
+        eml.write_bytes(b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")
         eml.with_suffix(".json").write_text(json.dumps({
             "mailbox": "INBOX",
             "uid": 1,
@@ -317,7 +430,7 @@ class TestLegacyImportJournal:
         assert fake_imap.append.call_count == 1
 
     def test_import_rejects_pending_journal_entry(self, tmp_path: Path) -> None:
-        from components.imap_ops import _legacy_import_key, import_account
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
         from components.models import Account, ServerConfig
 
         in_root = self._make_export(tmp_path)
@@ -325,16 +438,18 @@ class TestLegacyImportJournal:
         eml = account_dir / "INBOX" / "u0000000001.eml"
         data = eml.read_bytes()
         key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        target_id = _legacy_import_target_id(server, account)
+        fake_imap = mock.MagicMock()
+        fake_imap.select.return_value = ("OK", [b""])
         (account_dir / "import.journal.jsonl").write_text(json.dumps({
             "key": key,
             "status": "pending",
+            "target": target_id,
             "mailbox": "INBOX",
             "path": "INBOX/u0000000001.eml",
         }) + "\n")
-        account = Account(email="user@example.com", password="pass")
-        server = ServerConfig(host="dummy", port=993, ssl=True)
-        fake_imap = mock.MagicMock()
-        fake_imap.select.return_value = ("OK", [b""])
 
         @contextlib.contextmanager
         def fake_factory(*_args, **_kwargs) -> Iterator:
@@ -342,6 +457,143 @@ class TestLegacyImportJournal:
 
         with pytest.raises(RuntimeError, match="pending append"):
             import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+    def test_import_ignore_errors_continues_but_raises_aggregate(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com"
+        for mailbox in ("Bad", "Good"):
+            folder = account_dir / mailbox
+            folder.mkdir(parents=True)
+            eml = folder / "u0000000001.eml"
+            eml.write_bytes(f"Message-ID: <{mailbox.lower()}@example.com>\r\n\r\nbody".encode("ascii"))
+            eml.with_suffix(".json").write_text(json.dumps({
+                "mailbox": mailbox,
+                "uid": 1,
+                "flags": "",
+                "internaldate": "",
+            }))
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+
+        class PartialImportImap:
+            def __init__(self) -> None:
+                self.appended: List[str] = []
+
+            def _normalize(self, mailbox: str) -> str:
+                return mailbox.strip('"').replace(r"\"", '"')
+
+            def select(self, mailbox: str, readonly: bool = False):
+                selected = self._normalize(mailbox)
+                return ("NO", [b"missing"]) if selected == "Bad" else ("OK", [b""])
+
+            def create(self, mailbox: str):
+                return "NO", [b"cannot create"]
+
+            def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+                self.appended.append(self._normalize(mailbox))
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake = PartialImportImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[PartialImportImap]:
+            yield fake
+
+        with pytest.raises(RuntimeError, match="legacy import user@example.com failed"):
+            import_account(account, server, tmp_path, ignore_errors=True, imap_factory=fake_factory)
+
+        assert fake.appended == ["Good"]
+
+    def test_import_ignores_committed_journal_from_different_target(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        data = eml.read_bytes()
+        key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        account = Account(email="user@example.com", password="pass")
+        old_server = ServerConfig(host="old-target.example.com", port=993, ssl=True)
+        new_server = ServerConfig(host="new-target.example.com", port=993, ssl=True)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "committed",
+            "target": _legacy_import_target_id(old_server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+        fake_imap = mock.MagicMock()
+        fake_imap.select.return_value = ("OK", [b""])
+        fake_imap.append.return_value = ("OK", [b""])
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator:
+            yield fake_imap
+
+        import_account(account, new_server, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.append.call_count == 1
+
+    def test_reset_archives_committed_journal_for_same_target_before_import(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        key = _legacy_import_key(account_dir, eml, "INBOX", eml.read_bytes())
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "committed",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 0
+        assert not (account_dir / "import.journal.jsonl").exists()
+        assert list(account_dir.glob("import.journal.reset-*.jsonl"))
+        import_mock.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +713,36 @@ class TestCliAndConfigHardening:
         with pytest.raises(ValueError, match="ssl.*starttls"):
             Config.from_json_file(bad_tls_combo)
 
+    def test_legacy_config_rejects_duplicate_accounts(self, tmp_path: Path) -> None:
+        from components.models import Config
+
+        duplicate = tmp_path / "duplicate.json"
+        duplicate.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "A@example.com", "password": "secret-a"},
+                {"email": "a@example.com", "password": "secret-b"},
+            ],
+        }))
+
+        with pytest.raises(ValueError, match="duplicates"):
+            Config.from_json_file(duplicate)
+
+    def test_legacy_config_rejects_sanitized_account_path_collisions(self, tmp_path: Path) -> None:
+        from components.models import Config
+
+        collision = tmp_path / "collision.json"
+        collision.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "a/b@example.com", "password": "secret-a"},
+                {"email": "a_b@example.com", "password": "secret-b"},
+            ],
+        }))
+
+        with pytest.raises(ValueError, match="path collision"):
+            Config.from_json_file(collision)
+
     def test_main_rejects_invalid_worker_timeout_and_empty_test(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -481,6 +763,13 @@ class TestCliAndConfigHardening:
             "--min-free-gb", "nan",
         ]) == 2
         assert main(["--mode", "test", *base, "--no-connectivity-test"]) == 2
+
+    def test_setup_logging_creates_private_log_file(self, tmp_path: Path) -> None:
+        from components.main import setup_logging
+
+        log_file = setup_logging(tmp_path / "logs")
+
+        assert log_file.stat().st_mode & 0o777 == 0o600
 
     def test_legacy_validate_returns_failure_on_account_error(self, tmp_path: Path) -> None:
         from components.main import main
@@ -539,6 +828,156 @@ class TestCliAndConfigHardening:
         @contextlib.contextmanager
         def fake_connection(*_args, **_kwargs) -> Iterator[RemoteOnlyImap]:
             yield RemoteOnlyImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_validate_fails_when_counts_match_but_message_identity_is_missing(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        mailbox_dir = input_dir / "a@example.com" / "INBOX"
+        mailbox_dir.mkdir(parents=True)
+        (mailbox_dir / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (mailbox_dir / "u0000000001.eml").write_bytes(b"Message-ID: <local@example.com>\r\n\r\nbody")
+        (mailbox_dir / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        class CountOnlyMatchImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                if criteria == ("HEADER", "Message-ID", "<local@example.com>"):
+                    return "OK", [b""]
+                raise AssertionError(criteria)
+
+            def fetch(self, *_args, **_kwargs):
+                raise AssertionError("fetch should not run when Message-ID search misses")
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CountOnlyMatchImap]:
+            yield CountOnlyMatchImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_validate_fails_with_pending_current_target_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / "a@example.com"
+        mailbox_dir = account_dir / "INBOX"
+        mailbox_dir.mkdir(parents=True)
+        eml = mailbox_dir / "u0000000001.eml"
+        eml.write_bytes(b"Message-ID: <m@example.com>\r\n\r\nbody")
+        eml.with_suffix(".json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": _legacy_import_key(account_dir, eml, "INBOX", eml.read_bytes()),
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+
+        class MatchingRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[MatchingRemote]:
+            yield MatchingRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_validate_fails_when_remote_has_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        input_dir.mkdir()
+
+        class EmptyRemoteFolderImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Projects"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[EmptyRemoteFolderImap]:
+            yield EmptyRemoteFolderImap()
 
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
             rc = main([
@@ -644,6 +1083,108 @@ class TestAuditHardening:
 
         assert any("missing remotely" in issue for issue in issues)
 
+    def test_audit_account_flags_matching_count_with_missing_remote_identity(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (inbox / "u0000000001.eml").write_bytes(b"Message-ID: <local@example.com>\r\n\r\nbody")
+        (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        class CountMatchWrongIdentityRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                if criteria == ("HEADER", "Message-ID", "<local@example.com>"):
+                    return "OK", [b""]
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                raise AssertionError(criteria)
+
+            def fetch(self, *_args, **_kwargs):
+                raise AssertionError("fetch should not run when Message-ID search misses")
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CountMatchWrongIdentityRemote]:
+            yield CountMatchWrongIdentityRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(account, tmp_path, ServerConfig(host="imap.example.com"), check_remote=True)
+
+        assert any("remote message identity missing" in issue for issue in issues)
+
+    def test_audit_account_flags_metadata_mailbox_mismatch(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / "u0000000001.eml").write_bytes(b"Message-ID: <m@example.com>\r\n\r\nbody")
+        (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "Trash"}))
+
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False)
+
+        assert any("mailbox metadata mismatch" in issue for issue in issues)
+
+    def test_audit_account_flags_mailbox_marker_count_mismatch(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 2}))
+        (inbox / "u0000000001.eml").write_bytes(b"Message-ID: <m@example.com>\r\n\r\nbody")
+        (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False)
+
+        assert any("mailbox marker count mismatch" in issue for issue in issues)
+
+    def test_audit_account_flags_trailing_imap_fetch_wrapper(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / "u0000000001.eml").write_bytes(
+            b"From: a@example.com\r\nTo: b@example.com\r\nSubject: ok\r\n\r\nbody\r\n"
+            b"1 (FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\")"
+        )
+        (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False)
+
+        assert any("suspicious raw IMAP metadata" in issue for issue in issues)
+
+    def test_audit_account_accepts_marked_empty_mailbox(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        projects = tmp_path / "a@example.com" / "Projects"
+        projects.mkdir(parents=True)
+        (projects / ".mailbox.json").write_text(json.dumps({"mailbox": "Projects", "message_count": 0}))
+
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False)
+
+        assert not issues
+
 
 class TestDirectAdminIndexerHardening:
     """DirectAdmin indexer secrets and generated config should avoid easy leaks."""
@@ -671,6 +1212,25 @@ class TestDirectAdminIndexerHardening:
 
         assert resolve_password(args) == "env-secret"
 
+    def test_resolve_default_password_supports_file_and_environment(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import argparse
+        from directadmin_indexer import resolve_default_password
+
+        secret = tmp_path / "mailbox-secret"
+        secret.write_text("mail-secret\n")
+        assert resolve_default_password(argparse.Namespace(
+            default_password="",
+            default_password_file=str(secret),
+            default_password_env=None,
+        )) == "mail-secret"
+
+        monkeypatch.setenv("MAILBOX_SECRET", "env-mail-secret")
+        assert resolve_default_password(argparse.Namespace(
+            default_password="",
+            default_password_file=None,
+            default_password_env="MAILBOX_SECRET",
+        )) == "env-mail-secret"
+
     def test_write_json_uses_private_permissions(self, tmp_path: Path) -> None:
         from directadmin_indexer import write_json
 
@@ -678,6 +1238,18 @@ class TestDirectAdminIndexerHardening:
         write_json({"accounts": []}, str(out), overwrite=False)
 
         assert out.stat().st_mode & 0o777 == 0o600
+
+    def test_write_json_overwrite_replaces_broad_permissions_atomically(self, tmp_path: Path) -> None:
+        from directadmin_indexer import write_json
+
+        out = tmp_path / "export.pass.config.json"
+        out.write_text("{}")
+        out.chmod(0o644)
+
+        write_json({"accounts": [{"email": "a@example.com", "password": "secret"}]}, str(out), overwrite=True)
+
+        assert out.stat().st_mode & 0o777 == 0o600
+        assert json.loads(out.read_text())["accounts"][0]["password"] == "secret"
 
     def test_indexer_list_pop_accounts_raises_on_api_error(self) -> None:
         from directadmin_indexer import DirectAdminClient
@@ -708,9 +1280,559 @@ class TestDirectAdminIndexerHardening:
             accounts=[Account(email="a@example.com", password="secret")],
         )
 
-        reset_accounts_directadmin(config, client, ignore_errors=True)
+        failed = reset_accounts_directadmin(config, client, ignore_errors=True)
 
         assert not client.created
+        assert failed == {"a@example.com"}
+
+    def test_directadmin_create_delete_require_parseable_status(self) -> None:
+        from components.da_client import DirectAdminClient
+
+        client = object.__new__(DirectAdminClient)
+        client._post = lambda *_args, **_kwargs: (None, {})
+
+        with pytest.raises(RuntimeError, match="create response"):
+            client.create_pop_account("example.com", "a", "secret")
+        with pytest.raises(RuntimeError, match="delete response"):
+            client.delete_pop_account("example.com", "a")
+
+    def test_directadmin_delete_only_tolerates_specific_not_found_errors(self) -> None:
+        from components.da_client import DirectAdminClient
+
+        client = object.__new__(DirectAdminClient)
+        client._post = lambda *_args, **_kwargs: ({"error": "1", "text": "Mailbox does not exist"}, None)
+        client.delete_pop_account("example.com", "a")
+
+        client._post = lambda *_args, **_kwargs: ({"error": "1", "text": "Deleted mailbox permission denied"}, None)
+        with pytest.raises(RuntimeError, match="permission denied"):
+            client.delete_pop_account("example.com", "a")
+
+    def test_import_returns_failure_when_reset_skip_occurs_under_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            inbox = input_dir / email / "INBOX"
+            inbox.mkdir(parents=True)
+            (inbox / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
+            (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        imported: List[str] = []
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value={"skip@example.com"}), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 3
+        assert imported == ["ok@example.com"]
+
+    def test_import_skips_all_accounts_when_reset_setup_fails_under_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported" / "a@example.com" / "INBOX"
+        input_dir.mkdir(parents=True)
+        (input_dir / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
+        (input_dir / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", side_effect=RuntimeError("panel unavailable")), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 3
+        import_mock.assert_not_called()
+
+
+class TestCPanelProvisioning:
+    """cPanel UAPI integration should be explicit, parse envelopes, and wire into import."""
+
+    def test_cpanel_call_parses_success_and_failure_envelopes(self) -> None:
+        from components.cpanel_client import CPanelClient
+
+        class Response:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self):
+                return self._payload
+
+        class Session:
+            def __init__(self) -> None:
+                self.payload = {
+                    "result": {
+                        "status": 1,
+                        "data": [{"email": "a@example.com"}],
+                        "errors": None,
+                        "messages": None,
+                        "warnings": None,
+                    }
+                }
+
+            def post(self, *_args, **_kwargs):
+                return Response(self.payload)
+
+        client = object.__new__(CPanelClient)
+        client.base_url = "https://panel.example.com:2083"
+        client.session = Session()
+        client.timeout_sec = 20
+
+        assert client._call("Email", "list_pops") == [{"email": "a@example.com"}]
+        client.session.payload = {
+            "result": {
+                "status": 0,
+                "data": None,
+                "errors": ["already exists"],
+                "messages": ["failed"],
+                "warnings": None,
+            }
+        }
+        with pytest.raises(RuntimeError, match="already exists.*failed"):
+            client._call("Email", "add_pop")
+
+    def test_cpanel_call_uses_post_and_redacts_request_errors(self) -> None:
+        from components.cpanel_client import CPanelClient
+
+        class Session:
+            verify = True
+
+            def post(self, url, data=None, timeout=None):
+                assert data == {"password": "super-secret", "email": "a", "domain": "example.com"}
+                raise RuntimeError(f"failed URL {url}?password=super-secret")
+
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("GET must not be used for cPanel UAPI calls")
+
+        client = object.__new__(CPanelClient)
+        client.base_url = "https://panel.example.com:2083"
+        client.session = Session()
+        client.timeout_sec = 20
+
+        with pytest.raises(RuntimeError) as exc_info:
+            client._call("Email", "add_pop", {"password": "super-secret", "email": "a", "domain": "example.com"})
+
+        assert "super-secret" not in str(exc_info.value)
+        assert "request failed" in str(exc_info.value)
+
+    def test_cpanel_client_uses_token_header_and_parses_accounts(self) -> None:
+        from components.cpanel_client import CPanelClient
+
+        class Session:
+            def __init__(self) -> None:
+                self.headers = {}
+                self.auth = None
+                self.verify = True
+
+        fake_session = Session()
+        with mock.patch("components.cpanel_client.requests.Session", return_value=fake_session):
+            client = CPanelClient(
+                "https://panel.example.com:2083",
+                "cpuser",
+                token="api-token",
+            )
+
+        assert fake_session.headers["Authorization"] == "cpanel cpuser:api-token"
+        calls = []
+
+        def fake_call(module, function, params=None):
+            calls.append((module, function, dict(params or {})))
+            return [
+                {"email": "a@example.com", "login": "a@example.com"},
+                {"user": "b", "domain": "example.com"},
+                {"email": "other@elsewhere.test"},
+            ]
+
+        client._call = fake_call
+
+        assert client.list_pop_accounts("example.com") == ["a", "b"]
+        assert client.list_all_email_accounts() == ["a@example.com", "b@example.com", "other@elsewhere.test"]
+        assert calls == [
+            ("Email", "list_pops", {"skip_main": 1}),
+            ("Email", "list_pops", {"skip_main": 1}),
+        ]
+
+    def test_cpanel_create_delete_send_documented_parameters(self) -> None:
+        from components.cpanel_client import CPanelClient
+
+        client = object.__new__(CPanelClient)
+        calls = []
+
+        def fake_call(module, function, params=None):
+            calls.append((module, function, dict(params or {})))
+            return None
+
+        client._call = fake_call
+
+        client.create_pop_account("example.com", "a", "secret", quota_mb=512)
+        client.delete_pop_account("example.com", "a")
+
+        assert calls[0] == (
+            "Email",
+            "add_pop",
+            {
+                "email": "a",
+                "domain": "example.com",
+                "password": "secret",
+                "quota": "512",
+                "skip_update_db": 1,
+            },
+        )
+        assert calls[1] == (
+            "Email",
+            "delete_pop",
+            {"email": "a@example.com", "domain": "example.com"},
+        )
+
+    def test_cpanel_reset_does_not_create_after_delete_failure(self) -> None:
+        from components.cpanel_ensure import reset_accounts_cpanel
+        from components.models import Account, Config, ServerConfig
+
+        class BrokenDeleteClient:
+            def __init__(self) -> None:
+                self.created = False
+
+            def delete_pop_account(self, domain: str, local_part: str) -> None:
+                raise RuntimeError("delete failed")
+
+            def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0, *, allow_existing: bool = True) -> None:
+                self.created = True
+
+        client = BrokenDeleteClient()
+        config = Config(
+            server=ServerConfig(host="imap.example.com"),
+            accounts=[Account(email="a@example.com", password="secret")],
+        )
+
+        failed = reset_accounts_cpanel(config, client, ignore_errors=True)
+
+        assert not client.created
+        assert failed == {"a@example.com"}
+
+    def test_main_import_uses_cpanel_reset_and_reports_skips(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            inbox = input_dir / email / "INBOX"
+            inbox.mkdir(parents=True)
+            (inbox / "u0000000001.eml").write_bytes(b"From: a\r\nTo: b\r\n\r\nbody")
+            (inbox / "u0000000001.json").write_text(json.dumps({"uid": 1, "mailbox": "INBOX"}))
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        imported: List[str] = []
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"skip@example.com"}), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 3
+        assert imported == ["ok@example.com"]
+
+    def test_reset_requires_confirmation_before_panel_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.CPanelClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+
+    def test_wrong_panel_dry_run_flag_does_not_bypass_directadmin_reset_confirmation(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--cpanel-dry-run",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+
+    def test_directadmin_reset_validates_staged_input_before_panel_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "missing-export"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+
+    def test_panel_reset_audits_staged_input_before_panel_calls_even_with_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        mailbox_dir = tmp_path / "exported" / "a@example.com" / "INBOX"
+        mailbox_dir.mkdir(parents=True)
+        (mailbox_dir / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 4
+        client_cls.assert_not_called()
+
+    def test_wrong_panel_dry_run_flag_does_not_bypass_cpanel_reset_confirmation(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.CPanelClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--da-dry-run",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+
+    def test_cpanel_dry_run_exits_before_imap_import(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.main.ensure_accounts_exist_cpanel") as ensure_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--cpanel-dry-run",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 0
+        ensure_mock.assert_called_once()
+        assert ensure_mock.call_args.kwargs["dry_run"] is True
+        import_mock.assert_not_called()
+
+    def test_cpanel_indexer_writes_selected_domains(self, tmp_path: Path) -> None:
+        import cpanel_indexer
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def list_all_email_accounts(self) -> List[str]:
+                return ["a@example.com", "b@example.com", "c@other.test"]
+
+        out = tmp_path / "export.pass.config.json"
+
+        with mock.patch("cpanel_indexer.CPanelClient", DummyCPanelClient), \
+            mock.patch("cpanel_indexer.prompt_select_from_list", return_value=[0]):
+            rc = cpanel_indexer.main([
+                "--url", "https://panel.example.com:2083",
+                "--username", "cpuser",
+                "--token", "api-token",
+                "--imap-host", "mail.example.com",
+                "--out", str(out),
+            ])
+
+        assert rc == 0
+        payload = json.loads(out.read_text())
+        assert [account["email"] for account in payload["accounts"]] == ["a@example.com", "b@example.com"]
+        assert out.stat().st_mode & 0o777 == 0o600
 
 
 class TestImapsyncPasswordHandling:

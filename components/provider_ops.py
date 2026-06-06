@@ -87,10 +87,11 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
     override = account.source_auth if role == "source" else account.target_auth
     auth = override or endpoint.auth
     fallback_email = account.source_email if role == "source" else account.target_email
-    if override is not None:
-        username = auth.username or fallback_email
-    else:
-        username = endpoint.auth.username or fallback_email
+    username = auth.username or endpoint.auth.username
+    if not username and endpoint.provider == "icloud" and "@" in fallback_email:
+        username = fallback_email.split("@", 1)[0]
+    if not username:
+        username = fallback_email
     return username, auth
 
 
@@ -169,8 +170,12 @@ def _read_imap_token(line: str, start: int) -> Tuple[Optional[str], int]:
     return line[idx:end], end
 
 
+def _decode_imap_response_text(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="replace")
+
+
 def parse_list_line(raw: bytes) -> Optional[MailboxInfo]:
-    line = raw.decode("ascii", errors="ignore").strip()
+    line = _decode_imap_response_text(raw).strip()
     if not line.startswith("("):
         return None
     attrs_end = line.find(")")
@@ -194,7 +199,7 @@ def parse_list_entry(raw: Any) -> Optional[MailboxInfo]:
     header, literal = raw
     if not isinstance(header, (bytes, bytearray)) or not isinstance(literal, (bytes, bytearray)):
         return None
-    line = bytes(header).decode("ascii", errors="ignore").strip()
+    line = _decode_imap_response_text(bytes(header)).strip()
     if not line.startswith("("):
         return None
     attrs_end = line.find(")")
@@ -208,12 +213,31 @@ def parse_list_entry(raw: Any) -> Optional[MailboxInfo]:
     if not re.fullmatch(r"\{\d+\}", rest):
         return None
     delimiter = "" if delimiter_raw.upper() == "NIL" else decode_imap_utf7(delimiter_raw)
-    name = decode_imap_utf7(bytes(literal).decode("ascii", errors="ignore"))
+    name = decode_imap_utf7(_decode_imap_response_text(bytes(literal)))
     return MailboxInfo(name=name, delimiter=delimiter, attributes=attrs)
 
 
 def is_noselect(mailbox: MailboxInfo) -> bool:
     return any(attr.lower() in {"\\noselect", "\\nonexistent"} for attr in mailbox.attributes)
+
+
+def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
+    return provider.lower() == "icloud" and mailbox.name.lower() == "vip"
+
+
+def gmail_source_readiness_issues(capabilities: List[str], mailboxes: List[MailboxInfo]) -> List[str]:
+    issues: List[str] = []
+    if "X-GM-EXT-1" not in capabilities:
+        issues.append("Gmail source did not advertise X-GM-EXT-1")
+    if not any(
+        any(attr.lower() == "\\all" for attr in mailbox.attributes)
+        or mailbox.name.lower() in {"[gmail]/all mail", "[googlemail]/all mail", "all mail"}
+        for mailbox in mailboxes
+    ):
+        issues.append(
+            "Gmail source All Mail is not visible via IMAP; enable All Mail/labels for IMAP or use OAuth/admin scope that exposes all mail before decommissioning"
+        )
+    return issues
 
 
 def quote_mailbox_name(mailbox: str) -> str:
@@ -407,15 +431,26 @@ def _message_id_header(msg_bytes: bytes) -> str:
     return ""
 
 
-def canonical_identity(parsed: Dict[str, Any], msg_bytes: bytes) -> Tuple[str, str, str]:
+def canonical_identity(
+    parsed: Dict[str, Any],
+    msg_bytes: bytes,
+    *,
+    mailbox: str = "",
+    uidvalidity: str = "",
+    uid: Optional[int] = None,
+    collapse_fallback: bool = False,
+) -> Tuple[str, str, str]:
     sha256 = hashlib.sha256(msg_bytes).hexdigest()
     gmail_msgid = str(parsed.get("gmail_msgid") or "")
     if gmail_msgid:
         return f"gmail-{gmail_msgid}", sha256, _message_id_header(msg_bytes)
     size = int(parsed.get("rfc822_size") or len(msg_bytes))
     message_id = _message_id_header(msg_bytes)
-    seed = f"{message_id}|{sha256}|{size}"
-    return f"fallback-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}", sha256, message_id
+    if collapse_fallback or not mailbox or uid is None:
+        seed = f"{message_id}|{sha256}|{size}"
+        return f"fallback-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}", sha256, message_id
+    seed = f"{mailbox}|{uidvalidity}|{uid}|{sha256}|{size}"
+    return f"physical-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}", sha256, message_id
 
 
 def _source_tokens(source_mailboxes: Iterable[str], gmail_labels: Iterable[str]) -> List[str]:
@@ -451,11 +486,19 @@ def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Itera
         return mapped("Deleted Messages", "[Gmail]/Trash", "[GoogleMail]/Trash", "Trash", "Bin", "\\Trash")
     if has_any("[gmail]/spam", "[googlemail]/spam", "spam", "junk", "\\junk"):
         return mapped("Junk", "[Gmail]/Spam", "[GoogleMail]/Spam", "Spam", "Junk", "\\Junk")
+    if has_any("[gmail]/important", "[googlemail]/important", "important", "\\important"):
+        return mapped("Important", "[Gmail]/Important", "[GoogleMail]/Important", "Important", "\\Important")
     if has_any("inbox", "\\inbox"):
         return mapped("INBOX", "INBOX", "\\Inbox", "\\INBOX")
     for token in tokens:
         lower = token.lower()
-        if token.upper() == "INBOX" or token.startswith("\\") or lower.startswith("[gmail]/") or lower.startswith("[googlemail]/"):
+        if (
+            token.upper() == "INBOX"
+            or token.startswith("\\")
+            or lower in {"all mail"}
+            or lower.startswith("[gmail]/")
+            or lower.startswith("[googlemail]/")
+        ):
             continue
         return folder_map.get(token, token)
     if has_any("[gmail]/all mail", "[googlemail]/all mail", "all mail", "\\all"):
@@ -513,6 +556,16 @@ def load_manifest(account_dir: Path) -> List[Dict[str, Any]]:
                 raise RuntimeError(f"invalid manifest row {line_no}: {manifest}")
             rows.append(row)
     return rows
+
+
+def require_complete_export_state(account_dir: Path) -> None:
+    state_path = account_dir / "export-state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"export-state missing or invalid: {exc}") from exc
+    if not isinstance(state, dict) or state.get("complete") is not True:
+        raise RuntimeError(f"export-state is not complete: {state_path}")
 
 
 def manifest_identity_issues(rows: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, int]]:
@@ -662,6 +715,15 @@ def provider_export_account(
     limiter: Optional[RateLimiter] = None,
 ) -> None:
     account_dir = account_export_dir(out_root, account)
+    _atomic_json(
+        account_dir / "export-state.json",
+        {
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": False,
+            "started_at": _utc_now(),
+        },
+    )
     messages: Dict[str, Dict[str, Any]] = {}
     manifest_path = account_dir / "manifest.jsonl"
     if manifest_path.exists():
@@ -706,19 +768,34 @@ def provider_export_account(
                 "exported_at": _utc_now(),
             },
         )
-        if config.source.provider == "gmail" and not gmail_extensions:
-            logging.warning("[provider-export] %s: Gmail X-GM-EXT-1 not advertised; falling back to hash identity", account.source_email)
+        if config.source.provider == "gmail":
+            gmail_issues = gmail_source_readiness_issues(capabilities, mailboxes)
+            if gmail_issues:
+                raise RuntimeError(f"Gmail source is not export-ready for {account.source_email}: {'; '.join(gmail_issues)}")
         for mailbox in mailboxes:
             if is_noselect(mailbox):
                 logging.info("[provider-export] %s: skipping non-selectable mailbox %s", account.source_email, mailbox.name)
                 continue
-            if _stop_requested(stop_event):
-                return
+            if is_virtual_source_mailbox(config.source.provider, mailbox):
+                logging.info("[provider-export] %s: skipping virtual source mailbox %s", account.source_email, mailbox.name)
+                continue
+            _raise_if_stopped(stop_event, f"provider export {account.source_email}")
             uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox.name)
+            previous_uidvalidities = {
+                str((row.get("uidvalidity_by_mailbox") or {}).get(mailbox.name) or "")
+                for row in messages.values()
+                if isinstance(row.get("uidvalidity_by_mailbox"), dict)
+                and (row.get("uidvalidity_by_mailbox") or {}).get(mailbox.name)
+            }
+            if previous_uidvalidities and uidvalidity and uidvalidity not in previous_uidvalidities:
+                raise RuntimeError(
+                    f"UIDVALIDITY changed since previous export for {mailbox.name}: "
+                    f"previous={sorted(previous_uidvalidities)} current={uidvalidity}; "
+                    "start a new export directory to avoid duplicate physical identities"
+                )
             logging.info("[provider-export] %s: %s -> %d messages", account.source_email, mailbox.name, len(uids))
             for uid in uids:
-                if _stop_requested(stop_event):
-                    return
+                _raise_if_stopped(stop_event, f"provider export {account.source_email}")
                 status, meta_data = imap.uid(
                     "fetch",
                     str(uid),
@@ -753,7 +830,14 @@ def provider_export_account(
                 msg_bytes = parsed.get("message_bytes")
                 if not isinstance(msg_bytes, bytes) or not msg_bytes:
                     raise RuntimeError(f"body fetch returned no message bytes in {mailbox.name} for UID {uid}")
-                identity, sha256, message_id = canonical_identity(parsed, msg_bytes)
+                identity, sha256, message_id = canonical_identity(
+                    parsed,
+                    msg_bytes,
+                    mailbox=mailbox.name,
+                    uidvalidity=uidvalidity,
+                    uid=uid,
+                    collapse_fallback=config.source.provider == "gmail",
+                )
                 safe_id = _safe_identity(identity)
                 if identity not in messages:
                     eml_rel = f"messages/{safe_id}.eml"
@@ -823,6 +907,16 @@ def provider_export_account(
                 )
 
     persist_export_records(account_dir, messages, config.migration.folder_map)
+    _atomic_json(
+        account_dir / "export-state.json",
+        {
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": True,
+            "canonical_messages": len(messages),
+            "completed_at": _utc_now(),
+        },
+    )
     logging.info("[provider-export] %s: completed with %d canonical messages", account.source_email, len(messages))
 
 
@@ -839,8 +933,7 @@ def provider_export_all(
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
-        if _stop_requested(stop_event):
-            return
+        _raise_if_stopped(stop_event, f"provider export {acc.source_email}")
         with_retry(
             lambda: provider_export_account(config, acc, out_root, stop_event=stop_event, limiter=limiter),
             attempts=config.limits.retry_max_attempts,
@@ -854,9 +947,12 @@ def _target_mailboxes_by_name(mailboxes: List[MailboxInfo]) -> Dict[str, Mailbox
     return {m.name.lower(): m for m in mailboxes}
 
 
-def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo]) -> str:
+def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target_provider: str = "imap") -> str:
     by_name = _target_mailboxes_by_name(mailboxes)
-    if desired.lower() in by_name:
+    desired_lower = desired.lower()
+    provider = (target_provider or "imap").lower()
+    gmail_special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important"}
+    if desired_lower in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
         return by_name[desired.lower()].name
     attr_map = {
         "sent": ("\\Sent",),
@@ -865,22 +961,39 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo]) -> str:
         "trash": ("\\Trash",),
         "junk": ("\\Junk",),
         "spam": ("\\Junk",),
-        "archive": ("\\Archive", "\\All"),
+        "important": ("\\Important",),
     }
-    desired_lower = desired.lower()
+    if provider == "gmail":
+        attr_map["archive"] = ("\\All", "\\Archive")
+    else:
+        attr_map["archive"] = ("\\Archive",)
     attrs = attr_map.get(desired_lower)
     if attrs:
         for mailbox in mailboxes:
             if any(a.lower() in {attr.lower() for attr in attrs} for a in mailbox.attributes):
                 return mailbox.name
+    gmail_candidates = {
+        "sent": ["[Gmail]/Sent Mail", "[GoogleMail]/Sent Mail", "Sent", "Sent Messages"],
+        "drafts": ["[Gmail]/Drafts", "[GoogleMail]/Drafts", "Drafts"],
+        "deleted messages": ["[Gmail]/Trash", "[GoogleMail]/Trash", "Trash", "Deleted Messages"],
+        "trash": ["[Gmail]/Trash", "[GoogleMail]/Trash", "Trash", "Deleted Messages"],
+        "junk": ["[Gmail]/Spam", "[GoogleMail]/Spam", "Junk", "Spam"],
+        "spam": ["[Gmail]/Spam", "[GoogleMail]/Spam", "Spam", "Junk"],
+        "archive": ["[Gmail]/All Mail", "[GoogleMail]/All Mail", "All Mail", "Archive"],
+        "important": ["[Gmail]/Important", "[GoogleMail]/Important", "Important"],
+    }
+    generic_candidates = {
+        "sent": ["Sent", "Sent Messages"],
+        "drafts": ["Drafts"],
+        "deleted messages": ["Deleted Messages", "Trash"],
+        "trash": ["Trash", "Deleted Messages"],
+        "junk": ["Junk", "Spam"],
+        "spam": ["Spam", "Junk"],
+        "archive": ["Archive"],
+        "important": ["Important"],
+    }
     candidates = {
-        "sent": ["Sent", "Sent Messages", "[Gmail]/Sent Mail", "[GoogleMail]/Sent Mail"],
-        "drafts": ["Drafts", "[Gmail]/Drafts", "[GoogleMail]/Drafts"],
-        "deleted messages": ["Deleted Messages", "Trash", "[Gmail]/Trash", "[GoogleMail]/Trash"],
-        "trash": ["Trash", "Deleted Messages", "[Gmail]/Trash", "[GoogleMail]/Trash"],
-        "junk": ["Junk", "Spam", "[Gmail]/Spam", "[GoogleMail]/Spam"],
-        "spam": ["Spam", "Junk", "[Gmail]/Spam", "[GoogleMail]/Spam"],
-        "archive": ["Archive", "All Mail", "[Gmail]/All Mail", "[GoogleMail]/All Mail"],
+        **(gmail_candidates if provider == "gmail" else generic_candidates),
     }.get(desired_lower, [desired])
     for candidate in candidates:
         if candidate.lower() in by_name:
@@ -915,23 +1028,83 @@ def _internaldate_for_append(internaldate: str) -> str:
     return imaplib.Time2Internaldate(time.time())
 
 
-def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> bool:
+def _quote_gmail_label(label: str) -> str:
+    if label.startswith("\\"):
+        return label
+    encoded = encode_imap_utf7(label)
+    escaped = encoded.replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
+
+
+def gmail_labels_for_restore(row: Dict[str, Any], target_mailbox: str) -> List[str]:
+    system_labels = {
+        "\\all",
+        "\\archive",
+        "\\drafts",
+        "\\flagged",
+        "\\important",
+        "\\inbox",
+        "\\junk",
+        "\\muted",
+        "\\sent",
+        "\\spam",
+        "\\starred",
+        "\\trash",
+        "important",
+        "starred",
+    }
+    labels: List[str] = []
+    for raw in row.get("gmail_labels") or []:
+        label = str(raw).strip()
+        lower = label.lower()
+        if (
+            not label
+            or lower in system_labels
+            or lower.startswith("[gmail]/")
+            or lower.startswith("[googlemail]/")
+            or lower == target_mailbox.lower()
+        ):
+            continue
+        if label not in labels:
+            labels.append(label)
+    return sorted(labels, key=str.lower)
+
+
+def restore_gmail_labels(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any]) -> None:
+    labels = gmail_labels_for_restore(row, target_mailbox)
+    if not labels:
+        return
+    nums = target_matching_message_nums(imap, target_mailbox, row, create_if_missing=False)
+    if not nums:
+        raise RuntimeError(f"cannot find target message for {row.get('canonical_id')} to restore Gmail labels")
+    status, _ = select_mailbox(imap, target_mailbox)
+    if status != "OK":
+        raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail labels")
+    label_list = "(" + " ".join(_quote_gmail_label(label) for label in labels) + ")"
+    for num in nums:
+        status, response = imap.store(num, "+X-GM-LABELS", label_list)
+        if status != "OK":
+            raise RuntimeError(f"failed to restore Gmail labels for {row.get('canonical_id')}: {response}")
+
+
+def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> List[bytes]:
     message_id = str(manifest_row.get("message_id_header") or "").strip()
     if create_if_missing:
         ensure_mailbox(imap, mailbox)
     status, _ = select_mailbox(imap, mailbox, readonly=True)
     if status != "OK":
-        return False
+        return []
     if message_id:
         status, data = imap.search(None, "HEADER", "Message-ID", message_id)
     else:
         status, data = imap.search(None, "ALL")
     if status != "OK" or not data or not data[0]:
-        return False
+        return []
     expected_size = int(manifest_row.get("rfc822_size") or 0)
     expected_hash = str(manifest_row.get("content_sha256") or "")
     if expected_size <= 0 and not expected_hash and message_id:
-        return True
+        return list(data[0].split())
+    matches: List[bytes] = []
     for num in data[0].split():
         status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
         if status != "OK":
@@ -945,10 +1118,33 @@ def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str
                 continue
             if expected_hash and isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
                 if hashlib.sha256(bytes(part[1])).hexdigest() == expected_hash:
-                    return True
+                    matches.append(num)
+                    break
                 continue
             if match and not expected_hash:
-                return True
+                matches.append(num)
+                break
+    return matches
+
+
+def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> bool:
+    return bool(target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing))
+
+
+def consume_target_match(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    used_by_mailbox: Dict[str, set[bytes]],
+    *,
+    create_if_missing: bool = True,
+) -> bool:
+    mailbox_key = mailbox.lower()
+    used = used_by_mailbox.setdefault(mailbox_key, set())
+    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+        if num not in used:
+            used.add(num)
+            return True
     return False
 
 
@@ -962,38 +1158,72 @@ def target_message_count(imap: imaplib.IMAP4, mailbox: str) -> int:
     return len((data[0] or b"").split())
 
 
+def gmail_system_view_mailboxes_for_row(row: Dict[str, Any], target_mailboxes: List[MailboxInfo]) -> List[str]:
+    flags = {token.lower() for token in str(row.get("flags") or "").split()}
+    labels = {str(label).lower() for label in (row.get("gmail_labels") or [])}
+    wanted: set[str] = set()
+    if "\\flagged" in flags or "\\starred" in labels or "\\flagged" in labels:
+        wanted.update({"\\flagged", "\\starred", "starred", "[gmail]/starred", "[googlemail]/starred"})
+    if "\\important" in labels or "important" in labels or "\\important" in flags:
+        wanted.update({"\\important", "important", "[gmail]/important", "[googlemail]/important"})
+    result: List[str] = []
+    for mailbox in target_mailboxes:
+        attr_lowers = {attr.lower() for attr in mailbox.attributes}
+        name_lower = mailbox.name.lower()
+        if attr_lowers & wanted or name_lower in wanted:
+            result.append(mailbox.name)
+    return result
+
+
 def enforce_empty_target(
     imap: imaplib.IMAP4,
     target_mailboxes: List[MailboxInfo],
     manifest_rows: List[Dict[str, Any]],
     journaled: set[Tuple[str, str]],
+    *,
+    target_provider: str = "imap",
 ) -> None:
-    existing = {mailbox.name.lower() for mailbox in target_mailboxes}
-    checked: set[str] = set()
     permitted_by_mailbox: Dict[str, List[Dict[str, Any]]] = {}
+    by_name = _target_mailboxes_by_name(target_mailboxes)
+    gmail_all_mailboxes = [
+        mailbox.name
+        for mailbox in target_mailboxes
+        if target_provider == "gmail"
+        and (
+            any(attr.lower() == "\\all" for attr in mailbox.attributes)
+            or mailbox.name.lower() in {"[gmail]/all mail", "[googlemail]/all mail", "all mail"}
+        )
+    ]
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
         desired = str(row.get("primary_mailbox") or "Archive")
-        target_mailbox = resolve_target_mailbox(desired, target_mailboxes)
+        target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
         key = (identity, target_mailbox)
         if key in journaled:
-            permitted_by_mailbox.setdefault(target_mailbox.lower(), []).append(row)
-    for row in manifest_rows:
-        desired = str(row.get("primary_mailbox") or "Archive")
-        target_mailbox = resolve_target_mailbox(desired, target_mailboxes)
-        if target_mailbox.lower() not in existing or target_mailbox.lower() in checked:
+            permitted_names = [target_mailbox]
+            if target_provider == "gmail":
+                permitted_names.extend(gmail_all_mailboxes)
+                permitted_names.extend(gmail_system_view_mailboxes_for_row(row, target_mailboxes))
+                for label in gmail_labels_for_restore(row, target_mailbox):
+                    mailbox = by_name.get(label.lower())
+                    if mailbox is not None:
+                        permitted_names.append(mailbox.name)
+            for name in permitted_names:
+                permitted_by_mailbox.setdefault(name.lower(), []).append(row)
+    for mailbox in target_mailboxes:
+        if is_noselect(mailbox):
             continue
-        checked.add(target_mailbox.lower())
-        count = target_message_count(imap, target_mailbox)
+        count = target_message_count(imap, mailbox.name)
         if count <= 0:
             continue
         verified = 0
-        for permitted_row in permitted_by_mailbox.get(target_mailbox.lower(), []):
-            if target_has_message(imap, target_mailbox, permitted_row, create_if_missing=False):
+        used: Dict[str, set[bytes]] = {}
+        for permitted_row in permitted_by_mailbox.get(mailbox.name.lower(), []):
+            if consume_target_match(imap, mailbox.name, permitted_row, used, create_if_missing=False):
                 verified += 1
         if count > verified:
             raise RuntimeError(
-                f"target_mode=empty but target mailbox {target_mailbox!r} contains "
+                f"target_mode=empty but target mailbox {mailbox.name!r} contains "
                 f"{count} message(s), only {verified} matching journaled message(s) from this migration"
             )
 
@@ -1007,6 +1237,7 @@ def provider_import_account(
     limiter: Optional[RateLimiter] = None,
 ) -> None:
     account_dir = account_export_dir(in_root, account)
+    require_complete_export_state(account_dir)
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_target_account(manifest_rows, account)
@@ -1023,20 +1254,26 @@ def provider_import_account(
         if row.get("status") == "pending"
     }
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
+    used_target_nums: Dict[str, set[bytes]] = {}
 
     with imap_connection(config.target, account, role="target") as imap:
         target_mailboxes = list_mailboxes(imap)
         if config.migration.target_mode == "empty":
-            enforce_empty_target(imap, target_mailboxes, manifest_rows, committed | pending)
+            enforce_empty_target(
+                imap,
+                target_mailboxes,
+                manifest_rows,
+                committed | pending,
+                target_provider=config.target.provider,
+            )
         for row in sorted(manifest_rows, key=lambda item: str(item.get("canonical_id", ""))):
-            if _stop_requested(stop_event):
-                return
+            _raise_if_stopped(stop_event, f"provider import {account.target_email}")
             identity = str(row.get("canonical_id") or "")
             desired = str(row.get("primary_mailbox") or "Archive")
-            target_mailbox = resolve_target_mailbox(desired, target_mailboxes)
+            target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = (identity, target_mailbox)
             if key in committed:
-                if config.migration.target_mode == "empty" and not target_has_message(imap, target_mailbox, row, create_if_missing=False):
+                if config.migration.target_mode == "empty" and not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
                     raise RuntimeError(
                         f"journal says {identity} is committed to {target_mailbox!r}, "
                         "but the target message was not found"
@@ -1045,7 +1282,9 @@ def provider_import_account(
             eml_path = _manifest_path(account_dir, row, "eml_path")
             if not eml_path.exists():
                 raise RuntimeError(f"message file missing for {identity}: {eml_path}")
-            if (config.migration.target_mode == "merge" or key in pending) and target_has_message(imap, target_mailbox, row):
+            if (config.migration.target_mode == "merge" or key in pending) and consume_target_match(imap, target_mailbox, row, used_target_nums):
+                if config.target.provider == "gmail":
+                    restore_gmail_labels(imap, target_mailbox, row)
                 append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "existing"))
                 committed.add(key)
                 continue
@@ -1062,6 +1301,8 @@ def provider_import_account(
             )
             if status != "OK":
                 raise RuntimeError(f"append failed for {identity}: {response}")
+            if config.target.provider == "gmail":
+                restore_gmail_labels(imap, target_mailbox, row)
             append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "appended"))
             committed.add(key)
     logging.info("[provider-import] %s -> %s: completed", account.source_email, account.target_email)
@@ -1079,8 +1320,7 @@ def provider_import_all(
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
-        if _stop_requested(stop_event):
-            return
+        _raise_if_stopped(stop_event, f"provider import {acc.target_email}")
         with_retry(
             lambda: provider_import_account(config, acc, in_root, stop_event=stop_event, limiter=limiter),
             attempts=config.limits.retry_max_attempts,
@@ -1109,6 +1349,10 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     account_dir = account_export_dir(in_root, account)
     if not account_dir.exists():
         return account.email, [f"account export directory missing: {account_dir}"]
+    try:
+        require_complete_export_state(account_dir)
+    except Exception as exc:
+        issues.append(str(exc))
     try:
         rows = load_manifest(account_dir)
     except Exception as exc:
@@ -1201,6 +1445,7 @@ def provider_validate_account(
         "ok": False,
     }
     try:
+        require_complete_export_state(account_dir)
         manifest_rows = load_manifest(account_dir)
         journal_rows = load_import_journal(account_dir, account)
     except Exception as exc:
@@ -1214,6 +1459,20 @@ def provider_validate_account(
 
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
+    committed_journal_keys = {
+        (str(row.get("canonical_id") or ""), str(row.get("target_mailbox") or ""))
+        for row in journal_rows
+        if row.get("status") == "committed"
+    }
+    for row in journal_rows:
+        if row.get("status") != "pending":
+            continue
+        identity = str(row.get("canonical_id") or "")
+        target_mailbox = str(row.get("target_mailbox") or "")
+        if (identity, target_mailbox) not in committed_journal_keys:
+            report["failed"].append(
+                f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
+            )
 
     identity_issues, manifest_id_counts = manifest_identity_issues(manifest_rows)
     for issue in identity_issues:
@@ -1278,19 +1537,24 @@ def provider_validate_account(
             with imap_connection(config.target, account, role="target") as imap:
                 target_mailboxes = list_mailboxes(imap)
                 expected_target_by_id = {
-                    identity: resolve_target_mailbox(str(row.get("primary_mailbox") or "Archive"), target_mailboxes)
+                    identity: resolve_target_mailbox(
+                        str(row.get("primary_mailbox") or "Archive"),
+                        target_mailboxes,
+                        target_provider=config.target.provider,
+                    )
                     for identity, row in by_id.items()
                 }
                 committed_by_id, target_by_id, failures = evaluate_journal(expected_target_by_id)
                 report["failed"].extend(failures)
                 apply_counts(committed_by_id)
                 if not report["missing"]:
+                    used_target_nums: Dict[str, set[bytes]] = {}
                     for identity, row in by_id.items():
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
                             continue
                         report["remote_checked"] += 1
-                        if not target_has_message(imap, target_mailbox, row, create_if_missing=False):
+                        if not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
                             report["remote_missing"].append(identity)
         except Exception as exc:
             committed_by_id, _target_by_id, failures = evaluate_journal()
@@ -1358,10 +1622,11 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
             with imap_connection(config.source, acc, role="source") as source_imap:
                 capabilities = get_capabilities(source_imap)
                 gmail_extensions = "X-GM-EXT-1" in capabilities
-                if config.source.provider == "gmail" and not gmail_extensions:
-                    account_issues.append("Gmail source did not advertise X-GM-EXT-1")
-                for mailbox in list_mailboxes(source_imap):
-                    if is_noselect(mailbox):
+                source_mailboxes = list_mailboxes(source_imap)
+                if config.source.provider == "gmail":
+                    account_issues.extend(gmail_source_readiness_issues(capabilities, source_mailboxes))
+                for mailbox in source_mailboxes:
+                    if is_noselect(mailbox) or is_virtual_source_mailbox(config.source.provider, mailbox):
                         continue
                     try:
                         uids, _uidvalidity = fetch_all_uids_and_uidvalidity(source_imap, mailbox.name)
@@ -1410,6 +1675,11 @@ def _append_unique(values: List[str], value: str) -> None:
 
 def _stop_requested(stop_event: Optional[object]) -> bool:
     return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+
+def _raise_if_stopped(stop_event: Optional[object], label: str) -> None:
+    if _stop_requested(stop_event):
+        raise RuntimeError(f"{label}: stop requested before completion")
 
 
 def _require_max_workers(max_workers: int) -> int:
