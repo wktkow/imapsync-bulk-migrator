@@ -325,6 +325,13 @@ class ProviderMigrationConfig:
                         f"accounts[{idx}].{role}_auth.username must be set in multi-account provider configs; "
                         f"endpoint-level provider username would be reused for every account"
                     )
+                expected_email = account.source_email if role == "source" else account.target_email
+                auth_username = auth.username or endpoint.auth.username
+                if endpoint.provider == "gmail" and auth_username and auth_username.strip().lower() != expected_email.strip().lower():
+                    raise ValueError(
+                        f"accounts[{idx}].{role}_auth.username must match {role}_email for Gmail "
+                        f"({expected_email})"
+                    )
 
 
 @dataclasses.dataclass

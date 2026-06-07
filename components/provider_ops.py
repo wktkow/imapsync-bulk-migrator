@@ -678,6 +678,13 @@ def provider_export_state_issues(
                 f"{account.target_email}: {target_account or '<missing>'}"
             )
     if manifest_rows is not None:
+        source_provider = str(state.get("source_provider") or "").lower()
+        if not source_provider:
+            providers = {str(row.get("source_provider") or "").lower() for row in manifest_rows}
+            if len(providers) == 1:
+                source_provider = next(iter(providers))
+        if source_provider == "gmail" and state.get("gmail_full_visibility_verified") is not True:
+            issues.append("export-state Gmail full visibility attestation is missing or false")
         expected_count = len(manifest_rows)
         actual_count = state.get("canonical_messages")
         if type(actual_count) is not int or actual_count != expected_count:
@@ -945,6 +952,11 @@ def provider_export_account(
         {
             "source_account": account.source_email,
             "target_account": account.target_email,
+            "source_provider": config.source.provider,
+            "target_provider": config.target.provider,
+            "gmail_full_visibility_verified": bool(config.source.gmail_full_visibility_verified)
+            if config.source.provider == "gmail"
+            else None,
             "complete": False,
             "started_at": _utc_now(),
         },
@@ -999,6 +1011,7 @@ def provider_export_account(
         )
         if config.source.provider == "gmail":
             gmail_issues = gmail_source_readiness_issues(capabilities, mailboxes)
+            gmail_issues.extend(gmail_source_decommission_issues(config.source))
             if gmail_issues:
                 raise RuntimeError(f"Gmail source is not export-ready for {account.source_email}: {'; '.join(gmail_issues)}")
         for mailbox in mailboxes:
@@ -1056,6 +1069,11 @@ def provider_export_account(
                 for key, value in pre_parsed.items():
                     if key != "message_bytes" and not parsed.get(key):
                         parsed[key] = value
+                if config.source.provider == "gmail" and not parsed.get("gmail_msgid"):
+                    raise RuntimeError(
+                        f"Gmail source fetch for {account.source_email} UID {uid} in {mailbox.name} "
+                        "did not return X-GM-MSGID"
+                    )
                 msg_bytes = parsed.get("message_bytes")
                 if not isinstance(msg_bytes, bytes) or not msg_bytes:
                     raise RuntimeError(f"body fetch returned no message bytes in {mailbox.name} for UID {uid}")
@@ -1142,6 +1160,11 @@ def provider_export_account(
         {
             "source_account": account.source_email,
             "target_account": account.target_email,
+            "source_provider": config.source.provider,
+            "target_provider": config.target.provider,
+            "gmail_full_visibility_verified": bool(config.source.gmail_full_visibility_verified)
+            if config.source.provider == "gmail"
+            else None,
             "complete": True,
             "canonical_messages": len(final_manifest_rows),
             "manifest_sha256": provider_manifest_digest(final_manifest_rows),
@@ -1272,8 +1295,136 @@ def _quote_gmail_label(label: str) -> str:
     return f'"{escaped}"'
 
 
+_GMAIL_LABEL_SYSTEM_KEYS = {
+    "\\inbox": "inbox",
+    "[gmail]/inbox": "inbox",
+    "[googlemail]/inbox": "inbox",
+    "\\sent": "sent",
+    "[gmail]/sent mail": "sent",
+    "[googlemail]/sent mail": "sent",
+    "\\drafts": "drafts",
+    "[gmail]/drafts": "drafts",
+    "[googlemail]/drafts": "drafts",
+    "\\trash": "trash",
+    "[gmail]/trash": "trash",
+    "[googlemail]/trash": "trash",
+    "\\junk": "spam",
+    "\\spam": "spam",
+    "[gmail]/spam": "spam",
+    "[googlemail]/spam": "spam",
+    "\\all": "all",
+    "\\allmail": "all",
+    "[gmail]/all mail": "all",
+    "[googlemail]/all mail": "all",
+}
+
+_GMAIL_TARGET_NAME_SYSTEM_KEYS = {
+    "inbox": "inbox",
+    "[gmail]/all mail": "all",
+    "[googlemail]/all mail": "all",
+    "all mail": "all",
+    "[gmail]/sent mail": "sent",
+    "[googlemail]/sent mail": "sent",
+    "[gmail]/drafts": "drafts",
+    "[googlemail]/drafts": "drafts",
+    "[gmail]/trash": "trash",
+    "[googlemail]/trash": "trash",
+    "[gmail]/spam": "spam",
+    "[googlemail]/spam": "spam",
+}
+
+_GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS = {
+    "inbox": "inbox",
+    "archive": "all",
+    "all mail": "all",
+    "[gmail]/all mail": "all",
+    "[googlemail]/all mail": "all",
+    "\\all": "all",
+    "\\allmail": "all",
+    "sent": "sent",
+    "[gmail]/sent mail": "sent",
+    "[googlemail]/sent mail": "sent",
+    "\\sent": "sent",
+    "drafts": "drafts",
+    "[gmail]/drafts": "drafts",
+    "[googlemail]/drafts": "drafts",
+    "\\drafts": "drafts",
+    "deleted messages": "trash",
+    "trash": "trash",
+    "[gmail]/trash": "trash",
+    "[googlemail]/trash": "trash",
+    "\\trash": "trash",
+    "junk": "spam",
+    "spam": "spam",
+    "[gmail]/spam": "spam",
+    "[googlemail]/spam": "spam",
+    "\\junk": "spam",
+    "\\spam": "spam",
+}
+
+
+def _gmail_system_key_for_label(label: str) -> str:
+    return _GMAIL_LABEL_SYSTEM_KEYS.get(str(label).strip().lower(), "")
+
+
+def _gmail_system_key_for_mailbox(mailbox: MailboxInfo) -> str:
+    attr_lowers = {attr.lower() for attr in mailbox.attributes}
+    attr_keys = {
+        "\\all": "all",
+        "\\archive": "all",
+        "\\sent": "sent",
+        "\\drafts": "drafts",
+        "\\trash": "trash",
+        "\\junk": "spam",
+        "\\inbox": "inbox",
+    }
+    for attr, key in attr_keys.items():
+        if attr in attr_lowers:
+            return key
+    return _GMAIL_TARGET_NAME_SYSTEM_KEYS.get(mailbox.name.strip().lower(), "")
+
+
+def _gmail_system_mailboxes_by_key(mailboxes: List[MailboxInfo]) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    for mailbox in mailboxes:
+        key = _gmail_system_key_for_mailbox(mailbox)
+        if key:
+            result.setdefault(key, []).append(mailbox.name)
+    return result
+
+
+def _gmail_target_system_key(target_mailbox: str, target_mailboxes: Optional[List[MailboxInfo]] = None) -> str:
+    if target_mailboxes is not None:
+        for mailbox in target_mailboxes:
+            if mailbox.name == target_mailbox:
+                key = _gmail_system_key_for_mailbox(mailbox)
+                if key:
+                    return key
+    return _GMAIL_TARGET_NAME_SYSTEM_KEYS.get(str(target_mailbox).strip().lower(), "")
+
+
+def gmail_target_system_mailbox_issues(
+    rows: List[Dict[str, Any]],
+    target_mailboxes: List[MailboxInfo],
+) -> List[str]:
+    available = set(_gmail_system_mailboxes_by_key(target_mailboxes))
+    issues: List[str] = []
+    for row in rows:
+        desired = str(row.get("primary_mailbox") or "Archive")
+        required = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(desired.strip().lower(), "")
+        if required and required not in available:
+            issues.append(
+                f"Gmail target missing required {required} system mailbox for "
+                f"{row.get('canonical_id') or '<unknown>'} primary_mailbox {desired!r}"
+            )
+    return issues
+
+
 def _gmail_label_key(label: str) -> str:
     lower = str(label).strip().lower()
+    system_key = _gmail_system_key_for_label(lower)
+    if system_key:
+        return system_key
     if lower in {"\\important", "important", "[gmail]/important", "[googlemail]/important"}:
         return "important"
     if lower in {"\\starred", "\\flagged", "starred", "[gmail]/starred", "[googlemail]/starred"}:
@@ -1293,7 +1444,24 @@ def row_has_gmail_starred(row: Dict[str, Any]) -> bool:
     return "starred" in labels or "starred" in flags
 
 
-def gmail_labels_for_restore(row: Dict[str, Any], target_mailbox: str) -> List[str]:
+def gmail_labels_for_restore(
+    row: Dict[str, Any],
+    target_mailbox: str,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> List[str]:
+    system_restore_labels = {
+        "\\inbox": ("inbox", "\\Inbox"),
+        "[gmail]/inbox": ("inbox", "\\Inbox"),
+        "[googlemail]/inbox": ("inbox", "\\Inbox"),
+        "\\trash": ("trash", "\\Trash"),
+        "[gmail]/trash": ("trash", "\\Trash"),
+        "[googlemail]/trash": ("trash", "\\Trash"),
+        "\\junk": ("spam", "\\Junk"),
+        "\\spam": ("spam", "\\Junk"),
+        "[gmail]/spam": ("spam", "\\Junk"),
+        "[googlemail]/spam": ("spam", "\\Junk"),
+    }
+    target_system_key = _gmail_target_system_key(target_mailbox, target_mailboxes)
     system_labels = {
         "\\all",
         "\\allmail",
@@ -1315,6 +1483,12 @@ def gmail_labels_for_restore(row: Dict[str, Any], target_mailbox: str) -> List[s
     for raw in row.get("gmail_labels") or []:
         label = str(raw).strip()
         lower = label.lower()
+        system_restore = system_restore_labels.get(lower)
+        if system_restore:
+            key, restore_label = system_restore
+            if key != target_system_key and restore_label not in labels:
+                labels.append(restore_label)
+            continue
         if (
             not label
             or lower in system_labels
@@ -1337,8 +1511,15 @@ def _first_target_match_num(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[
     return nums[0]
 
 
-def restore_gmail_labels(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any], *, target_num: Optional[bytes] = None) -> None:
-    labels = gmail_labels_for_restore(row, target_mailbox)
+def restore_gmail_labels(
+    imap: imaplib.IMAP4,
+    target_mailbox: str,
+    row: Dict[str, Any],
+    *,
+    target_num: Optional[bytes] = None,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> None:
+    labels = gmail_labels_for_restore(row, target_mailbox, target_mailboxes)
     if not labels:
         return
     num = target_num or _first_target_match_num(imap, target_mailbox, row)
@@ -1533,6 +1714,7 @@ def enforce_empty_target(
 ) -> None:
     permitted_by_mailbox: Dict[str, List[Dict[str, Any]]] = {}
     by_name = _target_mailboxes_by_name(target_mailboxes)
+    gmail_system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes) if target_provider == "gmail" else {}
     gmail_all_mailboxes = [
         mailbox.name
         for mailbox in target_mailboxes
@@ -1557,7 +1739,11 @@ def enforce_empty_target(
             if target_provider == "gmail":
                 permitted_names.extend(gmail_all_mailboxes)
                 permitted_names.extend(gmail_system_view_mailboxes_for_row(row, target_mailboxes))
-                for label in gmail_labels_for_restore(row, target_mailbox):
+                for label in gmail_labels_for_restore(row, target_mailbox, target_mailboxes):
+                    system_key = _gmail_system_key_for_label(label)
+                    if system_key in gmail_system_by_key:
+                        permitted_names.extend(gmail_system_by_key[system_key])
+                        continue
                     mailbox = by_name.get(label.lower())
                     if mailbox is not None:
                         permitted_names.append(mailbox.name)
@@ -1650,6 +1836,10 @@ def provider_import_account(
             target_mailboxes,
             target_provider=config.target.provider,
         )
+        if config.target.provider == "gmail":
+            target_issues = gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes)
+            if target_issues:
+                raise RuntimeError("Gmail target is not import-ready: " + "; ".join(target_issues))
         if config.migration.target_mode == "empty":
             enforce_empty_target(
                 imap,
@@ -1688,7 +1878,7 @@ def provider_import_account(
                 if committed_num is not None:
                     subscribe_mailbox(imap, target_mailbox)
                     if config.target.provider == "gmail":
-                        restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num)
+                        restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num, target_mailboxes=target_mailboxes)
                         restore_gmail_starred_flag(imap, target_mailbox, row, target_num=committed_num)
                     continue
             eml_path = _manifest_path(account_dir, row, "eml_path")
@@ -1706,7 +1896,7 @@ def provider_import_account(
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
                 if config.target.provider == "gmail":
-                    restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num)
+                    restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num, target_mailboxes=target_mailboxes)
                     restore_gmail_starred_flag(imap, target_mailbox, row, target_num=matched_num)
                 append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "existing"))
                 committed.add(key)
@@ -1736,7 +1926,7 @@ def provider_import_account(
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
             if config.target.provider == "gmail":
-                restore_gmail_labels(imap, target_mailbox, row, target_num=appended_num)
+                restore_gmail_labels(imap, target_mailbox, row, target_num=appended_num, target_mailboxes=target_mailboxes)
                 restore_gmail_starred_flag(imap, target_mailbox, row, target_num=appended_num)
             append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "appended"))
             committed.add(key)
@@ -1960,6 +2150,8 @@ def provider_validate_account(
                     target_mailboxes,
                     target_provider=config.target.provider,
                 )
+                if config.target.provider == "gmail":
+                    report["failed"].extend(gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes))
                 expected_target_by_id = {
                     identity: target_mailbox_by_identity[identity]
                     for identity, row in by_id.items()
@@ -1976,6 +2168,22 @@ def provider_validate_account(
                             continue
                         report["remote_checked"] += 1
                         if config.target.provider == "gmail":
+                            matching_nums = target_matching_message_nums(
+                                imap,
+                                target_mailbox,
+                                row,
+                                create_if_missing=False,
+                            )
+                            matching_gmail_msgids = {
+                                _target_gmail_msgid(imap, num)
+                                for num in matching_nums
+                            }
+                            if len(matching_gmail_msgids) > 1:
+                                report["duplicates"].append({
+                                    "canonical_id": identity,
+                                    "count": len(matching_gmail_msgids),
+                                    "source": "target",
+                                })
                             actual_labels = consume_target_match_with_gmail_labels(
                                 imap,
                                 target_mailbox,
@@ -1989,7 +2197,7 @@ def provider_validate_account(
                                 continue
                             expected_labels = {
                                 _gmail_label_key(label)
-                                for label in gmail_labels_for_restore(row, target_mailbox)
+                                for label in gmail_labels_for_restore(row, target_mailbox, target_mailboxes)
                             }
                             if row_has_gmail_starred(row):
                                 expected_labels.add("starred")
