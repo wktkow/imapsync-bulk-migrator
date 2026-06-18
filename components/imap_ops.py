@@ -18,12 +18,62 @@ from .models import Account, ServerConfig
 from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
 
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
 def quote_mailbox_name(mailbox: str) -> str:
     if mailbox.upper() == "INBOX":
         return "INBOX"
     encoded = encode_imap_utf7(mailbox)
     escaped = encoded.replace("\\", "\\\\").replace('"', r"\"")
     return f'"{escaped}"'
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
+    ensure_private_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        with contextlib.suppress(Exception):
+            os.chmod(path, PRIVATE_FILE_MODE)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+
+
+def _secure_atomic_write_text(path: Path, payload: str) -> None:
+    _secure_atomic_write_bytes(path, payload.encode("utf-8"))
+
+
+def _secure_atomic_json(path: Path, payload: Dict[str, object]) -> None:
+    _secure_atomic_write_text(path, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def legacy_server_endpoint(server: ServerConfig) -> Dict[str, object]:
+    return {
+        "host": server.host.strip().lower().rstrip("."),
+        "port": int(server.port),
+        "ssl": bool(server.ssl),
+        "starttls": bool(server.starttls),
+    }
+
+
+def legacy_server_endpoint_digest(server: ServerConfig) -> str:
+    payload = json.dumps(legacy_server_endpoint(server), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def subscribe_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
@@ -246,21 +296,21 @@ def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
 
 def _write_legacy_import_journal(account_dir: Path, rows: List[Dict[str, str]]) -> None:
     path = _legacy_import_journal_path(account_dir)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for row in rows:
-            json.dump(row, f, ensure_ascii=False, sort_keys=True)
-            f.write("\n")
-    tmp.replace(path)
+    payload = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    _secure_atomic_write_text(path, payload)
 
 
 def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> None:
     path = _legacy_import_journal_path(account_dir)
-    with path.open("a", encoding="utf-8") as f:
+    ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
+    with contextlib.suppress(Exception):
+        os.chmod(path, PRIVATE_FILE_MODE)
 
 
 def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
@@ -307,25 +357,23 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     Writes one .eml per message and a .json with mailbox/uid/flags/internaldate.
     """
     account_dir = out_root / sanitize_for_path(account.email)
-    account_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(account_dir)
     logging.info("[export] %s: starting", account.email)
     state_path = account_dir / "export-state.json"
-    tmp_state = state_path.with_suffix(".json.tmp")
-    with open(tmp_state, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "schema_version": 1,
-                "account": account.email,
-                "complete": False,
-                "started_at": int(time.time()),
-                "mailboxes": [],
-            },
-            f,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        f.write("\n")
-    tmp_state.replace(state_path)
+    source_endpoint = legacy_server_endpoint(server)
+    source_endpoint_sha256 = legacy_server_endpoint_digest(server)
+    _secure_atomic_json(
+        state_path,
+        {
+            "schema_version": 1,
+            "account": account.email,
+            "source_server": source_endpoint,
+            "source_server_sha256": source_endpoint_sha256,
+            "complete": False,
+            "started_at": int(time.time()),
+            "mailboxes": [],
+        },
+    )
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     with imap_connection(server, account) as imap:
@@ -357,15 +405,13 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 })
                 if not uids:
                     folder_dir = account_dir / sanitize_for_path(mailbox)
-                    folder_dir.mkdir(parents=True, exist_ok=True)
-                    with open(folder_dir / ".mailbox.json", "w", encoding="utf-8") as f:
-                        json.dump({"mailbox": mailbox, "message_count": 0}, f, ensure_ascii=False)
+                    ensure_private_dir(folder_dir)
+                    _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": 0})
                     continue
 
                 folder_dir = account_dir / sanitize_for_path(mailbox)
-                folder_dir.mkdir(parents=True, exist_ok=True)
-                with open(folder_dir / ".mailbox.json", "w", encoding="utf-8") as f:
-                    json.dump({"mailbox": mailbox, "message_count": len(uids)}, f, ensure_ascii=False)
+                ensure_private_dir(folder_dir)
+                _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": len(uids)})
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
@@ -385,8 +431,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         base = f"u{int(uid):010d}"
                         eml_path = folder_dir / f"{base}.eml"
                         meta_path = folder_dir / f"{base}.json"
-                        with open(eml_path, "wb") as f:
-                            f.write(msg_bytes)
+                        _secure_atomic_write_bytes(eml_path, msg_bytes)
                         meta = {
                             "mailbox": mailbox,
                             "uid": int(uid),
@@ -395,8 +440,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "rfc822_size": len(msg_bytes),
                             "content_sha256": hashlib.sha256(msg_bytes).hexdigest(),
                         }
-                        with open(meta_path, "w", encoding="utf-8") as f:
-                            json.dump(meta, f, ensure_ascii=False)
+                        _secure_atomic_json(meta_path, meta)
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if _stop_requested(stop_event):
@@ -409,21 +453,18 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             f"legacy export {account.email} failed for {len(mailbox_errors)} mailbox(es): "
             + "; ".join(mailbox_errors)
         )
-    with open(tmp_state, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "schema_version": 1,
-                "account": account.email,
-                "complete": True,
-                "completed_at": int(time.time()),
-                "mailboxes": export_state_mailboxes,
-            },
-            f,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        f.write("\n")
-    tmp_state.replace(state_path)
+    _secure_atomic_json(
+        state_path,
+        {
+            "schema_version": 1,
+            "account": account.email,
+            "source_server": source_endpoint,
+            "source_server_sha256": source_endpoint_sha256,
+            "complete": True,
+            "completed_at": int(time.time()),
+            "mailboxes": export_state_mailboxes,
+        },
+    )
     logging.info("[export] %s: completed", account.email)
 
 

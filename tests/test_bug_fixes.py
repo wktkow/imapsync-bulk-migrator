@@ -19,7 +19,18 @@ from unittest import mock
 import pytest
 
 
-def _write_legacy_message_fixture(folder: Path, *, uid: int = 1, mailbox: str = "INBOX", data: bytes = b"From: a\r\nTo: b\r\n\r\nbody") -> Path:
+def _write_legacy_message_fixture(
+    folder: Path,
+    *,
+    uid: int = 1,
+    mailbox: str = "INBOX",
+    data: bytes = b"From: a\r\nTo: b\r\n\r\nbody",
+    source_server=None,
+) -> Path:
+    from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+    from components.models import ServerConfig
+
+    source_server = source_server or ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
     folder.mkdir(parents=True, exist_ok=True)
     eml = folder / f"u{uid:010d}.eml"
     eml.write_bytes(data)
@@ -36,12 +47,16 @@ def _write_legacy_message_fixture(folder: Path, *, uid: int = 1, mailbox: str = 
     state = {
         "schema_version": 1,
         "account": account_dir.name,
+        "source_server": legacy_server_endpoint(source_server),
+        "source_server_sha256": legacy_server_endpoint_digest(source_server),
         "complete": True,
         "completed_at": 0,
         "mailboxes": [],
     }
     if state_path.exists():
         state = json.loads(state_path.read_text())
+    state.setdefault("source_server", legacy_server_endpoint(source_server))
+    state.setdefault("source_server_sha256", legacy_server_endpoint_digest(source_server))
     mailboxes = [entry for entry in state.get("mailboxes", []) if isinstance(entry, dict) and entry.get("path") != folder.name]
     mailboxes.append({
         "mailbox": mailbox,
@@ -138,6 +153,12 @@ class TestBug7ImportConfigPlaceholder:
         result = json.loads(import_path.read_text())
         assert result["server"]["host"] == "CHANGE_ME.example.com"
         assert result["server"]["host"] != "real-export-server.example.com"
+        assert result["source_server"] == {
+            "host": "real-export-server.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
         assert result["accounts"][0]["email"] == "a@example.com"
         assert import_path.stat().st_mode & 0o777 == 0o600
 
@@ -167,6 +188,12 @@ class TestBug7ImportConfigPlaceholder:
                     "ssl": True,
                     "starttls": False,
                 },
+                "source_server": {
+                    "host": config.server.host,
+                    "port": config.server.port,
+                    "ssl": config.server.ssl,
+                    "starttls": config.server.starttls,
+                },
                 "accounts": [{"email": a.email, "password": a.password} for a in config.accounts],
             },
         )
@@ -174,6 +201,7 @@ class TestBug7ImportConfigPlaceholder:
         result = json.loads(import_path.read_text())
         assert result["server"]["host"] == "CHANGE_ME.example.com"
         assert result["server"]["host"] != config.server.host
+        assert result["source_server"]["host"] == config.server.host
         assert result["accounts"][0]["email"] == "a@example.com"
         assert import_path.stat().st_mode & 0o777 == 0o600
 
@@ -191,11 +219,12 @@ class TestBug1ExecutorErrorDraining:
         from components.models import Account
 
         accounts = [Account(email=f"user{i}@test.com", password="") for i in range(3)]
-        call_count = 0
+        failed_accounts: List[str] = []
+        failed_lock = threading.Lock()
 
         def always_fail(acc: Account) -> None:
-            nonlocal call_count
-            call_count += 1
+            with failed_lock:
+                failed_accounts.append(acc.email)
             raise RuntimeError(f"fail-{acc.email}")
 
         with mock.patch("components.executor.logging") as mock_log:
@@ -207,8 +236,8 @@ class TestBug1ExecutorErrorDraining:
             warning_text = " ".join(warning_calls)
             # At least the errors that ran should appear
             assert "Completed with errors" in warning_text or mock_log.warning.called
-            for acc in accounts[:call_count]:
-                assert acc.email in warning_text
+            for email in failed_accounts:
+                assert email in warning_text
 
     def test_stop_on_error_false_logs_all_errors(self) -> None:
         from components.executor import parallel_process_accounts
@@ -258,6 +287,7 @@ class TestBug12SignalThreadGuard:
         config_path = tmp_path / "export.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
         input_dir = tmp_path / "exported"
@@ -341,6 +371,55 @@ class TestBug2NoDoubleSelect:
         state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
         assert state["complete"] is True
         assert state["mailboxes"] == [{"mailbox": "INBOX", "message_count": 0, "path": "INBOX"}]
+
+    def test_export_writes_private_source_bound_staging_artifacts(self, tmp_path: Path) -> None:
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest, export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="user@example.com", password="pass")
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+
+        class SingleMessageExportImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        data,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SingleMessageExportImap]:
+            yield SingleMessageExportImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        inbox = account_dir / "INBOX"
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+
+        assert state["source_server"] == legacy_server_endpoint(server)
+        assert state["source_server_sha256"] == legacy_server_endpoint_digest(server)
+        assert account_dir.stat().st_mode & 0o777 == 0o700
+        assert inbox.stat().st_mode & 0o777 == 0o700
+        assert state_path.stat().st_mode & 0o777 == 0o600
+        assert (inbox / ".mailbox.json").stat().st_mode & 0o777 == 0o600
+        assert (inbox / "u0000000001.eml").stat().st_mode & 0o777 == 0o600
+        assert (inbox / "u0000000001.json").stat().st_mode & 0o777 == 0o600
 
 
 class TestLegacyExportCompleteness:
@@ -504,6 +583,59 @@ class TestLegacyImportJournal:
             data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
         )
         return tmp_path
+
+    def test_cli_import_refuses_source_server_mismatch_before_append(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        in_root = self._make_export(tmp_path / "exported")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "wrong-source.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "pass"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        import_mock.assert_not_called()
+
+    def test_cli_import_requires_explicit_source_server_before_append(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        in_root = self._make_export(tmp_path / "exported")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "pass"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        import_mock.assert_not_called()
 
     def test_import_rerun_skips_committed_journal_entry(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
@@ -812,6 +944,7 @@ class TestLegacyImportJournal:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
             "accounts": [{"email": account.email, "password": account.password}],
         }))
 
@@ -866,6 +999,7 @@ class TestLegacyImportJournal:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
             "accounts": [{"email": account.email, "password": account.password}],
         }))
 
@@ -1047,6 +1181,40 @@ class TestCliAndConfigHardening:
 
         with pytest.raises(ValueError, match="path collision"):
             Config.from_json_file(collision)
+
+    def test_legacy_config_parses_source_server_and_rejects_known_provider_hosts(self, tmp_path: Path) -> None:
+        from components.models import Config
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "source.example.com", "port": 143, "ssl": False, "starttls": True},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        config = Config.from_json_file(config_path)
+
+        assert config.source_server is not None
+        assert config.source_server.host == "source.example.com"
+        assert config.source_server.port == 143
+        assert config.source_server.starttls is True
+
+        bad_server = tmp_path / "bad-server.json"
+        bad_server.write_text(json.dumps({
+            "server": {"host": "imap.gmail.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        with pytest.raises(ValueError, match="known gmail IMAP host"):
+            Config.from_json_file(bad_server)
+
+        bad_source = tmp_path / "bad-source.json"
+        bad_source.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.mail.me.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        with pytest.raises(ValueError, match="known icloud IMAP host"):
+            Config.from_json_file(bad_source)
 
     def test_main_rejects_invalid_worker_timeout_and_empty_test(self, tmp_path: Path) -> None:
         from components.main import main
@@ -1314,16 +1482,29 @@ class TestCliAndConfigHardening:
 
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import ServerConfig
 
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
         input_dir = tmp_path / "exported"
         inbox = input_dir / "a@example.com" / "INBOX"
         inbox.mkdir(parents=True)
         (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        source_server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        (input_dir / "a@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "a@example.com",
+            "source_server": legacy_server_endpoint(source_server),
+            "source_server_sha256": legacy_server_endpoint_digest(source_server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
 
         class EmptyRemoteFolderImap:
             def list(self):
@@ -1674,6 +1855,36 @@ class TestAuditHardening:
 
         assert any("export-state missing" in issue for issue in issues)
 
+    def test_strict_audit_binds_legacy_export_to_source_server(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        account = Account(email="a@example.com", password="secret")
+        source_server = ServerConfig(host="old.example.com", port=993, ssl=True, starttls=False)
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        _write_legacy_message_fixture(inbox, source_server=source_server)
+
+        _email, matching_issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+            expected_source_server=source_server,
+        )
+        _email, mismatched_issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+            expected_source_server=ServerConfig(host="new.example.com", port=993, ssl=True, starttls=False),
+        )
+
+        assert matching_issues == []
+        assert any("export-state source_server does not match" in issue for issue in mismatched_issues)
+        assert any("export-state source_server_sha256 does not match" in issue for issue in mismatched_issues)
+
     def test_strict_audit_flags_stale_message_integrity_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
@@ -1901,6 +2112,7 @@ class TestDirectAdminIndexerHardening:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [
                 {"email": "skip@example.com", "password": "secret"},
                 {"email": "ok@example.com", "password": "secret"},
@@ -1951,6 +2163,7 @@ class TestDirectAdminIndexerHardening:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [
                 {"email": "skip@example.com", "password": "secret"},
                 {"email": "ok@example.com", "password": "secret"},
@@ -2007,6 +2220,7 @@ class TestDirectAdminIndexerHardening:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
         input_dir = tmp_path / "exported" / "a@example.com" / "INBOX"
@@ -2065,7 +2279,7 @@ class TestCPanelProvisioning:
                     }
                 }
 
-            def post(self, *_args, **_kwargs):
+            def get(self, *_args, **_kwargs):
                 return Response(self.payload)
 
         client = object.__new__(CPanelClient)
@@ -2086,18 +2300,18 @@ class TestCPanelProvisioning:
         with pytest.raises(RuntimeError, match="already exists.*failed"):
             client._call("Email", "add_pop")
 
-    def test_cpanel_call_uses_post_and_redacts_request_errors(self) -> None:
+    def test_cpanel_call_uses_get_and_redacts_request_errors(self) -> None:
         from components.cpanel_client import CPanelClient
 
         class Session:
             verify = True
 
-            def post(self, url, data=None, timeout=None):
-                assert data == {"password": "super-secret", "email": "a", "domain": "example.com"}
+            def get(self, url, params=None, timeout=None):
+                assert params == {"password": "super-secret", "email": "a", "domain": "example.com"}
                 raise RuntimeError(f"failed URL {url}?password=super-secret")
 
-            def get(self, *_args, **_kwargs):
-                raise AssertionError("GET must not be used for cPanel UAPI calls")
+            def post(self, *_args, **_kwargs):
+                raise AssertionError("POST must not be used for documented cPanel UAPI GET calls")
 
         client = object.__new__(CPanelClient)
         client.base_url = "https://panel.example.com:2083"
@@ -2210,6 +2424,7 @@ class TestCPanelProvisioning:
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [
                 {"email": "skip@example.com", "password": "secret"},
                 {"email": "ok@example.com", "password": "secret"},
@@ -2263,6 +2478,7 @@ class TestCPanelProvisioning:
         server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
         config_path.write_text(json.dumps({
             "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
             "accounts": [
                 {"email": "skip@example.com", "password": "secret"},
                 {"email": "ok@example.com", "password": "secret"},
@@ -2414,6 +2630,38 @@ class TestCPanelProvisioning:
             ])
 
         assert rc == 2
+        client_cls.assert_not_called()
+
+    def test_directadmin_create_missing_requires_strict_staged_audit_before_panel_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "wrong-source.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 4
         client_cls.assert_not_called()
 
     def test_panel_reset_audits_staged_input_before_panel_calls_even_with_ignore_errors(self, tmp_path: Path) -> None:

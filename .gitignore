@@ -43,6 +43,11 @@ migration.*.config.json*
 
 # Provider migration secrets referenced by local configs/README
 secrets/
+.env
+.env.*
+*.token
+prompt.md
+prompts/
 k.md
 
 # Editor/OS backups for JSON configs
@@ -51,8 +56,4 @@ k.md
 *.json.orig
 *.json.old
 *.json.tmp
-
-
-# charm.com.pl
-*charm*
-charm.media.pl dns config
+*.jsonl.tmp

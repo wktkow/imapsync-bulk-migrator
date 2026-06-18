@@ -437,7 +437,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             audit_for_reset = bool(getattr(args, "reset", False))
             try:
                 logging.info(
-                    "[panel] Running local staged export audit before %s...",
+                    "[panel] Running strict local staged export audit before %s...",
                     "destructive reset" if audit_for_reset else "panel provisioning",
                 )
                 ok, staged_audit_issues = audit_export(
@@ -445,7 +445,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     config,
                     int(args.max_workers),
                     check_remote=False,
-                    require_integrity_metadata=audit_for_reset,
+                    require_integrity_metadata=True,
                 )
             except Exception as exc:
                 logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
@@ -577,7 +577,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "[panel] Skipping connectivity tests for %d account(s) whose control-panel reset failed",
                         skipped,
                     )
-                    connectivity_config = Config(server=config.server, accounts=active_accounts)
+                    connectivity_config = Config(server=config.server, accounts=active_accounts, source_server=config.source_server)
                 test_accounts(connectivity_config, max_workers=int(args.max_workers))
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
@@ -697,6 +697,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "ssl": True,
                             "starttls": False,
                         },
+                        "source_server": {
+                            "host": config.server.host,
+                            "port": config.server.port,
+                            "ssl": config.server.ssl,
+                            "starttls": config.server.starttls,
+                        },
                         "accounts": [{"email": a.email, "password": a.password} for a in config.accounts],
                     })
                     logging.warning("Generated import config TEMPLATE at: %s — you MUST edit server.host before importing!", payload_path)
@@ -733,6 +739,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             check_free_space_for_path(in_root, min_free_gb)
             panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+            if not panel_dry_run:
+                try:
+                    logging.info("Running strict local staged export audit before import...")
+                    ok, staged_audit_issues = audit_export(
+                        in_root,
+                        config,
+                        int(args.max_workers),
+                        check_remote=False,
+                        require_integrity_metadata=True,
+                    )
+                except Exception as exc:
+                    logging.error("Staged export audit failed before import: %s", exc)
+                    return 4
+                if not ok:
+                    logging.error(
+                        "Refusing import because staged export audit found %d issue(s)",
+                        len(staged_audit_issues),
+                    )
+                    for issue in staged_audit_issues:
+                        logging.error("[staged-audit] %s", issue)
+                    return 4
 
             def do_import(acc: Account) -> None:
                 if stop_event.is_set():
@@ -793,6 +820,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if not account_dir.exists():
                         with mismatches_lock:
                             validation_errors.append((email, f"account directory missing: {account_dir}"))
+                        return
+                    ok, audit_issues = audit_export(
+                        in_root,
+                        Config(server=config.server, accounts=[acc], source_server=config.source_server),
+                        1,
+                        check_remote=False,
+                        require_integrity_metadata=True,
+                    )
+                    if not ok:
+                        with mismatches_lock:
+                            validation_errors.extend((email, issue) for issue in audit_issues)
                         return
                     current_target = _legacy_import_target_id(config.server, acc)
                     pending_rows = [

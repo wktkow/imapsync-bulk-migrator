@@ -131,14 +131,24 @@ class ProviderEndpoint:
 
     def validate_provider_contract(self, *, context: str) -> None:
         expected_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
+        host_key = self.host.strip().lower().rstrip(".")
         if self.provider != "gmail" and self.gmail_full_visibility_verified:
             raise ValueError(f"{context}.gmail_full_visibility_verified is only valid for provider 'gmail'")
         if self.provider == "imap":
+            known_provider = {
+                host: provider
+                for provider, host in expected_hosts.items()
+            }.get(host_key)
+            if known_provider:
+                raise ValueError(
+                    f"{context}.host {self.host!r} is the known {known_provider} IMAP host; "
+                    f"use provider {known_provider!r} so provider-specific safeguards run"
+                )
             if self.ssl and self.starttls:
                 raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")
             self.validate_auth_method(self.auth, context=f"{context}.auth")
             return
-        if self.host.strip().lower() != expected_hosts[self.provider]:
+        if host_key != expected_hosts[self.provider]:
             raise ValueError(f"{context}.host must be {expected_hosts[self.provider]!r} for provider {self.provider!r}")
         if self.port != 993:
             raise ValueError(f"{context}.port must be 993 for provider {self.provider!r}")
@@ -146,6 +156,7 @@ class ProviderEndpoint:
             raise ValueError(f"{context}.ssl must be true for provider {self.provider!r}")
         if self.starttls:
             raise ValueError(f"{context}.starttls must be false; provider IMAP uses implicit SSL on port 993")
+        self.host = expected_hosts[self.provider]
         self.validate_auth_method(self.auth, context=f"{context}.auth")
 
     def validate_auth_method(self, auth: AuthConfig, *, context: str) -> None:
@@ -165,6 +176,8 @@ class MigrationAccount:
     target_email: str
     source_auth: Optional[AuthConfig] = None
     target_auth: Optional[AuthConfig] = None
+    gmail_full_visibility_verified: bool = False
+    target_gmail_full_visibility_verified: bool = False
 
     @property
     def email(self) -> str:
@@ -185,6 +198,14 @@ class MigrationAccount:
             target_email=target_email,
             source_auth=AuthConfig.from_dict(raw.get("source_auth"), context=f"accounts[{index}].source_auth", required=False, base_dir=base_dir),
             target_auth=AuthConfig.from_dict(raw.get("target_auth"), context=f"accounts[{index}].target_auth", required=False, base_dir=base_dir),
+            gmail_full_visibility_verified=_bool_value(
+                raw.get("gmail_full_visibility_verified", False),
+                f"accounts[{index}].gmail_full_visibility_verified",
+            ),
+            target_gmail_full_visibility_verified=_bool_value(
+                raw.get("target_gmail_full_visibility_verified", False),
+                f"accounts[{index}].target_gmail_full_visibility_verified",
+            ),
         )
 
 
@@ -332,12 +353,29 @@ class ProviderMigrationConfig:
                         f"accounts[{idx}].{role}_auth.username must match {role}_email for Gmail "
                         f"({expected_email})"
                     )
+            if self.source.provider == "gmail" and multi_account and not account.gmail_full_visibility_verified:
+                raise ValueError(
+                    f"accounts[{idx}].gmail_full_visibility_verified must be true for multi-account Gmail source configs"
+                )
+            if self.source.provider != "gmail" and account.gmail_full_visibility_verified:
+                raise ValueError(
+                    f"accounts[{idx}].gmail_full_visibility_verified is only valid when source.provider is 'gmail'"
+                )
+            if self.target.provider == "gmail" and multi_account and not account.target_gmail_full_visibility_verified:
+                raise ValueError(
+                    f"accounts[{idx}].target_gmail_full_visibility_verified must be true for multi-account Gmail target configs"
+                )
+            if self.target.provider != "gmail" and account.target_gmail_full_visibility_verified:
+                raise ValueError(
+                    f"accounts[{idx}].target_gmail_full_visibility_verified is only valid when target.provider is 'gmail'"
+                )
 
 
 @dataclasses.dataclass
 class Config:
     server: ServerConfig
     accounts: List[Account]
+    source_server: Optional[ServerConfig] = None
 
     @staticmethod
     def from_json_file(path: Path) -> "Config":
@@ -348,17 +386,10 @@ class Config:
         if not isinstance(data, dict):
             raise ValueError("Config root must be an object")
 
-        server_raw = data.get("server")
-        if not isinstance(server_raw, dict):
-            raise ValueError("Config must include 'server' object")
-        host = server_raw.get("host")
-        if not host or not isinstance(host, str):
-            raise ValueError("server.host must be a non-empty string")
-        port = _int_value(server_raw.get("port", 993), "server.port", min_value=1, max_value=65535)
-        use_ssl = _bool_value(server_raw.get("ssl", True), "server.ssl")
-        starttls = _bool_value(server_raw.get("starttls", False), "server.starttls")
-        if use_ssl and starttls:
-            raise ValueError("server.ssl and server.starttls cannot both be true")
+        server = _server_config_from_dict(data.get("server"), context="server")
+        source_server = None
+        if "source_server" in data and data.get("source_server") is not None:
+            source_server = _server_config_from_dict(data.get("source_server"), context="source_server")
 
         accounts_raw = data.get("accounts")
         if not isinstance(accounts_raw, list) or not accounts_raw:
@@ -381,8 +412,29 @@ class Config:
             accounts.append(Account(email=email, password=password))
         _reject_sanitized_path_collisions([account.email for account in accounts], context="accounts.email")
 
-        server = ServerConfig(host=host, port=port, ssl=use_ssl, starttls=starttls)
-        return Config(server=server, accounts=accounts)
+        return Config(server=server, accounts=accounts, source_server=source_server)
+
+
+def _server_config_from_dict(raw: Any, *, context: str) -> ServerConfig:
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config must include '{context}' object" if context == "server" else f"{context} must be an object")
+    host = raw.get("host")
+    if not host or not isinstance(host, str):
+        raise ValueError(f"{context}.host must be a non-empty string")
+    host_key = host.strip().lower().rstrip(".")
+    known_provider_hosts = {"imap.gmail.com": "gmail", "imap.mail.me.com": "icloud"}
+    if host_key in known_provider_hosts:
+        provider = known_provider_hosts[host_key]
+        raise ValueError(
+            f"{context}.host {host!r} is the known {provider} IMAP host; "
+            "use provider config mode so provider-specific safeguards run"
+        )
+    port = _int_value(raw.get("port", 993), f"{context}.port", min_value=1, max_value=65535)
+    use_ssl = _bool_value(raw.get("ssl", True), f"{context}.ssl")
+    starttls = _bool_value(raw.get("starttls", False), f"{context}.starttls")
+    if use_ssl and starttls:
+        raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")
+    return ServerConfig(host=host, port=port, ssl=use_ssl, starttls=starttls)
 
 
 def is_provider_config_file(path: Path) -> bool:

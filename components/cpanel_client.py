@@ -61,7 +61,7 @@ class CPanelClient:
     def _call(self, module: str, function: str, params: Optional[Dict[str, Any]] = None) -> Any:
         endpoint = self._endpoint(module, function)
         try:
-            response = self.session.post(endpoint, data=dict(params or {}), timeout=self.timeout_sec)
+            response = self.session.get(endpoint, params=dict(params or {}), timeout=self.timeout_sec)
             response.raise_for_status()
         except Exception as exc:
             raise RuntimeError(f"cPanel UAPI {module}/{function} request failed: {type(exc).__name__}") from None

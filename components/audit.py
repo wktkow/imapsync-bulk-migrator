@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
 from .models import Account, Config, ServerConfig
-from .imap_ops import imap_connection, list_all_mailboxes, quote_mailbox_name
+from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
 from .utils import sanitize_for_path
 
 
@@ -62,7 +62,14 @@ def _folder_mailbox_name(folder_dir: Path) -> str:
     return folder_dir.name
 
 
-def _legacy_export_state_issues(account: Account, account_dir: Path, folder_dirs: List[Path], *, require_state: bool) -> List[str]:
+def _legacy_export_state_issues(
+    account: Account,
+    account_dir: Path,
+    folder_dirs: List[Path],
+    *,
+    require_state: bool,
+    expected_source_server: Optional[ServerConfig] = None,
+) -> List[str]:
     issues: List[str] = []
     state_path = account_dir / "export-state.json"
     if not state_path.exists():
@@ -79,6 +86,22 @@ def _legacy_export_state_issues(account: Account, account_dir: Path, folder_dirs
         issues.append(f"{account.email}: export-state is not complete")
     if state.get("account") not in {None, account.email}:
         issues.append(f"{account.email}: export-state account mismatch ({state.get('account')})")
+    source_server = state.get("source_server")
+    source_server_sha256 = state.get("source_server_sha256")
+    if expected_source_server is not None:
+        expected_endpoint = legacy_server_endpoint(expected_source_server)
+        expected_digest = legacy_server_endpoint_digest(expected_source_server)
+        if not isinstance(source_server, dict):
+            issues.append(f"{account.email}: export-state source_server missing; rerun legacy export with current version")
+        elif source_server != expected_endpoint:
+            issues.append(
+                f"{account.email}: export-state source_server does not match config source_server "
+                f"(state={source_server} config={expected_endpoint})"
+            )
+        if source_server_sha256 != expected_digest:
+            issues.append(f"{account.email}: export-state source_server_sha256 does not match config source_server")
+    elif require_state:
+        issues.append(f"{account.email}: config source_server missing; cannot bind staged export to source endpoint")
     raw_mailboxes = state.get("mailboxes")
     if not isinstance(raw_mailboxes, list):
         issues.append(f"{account.email}: export-state mailboxes is missing or invalid")
@@ -165,6 +188,7 @@ def audit_account(
     check_remote: bool = True,
     *,
     require_integrity_metadata: bool = False,
+    expected_source_server: Optional[ServerConfig] = None,
 ) -> Tuple[str, List[str]]:
     """Audit a single account directory and optionally compare to remote counts."""
     issues: List[str] = []
@@ -175,7 +199,15 @@ def audit_account(
     folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
     if not folder_dirs:
         issues.append(f"{account.email}: no mailbox folders found")
-    issues.extend(_legacy_export_state_issues(account, account_dir, folder_dirs, require_state=require_integrity_metadata))
+    issues.extend(
+        _legacy_export_state_issues(
+            account,
+            account_dir,
+            folder_dirs,
+            require_state=require_integrity_metadata,
+            expected_source_server=expected_source_server,
+        )
+    )
     for folder_dir in folder_dirs:
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
@@ -317,6 +349,9 @@ def audit_export(
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     issues_accum: List[str] = []
+    expected_source_server = config.source_server if config.source_server is not None else None
+    if expected_source_server is None and not require_integrity_metadata:
+        expected_source_server = config.server
 
     def worker(acc: Account) -> List[str]:
         _email, issues = audit_account(
@@ -325,6 +360,7 @@ def audit_export(
             config.server if check_remote else None,
             check_remote=check_remote,
             require_integrity_metadata=require_integrity_metadata,
+            expected_source_server=expected_source_server,
         )
         if not issues:
             return []

@@ -21,6 +21,8 @@ Provider staged mode supports every source-target combination of:
 - `icloud`: iCloud Mail IMAP at `imap.mail.me.com:993`.
 - `imap`: any generic IMAP server, including mailboxes normally accessed through
   Roundcube, DirectAdmin webmail, cPanel webmail, or another hosted webmail UI.
+  Gmail and iCloud's known IMAP hosts are rejected under `imap` so their
+  provider-specific safeguards cannot be bypassed accidentally.
 
 Supported route classes:
 
@@ -124,28 +126,50 @@ Minimal provider config:
 }
 ```
 
-For multi-account provider configs, put credentials and usernames on each
+The sample is intentionally conservative: Gmail export will fail until
+`source.gmail_full_visibility_verified` is verified operationally and changed to
+`true`.
+
+For multi-account provider configs, put credentials, usernames, Gmail source
+visibility attestations, and Gmail target visibility attestations on each
 account override. Shared endpoint-level usernames or secrets are rejected to
 avoid accidentally migrating multiple accounts with one login.
 
-Gmail source migrations require `X-GM-EXT-1` and a visible All Mail view. Gmail
-labels are captured in metadata. Provider preflight also requires
-`source.gmail_full_visibility_verified=true` for Gmail sources. Set that flag
-only after verifying the account is not hiding messages from IMAP, for example
-by using Workspace XOAUTH2 with the `gmail.imap_admin` scope or by confirming
-Gmail IMAP settings use no folder-size limit and required labels are visible in
-IMAP. Without that, an IMAP scan can be internally consistent but still not be a
-complete decommissioning proof.
+Gmail source migrations require `X-GM-EXT-1`, a selectable All Mail view
+advertised with the `\All` special-use attribute, and full-visibility
+attestation before export can complete. For a single account,
+`source.gmail_full_visibility_verified=true` is accepted. For multi-account
+Gmail source migrations, each `accounts[].gmail_full_visibility_verified` value
+must be true. Validation also rejects Gmail export state that lacks the effective
+attestation for that account. Set the flag only after verifying the account is
+not hiding messages from IMAP, for example by using Workspace XOAUTH2 with the
+`gmail.imap_admin` scope or by confirming Gmail IMAP settings use no folder-size
+limit and required labels are visible in IMAP. Without that, an IMAP scan can be
+internally consistent but still not be a complete decommissioning proof.
 
 When Gmail is the target, non-system Gmail labels are restored with
 `+X-GM-LABELS`; Gmail `Starred` and `Important` are handled as special/system
 labels rather than normal custom labels.
 
+Gmail target migrations require `X-GM-EXT-1`, a selectable All Mail view
+advertised with `\All`, and full-visibility attestation before import or target
+validation can be treated as a decommissioning proof. For a single account, set
+`target.gmail_full_visibility_verified=true` only after confirming the target is
+not hiding messages from IMAP. For multi-account Gmail target migrations, each
+`accounts[].target_gmail_full_visibility_verified` value must be true.
+
 iCloud and generic IMAP do not expose Gmail's cross-label identity. Physical
-copies in different folders are preserved as separate messages. iCloud `VIP` and
-non-Gmail IMAP `\All` / `\Flagged` special-use views are treated as virtual
-mailboxes and skipped as sources to avoid importing search views as duplicate
-real folders.
+copies in different folders are preserved as separate messages. Generic IMAP,
+including Roundcube-backed hosted mail, exports every selectable mailbox even
+when the server advertises special-use attributes such as `\All` or `\Flagged`;
+those attributes are advisory and are not treated as proof that the mailbox is a
+virtual search view. A generic `\Archive` mailbox maps to `Archive`. iCloud
+`VIP` is skipped as a known provider search view.
+
+During `target_mode=empty` resume checks, generic target `\All` and `\Flagged`
+special-use views are allowed only for messages that match committed journal
+rows from the same migration. Unmatched messages in those views still fail the
+empty-target gate.
 
 For custom nested folders, provider mode stores source hierarchy segments and
 translates them to the target server's advertised hierarchy delimiter during
@@ -155,9 +179,12 @@ same translated target mailbox, import and target validation fail before
 claiming the migration is safe.
 
 Provider export writes an account-level `export-state.json` with the source
-account, target account, completion flag, canonical message count, and a digest
-of the manifest. Import, audit, and validation require that state to match the
-manifest before trusting the staged data.
+account, target account, configured source endpoint, effective source login
+username, completion flag, canonical message count, and a digest of the
+manifest. Import, audit, and validation require that state to match the config
+and manifest before trusting the staged data. Provider import journals also bind
+each row to the configured target endpoint and effective target login username,
+so copied rows cannot be reused against a different target mailbox.
 
 ## Legacy Generic IMAP Workflow
 
@@ -190,13 +217,24 @@ Example legacy config:
 ```
 
 During legacy export, the tool generates `import.pass.config.json` with
-`CHANGE_ME.example.com` as the target host. Edit that generated config before
-import.
+`CHANGE_ME.example.com` as the target host and `source_server` set to the
+export server. Edit only the generated `server` block for the target before
+import. `source_server` is used by strict import, audit, validation, and reset
+gates to prove the staged export came from the expected old server. Hand-written
+legacy import configs must include `source_server`; strict import, validation,
+and non-dry-run panel provisioning fail closed when it is missing.
+
+Legacy export writes account directories and mailbox directories with mode
+`0700`; staged `.eml`, metadata, journals, and state files are written with mode
+`0600`.
 
 ## DirectAdmin And cPanel
 
 DirectAdmin and cPanel integration is available for legacy generic IMAP imports.
 Provider configs do not call hosting panel APIs.
+
+cPanel provisioning uses the documented UAPI `Email` GET endpoints under
+`/execute/Email/...`.
 
 Every configured account must be a mailbox address in `local@domain` form. Panel
 workflows fail fast for malformed accounts instead of silently skipping them.
@@ -223,9 +261,9 @@ python imapsync_bulk_migrator.py --mode import --config import.pass.config.json 
   --cpanel-token-file secrets/cpanel-api-token
 ```
 
-Non-dry-run panel provisioning audits the staged export before any panel API
-call. If the staged data is missing, malformed, or inconsistent, provisioning
-aborts before accounts are created or reset.
+Non-dry-run panel provisioning runs the strict local staged export audit before
+any panel API call. If the staged data is missing, malformed, source-mismatched,
+or inconsistent, provisioning aborts before accounts are created or reset.
 
 ## Server Decommissioning Workflows
 
@@ -253,6 +291,9 @@ Reset safeguards:
 - The staged legacy export must include a completed account-level
   `export-state.json` written by a successful legacy export; hand-shaped or
   partial export directories are rejected before destructive reset.
+- `export-state.json` must match the generated import config `source_server`,
+  so a reset/import cannot accidentally use staged mail from a different old
+  server.
 - After a successful reset, stale legacy import journals for that account are
   archived before connectivity tests or import begin, so an old committed journal
   cannot make a freshly reset mailbox look imported.
@@ -329,6 +370,10 @@ Local config and secret paths are ignored by Git:
 - `migration.config.json*`
 - `migration.*.config.json*`
 - `secrets/`
+- `.env` and `.env.*`
+- `*.token`
+- `prompt.md`
+- `prompts/`
 
 Prefer `*_file` or `*_env` options for panel credentials and mailbox secrets.
 Inline password flags work where documented, but they can be exposed through
@@ -341,26 +386,34 @@ Log files are created with mode `0600`.
 Provider mode validation is manifest/journal based. It checks:
 
 - Complete `export-state.json` matching the source account, target account,
-  manifest message count, and manifest digest.
+  configured source endpoint, effective source login username, configured
+  source/target providers, manifest message count, and manifest digest.
+- Gmail source full-visibility attestation in `export-state.json` when the
+  configured source provider is Gmail.
+- Gmail target full-visibility attestation in the config, plus selectable
+  `\All` All Mail and `X-GM-EXT-1`, when target validation checks Gmail.
 - Unique manifest identities.
-- Manifest source and target account consistency.
+- Manifest source and target account consistency, plus manifest source-provider
+  consistency with the configured source provider.
 - Required manifest integrity metadata.
 - Per-message metadata JSON consistency with the manifest.
 - Import journal consistency.
+- Provider import journal target endpoint and effective target login binding.
 - Target folder mapping consistency, including translated hierarchy collision
   checks when target validation is enabled.
 - Target message presence by `Message-ID` plus content hash/size where target
   validation is enabled.
 - Expected Gmail labels when Gmail is the target.
-- Gmail target `X-GM-MSGID` uniqueness across matched rows, so one Gmail message
-  visible through multiple labels cannot satisfy multiple physical source
-  messages.
+- Gmail target `X-GM-MSGID` values as decimal unsigned 64-bit integers, plus
+  uniqueness across matched rows, so one Gmail message visible through multiple
+  labels cannot satisfy multiple physical source messages.
 
 Legacy validation checks folder counts and best-effort message identity by
 `Message-ID` or content hash/size, consuming each remote match once so duplicate
 local messages require duplicate remote messages. Legacy audit can run online or
-offline; the pre-reset gate always requires strict local staged integrity checks
-and completed account-level legacy export state.
+offline. Legacy import, validation, and the pre-reset gate require strict local
+staged integrity checks, completed account-level legacy export state, and a
+matching `source_server` binding before target-side work is trusted.
 
 ## Known Constraints
 
@@ -381,8 +434,12 @@ and completed account-level legacy export state.
 - IMAP UIDs are not preserved. Message identity is staged through content,
   metadata, Gmail IDs where available, and import journals.
 - Provider staged exports created by older versions may need to be rerun if they
-  lack account-bound manifest rows or the current `export-state.json` manifest
+  lack account-bound manifest rows, effective source-login binding, target
+  endpoint-bound import journals, or the current `export-state.json` manifest
   digest.
+- Legacy staged exports created by older versions may need to be rerun if they
+  lack `source_server`, `source_server_sha256`, or per-message integrity
+  metadata.
 - DirectAdmin/cPanel reset deletes target mailbox contents. Use dry-run, verify
   staged data, and keep independent backups before destructive operations.
 

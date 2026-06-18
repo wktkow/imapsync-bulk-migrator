@@ -22,6 +22,10 @@ from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigr
 from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
 
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
 @dataclass(frozen=True)
 class MailboxInfo:
     name: str
@@ -95,12 +99,57 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
     return username, auth
 
 
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(Exception):
+        os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def provider_endpoint_state(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> Dict[str, Any]:
+    provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
+    host = provider_hosts.get(endpoint.provider, endpoint.host)
+    state: Dict[str, Any] = {
+        "provider": endpoint.provider,
+        "host": host.strip().lower().rstrip("."),
+        "port": int(endpoint.port),
+        "ssl": bool(endpoint.ssl),
+        "starttls": bool(endpoint.starttls),
+    }
+    if username is not None:
+        state["username"] = str(username).strip()
+    return state
+
+
+def provider_endpoint_state_digest(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> str:
+    payload = json.dumps(provider_endpoint_state(endpoint, username=username), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def provider_account_endpoint_state(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> Dict[str, Any]:
+    username, _auth = effective_auth(endpoint, account, role=role)
+    return provider_endpoint_state(endpoint, username=username)
+
+
+def provider_account_endpoint_state_digest(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> str:
+    username, _auth = effective_auth(endpoint, account, role=role)
+    return provider_endpoint_state_digest(endpoint, username=username)
+
+
+def provider_target_journal_binding(config: ProviderMigrationConfig, account: MigrationAccount) -> Dict[str, Any]:
+    return {
+        "target_endpoint": provider_account_endpoint_state(config.target, account, role="target"),
+        "target_endpoint_sha256": provider_account_endpoint_state_digest(config.target, account, role="target"),
+    }
+
+
 @contextlib.contextmanager
 def imap_connection(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> Iterator[imaplib.IMAP4]:
+    provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
+    host = provider_hosts.get(endpoint.provider, endpoint.host)
     if endpoint.ssl:
-        imap = imaplib.IMAP4_SSL(host=endpoint.host, port=endpoint.port, ssl_context=ssl.create_default_context())
+        imap = imaplib.IMAP4_SSL(host=host, port=endpoint.port, ssl_context=ssl.create_default_context())
     else:
-        imap = imaplib.IMAP4(host=endpoint.host, port=endpoint.port)
+        imap = imaplib.IMAP4(host=host, port=endpoint.port)
     try:
         if (not endpoint.ssl) and endpoint.starttls:
             imap.starttls(ssl_context=ssl.create_default_context())
@@ -223,12 +272,9 @@ def is_noselect(mailbox: MailboxInfo) -> bool:
 
 def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     provider_key = provider.lower()
-    attr_lowers = {attr.lower() for attr in mailbox.attributes}
-    if provider_key == "gmail":
-        return False
     if provider_key == "icloud" and mailbox.name.lower() == "vip":
         return True
-    return bool(attr_lowers & {"\\all", "\\flagged"})
+    return False
 
 
 def mailbox_path_segments(mailbox_name: str, delimiter: str) -> List[str]:
@@ -269,17 +315,55 @@ def translate_source_mailbox_for_target(
     return delimiter.join(segments)
 
 
+def gmail_all_mail_visible(mailboxes: List[MailboxInfo]) -> bool:
+    return any(
+        not is_noselect(mailbox)
+        and any(attr.lower() == "\\all" for attr in mailbox.attributes)
+        for mailbox in mailboxes
+    )
+
+
+def gmail_all_mail_names(mailboxes: List[MailboxInfo]) -> List[str]:
+    return [
+        mailbox.name
+        for mailbox in mailboxes
+        if not is_noselect(mailbox)
+        and any(attr.lower() == "\\all" for attr in mailbox.attributes)
+    ]
+
+
+def gmail_all_mail_select_issues(
+    imap: imaplib.IMAP4,
+    mailboxes: List[MailboxInfo],
+    *,
+    role: str,
+) -> List[str]:
+    issues: List[str] = []
+    for mailbox in gmail_all_mail_names(mailboxes):
+        status, response = select_mailbox(imap, mailbox, readonly=True)
+        if status != "OK":
+            issues.append(f"Gmail {role} All Mail is not selectable via IMAP: {mailbox!r} ({response})")
+    return issues
+
+
 def gmail_source_readiness_issues(capabilities: List[str], mailboxes: List[MailboxInfo]) -> List[str]:
     issues: List[str] = []
     if "X-GM-EXT-1" not in capabilities:
         issues.append("Gmail source did not advertise X-GM-EXT-1")
-    if not any(
-        any(attr.lower() == "\\all" for attr in mailbox.attributes)
-        or mailbox.name.lower() in {"[gmail]/all mail", "[googlemail]/all mail", "all mail"}
-        for mailbox in mailboxes
-    ):
+    if not gmail_all_mail_visible(mailboxes):
         issues.append(
             "Gmail source All Mail is not visible via IMAP; enable All Mail/labels for IMAP or use OAuth/admin scope that exposes all mail before decommissioning"
+        )
+    return issues
+
+
+def gmail_target_readiness_issues(capabilities: List[str], mailboxes: List[MailboxInfo]) -> List[str]:
+    issues: List[str] = []
+    if "X-GM-EXT-1" not in capabilities:
+        issues.append("target Gmail IMAP server did not advertise X-GM-EXT-1")
+    if not gmail_all_mail_visible(mailboxes):
+        issues.append(
+            "Gmail target All Mail is not visible via IMAP; enable All Mail/labels for IMAP or use OAuth/admin scope that exposes all mail before decommissioning proof"
         )
     return issues
 
@@ -291,6 +375,35 @@ def gmail_source_decommission_issues(endpoint: ProviderEndpoint) -> List[str]:
         "Gmail source full IMAP visibility is not attested; before server decommissioning, "
         "set source.gmail_full_visibility_verified=true only after verifying Workspace "
         "gmail.imap_admin access or Gmail IMAP settings with no folder-size limit and required labels visible in IMAP"
+    ]
+
+
+def gmail_full_visibility_attested(endpoint: ProviderEndpoint, account: MigrationAccount) -> bool:
+    if endpoint.provider != "gmail":
+        return False
+    return bool(account.gmail_full_visibility_verified or endpoint.gmail_full_visibility_verified)
+
+
+def gmail_target_full_visibility_attested(endpoint: ProviderEndpoint, account: MigrationAccount) -> bool:
+    if endpoint.provider != "gmail":
+        return False
+    return bool(account.target_gmail_full_visibility_verified or endpoint.gmail_full_visibility_verified)
+
+
+def gmail_account_decommission_issues(endpoint: ProviderEndpoint, account: MigrationAccount) -> List[str]:
+    if endpoint.provider != "gmail" or gmail_full_visibility_attested(endpoint, account):
+        return []
+    return gmail_source_decommission_issues(endpoint)
+
+
+def gmail_target_decommission_issues(endpoint: ProviderEndpoint, account: MigrationAccount) -> List[str]:
+    if endpoint.provider != "gmail" or gmail_target_full_visibility_attested(endpoint, account):
+        return []
+    return [
+        "Gmail target full IMAP visibility is not attested; before server decommissioning, "
+        "set target.gmail_full_visibility_verified=true for single-account configs or "
+        "accounts[].target_gmail_full_visibility_verified=true for multi-account configs only after "
+        "verifying the target is not hiding messages from IMAP"
     ]
 
 
@@ -354,10 +467,12 @@ def get_capabilities(imap: imaplib.IMAP4) -> List[str]:
     return sorted({tok.decode(errors="ignore").upper() for tok in joined.split() if tok})
 
 
-def _parse_parenthesized_words(raw: str) -> List[str]:
+def _parse_parenthesized_words(raw: str, *, drop_literal_markers: bool = False) -> List[str]:
     words: List[str] = []
     for match in re.finditer(r'"((?:\\.|[^"])*)"|(\S+)', raw):
         quoted, atom = match.groups()
+        if drop_literal_markers and quoted is None and re.fullmatch(r"\{\d+\}", str(atom or "").strip()):
+            continue
         value = quoted if quoted is not None else atom
         value = value.replace(r"\"", '"').replace(r"\\", "\\")
         if value:
@@ -411,6 +526,7 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
     msg_bytes: Optional[bytes] = None
     meta_chunks: List[str] = []
     literal_labels: List[str] = []
+    label_literal_context = False
     for part in fetch_response:
         if isinstance(part, tuple) and len(part) == 2:
             meta, body = part
@@ -418,22 +534,27 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
             if isinstance(meta, (bytes, bytearray)):
                 meta_text = bytes(meta).decode(errors="ignore")
                 meta_chunks.append(meta_text)
+                if re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE):
+                    label_literal_context = True
+            is_label_literal = bool(
+                re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE)
+                or (label_literal_context and re.fullmatch(r"\s*\{\d+\}\s*", meta_text))
+            )
             if (
                 isinstance(body, (bytes, bytearray))
                 and body
                 and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
             ):
                 msg_bytes = bytes(body) if msg_bytes is None else msg_bytes + bytes(body)
-            elif (
-                isinstance(body, (bytes, bytearray))
-                and body
-                and re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE)
-            ):
+            elif isinstance(body, (bytes, bytearray)) and body and is_label_literal:
                 label = decode_imap_utf7(bytes(body).decode("ascii", errors="ignore").strip())
                 if label:
                     literal_labels.append(label)
         elif isinstance(part, (bytes, bytearray)):
-            meta_chunks.append(bytes(part).decode(errors="ignore"))
+            meta_text = bytes(part).decode(errors="ignore")
+            meta_chunks.append(meta_text)
+            if label_literal_context and ")" in meta_text:
+                label_literal_context = False
     meta_str = " ".join(meta_chunks)
 
     def group(pattern: str) -> Optional[str]:
@@ -442,7 +563,7 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
 
     size_raw = group(r"RFC822\.SIZE\s+(\d+)")
     labels_raw = _extract_parenthesized_after(meta_str, "X-GM-LABELS")
-    labels = _parse_parenthesized_words(labels_raw or "")
+    labels = _parse_parenthesized_words(labels_raw or "", drop_literal_markers=True)
     for label in literal_labels:
         if label not in labels:
             labels.append(label)
@@ -561,6 +682,8 @@ def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Itera
         return mapped("Junk", "[Gmail]/Spam", "[GoogleMail]/Spam", "Spam", "Junk", "\\Junk")
     if has_any("inbox", "\\inbox"):
         return mapped("INBOX", "INBOX", "\\Inbox", "\\INBOX")
+    if has_any("\\archive"):
+        return mapped("Archive", "Archive", "\\Archive")
     for token in tokens:
         lower = token.lower()
         if (
@@ -583,30 +706,60 @@ def _safe_identity(identity: str) -> str:
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, sort_keys=True)
-        f.write("\n")
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        with contextlib.suppress(Exception):
+            os.chmod(path, PRIVATE_FILE_MODE)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("wb") as f:
-        f.write(payload)
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        with contextlib.suppress(Exception):
+            os.chmod(path, PRIVATE_FILE_MODE)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for row in rows:
-            json.dump(row, f, ensure_ascii=False, sort_keys=True)
-            f.write("\n")
-    tmp.replace(path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for row in rows:
+                json.dump(row, f, ensure_ascii=False, sort_keys=True)
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+        with contextlib.suppress(Exception):
+            os.chmod(path, PRIVATE_FILE_MODE)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
 
 
 def account_export_dir(root: Path, account: MigrationAccount) -> Path:
@@ -654,6 +807,9 @@ def provider_export_state_issues(
     *,
     account: Optional[MigrationAccount] = None,
     manifest_rows: Optional[List[Dict[str, Any]]] = None,
+    source_provider: Optional[str] = None,
+    target_provider: Optional[str] = None,
+    source_endpoint: Optional[ProviderEndpoint] = None,
 ) -> List[str]:
     state_path = account_dir / "export-state.json"
     try:
@@ -661,29 +817,28 @@ def provider_export_state_issues(
     except Exception as exc:
         return [f"export-state missing or invalid: {exc}"]
     issues: List[str] = []
-    if not isinstance(state, dict) or state.get("complete") is not True:
+    if not isinstance(state, dict):
         issues.append(f"export-state is not complete: {state_path}")
         return issues
-    if account is not None:
-        source_account = state.get("source_account")
-        target_account = state.get("target_account")
-        if source_account != account.source_email:
-            issues.append(
-                f"export-state source_account does not match config source_email "
-                f"{account.source_email}: {source_account or '<missing>'}"
-            )
-        if target_account != account.target_email:
-            issues.append(
-                f"export-state target_account does not match config target_email "
-                f"{account.target_email}: {target_account or '<missing>'}"
-            )
+    issues.extend(
+        provider_export_state_contract_issues(
+            state,
+            account=account,
+            source_provider=source_provider,
+            target_provider=target_provider,
+            source_endpoint=source_endpoint,
+        )
+    )
+    if state.get("complete") is not True:
+        issues.append(f"export-state is not complete: {state_path}")
+        return issues
     if manifest_rows is not None:
-        source_provider = str(state.get("source_provider") or "").lower()
-        if not source_provider:
+        effective_source_provider = str(source_provider or state.get("source_provider") or "").lower()
+        if not effective_source_provider:
             providers = {str(row.get("source_provider") or "").lower() for row in manifest_rows}
             if len(providers) == 1:
-                source_provider = next(iter(providers))
-        if source_provider == "gmail" and state.get("gmail_full_visibility_verified") is not True:
+                effective_source_provider = next(iter(providers))
+        if effective_source_provider == "gmail" and state.get("gmail_full_visibility_verified") is not True:
             issues.append("export-state Gmail full visibility attestation is missing or false")
         expected_count = len(manifest_rows)
         actual_count = state.get("canonical_messages")
@@ -704,13 +859,83 @@ def provider_export_state_issues(
     return issues
 
 
+def provider_export_state_contract_issues(
+    state: Dict[str, Any],
+    *,
+    account: Optional[MigrationAccount] = None,
+    source_provider: Optional[str] = None,
+    target_provider: Optional[str] = None,
+    source_endpoint: Optional[ProviderEndpoint] = None,
+) -> List[str]:
+    issues: List[str] = []
+    if account is not None:
+        source_account = state.get("source_account")
+        target_account = state.get("target_account")
+        if source_account != account.source_email:
+            issues.append(
+                f"export-state source_account does not match config source_email "
+                f"{account.source_email}: {source_account or '<missing>'}"
+            )
+        if target_account != account.target_email:
+            issues.append(
+                f"export-state target_account does not match config target_email "
+                f"{account.target_email}: {target_account or '<missing>'}"
+            )
+    if source_provider is not None:
+        state_source_provider = str(state.get("source_provider") or "").lower()
+        if state_source_provider != source_provider.lower():
+            issues.append(
+                f"export-state source_provider does not match config source.provider "
+                f"{source_provider}: {state_source_provider or '<missing>'}"
+            )
+    if source_endpoint is not None:
+        expected_source_endpoint = (
+            provider_account_endpoint_state(source_endpoint, account, role="source")
+            if account is not None
+            else provider_endpoint_state(source_endpoint)
+        )
+        state_source_endpoint = state.get("source_endpoint")
+        if not isinstance(state_source_endpoint, dict):
+            issues.append("export-state source_endpoint is missing; rerun provider export with current version")
+        elif state_source_endpoint != expected_source_endpoint:
+            issues.append(
+                "export-state source_endpoint does not match config source endpoint: "
+                f"{state_source_endpoint} != {expected_source_endpoint}"
+            )
+        expected_source_endpoint_sha = (
+            provider_account_endpoint_state_digest(source_endpoint, account, role="source")
+            if account is not None
+            else provider_endpoint_state_digest(source_endpoint)
+        )
+        if state.get("source_endpoint_sha256") != expected_source_endpoint_sha:
+            issues.append("export-state source_endpoint_sha256 does not match config source endpoint")
+    if target_provider is not None:
+        state_target_provider = str(state.get("target_provider") or "").lower()
+        if state_target_provider != target_provider.lower():
+            issues.append(
+                f"export-state target_provider does not match config target.provider "
+                f"{target_provider}: {state_target_provider or '<missing>'}"
+            )
+    return issues
+
+
 def require_complete_export_state(
     account_dir: Path,
     *,
     account: Optional[MigrationAccount] = None,
     manifest_rows: Optional[List[Dict[str, Any]]] = None,
+    source_provider: Optional[str] = None,
+    target_provider: Optional[str] = None,
+    source_endpoint: Optional[ProviderEndpoint] = None,
 ) -> None:
-    issues = provider_export_state_issues(account_dir, account=account, manifest_rows=manifest_rows)
+    issues = provider_export_state_issues(
+        account_dir,
+        account=account,
+        manifest_rows=manifest_rows,
+        source_provider=source_provider,
+        target_provider=target_provider,
+        source_endpoint=source_endpoint,
+    )
     if issues:
         raise RuntimeError("; ".join(issues))
 
@@ -759,6 +984,27 @@ def manifest_account_issues(rows: List[Dict[str, Any]], account: MigrationAccoun
             + ", ".join(target_mismatches)
         )
     return issues
+
+
+def manifest_source_provider_issues(rows: List[Dict[str, Any]], source_provider: str) -> List[str]:
+    expected = source_provider.strip().lower()
+    mismatches = [
+        str(row.get("canonical_id") or f"row {idx}")
+        for idx, row in enumerate(rows, 1)
+        if str(row.get("source_provider") or "").lower() != expected
+    ]
+    if not mismatches:
+        return []
+    return [
+        f"manifest source_provider does not match config source.provider {expected}: "
+        + ", ".join(mismatches)
+    ]
+
+
+def require_manifest_source_provider(rows: List[Dict[str, Any]], source_provider: str) -> None:
+    issues = manifest_source_provider_issues(rows, source_provider)
+    if issues:
+        raise RuntimeError("; ".join(issues))
 
 
 def require_manifest_accounts(rows: List[Dict[str, Any]], account: MigrationAccount) -> None:
@@ -837,8 +1083,12 @@ def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, r
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
     issues: List[str] = []
     for idx, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            issues.append(f"journal row {idx} is not an object")
+            continue
         status = str(row.get("status") or "")
         if status not in {"pending", "committed"}:
+            issues.append(f"journal row {idx} has invalid status: {status or '<missing>'}")
             continue
         identity = str(row.get("canonical_id") or "")
         target_mailbox = str(row.get("target_mailbox") or "")
@@ -856,17 +1106,249 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
     return issues
 
 
+def journal_target_endpoint_issues(
+    rows: List[Dict[str, Any]],
+    *,
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+) -> List[str]:
+    expected_binding = provider_target_journal_binding(config, account)
+    expected_endpoint = expected_binding["target_endpoint"]
+    expected_digest = expected_binding["target_endpoint_sha256"]
+    issues: List[str] = []
+    for idx, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("canonical_id") or f"row {idx}")
+        target_endpoint = row.get("target_endpoint")
+        if not isinstance(target_endpoint, dict):
+            issues.append(f"journal {label} target_endpoint missing; rerun provider import with current version")
+        elif target_endpoint != expected_endpoint:
+            issues.append(
+                f"journal {label} target_endpoint does not match config target endpoint: "
+                f"{target_endpoint} != {expected_endpoint}"
+            )
+        if row.get("target_endpoint_sha256") != expected_digest:
+            issues.append(f"journal {label} target_endpoint_sha256 does not match config target endpoint")
+    return issues
+
+
+def is_valid_gmail_msgid(value: Any) -> bool:
+    text = str(value or "")
+    if not re.fullmatch(r"\d+", text):
+        return False
+    try:
+        return 0 <= int(text) <= (2**64 - 1)
+    except ValueError:
+        return False
+
+
+def invalid_journal_target_gmail_msgid_issues(
+    rows: List[Dict[str, Any]],
+    *,
+    manifest_ids: Optional[set[str]] = None,
+) -> List[str]:
+    issues: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("status") != "committed":
+            continue
+        identity = str(row.get("canonical_id") or "")
+        if not identity or (manifest_ids is not None and identity not in manifest_ids):
+            continue
+        target_gmail_msgid = row.get("target_gmail_msgid")
+        if target_gmail_msgid in (None, ""):
+            continue
+        if not is_valid_gmail_msgid(target_gmail_msgid):
+            issues.append(
+                f"journal committed Gmail target row has invalid target_gmail_msgid: "
+                f"{identity} -> {target_gmail_msgid!r}"
+            )
+    return issues
+
+
 def require_valid_import_journal(rows: List[Dict[str, Any]], account: MigrationAccount) -> None:
     issues = journal_row_issues(rows, account)
     if issues:
         raise RuntimeError("invalid import journal: " + "; ".join(issues))
 
 
+def duplicate_journal_target_gmail_msgid_issues(
+    rows: List[Dict[str, Any]],
+    *,
+    manifest_ids: Optional[set[str]] = None,
+) -> List[str]:
+    by_msgid: Dict[str, set[str]] = {}
+    by_identity: Dict[str, set[str]] = {}
+    latest_rows = latest_committed_journal_rows(rows)
+    for (identity, _target_mailbox), row in latest_rows.items():
+        if manifest_ids is not None and identity not in manifest_ids:
+            continue
+        target_gmail_msgid = str(row.get("target_gmail_msgid") or "")
+        if not target_gmail_msgid:
+            continue
+        by_msgid.setdefault(target_gmail_msgid, set()).add(identity)
+    for row in rows:
+        if row.get("status") != "committed":
+            continue
+        identity = str(row.get("canonical_id") or "")
+        if not identity or (manifest_ids is not None and identity not in manifest_ids):
+            continue
+        target_gmail_msgid = str(row.get("target_gmail_msgid") or "")
+        if not target_gmail_msgid:
+            continue
+        by_identity.setdefault(identity, set()).add(target_gmail_msgid)
+    issues: List[str] = []
+    for target_gmail_msgid, identities in sorted(by_msgid.items()):
+        if len(identities) > 1:
+            issues.append(
+                f"journal target_gmail_msgid {target_gmail_msgid} is committed to multiple manifest identities: "
+                + ", ".join(sorted(identities))
+            )
+    for identity, target_gmail_msgids in sorted(by_identity.items()):
+        if len(target_gmail_msgids) > 1:
+            issues.append(
+                f"journal manifest identity {identity} is committed to multiple target_gmail_msgid values: "
+                + ", ".join(sorted(target_gmail_msgids))
+            )
+    return issues
+
+
+def missing_journal_target_gmail_msgid_issues(
+    rows: List[Dict[str, Any]],
+    *,
+    manifest_ids: set[str],
+) -> List[str]:
+    issues: List[str] = []
+    for (identity, target_mailbox), row in latest_committed_journal_rows(rows).items():
+        if identity not in manifest_ids:
+            continue
+        if row.get("target_gmail_msgid"):
+            continue
+        issues.append(
+            f"journal committed Gmail target row missing target_gmail_msgid: "
+            f"{identity} in {target_mailbox or '<missing>'}"
+        )
+    return issues
+
+
+def repair_missing_journal_target_gmail_msgids(
+    imap: imaplib.IMAP4,
+    account_dir: Path,
+    account: MigrationAccount,
+    rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+    target_mailbox_by_identity: Dict[str, str],
+    target_binding: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    manifest_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    repaired_rows = list(rows)
+    issues: List[str] = []
+    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(repaired_rows).items():
+        if not identity or identity not in manifest_by_id or journal_row.get("target_gmail_msgid"):
+            continue
+        expected_target_mailbox = target_mailbox_by_identity.get(identity)
+        if expected_target_mailbox and target_mailbox != expected_target_mailbox:
+            issues.append(
+                f"journal committed Gmail target row missing target_gmail_msgid and is in wrong target mailbox: "
+                f"{identity} expected {expected_target_mailbox!r} got {target_mailbox!r}"
+            )
+            continue
+        manifest_row = manifest_by_id[identity]
+        matches: Dict[str, bytes] = {}
+        for num in target_matching_message_nums(imap, target_mailbox, manifest_row, create_if_missing=False):
+            gmail_msgid = _target_gmail_msgid(imap, num)
+            if gmail_msgid:
+                matches.setdefault(gmail_msgid, num)
+        if not matches:
+            issues.append(
+                f"journal committed Gmail target row missing target_gmail_msgid and target message was not found: "
+                f"{identity} in {target_mailbox or '<missing>'}"
+            )
+            continue
+        if len(matches) > 1:
+            issues.append(
+                f"journal committed Gmail target row missing target_gmail_msgid and matched multiple target Gmail messages: "
+                f"{identity} in {target_mailbox}: " + ", ".join(sorted(matches))
+            )
+            continue
+        target_gmail_msgid = next(iter(matches))
+        repaired = _journal_row(
+            manifest_row,
+            target_mailbox,
+            "committed",
+            "verified",
+            target_binding=target_binding,
+            target_gmail_msgid=target_gmail_msgid,
+        )
+        append_journal(account_dir, account, repaired)
+        repaired_rows.append(repaired)
+    if issues:
+        raise RuntimeError("invalid import journal: " + "; ".join(issues))
+    return repaired_rows
+
+
+def duplicate_journal_target_gmail_msgid_entries(
+    rows: List[Dict[str, Any]],
+    *,
+    manifest_ids: set[str],
+) -> List[Dict[str, Any]]:
+    by_msgid: Dict[str, set[str]] = {}
+    by_identity: Dict[str, set[str]] = {}
+    latest_rows = latest_committed_journal_rows(rows)
+    for (identity, _target_mailbox), row in latest_rows.items():
+        if identity not in manifest_ids:
+            continue
+        target_gmail_msgid = str(row.get("target_gmail_msgid") or "")
+        if not target_gmail_msgid:
+            continue
+        by_msgid.setdefault(target_gmail_msgid, set()).add(identity)
+    for row in rows:
+        if row.get("status") != "committed":
+            continue
+        identity = str(row.get("canonical_id") or "")
+        if identity not in manifest_ids:
+            continue
+        target_gmail_msgid = str(row.get("target_gmail_msgid") or "")
+        if not target_gmail_msgid:
+            continue
+        by_identity.setdefault(identity, set()).add(target_gmail_msgid)
+    entries = [
+        {
+            "canonical_id": ",".join(sorted(identities)),
+            "count": len(identities),
+            "source": "journal-target-gmail-msgid",
+            "target_gmail_msgid": target_gmail_msgid,
+        }
+        for target_gmail_msgid, identities in sorted(by_msgid.items())
+        if len(identities) > 1
+    ]
+    entries.extend(
+        {
+            "canonical_id": identity,
+            "count": len(target_gmail_msgids),
+            "source": "journal-target-gmail-msgid",
+            "target_gmail_msgids": sorted(target_gmail_msgids),
+        }
+        for identity, target_gmail_msgids in sorted(by_identity.items())
+        if len(target_gmail_msgids) > 1
+    )
+    return entries
+
+
 def _journal_path(account_dir: Path, account: MigrationAccount) -> Path:
     return account_dir / f"import-{sanitize_for_path(account.target_email)}.journal.jsonl"
 
 
-def load_import_journal(account_dir: Path, account: MigrationAccount) -> List[Dict[str, Any]]:
+def load_import_journal(
+    account_dir: Path,
+    account: MigrationAccount,
+    *,
+    repair_trailing: bool = False,
+) -> List[Dict[str, Any]]:
     path = _journal_path(account_dir, account)
     rows: List[Dict[str, Any]] = []
     if not path.exists():
@@ -878,13 +1360,16 @@ def load_import_journal(account_dir: Path, account: MigrationAccount) -> List[Di
         if not line:
             continue
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
         except json.JSONDecodeError:
-            if line_no == len(lines):
+            if repair_trailing and line_no == len(lines):
                 logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
                 needs_rewrite = True
                 break
             raise
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}: journal row {line_no} is not an object")
+        rows.append(row)
     if needs_rewrite:
         _write_jsonl(path, rows)
     return rows
@@ -892,12 +1377,15 @@ def load_import_journal(account_dir: Path, account: MigrationAccount) -> List[Di
 
 def append_journal(account_dir: Path, account: MigrationAccount, row: Dict[str, Any]) -> None:
     path = _journal_path(account_dir, account)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
+    ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
+    with contextlib.suppress(Exception):
+        os.chmod(path, PRIVATE_FILE_MODE)
 
 
 def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:
@@ -938,6 +1426,19 @@ def persist_export_records(account_dir: Path, records: Dict[str, Dict[str, Any]]
     _write_jsonl(account_dir / "manifest.jsonl", sorted(records.values(), key=lambda row: str(row["canonical_id"])))
 
 
+def _existing_record_for_rescan(row: Dict[str, Any]) -> Dict[str, Any]:
+    record = dict(row)
+    record["source_mailboxes"] = []
+    record["source_mailbox_attributes"] = {}
+    record["source_mailbox_delimiters"] = {}
+    record["source_mailbox_paths"] = {}
+    record["gmail_labels"] = []
+    record["uid_by_mailbox"] = {}
+    record["uidvalidity_by_mailbox"] = {}
+    record["primary_mailbox"] = ""
+    return record
+
+
 def provider_export_account(
     config: ProviderMigrationConfig,
     account: MigrationAccount,
@@ -947,34 +1448,79 @@ def provider_export_account(
     limiter: Optional[RateLimiter] = None,
 ) -> None:
     account_dir = account_export_dir(out_root, account)
-    _atomic_json(
-        account_dir / "export-state.json",
-        {
-            "source_account": account.source_email,
-            "target_account": account.target_email,
-            "source_provider": config.source.provider,
-            "target_provider": config.target.provider,
-            "gmail_full_visibility_verified": bool(config.source.gmail_full_visibility_verified)
-            if config.source.provider == "gmail"
-            else None,
-            "complete": False,
-            "started_at": _utc_now(),
-        },
-    )
     messages: Dict[str, Dict[str, Any]] = {}
     manifest_path = account_dir / "manifest.jsonl"
+    preserve_complete_state_until_ready = False
+    active_identities: set[str] = set()
+    previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
         require_unique_manifest_identities(existing_rows)
         require_manifest_accounts(existing_rows, account)
+        require_manifest_source_provider(existing_rows, config.source.provider)
         for row in existing_rows:
             _manifest_path(account_dir, row, "eml_path")
             _manifest_path(account_dir, row, "metadata_path")
         messages = {
-            str(row["canonical_id"]): row
+            str(row["canonical_id"]): _existing_record_for_rescan(row)
             for row in existing_rows
             if row.get("canonical_id")
         }
+        try:
+            existing_state = json.loads((account_dir / "export-state.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"export-state missing or invalid for existing manifest: {exc}") from exc
+        if not isinstance(existing_state, dict):
+            raise RuntimeError("export-state is invalid for existing manifest")
+        state_contract_issues = provider_export_state_contract_issues(
+            existing_state,
+            account=account,
+            source_provider=config.source.provider,
+            target_provider=config.target.provider,
+            source_endpoint=config.source,
+        )
+        if state_contract_issues:
+            raise RuntimeError("; ".join(state_contract_issues))
+        for row in existing_rows:
+            uidvalidities = row.get("uidvalidity_by_mailbox")
+            if not isinstance(uidvalidities, dict):
+                continue
+            for mailbox_name, value in uidvalidities.items():
+                if value:
+                    previous_uidvalidities_by_mailbox.setdefault(str(mailbox_name), set()).add(str(value))
+        if isinstance(existing_state, dict) and existing_state.get("complete") is True:
+            state_issues = provider_export_state_issues(
+                account_dir,
+                account=account,
+                manifest_rows=existing_rows,
+                source_provider=config.source.provider,
+                target_provider=config.target.provider,
+                source_endpoint=config.source,
+            )
+            if state_issues:
+                raise RuntimeError("; ".join(state_issues))
+            preserve_complete_state_until_ready = True
+
+    def write_in_progress_state() -> None:
+        _atomic_json(
+            account_dir / "export-state.json",
+            {
+                "source_account": account.source_email,
+                "target_account": account.target_email,
+                "source_provider": config.source.provider,
+                "target_provider": config.target.provider,
+                "source_endpoint": provider_account_endpoint_state(config.source, account, role="source"),
+                "source_endpoint_sha256": provider_account_endpoint_state_digest(config.source, account, role="source"),
+                "gmail_full_visibility_verified": gmail_full_visibility_attested(config.source, account)
+                if config.source.provider == "gmail"
+                else None,
+                "complete": False,
+                "started_at": _utc_now(),
+            },
+        )
+
+    if not preserve_complete_state_until_ready:
+        write_in_progress_state()
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def update_membership(identity: str, mailbox: MailboxInfo, uid: int, uidvalidity: str, parsed: Dict[str, Any]) -> None:
@@ -994,6 +1540,14 @@ def provider_export_account(
             _append_unique(record["gmail_labels"], str(label))
         record["uid_by_mailbox"][mailbox.name] = int(uid)
         record["uidvalidity_by_mailbox"][mailbox.name] = uidvalidity
+        active_identities.add(identity)
+
+    def active_export_records() -> Dict[str, Dict[str, Any]]:
+        return {
+            identity: messages[identity]
+            for identity in sorted(active_identities)
+            if identity in messages
+        }
 
     with imap_connection(config.source, account, role="source") as imap:
         capabilities = get_capabilities(imap)
@@ -1011,9 +1565,12 @@ def provider_export_account(
         )
         if config.source.provider == "gmail":
             gmail_issues = gmail_source_readiness_issues(capabilities, mailboxes)
-            gmail_issues.extend(gmail_source_decommission_issues(config.source))
+            gmail_issues.extend(gmail_all_mail_select_issues(imap, mailboxes, role="source"))
+            gmail_issues.extend(gmail_account_decommission_issues(config.source, account))
             if gmail_issues:
                 raise RuntimeError(f"Gmail source is not export-ready for {account.source_email}: {'; '.join(gmail_issues)}")
+        if preserve_complete_state_until_ready:
+            write_in_progress_state()
         for mailbox in mailboxes:
             if is_noselect(mailbox):
                 logging.info("[provider-export] %s: skipping non-selectable mailbox %s", account.source_email, mailbox.name)
@@ -1023,12 +1580,7 @@ def provider_export_account(
                 continue
             _raise_if_stopped(stop_event, f"provider export {account.source_email}")
             uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox.name)
-            previous_uidvalidities = {
-                str((row.get("uidvalidity_by_mailbox") or {}).get(mailbox.name) or "")
-                for row in messages.values()
-                if isinstance(row.get("uidvalidity_by_mailbox"), dict)
-                and (row.get("uidvalidity_by_mailbox") or {}).get(mailbox.name)
-            }
+            previous_uidvalidities = previous_uidvalidities_by_mailbox.get(mailbox.name, set())
             if previous_uidvalidities and uidvalidity and uidvalidity not in previous_uidvalidities:
                 raise RuntimeError(
                     f"UIDVALIDITY changed since previous export for {mailbox.name}: "
@@ -1055,7 +1607,7 @@ def provider_export_account(
                     else:
                         if _manifest_path(account_dir, messages[identity_hint], "eml_path").exists():
                             update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
-                            persist_export_records(account_dir, messages, config.migration.folder_map)
+                            persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
                             continue
                 limiter.wait_for(int(pre_parsed.get("rfc822_size") or 0))
                 status, data = imap.uid(
@@ -1133,7 +1685,7 @@ def provider_export_account(
                     record.setdefault("exported_at", _utc_now())
                 record = messages[identity]
                 update_membership(identity, mailbox, uid, uidvalidity, parsed)
-                persist_export_records(account_dir, messages, config.migration.folder_map)
+                persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")
@@ -1153,7 +1705,8 @@ def provider_export_account(
                     f"initial={len(uids)} final={len(final_uids)}; rerun export after mailbox quiesces"
                 )
 
-    persist_export_records(account_dir, messages, config.migration.folder_map)
+    final_records = active_export_records()
+    persist_export_records(account_dir, final_records, config.migration.folder_map)
     final_manifest_rows = load_manifest(account_dir)
     _atomic_json(
         account_dir / "export-state.json",
@@ -1162,7 +1715,9 @@ def provider_export_account(
             "target_account": account.target_email,
             "source_provider": config.source.provider,
             "target_provider": config.target.provider,
-            "gmail_full_visibility_verified": bool(config.source.gmail_full_visibility_verified)
+            "source_endpoint": provider_account_endpoint_state(config.source, account, role="source"),
+            "source_endpoint_sha256": provider_account_endpoint_state_digest(config.source, account, role="source"),
+            "gmail_full_visibility_verified": gmail_full_visibility_attested(config.source, account)
             if config.source.provider == "gmail"
             else None,
             "complete": True,
@@ -1171,7 +1726,7 @@ def provider_export_account(
             "completed_at": _utc_now(),
         },
     )
-    logging.info("[provider-export] %s: completed with %d canonical messages", account.source_email, len(messages))
+    logging.info("[provider-export] %s: completed with %d canonical messages", account.source_email, len(final_records))
 
 
 def provider_export_all(
@@ -1275,6 +1830,15 @@ def ensure_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
 
 def _flags_for_append(flags: str) -> str:
     portable = {"\\ANSWERED", "\\FLAGGED", "\\DELETED", "\\SEEN", "\\DRAFT"}
+    tokens = [tok for tok in flags.split() if tok.strip()]
+    filtered = [tok for tok in tokens if tok.strip().upper() in portable]
+    return f"({' '.join(filtered)})" if filtered else ""
+
+
+def _flags_for_provider_append(flags: str, *, target_provider: str) -> str:
+    portable = {"\\ANSWERED", "\\FLAGGED", "\\SEEN", "\\DRAFT"}
+    if target_provider != "gmail":
+        portable.add("\\DELETED")
     tokens = [tok for tok in flags.split() if tok.strip()]
     filtered = [tok for tok in tokens if tok.strip().upper() in portable]
     return f"({' '.join(filtered)})" if filtered else ""
@@ -1623,6 +2187,35 @@ def consume_target_match_num(
     return None
 
 
+def consume_target_gmail_msgid_match_num(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    target_gmail_msgid: str,
+    used_by_mailbox: Dict[str, set[bytes]],
+    *,
+    create_if_missing: bool = True,
+    used_gmail_msgids: Optional[set[str]] = None,
+) -> Optional[bytes]:
+    if not target_gmail_msgid:
+        return None
+    mailbox_key = mailbox.lower()
+    used = used_by_mailbox.setdefault(mailbox_key, set())
+    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+        if num in used:
+            continue
+        gmail_msgid = _target_gmail_msgid(imap, num)
+        if gmail_msgid != target_gmail_msgid:
+            continue
+        if used_gmail_msgids is not None:
+            if gmail_msgid in used_gmail_msgids:
+                continue
+            used_gmail_msgids.add(gmail_msgid)
+        used.add(num)
+        return num
+    return None
+
+
 def consume_target_match(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -1677,13 +2270,80 @@ def consume_target_match_with_gmail_labels(
     return None
 
 
+def gmail_expected_target_mailboxes_for_row(
+    row: Dict[str, Any],
+    target_mailbox: str,
+    target_mailboxes: List[MailboxInfo],
+) -> List[str]:
+    names: List[str] = []
+    by_name = _target_mailboxes_by_name(target_mailboxes)
+    system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes)
+
+    def add(name: str) -> None:
+        if name and name not in names:
+            names.append(name)
+
+    add(target_mailbox)
+    for name in system_by_key.get("all", []):
+        add(name)
+    for name in gmail_system_view_mailboxes_for_row(row, target_mailboxes):
+        add(name)
+    for label in gmail_labels_for_restore(row, target_mailbox, target_mailboxes):
+        system_key = _gmail_system_key_for_label(label)
+        if system_key in system_by_key:
+            for name in system_by_key[system_key]:
+                add(name)
+            continue
+        mailbox = by_name.get(label.lower())
+        if mailbox is not None:
+            add(mailbox.name)
+    return names
+
+
+def matching_gmail_msgids_for_row(
+    imap: imaplib.IMAP4,
+    row: Dict[str, Any],
+    mailboxes: List[str],
+) -> set[str]:
+    gmail_msgids: set[str] = set()
+    used_by_mailbox: Dict[str, set[bytes]] = {}
+    for mailbox in mailboxes:
+        for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
+            used = used_by_mailbox.setdefault(mailbox.lower(), set())
+            if num in used:
+                continue
+            used.add(num)
+            gmail_msgid = _target_gmail_msgid(imap, num)
+            if gmail_msgid:
+                gmail_msgids.add(gmail_msgid)
+    return gmail_msgids
+
+
+def target_gmail_labels_for_msgid(
+    imap: imaplib.IMAP4,
+    row: Dict[str, Any],
+    mailboxes: List[str],
+    target_gmail_msgid: str,
+) -> Optional[set[str]]:
+    used_by_mailbox: Dict[str, set[bytes]] = {}
+    for mailbox in mailboxes:
+        for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
+            used = used_by_mailbox.setdefault(mailbox.lower(), set())
+            if num in used:
+                continue
+            used.add(num)
+            if _target_gmail_msgid(imap, num) == target_gmail_msgid:
+                return _target_gmail_label_keys(imap, num)
+    return None
+
+
 def target_message_count(imap: imaplib.IMAP4, mailbox: str) -> int:
     status, data = select_mailbox(imap, mailbox, readonly=True)
     if status != "OK":
-        return 0
+        raise RuntimeError(f"target mailbox {mailbox!r} could not be selected for empty-target check: {data}")
     status, data = imap.search(None, "ALL")
     if status != "OK" or not data:
-        return 0
+        raise RuntimeError(f"target mailbox {mailbox!r} could not be searched for empty-target check: {data}")
     return len((data[0] or b"").split())
 
 
@@ -1704,6 +2364,20 @@ def gmail_system_view_mailboxes_for_row(row: Dict[str, Any], target_mailboxes: L
     return result
 
 
+def generic_special_view_mailboxes_for_row(row: Dict[str, Any], target_mailboxes: List[MailboxInfo]) -> List[str]:
+    result: List[str] = []
+    row_is_flagged = row_has_gmail_starred(row)
+    for mailbox in target_mailboxes:
+        if is_noselect(mailbox):
+            continue
+        attr_lowers = {attr.lower() for attr in mailbox.attributes}
+        if "\\all" in attr_lowers:
+            result.append(mailbox.name)
+        elif "\\flagged" in attr_lowers and row_is_flagged:
+            result.append(mailbox.name)
+    return result
+
+
 def enforce_empty_target(
     imap: imaplib.IMAP4,
     target_mailboxes: List[MailboxInfo],
@@ -1715,15 +2389,7 @@ def enforce_empty_target(
     permitted_by_mailbox: Dict[str, List[Dict[str, Any]]] = {}
     by_name = _target_mailboxes_by_name(target_mailboxes)
     gmail_system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes) if target_provider == "gmail" else {}
-    gmail_all_mailboxes = [
-        mailbox.name
-        for mailbox in target_mailboxes
-        if target_provider == "gmail"
-        and (
-            any(attr.lower() == "\\all" for attr in mailbox.attributes)
-            or mailbox.name.lower() in {"[gmail]/all mail", "[googlemail]/all mail", "all mail"}
-        )
-    ]
+    gmail_all_mailboxes = gmail_all_mail_names(target_mailboxes) if target_provider == "gmail" else []
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
         desired = translate_source_mailbox_for_target(
@@ -1747,8 +2413,15 @@ def enforce_empty_target(
                     mailbox = by_name.get(label.lower())
                     if mailbox is not None:
                         permitted_names.append(mailbox.name)
+            else:
+                permitted_names.extend(generic_special_view_mailboxes_for_row(row, target_mailboxes))
+            seen_permitted_names: set[str] = set()
             for name in permitted_names:
-                permitted_by_mailbox.setdefault(name.lower(), []).append(row)
+                key_name = name.lower()
+                if key_name in seen_permitted_names:
+                    continue
+                seen_permitted_names.add(key_name)
+                permitted_by_mailbox.setdefault(key_name, []).append(row)
     for mailbox in target_mailboxes:
         if is_noselect(mailbox):
             continue
@@ -1812,14 +2485,47 @@ def provider_import_account(
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_accounts(manifest_rows, account)
+    require_manifest_source_provider(manifest_rows, config.source.provider)
     require_manifest_integrity_metadata(manifest_rows)
-    require_complete_export_state(account_dir, account=account, manifest_rows=manifest_rows)
+    require_complete_export_state(
+        account_dir,
+        account=account,
+        manifest_rows=manifest_rows,
+        source_provider=config.source.provider,
+        target_provider=config.target.provider,
+        source_endpoint=config.source,
+    )
     metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
     if metadata_issues:
         raise RuntimeError("metadata does not match manifest: " + "; ".join(metadata_issues))
-    journal_rows = load_import_journal(account_dir, account)
+    payloads_by_identity: Dict[str, bytes] = {}
+    for row in manifest_rows:
+        identity = str(row.get("canonical_id") or "")
+        eml_path = _manifest_path(account_dir, row, "eml_path")
+        if not eml_path.exists():
+            raise RuntimeError(f"message file missing for {identity}: {eml_path}")
+        data = eml_path.read_bytes()
+        require_manifest_payload_matches(row, data)
+        payloads_by_identity[identity] = data
+    journal_rows = load_import_journal(account_dir, account, repair_trailing=True)
     require_valid_import_journal(journal_rows, account)
-    committed = set(latest_committed_journal_rows(journal_rows))
+    journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
+    if journal_target_issues:
+        raise RuntimeError("invalid import journal: " + "; ".join(journal_target_issues))
+    manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
+    if config.target.provider == "gmail":
+        invalid_gmail_msgid_issues = invalid_journal_target_gmail_msgid_issues(
+            journal_rows,
+            manifest_ids=manifest_ids,
+        )
+        if invalid_gmail_msgid_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(invalid_gmail_msgid_issues))
+        duplicate_gmail_msgid_issues = duplicate_journal_target_gmail_msgid_issues(
+            journal_rows,
+            manifest_ids=manifest_ids,
+        )
+        if duplicate_gmail_msgid_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(duplicate_gmail_msgid_issues))
     pending = {
         (str(row.get("canonical_id")), str(row.get("target_mailbox")))
         for row in journal_rows
@@ -1828,8 +2534,17 @@ def provider_import_account(
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
     used_target_nums: Dict[str, set[bytes]] = {}
     used_target_gmail_msgids: set[str] = set()
+    target_binding = provider_target_journal_binding(config, account)
 
     with imap_connection(config.target, account, role="target") as imap:
+        capabilities: List[str] = []
+        if config.target.provider == "gmail":
+            capabilities = get_capabilities(imap)
+            if "X-GM-EXT-1" not in capabilities:
+                raise RuntimeError(
+                    f"Gmail target is not import-ready for {account.target_email}: "
+                    "IMAP server did not advertise X-GM-EXT-1"
+                )
         target_mailboxes = list_mailboxes(imap)
         target_mailbox_by_identity = translated_target_mailboxes_for_rows(
             manifest_rows,
@@ -1837,9 +2552,38 @@ def provider_import_account(
             target_provider=config.target.provider,
         )
         if config.target.provider == "gmail":
-            target_issues = gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes)
+            target_issues = gmail_target_readiness_issues(capabilities, target_mailboxes)
+            target_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))
+            target_issues.extend(gmail_target_decommission_issues(config.target, account))
+            target_issues.extend(gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes))
             if target_issues:
                 raise RuntimeError("Gmail target is not import-ready: " + "; ".join(target_issues))
+            journal_rows = repair_missing_journal_target_gmail_msgids(
+                imap,
+                account_dir,
+                account,
+                journal_rows,
+                manifest_rows,
+                target_mailbox_by_identity,
+                target_binding,
+            )
+            repaired_journal_issues = []
+            repaired_journal_issues.extend(
+                missing_journal_target_gmail_msgid_issues(
+                    journal_rows,
+                    manifest_ids=manifest_ids,
+                )
+            )
+            repaired_journal_issues.extend(
+                duplicate_journal_target_gmail_msgid_issues(
+                    journal_rows,
+                    manifest_ids=manifest_ids,
+                )
+            )
+            if repaired_journal_issues:
+                raise RuntimeError("invalid import journal: " + "; ".join(repaired_journal_issues))
+        latest_committed = latest_committed_journal_rows(journal_rows)
+        committed = set(latest_committed)
         if config.migration.target_mode == "empty":
             enforce_empty_target(
                 imap,
@@ -1861,15 +2605,33 @@ def provider_import_account(
                 )
                 target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = (identity, target_mailbox)
+            data = payloads_by_identity[identity]
             if key in committed:
-                committed_num = consume_target_match_num(
-                    imap,
-                    target_mailbox,
-                    row,
-                    used_target_nums,
-                    create_if_missing=False,
-                    used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
-                )
+                journal_target_gmail_msgid = str(latest_committed.get(key, {}).get("target_gmail_msgid") or "")
+                if config.target.provider == "gmail" and journal_target_gmail_msgid:
+                    committed_num = consume_target_gmail_msgid_match_num(
+                        imap,
+                        target_mailbox,
+                        row,
+                        journal_target_gmail_msgid,
+                        used_target_nums,
+                        create_if_missing=False,
+                        used_gmail_msgids=used_target_gmail_msgids,
+                    )
+                else:
+                    committed_num = consume_target_match_num(
+                        imap,
+                        target_mailbox,
+                        row,
+                        used_target_nums,
+                        create_if_missing=False,
+                        used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+                    )
+                if committed_num is None and config.target.provider == "gmail" and journal_target_gmail_msgid:
+                    raise RuntimeError(
+                        f"journal says {identity} is committed to Gmail target message {journal_target_gmail_msgid} "
+                        f"in {target_mailbox!r}, but that exact target message was not found"
+                    )
                 if committed_num is None and config.migration.target_mode == "empty":
                     raise RuntimeError(
                         f"journal says {identity} is committed to {target_mailbox!r}, "
@@ -1881,9 +2643,6 @@ def provider_import_account(
                         restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num, target_mailboxes=target_mailboxes)
                         restore_gmail_starred_flag(imap, target_mailbox, row, target_num=committed_num)
                     continue
-            eml_path = _manifest_path(account_dir, row, "eml_path")
-            if not eml_path.exists():
-                raise RuntimeError(f"message file missing for {identity}: {eml_path}")
             matched_num = None
             if config.migration.target_mode == "merge" or key in pending:
                 matched_num = consume_target_match_num(
@@ -1896,20 +2655,36 @@ def provider_import_account(
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
                 if config.target.provider == "gmail":
+                    target_gmail_msgid = _target_gmail_msgid(imap, matched_num)
                     restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num, target_mailboxes=target_mailboxes)
                     restore_gmail_starred_flag(imap, target_mailbox, row, target_num=matched_num)
-                append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "existing"))
+                else:
+                    target_gmail_msgid = ""
+                append_journal(
+                    account_dir,
+                    account,
+                    _journal_row(
+                        row,
+                        target_mailbox,
+                        "committed",
+                        "existing",
+                        target_binding=target_binding,
+                        target_gmail_msgid=target_gmail_msgid,
+                    ),
+                )
                 committed.add(key)
                 continue
             ensure_mailbox(imap, target_mailbox)
-            data = eml_path.read_bytes()
-            require_manifest_payload_matches(row, data)
             limiter.wait_for(len(data))
-            append_journal(account_dir, account, _journal_row(row, target_mailbox, "pending", "append-started"))
+            append_journal(
+                account_dir,
+                account,
+                _journal_row(row, target_mailbox, "pending", "append-started", target_binding=target_binding),
+            )
             status, response = append_message(
                 imap,
                 target_mailbox,
-                _flags_for_append(str(row.get("flags") or "")),
+                _flags_for_provider_append(str(row.get("flags") or ""), target_provider=config.target.provider),
                 _internaldate_for_append(str(row.get("internaldate") or "")),
                 data,
             )
@@ -1926,9 +2701,23 @@ def provider_import_account(
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
             if config.target.provider == "gmail":
+                target_gmail_msgid = _target_gmail_msgid(imap, appended_num)
                 restore_gmail_labels(imap, target_mailbox, row, target_num=appended_num, target_mailboxes=target_mailboxes)
                 restore_gmail_starred_flag(imap, target_mailbox, row, target_num=appended_num)
-            append_journal(account_dir, account, _journal_row(row, target_mailbox, "committed", "appended"))
+            else:
+                target_gmail_msgid = ""
+            append_journal(
+                account_dir,
+                account,
+                _journal_row(
+                    row,
+                    target_mailbox,
+                    "committed",
+                    "appended",
+                    target_binding=target_binding,
+                    target_gmail_msgid=target_gmail_msgid,
+                ),
+            )
             committed.add(key)
     logging.info("[provider-import] %s -> %s: completed", account.source_email, account.target_email)
 
@@ -1955,10 +2744,20 @@ def provider_import_all(
     parallel_process_accounts("provider-import", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
 
 
-def _journal_row(row: Dict[str, Any], target_mailbox: str, status: str, action: str) -> Dict[str, Any]:
-    return {
+def _journal_row(
+    row: Dict[str, Any],
+    target_mailbox: str,
+    status: str,
+    action: str,
+    *,
+    target_binding: Dict[str, Any],
+    target_gmail_msgid: str = "",
+) -> Dict[str, Any]:
+    journal_row = {
         "canonical_id": row.get("canonical_id"),
         "target_account": row.get("target_account"),
+        "target_endpoint": target_binding["target_endpoint"],
+        "target_endpoint_sha256": target_binding["target_endpoint_sha256"],
         "target_mailbox": target_mailbox,
         "status": status,
         "action": action,
@@ -1967,6 +2766,9 @@ def _journal_row(row: Dict[str, Any], target_mailbox: str, status: str, action: 
         "rfc822_size": int(row.get("rfc822_size") or 0),
         "timestamp": _utc_now(),
     }
+    if target_gmail_msgid:
+        journal_row["target_gmail_msgid"] = target_gmail_msgid
+    return journal_row
 
 
 def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAccount, in_root: Path) -> Tuple[str, List[str]]:
@@ -1978,11 +2780,47 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         rows = load_manifest(account_dir)
     except Exception as exc:
         return account.email, [f"manifest load failed: {exc}"]
-    issues.extend(provider_export_state_issues(account_dir, account=account, manifest_rows=rows))
+    issues.extend(
+        provider_export_state_issues(
+            account_dir,
+            account=account,
+            manifest_rows=rows,
+            source_provider=config.source.provider,
+            target_provider=config.target.provider,
+            source_endpoint=config.source,
+        )
+    )
     identities = set()
     issues.extend(manifest_account_issues(rows, account))
+    issues.extend(manifest_source_provider_issues(rows, config.source.provider))
     issues.extend(manifest_integrity_issues(rows))
     issues.extend(metadata_manifest_issues(account_dir, rows, require_present=False))
+    issues.extend(gmail_target_decommission_issues(config.target, account))
+    manifest_ids = {str(row.get("canonical_id") or "") for row in rows if row.get("canonical_id")}
+    try:
+        journal_rows = load_import_journal(account_dir, account)
+    except Exception as exc:
+        journal_rows = None
+        issues.append(f"import journal load failed: {exc}")
+    else:
+        issues.extend(journal_row_issues(journal_rows, account))
+        issues.extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
+        if config.target.provider == "gmail":
+            issues.extend(invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
+    if config.target.provider == "gmail":
+        if journal_rows is not None:
+            issues.extend(
+                missing_journal_target_gmail_msgid_issues(
+                    journal_rows,
+                    manifest_ids=manifest_ids,
+                )
+            )
+            issues.extend(
+                duplicate_journal_target_gmail_msgid_issues(
+                    journal_rows,
+                    manifest_ids=manifest_ids,
+                )
+            )
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         if not identity:
@@ -2062,17 +2900,29 @@ def provider_validate_account(
         report["failed"].append(str(exc))
         return account.email, report
 
-    report["failed"].extend(provider_export_state_issues(account_dir, account=account, manifest_rows=manifest_rows))
+    report["failed"].extend(
+        provider_export_state_issues(
+            account_dir,
+            account=account,
+            manifest_rows=manifest_rows,
+            source_provider=config.source.provider,
+            target_provider=config.target.provider,
+            source_endpoint=config.source,
+        )
+    )
 
     try:
         require_manifest_accounts(manifest_rows, account)
     except Exception as exc:
         report["failed"].append(str(exc))
+    report["failed"].extend(manifest_source_provider_issues(manifest_rows, config.source.provider))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
     report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
+    report["failed"].extend(gmail_target_decommission_issues(config.target, account))
 
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
+    report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
     committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
     for row in journal_rows:
         if row.get("status") != "pending":
@@ -2097,6 +2947,21 @@ def provider_validate_account(
 
     by_id = {str(row.get("canonical_id")): row for row in manifest_rows if row.get("canonical_id")}
     manifest_ids = set(by_id)
+    journal_gmail_msgid_missing = (
+        missing_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids)
+        if config.target.provider == "gmail"
+        else []
+    )
+    journal_gmail_msgid_invalid = (
+        invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids)
+        if config.target.provider == "gmail"
+        else []
+    )
+    journal_gmail_msgid_duplicates = (
+        duplicate_journal_target_gmail_msgid_entries(journal_rows, manifest_ids=manifest_ids)
+        if config.target.provider == "gmail"
+        else []
+    )
     report["exported"] = len(manifest_ids)
 
     def evaluate_journal(expected_target_by_id: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, int], Dict[str, str], List[str]]:
@@ -2139,11 +3004,19 @@ def provider_validate_account(
                 report["missing"].append(identity)
             elif count > 1:
                 report["duplicates"].append({"canonical_id": identity, "count": count})
+        report["duplicates"].extend(journal_gmail_msgid_duplicates)
+        report["failed"].extend(journal_gmail_msgid_invalid)
+        report["failed"].extend(journal_gmail_msgid_missing)
         report["committed"] = sum(1 for identity in manifest_ids if committed_by_id.get(identity, 0) > 0)
 
     if check_target:
         try:
             with imap_connection(config.target, account, role="target") as imap:
+                capabilities: List[str] = []
+                if config.target.provider == "gmail":
+                    capabilities = get_capabilities(imap)
+                    if "X-GM-EXT-1" not in capabilities:
+                        raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
                 target_mailbox_by_identity = translated_target_mailboxes_for_rows(
                     manifest_rows,
@@ -2159,39 +3032,74 @@ def provider_validate_account(
                 committed_by_id, target_by_id, failures = evaluate_journal(expected_target_by_id)
                 report["failed"].extend(failures)
                 apply_counts(committed_by_id)
+                if config.target.provider == "gmail":
+                    target_readiness_issues = gmail_target_readiness_issues(capabilities, target_mailboxes)
+                    target_readiness_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))
+                    if target_readiness_issues:
+                        raise RuntimeError("; ".join(target_readiness_issues))
                 if not report["missing"]:
                     used_target_nums: Dict[str, set[bytes]] = {}
                     used_target_gmail_msgids: set[str] = set()
+                    effective_committed_rows = latest_committed_journal_rows(journal_rows)
+                    target_gmail_msgid_by_id = {
+                        str(row.get("canonical_id") or ""): str(row.get("target_gmail_msgid") or "")
+                        for row in effective_committed_rows.values()
+                        if row.get("target_gmail_msgid")
+                    }
+                    committed_target_gmail_msgids = {
+                        target_gmail_msgid
+                        for target_gmail_msgid in target_gmail_msgid_by_id.values()
+                        if target_gmail_msgid
+                    }
                     for identity, row in by_id.items():
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
                             continue
                         report["remote_checked"] += 1
                         if config.target.provider == "gmail":
-                            matching_nums = target_matching_message_nums(
-                                imap,
-                                target_mailbox,
+                            expected_mailboxes = gmail_expected_target_mailboxes_for_row(
                                 row,
-                                create_if_missing=False,
+                                target_mailbox,
+                                target_mailboxes,
                             )
-                            matching_gmail_msgids = {
-                                _target_gmail_msgid(imap, num)
-                                for num in matching_nums
-                            }
-                            if len(matching_gmail_msgids) > 1:
+                            matching_gmail_msgids = matching_gmail_msgids_for_row(imap, row, expected_mailboxes)
+                            journal_target_gmail_msgid = target_gmail_msgid_by_id.get(identity, "")
+                            primary_actual_labels: Optional[set[str]] = None
+                            if journal_target_gmail_msgid:
+                                if journal_target_gmail_msgid not in matching_gmail_msgids:
+                                    report["remote_missing"].append(identity)
+                                    continue
+                                primary_actual_labels = target_gmail_labels_for_msgid(
+                                    imap,
+                                    row,
+                                    [target_mailbox],
+                                    journal_target_gmail_msgid,
+                                )
+                                if primary_actual_labels is None:
+                                    report["remote_missing"].append(identity)
+                                    continue
+                                extra_gmail_msgids = matching_gmail_msgids - committed_target_gmail_msgids
+                            else:
+                                extra_gmail_msgids = matching_gmail_msgids if len(matching_gmail_msgids) > 1 else set()
+                            if extra_gmail_msgids:
                                 report["duplicates"].append({
                                     "canonical_id": identity,
-                                    "count": len(matching_gmail_msgids),
+                                    "count": len({journal_target_gmail_msgid} | extra_gmail_msgids)
+                                    if journal_target_gmail_msgid
+                                    else len(extra_gmail_msgids),
                                     "source": "target",
                                 })
-                            actual_labels = consume_target_match_with_gmail_labels(
-                                imap,
-                                target_mailbox,
-                                row,
-                                used_target_nums,
-                                create_if_missing=False,
-                                used_gmail_msgids=used_target_gmail_msgids,
-                            )
+                            if journal_target_gmail_msgid:
+                                actual_labels = primary_actual_labels
+                            else:
+                                actual_labels = consume_target_match_with_gmail_labels(
+                                    imap,
+                                    target_mailbox,
+                                    row,
+                                    used_target_nums,
+                                    create_if_missing=False,
+                                    used_gmail_msgids=used_target_gmail_msgids,
+                                )
                             if actual_labels is None:
                                 report["remote_missing"].append(identity)
                                 continue
@@ -2278,7 +3186,8 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                 source_mailboxes = list_mailboxes(source_imap)
                 if config.source.provider == "gmail":
                     account_issues.extend(gmail_source_readiness_issues(capabilities, source_mailboxes))
-                    account_issues.extend(gmail_source_decommission_issues(config.source))
+                    account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
+                    account_issues.extend(gmail_account_decommission_issues(config.source, acc))
                 for mailbox in source_mailboxes:
                     if is_noselect(mailbox) or is_virtual_source_mailbox(config.source.provider, mailbox):
                         continue
@@ -2302,7 +3211,12 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
             account_issues.append(f"source preflight failed: {exc}")
         try:
             with imap_connection(config.target, acc, role="target") as target_imap:
+                target_capabilities = get_capabilities(target_imap)
                 target_mailboxes = list_mailboxes(target_imap)
+                if config.target.provider == "gmail":
+                    account_issues.extend(gmail_target_readiness_issues(target_capabilities, target_mailboxes))
+                    account_issues.extend(gmail_all_mail_select_issues(target_imap, target_mailboxes, role="target"))
+                    account_issues.extend(gmail_target_decommission_issues(config.target, acc))
                 if not target_mailboxes:
                     account_issues.append("target returned no mailboxes")
         except Exception as exc:
