@@ -756,13 +756,17 @@ class TestLegacyImportJournal:
             import_account(account, server, tmp_path, ignore_errors=False)
 
     @pytest.mark.parametrize(
-        ("extra_marker", "marker_mailbox", "marker_count", "marker_text"),
+        ("extra_marker", "marker_mailbox", "marker_count", "marker_text", "state_count"),
         [
-            (True, "INBOX", 0, None),
-            (False, "Archive", 0, None),
-            (False, "INBOX", 1, None),
-            (True, "INBOX", 0, "{bad json"),
-            (True, "INBOX", 0, "[]"),
+            (True, "INBOX", 0, None, 0),
+            (False, "Archive", 0, None, 0),
+            (False, "INBOX", 1, None, 0),
+            (True, "INBOX", 0, "{bad json", 0),
+            (True, "INBOX", 0, "[]", 0),
+            (False, "INBOX", "0", None, 0),
+            (False, "INBOX", False, None, 0),
+            (False, "INBOX", 0, None, "0"),
+            (False, "INBOX", 0, None, False),
         ],
     )
     def test_import_rejects_unproven_zero_message_marker_state(
@@ -770,8 +774,9 @@ class TestLegacyImportJournal:
         tmp_path: Path,
         extra_marker: bool,
         marker_mailbox: str,
-        marker_count: int,
+        marker_count: object,
         marker_text: Optional[str],
+        state_count: object,
     ) -> None:
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest, import_account
         from components.models import Account, ServerConfig
@@ -793,7 +798,7 @@ class TestLegacyImportJournal:
             "source_server_sha256": legacy_server_endpoint_digest(server),
             "complete": True,
             "completed_at": 0,
-            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": state_count}],
         }))
         account = Account(email="user@example.com", password="pass")
 

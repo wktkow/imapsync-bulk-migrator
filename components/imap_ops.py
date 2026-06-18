@@ -524,9 +524,8 @@ def import_account(
             mailbox = str(entry.get("mailbox") or "")
             if not path or not mailbox:
                 return False
-            try:
-                message_count = int(entry.get("message_count"))
-            except Exception:
+            message_count = entry.get("message_count")
+            if type(message_count) is not int:
                 return False
             if message_count != 0:
                 return False
@@ -535,9 +534,8 @@ def import_account(
                 return False
             if marker_meta.get("mailbox") != mailbox:
                 return False
-            try:
-                marker_count = int(marker_meta.get("message_count"))
-            except Exception:
+            marker_count = marker_meta.get("message_count")
+            if type(marker_count) is not int:
                 return False
             if marker_count != 0:
                 return False
