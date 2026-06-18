@@ -178,7 +178,8 @@ def main():
     total_messages = 0
     total_attachments = 0
     total_errors = 0
-    
+    total_multiple_message_files = 0
+
     # Process each account
     for account_path in sorted(export_dir.iterdir()):
         if not account_path.is_dir():
@@ -189,6 +190,7 @@ def main():
         total_messages += stats['total_messages']
         total_attachments += stats['total_attachments']
         total_errors += stats['errors']
+        total_multiple_message_files += stats['multiple_message_files']
     
     # Overall summary
     print(f"\n{'='*50}")
@@ -198,14 +200,15 @@ def main():
     print(f"Total messages: {total_messages}")
     print(f"Total attachments: {total_attachments}")
     print(f"Total errors: {total_errors}")
+    print(f"Files with multiple messages: {total_multiple_message_files}")
     
-    if total_errors == 0:
+    if total_errors == 0 and total_multiple_message_files == 0:
         print("✅ All messages verified successfully!")
         print("✅ All attachments appear to be intact!")
     else:
-        print(f"⚠️  Found {total_errors} issues - check individual account reports above")
+        print("⚠️  Found export integrity issues - check individual account reports above")
     
-    return 0 if total_errors == 0 else 1
+    return 0 if total_errors == 0 and total_multiple_message_files == 0 else 1
 
 if __name__ == "__main__":
     sys.exit(main())

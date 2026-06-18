@@ -23,6 +23,7 @@ LOG_imapsync/
 # Exported mail data and logs
 exported/
 logs/
+opt/
 
 # Migrator config files (and their common backup variants)
 # Canonical names
@@ -34,9 +35,20 @@ import.pass.config.json*
 *.pass.config*.json*
 export.*.config.json*
 import.*.config.json*
+migration.config.json*
+migration.*.config.json*
 *export*config*.json*
 *import*config*.json*
 *_accounts_config.json
+
+# Provider migration secrets referenced by local configs/README
+secrets/
+.env
+.env.*
+*.token
+prompt.md
+prompts/
+k.md
 
 # Editor/OS backups for JSON configs
 *.json.bak
@@ -44,8 +56,4 @@ import.*.config.json*
 *.json.orig
 *.json.old
 *.json.tmp
-
-
-# charm.com.pl
-*charm*
-charm.media.pl dns config
+*.jsonl.tmp
