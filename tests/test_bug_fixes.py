@@ -755,6 +755,46 @@ class TestLegacyImportJournal:
         with pytest.raises(RuntimeError, match="no staged \\.eml files"):
             import_account(account, server, tmp_path, ignore_errors=False)
 
+    @pytest.mark.parametrize(
+        ("extra_marker", "marker_mailbox", "marker_count"),
+        [
+            (True, "INBOX", 0),
+            (False, "Archive", 0),
+            (False, "INBOX", 1),
+        ],
+    )
+    def test_import_rejects_unproven_zero_message_marker_state(
+        self,
+        tmp_path: Path,
+        extra_marker: bool,
+        marker_mailbox: str,
+        marker_count: int,
+    ) -> None:
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest, import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": marker_mailbox, "message_count": marker_count}))
+        if extra_marker:
+            extra = tmp_path / "user@example.com" / "Extra"
+            extra.mkdir()
+            (extra / ".mailbox.json").write_text(json.dumps({"mailbox": "Extra", "message_count": 0}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
+        account = Account(email="user@example.com", password="pass")
+
+        with pytest.raises(RuntimeError, match="no staged \\.eml files"):
+            import_account(account, server, tmp_path, ignore_errors=False)
+
     def test_import_rejects_pending_journal_entry(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
         from components.models import Account, ServerConfig

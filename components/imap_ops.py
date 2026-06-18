@@ -498,7 +498,7 @@ def import_account(
         if row.get("status") == "pending" and row.get("key") and row.get("target") == target_id
     }
 
-    def _completed_zero_message_export() -> bool:
+    def _completed_zero_message_export(staged_markers: Dict[str, Dict[str, object]]) -> bool:
         state_path = account_dir / "export-state.json"
         if not state_path.exists():
             return False
@@ -513,11 +513,13 @@ def import_account(
         mailboxes = state.get("mailboxes")
         if not isinstance(mailboxes, list) or not mailboxes:
             return False
+        state_paths: set[str] = set()
         for entry in mailboxes:
             if not isinstance(entry, dict):
                 return False
             path = str(entry.get("path") or "")
-            if not path:
+            mailbox = str(entry.get("mailbox") or "")
+            if not path or not mailbox:
                 return False
             try:
                 message_count = int(entry.get("message_count"))
@@ -525,12 +527,25 @@ def import_account(
                 return False
             if message_count != 0:
                 return False
-            if not (account_dir / path / ".mailbox.json").exists():
+            marker_meta = staged_markers.get(path)
+            if not isinstance(marker_meta, dict):
                 return False
+            if marker_meta.get("mailbox") != mailbox:
+                return False
+            try:
+                marker_count = int(marker_meta.get("message_count"))
+            except Exception:
+                return False
+            if marker_count != 0:
+                return False
+            state_paths.add(path)
+        if state_paths != set(staged_markers):
+            return False
         return True
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
+    staged_markers: Dict[str, Dict[str, object]] = {}
     for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
@@ -538,6 +553,8 @@ def import_account(
         if marker.exists():
             with contextlib.suppress(Exception):
                 marker_meta = json.loads(marker.read_text(encoding="utf-8"))
+                if isinstance(marker_meta, dict):
+                    staged_markers[folder_dir.name] = marker_meta
                 marker_mailbox = marker_meta.get("mailbox")
                 if isinstance(marker_mailbox, str) and marker_mailbox.strip():
                     mailbox_meta = marker_mailbox
@@ -560,7 +577,7 @@ def import_account(
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
     if not any(entries for entries in per_folder.values()):
-        if not _completed_zero_message_export():
+        if not _completed_zero_message_export(staged_markers):
             raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
         logging.info("[import] %s: completed zero-message export; importing empty mailbox structure only", account.email)
 
