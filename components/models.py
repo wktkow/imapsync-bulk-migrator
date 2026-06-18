@@ -213,6 +213,7 @@ class MigrationAccount:
 class MigrationSettings:
     label_policy: str = "single_copy_preserve_metadata"
     target_mode: str = "empty"
+    account_merge_mode: str = "one_to_one"
     folder_map: Dict[str, str] = dataclasses.field(default_factory=dict)
     validation: str = "manifest_exact"
 
@@ -228,6 +229,9 @@ class MigrationSettings:
         target_mode = str(raw.get("target_mode", "empty")).lower()
         if target_mode not in {"empty", "merge"}:
             raise ValueError("migration.target_mode must be one of: empty, merge")
+        account_merge_mode = str(raw.get("account_merge_mode", "one_to_one")).lower()
+        if account_merge_mode not in {"one_to_one", "many_to_one"}:
+            raise ValueError("migration.account_merge_mode must be one of: one_to_one, many_to_one")
         folder_map_raw = raw.get("folder_map", {})
         if not isinstance(folder_map_raw, dict):
             raise ValueError("migration.folder_map must be an object")
@@ -238,6 +242,7 @@ class MigrationSettings:
         return MigrationSettings(
             label_policy=label_policy,
             target_mode=target_mode,
+            account_merge_mode=account_merge_mode,
             folder_map=folder_map,
             validation=validation,
         )
@@ -273,6 +278,18 @@ class LimitsSettings:
             throttle=ThrottleSettings.from_dict(raw.get("throttle")),
             retry_max_attempts=retry_max_attempts,
         )
+
+
+def _effective_auth_username(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> str:
+    override = account.source_auth if role == "source" else account.target_auth
+    auth = override or endpoint.auth
+    fallback_email = account.source_email if role == "source" else account.target_email
+    username = auth.username or endpoint.auth.username
+    if not username and endpoint.provider == "icloud" and "@" in fallback_email:
+        username = fallback_email.split("@", 1)[0]
+    if not username:
+        username = fallback_email
+    return username.strip()
 
 
 @dataclasses.dataclass
@@ -315,15 +332,45 @@ class ProviderMigrationConfig:
         self.target.validate_provider_contract(context="target")
         seen_sources: Dict[str, int] = {}
         seen_targets: Dict[str, int] = {}
+        allow_target_duplicates = self.migration.account_merge_mode == "many_to_one"
+        unique_target_keys = {account.target_email.strip().lower() for account in self.accounts}
+        shared_single_target = allow_target_duplicates and len(unique_target_keys) == 1
+        target_usernames_by_target: Dict[str, Dict[str, int]] = {}
+        target_labels_by_username: Dict[str, Dict[str, int]] = {}
         for idx, account in enumerate(self.accounts):
             source_key = account.source_email.strip().lower()
             target_key = account.target_email.strip().lower()
             if source_key in seen_sources:
                 raise ValueError(f"accounts[{idx}].source_email duplicates accounts[{seen_sources[source_key]}].source_email")
-            if target_key in seen_targets:
+            if target_key in seen_targets and not allow_target_duplicates:
                 raise ValueError(f"accounts[{idx}].target_email duplicates accounts[{seen_targets[target_key]}].target_email")
             seen_sources[source_key] = idx
             seen_targets[target_key] = idx
+            target_username_key = _effective_auth_username(self.target, account, role="target").lower()
+            target_usernames_by_target.setdefault(target_key, {}).setdefault(target_username_key, idx)
+            target_labels_by_username.setdefault(target_username_key, {}).setdefault(target_key, idx)
+        if not allow_target_duplicates:
+            for username_key, target_indexes in sorted(target_labels_by_username.items()):
+                if len(target_indexes) > 1:
+                    details = ", ".join(
+                        f"accounts[{idx}]={target!r}"
+                        for target, idx in sorted(target_indexes.items(), key=lambda item: item[1])
+                    )
+                    raise ValueError(
+                        f"effective target_auth.username {username_key!r} is reused by multiple target_email labels "
+                        f"({details}); set migration.account_merge_mode=many_to_one for intentional account merges"
+                    )
+        if allow_target_duplicates:
+            for target_key, username_indexes in sorted(target_usernames_by_target.items()):
+                if len(username_indexes) > 1:
+                    details = ", ".join(
+                        f"accounts[{idx}]={username!r}"
+                        for username, idx in sorted(username_indexes.items(), key=lambda item: item[1])
+                    )
+                    raise ValueError(
+                        f"migration.account_merge_mode=many_to_one requires the same effective target_auth.username "
+                        f"for every account targeting {target_key}: {details}"
+                    )
         _reject_sanitized_path_collisions([account.source_email for account in self.accounts], context="accounts.source_email")
         _reject_sanitized_path_collisions([account.target_email for account in self.accounts], context="accounts.target_email")
         multi_account = len(self.accounts) > 1
@@ -332,16 +379,17 @@ class ProviderMigrationConfig:
                 ("source", self.source, account.source_auth),
                 ("target", self.target, account.target_auth),
             ):
+                shared_target_login = role == "target" and shared_single_target
                 auth = override or endpoint.auth
                 endpoint.validate_auth_method(auth, context=f"accounts[{idx}].{role}_auth" if override else f"{role}.auth")
                 if auth.secret_source_count() == 0:
                     raise ValueError(f"accounts[{idx}].{role}_auth must provide a secret source or {role}.auth must provide one")
-                if multi_account and override is None and endpoint.auth.secret_source_count() > 0:
+                if multi_account and override is None and endpoint.auth.secret_source_count() > 0 and not shared_target_login:
                     raise ValueError(
                         f"accounts[{idx}].{role}_auth must be set in multi-account provider configs; "
                         f"endpoint-level provider secrets would be reused for every account"
                     )
-                if multi_account and override is not None and endpoint.auth.username and not override.username:
+                if multi_account and override is not None and endpoint.auth.username and not override.username and not shared_target_login:
                     raise ValueError(
                         f"accounts[{idx}].{role}_auth.username must be set in multi-account provider configs; "
                         f"endpoint-level provider username would be reused for every account"
@@ -361,7 +409,12 @@ class ProviderMigrationConfig:
                 raise ValueError(
                     f"accounts[{idx}].gmail_full_visibility_verified is only valid when source.provider is 'gmail'"
                 )
-            if self.target.provider == "gmail" and multi_account and not account.target_gmail_full_visibility_verified:
+            if (
+                self.target.provider == "gmail"
+                and multi_account
+                and not account.target_gmail_full_visibility_verified
+                and not (shared_single_target and self.target.gmail_full_visibility_verified)
+            ):
                 raise ValueError(
                     f"accounts[{idx}].target_gmail_full_visibility_verified must be true for multi-account Gmail target configs"
                 )

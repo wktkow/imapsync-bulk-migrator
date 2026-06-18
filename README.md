@@ -132,8 +132,89 @@ The sample is intentionally conservative: Gmail export will fail until
 
 For multi-account provider configs, put credentials, usernames, Gmail source
 visibility attestations, and Gmail target visibility attestations on each
-account override. Shared endpoint-level usernames or secrets are rejected to
-avoid accidentally migrating multiple accounts with one login.
+account override. Shared endpoint-level usernames or secrets are rejected by
+default to avoid accidentally migrating multiple accounts with one login; the
+only exception is the explicit many-to-one target mode described below.
+
+### Many-To-One Account Merges
+
+Provider mode can intentionally merge multiple source accounts into one target
+account. Set `migration.account_merge_mode` to `many_to_one` and give multiple
+accounts the same `target_email`:
+
+```json
+{
+  "source": {
+    "provider": "imap",
+    "host": "imap.old.example.com",
+    "auth": {
+      "method": "password"
+    }
+  },
+  "target": {
+    "provider": "imap",
+    "host": "imap.new.example.com",
+    "auth": {
+      "method": "password",
+      "username": "a@example.com",
+      "password_file": "secrets/a-target.password"
+    }
+  },
+  "migration": {
+    "target_mode": "empty",
+    "account_merge_mode": "many_to_one"
+  },
+  "accounts": [
+    {
+      "source_email": "a@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {
+        "method": "password",
+        "username": "a@example.com",
+        "password_file": "secrets/a-source.password"
+      }
+    },
+    {
+      "source_email": "b@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {
+        "method": "password",
+        "username": "b@example.com",
+        "password_file": "secrets/b-source.password"
+      }
+    },
+    {
+      "source_email": "c@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {
+        "method": "password",
+        "username": "c@example.com",
+        "password_file": "secrets/c-source.password"
+      }
+    }
+  ]
+}
+```
+
+This mode is explicit because duplicate `target_email` values and duplicate
+effective target IMAP logins are rejected in the default `one_to_one` account
+mode. Source credentials still have to be per-account in multi-account configs.
+When all accounts target the same mailbox and use the same `target_email` label,
+the target credentials may be configured once at `target.auth`. Merge groups are
+keyed by the effective target IMAP login and endpoint; if two account labels
+authenticate to the same target login, they are treated as the same destination
+account and serialized together.
+For a many-to-one Gmail target, a single `target.gmail_full_visibility_verified`
+attestation is accepted for that shared target mailbox; per-account
+`accounts[].target_gmail_full_visibility_verified` remains required for normal
+multi-target Gmail migrations.
+
+Imports into the same target account are serialized even if `--max-workers` is
+larger than one. In `target_mode=empty`, the target may contain only messages
+already committed or pending in journals from the same merge group; unjournaled
+target content still fails the empty-target gate. During the merge, duplicate
+messages already present from an earlier source account are journaled as
+existing instead of blindly appended again.
 
 Gmail source migrations require `X-GM-EXT-1`, a selectable All Mail view
 advertised with the `\All` special-use attribute, and full-visibility
@@ -156,7 +237,9 @@ advertised with `\All`, and full-visibility attestation before import or target
 validation can be treated as a decommissioning proof. For a single account, set
 `target.gmail_full_visibility_verified=true` only after confirming the target is
 not hiding messages from IMAP. For multi-account Gmail target migrations, each
-`accounts[].target_gmail_full_visibility_verified` value must be true.
+`accounts[].target_gmail_full_visibility_verified` value must be true unless
+the config uses explicit many-to-one mode with one shared target mailbox and the
+shared `target.gmail_full_visibility_verified` attestation described above.
 
 iCloud and generic IMAP do not expose Gmail's cross-label identity. Physical
 copies in different folders are preserved as separate messages. Generic IMAP,
@@ -399,6 +482,9 @@ Provider mode validation is manifest/journal based. It checks:
 - Per-message metadata JSON consistency with the manifest.
 - Import journal consistency.
 - Provider import journal target endpoint and effective target login binding.
+- Many-to-one account merge groups, when enabled, so empty-target checks trust
+  only journaled messages from the same target merge group and serialize writes
+  into the shared destination.
 - Target folder mapping consistency, including translated hierarchy collision
   checks when target validation is enabled.
 - Target message presence by `Message-ID` plus content hash/size where target

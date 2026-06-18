@@ -2012,6 +2012,7 @@ def gmail_labels_for_restore(
     row: Dict[str, Any],
     target_mailbox: str,
     target_mailboxes: Optional[List[MailboxInfo]] = None,
+    desired_target_mailbox: Optional[str] = None,
 ) -> List[str]:
     system_restore_labels = {
         "\\inbox": ("inbox", "\\Inbox"),
@@ -2026,6 +2027,11 @@ def gmail_labels_for_restore(
         "[googlemail]/spam": ("spam", "\\Junk"),
     }
     target_system_key = _gmail_target_system_key(target_mailbox, target_mailboxes)
+    desired_system_key = (
+        _gmail_target_system_key(desired_target_mailbox, target_mailboxes)
+        if desired_target_mailbox
+        else target_system_key
+    )
     system_labels = {
         "\\all",
         "\\allmail",
@@ -2044,6 +2050,16 @@ def gmail_labels_for_restore(
         "starred",
     }
     labels: List[str] = []
+    desired_restore_labels = {
+        "inbox": "\\Inbox",
+        "sent": "\\Sent",
+        "drafts": "\\Drafts",
+        "trash": "\\Trash",
+        "spam": "\\Junk",
+    }
+    desired_restore = desired_restore_labels.get(desired_system_key)
+    if desired_restore and desired_system_key != target_system_key:
+        labels.append(desired_restore)
     for raw in row.get("gmail_labels") or []:
         label = str(raw).strip()
         lower = label.lower()
@@ -2082,8 +2098,14 @@ def restore_gmail_labels(
     *,
     target_num: Optional[bytes] = None,
     target_mailboxes: Optional[List[MailboxInfo]] = None,
+    desired_target_mailbox: Optional[str] = None,
 ) -> None:
-    labels = gmail_labels_for_restore(row, target_mailbox, target_mailboxes)
+    labels = gmail_labels_for_restore(
+        row,
+        target_mailbox,
+        target_mailboxes,
+        desired_target_mailbox=desired_target_mailbox,
+    )
     if not labels:
         return
     num = target_num or _first_target_match_num(imap, target_mailbox, row)
@@ -2213,6 +2235,34 @@ def consume_target_gmail_msgid_match_num(
             used_gmail_msgids.add(gmail_msgid)
         used.add(num)
         return num
+    return None
+
+
+def consume_target_gmail_match_in_mailboxes(
+    imap: imaplib.IMAP4,
+    mailboxes: List[str],
+    manifest_row: Dict[str, Any],
+    used_by_mailbox: Dict[str, set[bytes]],
+    *,
+    target_gmail_msgid: str = "",
+    used_gmail_msgids: Optional[set[str]] = None,
+) -> Optional[Tuple[str, bytes, str]]:
+    for mailbox in mailboxes:
+        mailbox_key = mailbox.lower()
+        used = used_by_mailbox.setdefault(mailbox_key, set())
+        for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=False):
+            if num in used:
+                continue
+            gmail_msgid = _target_gmail_msgid(imap, num)
+            if target_gmail_msgid and gmail_msgid != target_gmail_msgid:
+                continue
+            if used_gmail_msgids is not None:
+                if gmail_msgid and gmail_msgid in used_gmail_msgids:
+                    continue
+                if gmail_msgid:
+                    used_gmail_msgids.add(gmail_msgid)
+            used.add(num)
+            return mailbox, num, gmail_msgid
     return None
 
 
@@ -2385,11 +2435,13 @@ def enforce_empty_target(
     journaled: set[Tuple[str, str]],
     *,
     target_provider: str = "imap",
+    gmail_journal_msgids: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> None:
-    permitted_by_mailbox: Dict[str, List[Dict[str, Any]]] = {}
+    permitted_by_mailbox: Dict[str, List[Tuple[Dict[str, Any], Tuple[str, str]]]] = {}
     by_name = _target_mailboxes_by_name(target_mailboxes)
     gmail_system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes) if target_provider == "gmail" else {}
     gmail_all_mailboxes = gmail_all_mail_names(target_mailboxes) if target_provider == "gmail" else []
+    gmail_journal_msgids = gmail_journal_msgids or {}
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
         desired = translate_source_mailbox_for_target(
@@ -2421,7 +2473,7 @@ def enforce_empty_target(
                 if key_name in seen_permitted_names:
                     continue
                 seen_permitted_names.add(key_name)
-                permitted_by_mailbox.setdefault(key_name, []).append(row)
+                permitted_by_mailbox.setdefault(key_name, []).append((row, key))
     for mailbox in target_mailboxes:
         if is_noselect(mailbox):
             continue
@@ -2430,7 +2482,20 @@ def enforce_empty_target(
             continue
         verified = 0
         used: Dict[str, set[bytes]] = {}
-        for permitted_row in permitted_by_mailbox.get(mailbox.name.lower(), []):
+        for permitted_row, journal_key in permitted_by_mailbox.get(mailbox.name.lower(), []):
+            target_gmail_msgid = gmail_journal_msgids.get(journal_key, "") if target_provider == "gmail" else ""
+            if target_gmail_msgid:
+                matched = consume_target_gmail_msgid_match_num(
+                    imap,
+                    mailbox.name,
+                    permitted_row,
+                    target_gmail_msgid,
+                    used,
+                    create_if_missing=False,
+                )
+                if matched is not None:
+                    verified += 1
+                continue
             if consume_target_match(imap, mailbox.name, permitted_row, used, create_if_missing=False):
                 verified += 1
         if count > verified:
@@ -2471,6 +2536,167 @@ def translated_target_mailboxes_for_rows(
         if identity:
             result[identity] = target_mailbox
     return result
+
+
+def provider_account_merge_enabled(config: ProviderMigrationConfig) -> bool:
+    return config.migration.account_merge_mode == "many_to_one"
+
+
+def target_merge_group_key(config: ProviderMigrationConfig, account: MigrationAccount) -> Tuple[str, str]:
+    target_username, _auth = effective_auth(config.target, account, role="target")
+    normalized_username = target_username.strip().lower()
+    return (
+        normalized_username,
+        provider_endpoint_state_digest(config.target, username=normalized_username),
+    )
+
+
+def same_target_accounts(config: ProviderMigrationConfig, account: MigrationAccount) -> List[MigrationAccount]:
+    target_key = target_merge_group_key(config, account)
+    return [
+        candidate
+        for candidate in config.accounts
+        if target_merge_group_key(config, candidate) == target_key
+    ]
+
+
+def _validated_group_stage(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    account: MigrationAccount,
+    current_account: MigrationAccount,
+    current_manifest_rows: List[Dict[str, Any]],
+    current_journal_rows: List[Dict[str, Any]],
+) -> Tuple[Path, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if account is current_account or account.source_email == current_account.source_email:
+        account_dir = account_export_dir(in_root, current_account)
+        return account_dir, current_manifest_rows, current_journal_rows
+    account_dir = account_export_dir(in_root, account)
+    manifest_rows = load_manifest(account_dir)
+    require_unique_manifest_identities(manifest_rows)
+    require_manifest_accounts(manifest_rows, account)
+    require_manifest_source_provider(manifest_rows, config.source.provider)
+    require_manifest_integrity_metadata(manifest_rows)
+    require_complete_export_state(
+        account_dir,
+        account=account,
+        manifest_rows=manifest_rows,
+        source_provider=config.source.provider,
+        target_provider=config.target.provider,
+        source_endpoint=config.source,
+    )
+    metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
+    if metadata_issues:
+        raise RuntimeError(
+            f"metadata does not match manifest for merge source {account.source_email}: "
+            + "; ".join(metadata_issues)
+        )
+    journal_rows = load_import_journal(account_dir, account)
+    require_valid_import_journal(journal_rows, account)
+    journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
+    if journal_target_issues:
+        raise RuntimeError(
+            f"invalid import journal for merge source {account.source_email}: "
+            + "; ".join(journal_target_issues)
+        )
+    if config.target.provider == "gmail":
+        manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
+        gmail_journal_issues: List[str] = []
+        gmail_journal_issues.extend(invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
+        gmail_journal_issues.extend(missing_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
+        gmail_journal_issues.extend(duplicate_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
+        if gmail_journal_issues:
+            raise RuntimeError(
+                f"invalid Gmail import journal for merge source {account.source_email}: "
+                + "; ".join(gmail_journal_issues)
+            )
+    return account_dir, manifest_rows, journal_rows
+
+
+def validated_merge_group_stages(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    account: MigrationAccount,
+    current_manifest_rows: List[Dict[str, Any]],
+    current_journal_rows: List[Dict[str, Any]],
+) -> List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]] = []
+    for group_account in same_target_accounts(config, account):
+        account_dir, manifest_rows, journal_rows = _validated_group_stage(
+            config,
+            in_root,
+            group_account,
+            account,
+            current_manifest_rows,
+            current_journal_rows,
+        )
+        stages.append((group_account, account_dir, manifest_rows, journal_rows))
+    return stages
+
+
+def require_merge_group_target_translation_safe(
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> None:
+    merged_rows: List[Dict[str, Any]] = []
+    for _account, _account_dir, manifest_rows, _journal_rows in stages:
+        merged_rows.extend(manifest_rows)
+    translated_target_mailboxes_for_rows(
+        merged_rows,
+        target_mailboxes,
+        target_provider=target_provider,
+    )
+
+
+def merge_group_empty_target_context(
+    config: ProviderMigrationConfig,
+    target_mailboxes: List[MailboxInfo],
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+) -> Tuple[List[Dict[str, Any]], set[Tuple[str, str]], Dict[Tuple[str, str], str]]:
+    permitted_rows: List[Dict[str, Any]] = []
+    permitted_keys: set[Tuple[str, str]] = set()
+    gmail_journal_msgids: Dict[Tuple[str, str], str] = {}
+    for _group_account, _account_dir, manifest_rows, journal_rows in stages:
+        latest_committed = latest_committed_journal_rows(journal_rows)
+        journaled = set(latest_committed)
+        if config.target.provider == "gmail":
+            for key, journal_row in latest_committed.items():
+                target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
+                if target_gmail_msgid:
+                    gmail_journal_msgids[key] = target_gmail_msgid
+        journaled.update(
+            (str(row.get("canonical_id")), str(row.get("target_mailbox")))
+            for row in journal_rows
+            if row.get("status") == "pending"
+        )
+        if not journaled:
+            continue
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider=config.target.provider,
+        )
+        for row in manifest_rows:
+            identity = str(row.get("canonical_id") or "")
+            if not identity:
+                continue
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not target_mailbox:
+                desired = translate_source_mailbox_for_target(
+                    row,
+                    str(row.get("primary_mailbox") or "Archive"),
+                    target_mailboxes,
+                    target_provider=config.target.provider,
+                )
+                target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
+            key = (identity, target_mailbox)
+            if key not in journaled:
+                continue
+            permitted_rows.append(row)
+            permitted_keys.add(key)
+    return permitted_rows, permitted_keys, gmail_journal_msgids
 
 
 def provider_import_account(
@@ -2546,6 +2772,20 @@ def provider_import_account(
                     "IMAP server did not advertise X-GM-EXT-1"
                 )
         target_mailboxes = list_mailboxes(imap)
+        merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
+        if provider_account_merge_enabled(config):
+            merge_group_stages = validated_merge_group_stages(
+                config,
+                in_root,
+                account,
+                manifest_rows,
+                journal_rows,
+            )
+            require_merge_group_target_translation_safe(
+                merge_group_stages,
+                target_mailboxes,
+                target_provider=config.target.provider,
+            )
         target_mailbox_by_identity = translated_target_mailboxes_for_rows(
             manifest_rows,
             target_mailboxes,
@@ -2585,12 +2825,26 @@ def provider_import_account(
         latest_committed = latest_committed_journal_rows(journal_rows)
         committed = set(latest_committed)
         if config.migration.target_mode == "empty":
+            empty_target_rows = manifest_rows
+            empty_target_journaled = committed | pending
+            empty_target_gmail_msgids = {
+                key: str(row.get("target_gmail_msgid") or "")
+                for key, row in latest_committed.items()
+                if config.target.provider == "gmail" and row.get("target_gmail_msgid")
+            }
+            if merge_group_stages is not None:
+                empty_target_rows, empty_target_journaled, empty_target_gmail_msgids = merge_group_empty_target_context(
+                    config,
+                    target_mailboxes,
+                    merge_group_stages,
+                )
             enforce_empty_target(
                 imap,
                 target_mailboxes,
-                manifest_rows,
-                committed | pending,
+                empty_target_rows,
+                empty_target_journaled,
                 target_provider=config.target.provider,
+                gmail_journal_msgids=empty_target_gmail_msgids,
             )
         for row in sorted(manifest_rows, key=lambda item: str(item.get("canonical_id", ""))):
             _raise_if_stopped(stop_event, f"provider import {account.target_email}")
@@ -2608,16 +2862,20 @@ def provider_import_account(
             data = payloads_by_identity[identity]
             if key in committed:
                 journal_target_gmail_msgid = str(latest_committed.get(key, {}).get("target_gmail_msgid") or "")
+                committed_mailbox = target_mailbox
                 if config.target.provider == "gmail" and journal_target_gmail_msgid:
-                    committed_num = consume_target_gmail_msgid_match_num(
+                    committed_match = consume_target_gmail_match_in_mailboxes(
                         imap,
-                        target_mailbox,
+                        gmail_expected_target_mailboxes_for_row(row, target_mailbox, target_mailboxes),
                         row,
-                        journal_target_gmail_msgid,
                         used_target_nums,
-                        create_if_missing=False,
+                        target_gmail_msgid=journal_target_gmail_msgid,
                         used_gmail_msgids=used_target_gmail_msgids,
                     )
+                    if committed_match is None:
+                        committed_num = None
+                    else:
+                        committed_mailbox, committed_num, _committed_gmail_msgid = committed_match
                 else:
                     committed_num = consume_target_match_num(
                         imap,
@@ -2640,24 +2898,50 @@ def provider_import_account(
                 if committed_num is not None:
                     subscribe_mailbox(imap, target_mailbox)
                     if config.target.provider == "gmail":
-                        restore_gmail_labels(imap, target_mailbox, row, target_num=committed_num, target_mailboxes=target_mailboxes)
-                        restore_gmail_starred_flag(imap, target_mailbox, row, target_num=committed_num)
+                        restore_gmail_labels(
+                            imap,
+                            committed_mailbox,
+                            row,
+                            target_num=committed_num,
+                            target_mailboxes=target_mailboxes,
+                            desired_target_mailbox=target_mailbox,
+                        )
+                        restore_gmail_starred_flag(imap, committed_mailbox, row, target_num=committed_num)
                     continue
             matched_num = None
-            if config.migration.target_mode == "merge" or key in pending:
-                matched_num = consume_target_match_num(
-                    imap,
-                    target_mailbox,
-                    row,
-                    used_target_nums,
-                    used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
-                )
+            matched_mailbox = target_mailbox
+            matched_gmail_msgid = ""
+            if config.migration.target_mode == "merge" or provider_account_merge_enabled(config) or key in pending:
+                if config.target.provider == "gmail":
+                    matched = consume_target_gmail_match_in_mailboxes(
+                        imap,
+                        gmail_expected_target_mailboxes_for_row(row, target_mailbox, target_mailboxes),
+                        row,
+                        used_target_nums,
+                        used_gmail_msgids=used_target_gmail_msgids,
+                    )
+                    if matched is not None:
+                        matched_mailbox, matched_num, matched_gmail_msgid = matched
+                else:
+                    matched_num = consume_target_match_num(
+                        imap,
+                        target_mailbox,
+                        row,
+                        used_target_nums,
+                    )
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
                 if config.target.provider == "gmail":
-                    target_gmail_msgid = _target_gmail_msgid(imap, matched_num)
-                    restore_gmail_labels(imap, target_mailbox, row, target_num=matched_num, target_mailboxes=target_mailboxes)
-                    restore_gmail_starred_flag(imap, target_mailbox, row, target_num=matched_num)
+                    target_gmail_msgid = matched_gmail_msgid or _target_gmail_msgid(imap, matched_num)
+                    restore_gmail_labels(
+                        imap,
+                        matched_mailbox,
+                        row,
+                        target_num=matched_num,
+                        target_mailboxes=target_mailboxes,
+                        desired_target_mailbox=target_mailbox,
+                    )
+                    restore_gmail_starred_flag(imap, matched_mailbox, row, target_num=matched_num)
                 else:
                     target_gmail_msgid = ""
                 append_journal(
@@ -2740,6 +3024,35 @@ def provider_import_all(
             attempts=config.limits.retry_max_attempts,
             label=f"provider import {acc.target_email}",
         )
+
+    if provider_account_merge_enabled(config):
+        errors: List[str] = []
+        grouped: Dict[Tuple[str, str], List[MigrationAccount]] = {}
+        for account in config.accounts:
+            grouped.setdefault(target_merge_group_key(config, account), []).append(account)
+        for target_key, accounts in grouped.items():
+            group_failed = False
+            for acc in accounts:
+                if group_failed:
+                    message = (
+                        f"{acc.email}: skipped because an earlier source in target merge group "
+                        f"{target_key[0]} failed"
+                    )
+                    logging.error("[provider-import] %s", message)
+                    errors.append(message)
+                    continue
+                try:
+                    worker(acc)
+                except Exception as exc:
+                    message = f"{acc.email}: {exc}"
+                    logging.error("[provider-import] %s", message)
+                    errors.append(message)
+                    group_failed = True
+                    if not ignore_errors:
+                        raise
+        if errors:
+            raise RuntimeError(f"provider-import failed for {len(errors)} account(s): " + "; ".join(errors))
+        return
 
     parallel_process_accounts("provider-import", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
 
@@ -3018,6 +3331,19 @@ def provider_validate_account(
                     if "X-GM-EXT-1" not in capabilities:
                         raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
+                if provider_account_merge_enabled(config):
+                    merge_group_stages = validated_merge_group_stages(
+                        config,
+                        in_root,
+                        account,
+                        manifest_rows,
+                        journal_rows,
+                    )
+                    require_merge_group_target_translation_safe(
+                        merge_group_stages,
+                        target_mailboxes,
+                        target_provider=config.target.provider,
+                    )
                 target_mailbox_by_identity = translated_target_mailboxes_for_rows(
                     manifest_rows,
                     target_mailboxes,
@@ -3175,7 +3501,7 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
     max_workers = _require_max_workers(max_workers)
     issues: List[str] = []
 
-    def worker(acc: MigrationAccount) -> List[str]:
+    def worker(acc: MigrationAccount) -> Tuple[List[str], int]:
         account_issues: List[str] = []
         source_total = 0
         seen_identity: set[str] = set()
@@ -3223,16 +3549,27 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
             account_issues.append(f"target preflight failed: {exc}")
         if config.target.available_bytes is None:
             logging.warning("[provider-preflight] %s: target.available_bytes not configured; storage gate skipped", acc.email)
-        elif source_total > config.target.available_bytes:
+        elif not provider_account_merge_enabled(config) and source_total > config.target.available_bytes:
             account_issues.append(f"estimated source bytes {source_total} exceed target.available_bytes {config.target.available_bytes}")
         logging.info("[provider-preflight] %s: estimated_source_bytes=%d", acc.email, source_total)
-        return account_issues
+        return account_issues, source_total
 
     import concurrent.futures
 
+    merge_group_source_totals: Dict[Tuple[str, str], int] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="provider-preflight") as ex:
-        for acc, result in zip(config.accounts, ex.map(worker, config.accounts)):
+        for acc, (result, source_total) in zip(config.accounts, ex.map(worker, config.accounts)):
             issues.extend(f"{acc.email}: {issue}" for issue in result)
+            if provider_account_merge_enabled(config) and config.target.available_bytes is not None:
+                target_key = target_merge_group_key(config, acc)
+                merge_group_source_totals[target_key] = merge_group_source_totals.get(target_key, 0) + source_total
+    if provider_account_merge_enabled(config) and config.target.available_bytes is not None:
+        for target_key, source_total in sorted(merge_group_source_totals.items()):
+            if source_total > config.target.available_bytes:
+                issues.append(
+                    f"target merge group {target_key[0]}: estimated source bytes {source_total} "
+                    f"exceed target.available_bytes {config.target.available_bytes}"
+                )
     return len(issues) == 0, issues
 
 

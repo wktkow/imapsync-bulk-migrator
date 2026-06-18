@@ -32,6 +32,7 @@ from components.provider_ops import (
     provider_audit_account,
     provider_export_account,
     provider_import_account,
+    provider_import_all,
     provider_manifest_digest,
     provider_endpoint_state,
     provider_endpoint_state_digest,
@@ -44,6 +45,7 @@ from components.provider_ops import (
     resolve_target_mailbox,
     restore_gmail_labels,
     restore_gmail_starred_flag,
+    target_merge_group_key,
     target_has_message,
     translate_source_mailbox_for_target,
     xoauth2_authenticator,
@@ -84,6 +86,63 @@ def _generic_target_config(*, target_mode: str = "empty") -> ProviderMigrationCo
         ),
         accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
         migration=MigrationSettings(target_mode=target_mode),
+    )
+
+
+def _many_to_one_config(*, target_mode: str = "empty") -> ProviderMigrationConfig:
+    return ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.source.example.com",
+            auth=AuthConfig(method="password"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.target.example.com",
+            auth=AuthConfig(method="password", username="merged@example.com", password="target-secret"),
+        ),
+        accounts=[
+            MigrationAccount(
+                source_email="a@example.com",
+                target_email="merged@example.com",
+                source_auth=AuthConfig(method="password", username="a@example.com", password="source-a"),
+            ),
+            MigrationAccount(
+                source_email="b@example.com",
+                target_email="merged@example.com",
+                source_auth=AuthConfig(method="password", username="b@example.com", password="source-b"),
+            ),
+        ],
+        migration=MigrationSettings(target_mode=target_mode, account_merge_mode="many_to_one"),
+    )
+
+
+def _many_to_one_gmail_config(*, target_mode: str = "empty") -> ProviderMigrationConfig:
+    return ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.source.example.com",
+            auth=AuthConfig(method="password"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="merged@gmail.com", password="target-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[
+            MigrationAccount(
+                source_email="a@example.com",
+                target_email="merged@gmail.com",
+                source_auth=AuthConfig(method="password", username="a@example.com", password="source-a"),
+            ),
+            MigrationAccount(
+                source_email="b@example.com",
+                target_email="merged@gmail.com",
+                source_auth=AuthConfig(method="password", username="b@example.com", password="source-b"),
+            ),
+        ],
+        migration=MigrationSettings(target_mode=target_mode, account_merge_mode="many_to_one"),
     )
 
 
@@ -641,6 +700,193 @@ def test_multi_account_provider_auth_requires_per_account_usernames(tmp_path: Pa
 
     with pytest.raises(ValueError, match="source_auth.username"):
         load_config_file(path)
+
+
+def test_provider_config_rejects_duplicate_target_email_without_merge_mode(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-target.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password", "username": "merged@example.com", "password": "target-secret"},
+        },
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="target_email duplicates"):
+        load_config_file(path)
+
+
+def test_provider_config_rejects_duplicate_effective_target_login_without_merge_mode(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-target-login.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password"},
+        },
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "target-alias-a@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "Merged@Example.com", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "target-alias-b@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "merged@example.com", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="migration.account_merge_mode=many_to_one"):
+        load_config_file(path)
+
+
+def test_provider_config_many_to_one_allows_shared_target_auth(tmp_path: Path) -> None:
+    path = tmp_path / "many-to-one.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password", "username": "merged@example.com", "password": "target-secret"},
+        },
+        "migration": {"account_merge_mode": "many_to_one"},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+            },
+        ],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.migration.account_merge_mode == "many_to_one"
+    assert [account.target_email for account in parsed.accounts] == ["merged@example.com", "merged@example.com"]
+
+
+def test_provider_config_many_to_one_groups_same_effective_target_login_with_alias_labels(tmp_path: Path) -> None:
+    path = tmp_path / "many-to-one-target-aliases.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password"},
+        },
+        "migration": {"account_merge_mode": "many_to_one"},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "target-alias-a@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "Merged@Example.com", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "target-alias-b@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "merged@example.com", "password": "target-b"},
+            },
+        ],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.accounts[0].target_email != parsed.accounts[1].target_email
+    assert target_merge_group_key(parsed, parsed.accounts[0]) == target_merge_group_key(parsed, parsed.accounts[1])
+
+
+def test_provider_config_many_to_one_rejects_mismatched_effective_target_login(tmp_path: Path) -> None:
+    path = tmp_path / "many-to-one-wrong-target-login.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password"},
+        },
+        "migration": {"account_merge_mode": "many_to_one"},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "merged@example.com", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "merged@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "other-login@example.com", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="same effective target_auth.username"):
+        load_config_file(path)
+
+
+def test_provider_config_many_to_one_accepts_documented_three_sources_to_self_target(tmp_path: Path) -> None:
+    path = tmp_path / "abc-to-a.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "imap.old.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "imap.new.example.com",
+            "auth": {"method": "password", "username": "a@example.com", "password": "target-a"},
+        },
+        "migration": {"target_mode": "empty", "account_merge_mode": "many_to_one"},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "a@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "a@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+            },
+            {
+                "source_email": "c@example.com",
+                "target_email": "a@example.com",
+                "source_auth": {"method": "password", "username": "c@example.com", "password": "source-c"},
+            },
+        ],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.migration.account_merge_mode == "many_to_one"
+    assert [account.source_email for account in parsed.accounts] == ["a@example.com", "b@example.com", "c@example.com"]
+    assert {account.target_email for account in parsed.accounts} == {"a@example.com"}
 
 
 def test_provider_config_rejects_sanitized_account_path_collisions(tmp_path: Path) -> None:
@@ -1634,12 +1880,14 @@ class FakeTargetImap:
         *,
         has_existing: bool = False,
         existing_message_id: str = "<m1@example.com>",
+        existing_body: bytes = b"Message-ID: <m1@example.com>\r\n\r\nbody",
         existing_mailbox: str = "Archive",
         messages_by_mailbox: Optional[dict[str, int]] = None,
     ) -> None:
         self.appended: List[str] = []
         self.has_existing = has_existing
         self.existing_message_id = existing_message_id
+        self.existing_body = existing_body
         self.existing_mailbox = existing_mailbox
         self.messages = 0
         self.messages_by_mailbox = dict(messages_by_mailbox or {})
@@ -1700,7 +1948,14 @@ class FakeTargetImap:
 
     def fetch(self, num: bytes, query: str):
         self.fetch_queries.append(query)
-        return "OK", [(b"99 (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
+        return "OK", [(
+            b"99 (RFC822.SIZE "
+            + str(len(self.existing_body)).encode("ascii")
+            + b" BODY[] {"
+            + str(len(self.existing_body)).encode("ascii")
+            + b"}",
+            self.existing_body,
+        )]
 
     def logout(self):
         return "OK", []
@@ -1837,6 +2092,50 @@ def _write_manifest_fixture(root: Path) -> Path:
     return account_dir
 
 
+def _write_provider_account_fixture(
+    root: Path,
+    *,
+    source: str,
+    target: str,
+    canonical_id: str,
+    message_id: str,
+    body: bytes,
+    source_provider: str = "imap",
+    source_host: str = "mail.source.example.com",
+    primary_mailbox: str = "Archive",
+    flags: str = "\\Seen",
+) -> Path:
+    account_dir = root / source
+    (account_dir / "messages").mkdir(parents=True)
+    (account_dir / "metadata").mkdir()
+    eml_rel = f"messages/{canonical_id}.eml"
+    meta_rel = f"metadata/{canonical_id}.json"
+    (account_dir / eml_rel).write_bytes(body)
+    row = {
+        "canonical_id": canonical_id,
+        "source_provider": source_provider,
+        "source_account": source,
+        "target_account": target,
+        "primary_mailbox": primary_mailbox,
+        "message_id_header": message_id,
+        "content_sha256": hashlib.sha256(body).hexdigest(),
+        "rfc822_size": len(body),
+        "flags": flags,
+        "internaldate": "01-Jan-2024 00:00:00 +0000",
+        "eml_path": eml_rel,
+        "metadata_path": meta_rel,
+    }
+    (account_dir / meta_rel).write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    _write_provider_export_state(
+        account_dir,
+        source=source,
+        target=target,
+        source_endpoint=ProviderEndpoint(provider=source_provider, host=source_host),
+    )
+    return account_dir
+
+
 def _write_provider_export_state(
     account_dir: Path,
     *,
@@ -1918,6 +2217,354 @@ def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_target(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    fake = StoredMessageTarget({"Archive": [(first_dir / first_row["eml_path"]).read_bytes()]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    second_journal = (second_dir / "import-merged@example.com.journal.jsonl").read_text()
+    assert '"canonical_id": "physical-b"' in second_journal
+    assert '"action": "appended"' in second_journal
+
+
+def test_provider_import_many_to_one_empty_mode_rejects_unjournaled_target_content(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    fake = StoredMessageTarget({"Archive": [first_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target_mode=empty"):
+            provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+
+
+def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nsame-body"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    fake = StoredMessageTarget({"Archive": [shared_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+    second_journal = (second_dir / "import-merged@example.com.journal.jsonl").read_text()
+    assert '"action": "existing"' in second_journal
+
+
+def test_provider_import_all_many_to_one_serializes_same_target_group(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_all(config, tmp_path, max_workers=8, ignore_errors=False)
+
+    assert fake.appended == ["Archive", "Archive"]
+    assert (tmp_path / "a@example.com" / "import-merged@example.com.journal.jsonl").exists()
+    assert (tmp_path / "b@example.com" / "import-merged@example.com.journal.jsonl").exists()
+
+
+def test_provider_import_and_validation_many_to_one_reject_cross_source_folder_collision(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+        primary_mailbox="Projects/Foo",
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+        primary_mailbox="Projects/Foo",
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    first_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects", "Foo"]}
+    _write_single_manifest_row(first_dir, first_row)
+    _write_provider_export_state(
+        first_dir,
+        source=first.source_email,
+        target=target,
+        source_endpoint=ProviderEndpoint(provider="imap", host="mail.source.example.com"),
+    )
+    second_row = json.loads((second_dir / "manifest.jsonl").read_text())
+    second_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects/Foo"]}
+    _write_single_manifest_row(second_dir, second_row)
+    _write_provider_export_state(
+        second_dir,
+        source=second.source_email,
+        target=target,
+        source_endpoint=ProviderEndpoint(provider="imap", host="mail.source.example.com"),
+    )
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+            provider_import_account(config, second, tmp_path)
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+
+    assert any("target mailbox translation collision" in item for item in report["failed"])
+
+
+def test_provider_import_many_to_one_rejects_gmail_group_journal_missing_msgid(tmp_path: Path) -> None:
+    config = _many_to_one_gmail_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+    }, account=first)) + "\n")
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="invalid Gmail import journal"):
+            provider_import_account(config, second, tmp_path)
+
+
+def test_provider_import_many_to_one_gmail_dedupes_cross_label_existing_message(tmp_path: Path) -> None:
+    config = _many_to_one_gmail_config()
+    first, second = config.accounts
+    target = first.target_email
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nsame-body"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<shared@example.com>",
+        body=shared_body,
+        primary_mailbox="Archive",
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<shared@example.com>",
+        body=shared_body,
+        primary_mailbox="INBOX",
+    )
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    }, account=first)) + "\n")
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_message_id="<shared@example.com>",
+        existing_body=shared_body,
+        existing_mailbox="[Gmail]/All Mail",
+        messages_by_mailbox={"[Gmail]/All Mail": 1},
+        gmail_msgid="9001",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+    assert any(command == "+X-GM-LABELS" and "\\Inbox" in labels for _num, command, labels in fake.stored_labels)
+    second_journal = (second_dir / "import-merged@gmail.com.journal.jsonl").read_text()
+    assert '"target_mailbox": "INBOX"' in second_journal
+    assert '"target_gmail_msgid": "9001"' in second_journal
+
+
+def test_provider_import_many_to_one_gmail_rejects_stale_group_target_msgid(tmp_path: Path) -> None:
+    config = _many_to_one_gmail_config()
+    first, second = config.accounts
+    target = first.target_email
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nsame-body"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<shared@example.com>",
+        body=shared_body,
+        primary_mailbox="Archive",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<other@example.com>",
+        body=b"Message-ID: <other@example.com>\r\n\r\nother",
+        primary_mailbox="Archive",
+    )
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    }, account=first)) + "\n")
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_message_id="<shared@example.com>",
+        existing_body=shared_body,
+        existing_mailbox="[Gmail]/All Mail",
+        messages_by_mailbox={"[Gmail]/All Mail": 1},
+        gmail_msgid="9002",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target_mode=empty"):
+            provider_import_account(config, second, tmp_path)
 
 
 def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) -> None:
@@ -5512,6 +6159,25 @@ def test_provider_preflight_reports_metadata_fetch_failures(tmp_path: Path) -> N
 
     assert not ok
     assert any("metadata fetch failed" in issue for issue in issues)
+
+
+def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    config.target.available_bytes = 60
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakeIcloudInboxSourceImap() if endpoint.provider == "imap" and endpoint.host == "mail.source.example.com" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=2)
+
+    assert not ok
+    assert any(
+        "target merge group merged@example.com" in issue
+        and "estimated source bytes 80 exceed target.available_bytes 60" in issue
+        for issue in issues
+    )
 
 
 def test_provider_preflight_reports_source_and_target_exceptions(tmp_path: Path) -> None:
