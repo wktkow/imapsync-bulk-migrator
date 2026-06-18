@@ -199,6 +199,70 @@ Shared-target imports are serialized even when `--max-workers` is higher than
 one. In `target_mode=empty`, the destination may contain only messages already
 accounted for by journals from the same merge group.
 
+Hybrid merge example:
+
+```json
+{
+  "source": {
+    "provider": "imap",
+    "host": "imap.old.example.com",
+    "auth": {
+      "method": "password"
+    }
+  },
+  "target": {
+    "provider": "imap",
+    "host": "imap.new.example.com",
+    "auth": {
+      "method": "password"
+    }
+  },
+  "migration": {
+    "target_mode": "empty",
+    "account_merge_mode": "many_to_one"
+  },
+  "accounts": [
+    {
+      "source_email": "a@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {"method": "password", "username": "a@example.com", "password_file": "secrets/a-source.password"},
+      "target_auth": {"method": "password", "username": "a@example.com", "password_file": "secrets/a-target.password"}
+    },
+    {
+      "source_email": "b@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {"method": "password", "username": "b@example.com", "password_file": "secrets/b-source.password"},
+      "target_auth": {"method": "password", "username": "a@example.com", "password_file": "secrets/a-target.password"}
+    },
+    {
+      "source_email": "c@example.com",
+      "target_email": "a@example.com",
+      "source_auth": {"method": "password", "username": "c@example.com", "password_file": "secrets/c-source.password"},
+      "target_auth": {"method": "password", "username": "a@example.com", "password_file": "secrets/a-target.password"}
+    },
+    {
+      "source_email": "d@example.com",
+      "target_email": "d@example.com",
+      "source_auth": {"method": "password", "username": "d@example.com", "password_file": "secrets/d-source.password"},
+      "target_auth": {"method": "password", "username": "d@example.com", "password_file": "secrets/d-target.password"}
+    },
+    {
+      "source_email": "e@example.com",
+      "target_email": "e@example.com",
+      "source_auth": {"method": "password", "username": "e@example.com", "password_file": "secrets/e-source.password"},
+      "target_auth": {"method": "password", "username": "e@example.com", "password_file": "secrets/e-target.password"}
+    }
+  ]
+}
+```
+
+Here `a`, `b`, and `c` import into the target login `a@example.com`; `d` and
+`e` stay one-to-one. In hybrid configs, put target credentials on each account
+so unrelated one-to-one accounts do not accidentally reuse the merge target
+login. In `many_to_one` mode, imports are processed by target group; the
+important guarantee is that each distinct target login keeps its own journal
+and empty-target gate.
+
 ## Legacy Panel Workflow
 
 Use legacy mode for same-address generic IMAP migrations and hosting-panel

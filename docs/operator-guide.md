@@ -144,6 +144,11 @@ target content still fails the empty-target gate.
 Duplicate messages already present from an earlier source account are journaled
 as existing instead of blindly appended again.
 
+Hybrid configs are allowed: one target group can merge `a`, `b`, and `c` into
+`a`, while `d` and `e` remain one-to-one in the same provider config. Use
+per-account target auth in that shape so singleton targets do not reuse the
+merge target login by accident.
+
 ## Legacy Generic IMAP Mode
 
 Use legacy mode for straightforward same-address migrations:

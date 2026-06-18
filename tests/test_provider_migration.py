@@ -146,6 +146,54 @@ def _many_to_one_gmail_config(*, target_mode: str = "empty") -> ProviderMigratio
     )
 
 
+def _hybrid_many_to_one_config(*, target_mode: str = "empty") -> ProviderMigrationConfig:
+    return ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.source.example.com",
+            auth=AuthConfig(method="password"),
+        ),
+        target=ProviderEndpoint(
+            provider="imap",
+            host="mail.target.example.com",
+            auth=AuthConfig(method="password"),
+        ),
+        accounts=[
+            MigrationAccount(
+                source_email="a@example.com",
+                target_email="a@example.com",
+                source_auth=AuthConfig(method="password", username="a@example.com", password="source-a"),
+                target_auth=AuthConfig(method="password", username="a@example.com", password="target-a"),
+            ),
+            MigrationAccount(
+                source_email="b@example.com",
+                target_email="a@example.com",
+                source_auth=AuthConfig(method="password", username="b@example.com", password="source-b"),
+                target_auth=AuthConfig(method="password", username="a@example.com", password="target-a"),
+            ),
+            MigrationAccount(
+                source_email="c@example.com",
+                target_email="a@example.com",
+                source_auth=AuthConfig(method="password", username="c@example.com", password="source-c"),
+                target_auth=AuthConfig(method="password", username="a@example.com", password="target-a"),
+            ),
+            MigrationAccount(
+                source_email="d@example.com",
+                target_email="d@example.com",
+                source_auth=AuthConfig(method="password", username="d@example.com", password="source-d"),
+                target_auth=AuthConfig(method="password", username="d@example.com", password="target-d"),
+            ),
+            MigrationAccount(
+                source_email="e@example.com",
+                target_email="e@example.com",
+                source_auth=AuthConfig(method="password", username="e@example.com", password="source-e"),
+                target_auth=AuthConfig(method="password", username="e@example.com", password="target-e"),
+            ),
+        ],
+        migration=MigrationSettings(target_mode=target_mode, account_merge_mode="many_to_one"),
+    )
+
+
 def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
     provider_path = tmp_path / "provider.json"
     provider_path.write_text(json.dumps({
@@ -439,6 +487,35 @@ def test_readme_minimal_provider_config_does_not_preverify_gmail_visibility() ->
     sample = json.loads(readme[code_start:code_end])
 
     assert sample["source"]["gmail_full_visibility_verified"] is False
+
+
+def test_readme_hybrid_many_to_one_example_parses(tmp_path: Path) -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    marker = "Hybrid merge example:"
+    start = readme.index(marker)
+    code_start = readme.index("```json", start) + len("```json")
+    code_end = readme.index("```", code_start)
+    sample = json.loads(readme[code_start:code_end])
+    path = tmp_path / "hybrid-many-to-one.json"
+    path.write_text(json.dumps(sample))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.migration.account_merge_mode == "many_to_one"
+    assert [account.target_email for account in parsed.accounts] == [
+        "a@example.com",
+        "a@example.com",
+        "a@example.com",
+        "d@example.com",
+        "e@example.com",
+    ]
+    merge_key = target_merge_group_key(parsed, parsed.accounts[0])
+    assert target_merge_group_key(parsed, parsed.accounts[1]) == merge_key
+    assert target_merge_group_key(parsed, parsed.accounts[2]) == merge_key
+    assert target_merge_group_key(parsed, parsed.accounts[3]) != merge_key
+    assert target_merge_group_key(parsed, parsed.accounts[4]) != merge_key
+    assert target_merge_group_key(parsed, parsed.accounts[3]) != target_merge_group_key(parsed, parsed.accounts[4])
 
 
 def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
@@ -2631,6 +2708,50 @@ def test_provider_import_all_many_to_one_serializes_same_target_group(tmp_path: 
     assert fake.appended == ["Archive", "Archive"]
     assert (tmp_path / "a@example.com" / "import-merged@example.com.journal.jsonl").exists()
     assert (tmp_path / "b@example.com" / "import-merged@example.com.journal.jsonl").exists()
+
+
+def test_provider_import_all_hybrid_many_to_one_keeps_distinct_target_groups(tmp_path: Path) -> None:
+    config = _hybrid_many_to_one_config()
+    bodies_by_source = {
+        account.source_email: f"Message-ID: <{account.source_email}>\r\n\r\nfrom-{account.source_email}".encode("ascii")
+        for account in config.accounts
+    }
+    for account in config.accounts:
+        _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=f"physical-{account.source_email[0]}",
+            message_id=f"<{account.source_email}>",
+            body=bodies_by_source[account.source_email],
+        )
+    targets = {
+        "a@example.com": StoredMessageTarget(),
+        "d@example.com": StoredMessageTarget(),
+        "e@example.com": StoredMessageTarget(),
+    }
+
+    @contextlib.contextmanager
+    def fake_target_connection(endpoint, account, *, role: str) -> Iterator[StoredMessageTarget]:
+        assert role == "target"
+        username, _auth = effective_auth(endpoint, account, role=role)
+        yield targets[username]
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_all(config, tmp_path, max_workers=8, ignore_errors=False)
+
+    assert targets["a@example.com"].bodies_by_mailbox["Archive"] == [
+        bodies_by_source["a@example.com"],
+        bodies_by_source["b@example.com"],
+        bodies_by_source["c@example.com"],
+    ]
+    assert targets["d@example.com"].bodies_by_mailbox["Archive"] == [bodies_by_source["d@example.com"]]
+    assert targets["e@example.com"].bodies_by_mailbox["Archive"] == [bodies_by_source["e@example.com"]]
+    assert (tmp_path / "a@example.com" / "import-a@example.com.journal.jsonl").exists()
+    assert (tmp_path / "b@example.com" / "import-a@example.com.journal.jsonl").exists()
+    assert (tmp_path / "c@example.com" / "import-a@example.com.journal.jsonl").exists()
+    assert (tmp_path / "d@example.com" / "import-d@example.com.journal.jsonl").exists()
+    assert (tmp_path / "e@example.com" / "import-e@example.com.journal.jsonl").exists()
 
 
 def test_provider_import_and_validation_many_to_one_reject_cross_source_folder_collision(tmp_path: Path) -> None:
@@ -6436,6 +6557,27 @@ def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_pa
         and "estimated source bytes 80 exceed target.available_bytes 60" in issue
         for issue in issues
     )
+
+
+def test_provider_preflight_hybrid_many_to_one_aggregates_by_target_group(tmp_path: Path) -> None:
+    config = _hybrid_many_to_one_config()
+    config.target.available_bytes = 80
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakeIcloudInboxSourceImap() if endpoint.provider == "imap" and endpoint.host == "mail.source.example.com" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=5)
+
+    assert not ok
+    assert any(
+        "target merge group a@example.com" in issue
+        and "estimated source bytes 120 exceed target.available_bytes 80" in issue
+        for issue in issues
+    )
+    assert not any("target merge group d@example.com" in issue for issue in issues)
+    assert not any("target merge group e@example.com" in issue for issue in issues)
 
 
 def test_provider_preflight_reports_source_and_target_exceptions(tmp_path: Path) -> None:
