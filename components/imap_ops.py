@@ -498,7 +498,10 @@ def import_account(
         if row.get("status") == "pending" and row.get("key") and row.get("target") == target_id
     }
 
-    def _completed_zero_message_export(staged_markers: Dict[str, Dict[str, object]]) -> bool:
+    def _completed_zero_message_export(
+        staged_marker_paths: set[str],
+        staged_markers: Dict[str, Dict[str, object]],
+    ) -> bool:
         state_path = account_dir / "export-state.json"
         if not state_path.exists():
             return False
@@ -539,18 +542,20 @@ def import_account(
             if marker_count != 0:
                 return False
             state_paths.add(path)
-        if state_paths != set(staged_markers):
+        if state_paths != staged_marker_paths or state_paths != set(staged_markers):
             return False
         return True
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
+    staged_marker_paths: set[str] = set()
     staged_markers: Dict[str, Dict[str, object]] = {}
     for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
         marker = folder_dir / ".mailbox.json"
         if marker.exists():
+            staged_marker_paths.add(folder_dir.name)
             with contextlib.suppress(Exception):
                 marker_meta = json.loads(marker.read_text(encoding="utf-8"))
                 if isinstance(marker_meta, dict):
@@ -577,7 +582,7 @@ def import_account(
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
     if not any(entries for entries in per_folder.values()):
-        if not _completed_zero_message_export(staged_markers):
+        if not _completed_zero_message_export(staged_marker_paths, staged_markers):
             raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
         logging.info("[import] %s: completed zero-message export; importing empty mailbox structure only", account.email)
 
