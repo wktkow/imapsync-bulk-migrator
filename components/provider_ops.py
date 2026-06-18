@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .executor import parallel_process_accounts
-from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
 from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
 
 
@@ -1866,13 +1866,27 @@ def _flags_for_provider_append(
     target_provider: str,
     permanent_flags: Optional[set[str]] = None,
 ) -> str:
+    filtered = _provider_flag_tokens(
+        flags,
+        target_provider=target_provider,
+        permanent_flags=permanent_flags,
+    )
+    return f"({' '.join(filtered)})" if filtered else ""
+
+
+def _provider_flag_tokens(
+    flags: str,
+    *,
+    target_provider: str,
+    permanent_flags: Optional[set[str]] = None,
+) -> List[str]:
     portable = {"\\ANSWERED", "\\FLAGGED", "\\SEEN", "\\DRAFT"}
     if target_provider != "gmail":
         portable.add("\\DELETED")
     tokens = [tok for tok in flags.split() if tok.strip()]
     filtered: List[str] = []
     unsupported: List[str] = []
-    wildcard = permanent_flags is None or "\\*" in permanent_flags
+    wildcard = permanent_flags is not None and "\\*" in permanent_flags
     for token in tokens:
         token = token.strip()
         upper = token.upper()
@@ -1898,7 +1912,54 @@ def _flags_for_provider_append(
             "target does not support exported IMAP flag/keyword(s): "
             + ", ".join(sorted(set(unsupported), key=str.upper))
         )
-    return f"({' '.join(filtered)})" if filtered else ""
+    return filtered
+
+
+def required_provider_flag_set(
+    flags: str,
+    *,
+    target_provider: str,
+    permanent_flags: Optional[set[str]],
+) -> set[str]:
+    return {
+        token.upper()
+        for token in _provider_flag_tokens(
+            flags,
+            target_provider=target_provider,
+            permanent_flags=permanent_flags,
+        )
+    }
+
+
+def target_message_flag_set(imap: imaplib.IMAP4, num: bytes) -> set[str]:
+    status, fetched = imap.fetch(num, "(FLAGS)")
+    if status != "OK":
+        raise RuntimeError(f"failed to fetch target flags for message {num!r}")
+    parsed = parse_provider_fetch_response(fetched or [])
+    return {token.upper() for token in str(parsed.get("flags") or "").split()}
+
+
+def restore_imap_flags(
+    imap: imaplib.IMAP4,
+    target_mailbox: str,
+    row: Dict[str, Any],
+    *,
+    target_num: bytes,
+    target_provider: str,
+) -> None:
+    status, _ = select_mailbox(imap, target_mailbox)
+    if status != "OK":
+        raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore IMAP flags")
+    flags = _flags_for_provider_append(
+        str(row.get("flags") or ""),
+        target_provider=target_provider,
+        permanent_flags=target_permanent_flags(imap),
+    )
+    if not flags:
+        return
+    status, response = imap.store(target_num, "+FLAGS.SILENT", flags)
+    if status != "OK":
+        raise RuntimeError(f"failed to restore IMAP flags for {row.get('canonical_id')}: {response}")
 
 
 def _internaldate_for_append(internaldate: str) -> str:
@@ -2601,7 +2662,7 @@ def provider_account_merge_enabled(config: ProviderMigrationConfig) -> bool:
 
 def target_merge_group_key(config: ProviderMigrationConfig, account: MigrationAccount) -> Tuple[str, str]:
     target_username, _auth = effective_auth(config.target, account, role="target")
-    normalized_username = target_username.strip().lower()
+    normalized_username = auth_username_identity(config.target, target_username)
     return (
         normalized_username,
         provider_endpoint_state_digest(config.target, username=normalized_username),
@@ -2964,6 +3025,14 @@ def provider_import_account(
                             desired_target_mailbox=target_mailbox,
                         )
                         restore_gmail_starred_flag(imap, committed_mailbox, row, target_num=committed_num)
+                    else:
+                        restore_imap_flags(
+                            imap,
+                            target_mailbox,
+                            row,
+                            target_num=committed_num,
+                            target_provider=config.target.provider,
+                        )
                     continue
             matched_num = None
             matched_mailbox = target_mailbox
@@ -3000,6 +3069,13 @@ def provider_import_account(
                     )
                     restore_gmail_starred_flag(imap, matched_mailbox, row, target_num=matched_num)
                 else:
+                    restore_imap_flags(
+                        imap,
+                        target_mailbox,
+                        row,
+                        target_num=matched_num,
+                        target_provider=config.target.provider,
+                    )
                     target_gmail_msgid = ""
                 append_journal(
                     account_dir,
@@ -3393,6 +3469,7 @@ def provider_validate_account(
                     if "X-GM-EXT-1" not in capabilities:
                         raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
+                merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
                 if provider_account_merge_enabled(config):
                     merge_group_stages = validated_merge_group_stages(
                         config,
@@ -3425,6 +3502,32 @@ def provider_validate_account(
                     target_readiness_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))
                     if target_readiness_issues:
                         raise RuntimeError("; ".join(target_readiness_issues))
+                if config.migration.target_mode == "empty":
+                    empty_target_rows = manifest_rows
+                    effective_committed_rows = latest_committed_journal_rows(journal_rows)
+                    empty_target_journaled = set(effective_committed_rows)
+                    empty_target_gmail_msgids = {
+                        key: str(row.get("target_gmail_msgid") or "")
+                        for key, row in effective_committed_rows.items()
+                        if config.target.provider == "gmail" and row.get("target_gmail_msgid")
+                    }
+                    if merge_group_stages is not None:
+                        empty_target_rows, empty_target_journaled, empty_target_gmail_msgids = merge_group_empty_target_context(
+                            config,
+                            target_mailboxes,
+                            merge_group_stages,
+                        )
+                    try:
+                        enforce_empty_target(
+                            imap,
+                            target_mailboxes,
+                            empty_target_rows,
+                            empty_target_journaled,
+                            target_provider=config.target.provider,
+                            gmail_journal_msgids=empty_target_gmail_msgids,
+                        )
+                    except Exception as exc:
+                        report["failed"].append(f"remote target validation failed: {exc}")
                 if not report["missing"]:
                     used_target_nums: Dict[str, set[bytes]] = {}
                     used_target_gmail_msgids: set[str] = set()
@@ -3503,8 +3606,33 @@ def provider_validate_account(
                                     f"target Gmail labels missing for {identity} in {target_mailbox}: "
                                     + ", ".join(missing_labels)
                                 )
-                        elif not consume_target_match(imap, target_mailbox, row, used_target_nums, create_if_missing=False):
-                            report["remote_missing"].append(identity)
+                        else:
+                            target_num = consume_target_match_num(
+                                imap,
+                                target_mailbox,
+                                row,
+                                used_target_nums,
+                                create_if_missing=False,
+                            )
+                            if target_num is None:
+                                report["remote_missing"].append(identity)
+                                continue
+                            try:
+                                required_flags = required_provider_flag_set(
+                                    str(row.get("flags") or ""),
+                                    target_provider=config.target.provider,
+                                    permanent_flags=target_permanent_flags(imap),
+                                )
+                                actual_flags = target_message_flag_set(imap, target_num)
+                            except Exception as exc:
+                                report["failed"].append(f"target IMAP flag validation failed for {identity}: {exc}")
+                                continue
+                            missing_flags = sorted(required_flags - actual_flags)
+                            if missing_flags:
+                                report["failed"].append(
+                                    f"target IMAP flags missing for {identity} in {target_mailbox}: "
+                                    + ", ".join(missing_flags)
+                                )
         except Exception as exc:
             committed_by_id, _target_by_id, failures = evaluate_journal()
             report["failed"].extend(failures)

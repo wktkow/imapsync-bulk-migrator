@@ -743,7 +743,7 @@ def test_provider_config_rejects_duplicate_effective_target_login_without_merge_
                 "source_email": "a@example.com",
                 "target_email": "target-alias-a@example.com",
                 "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
-                "target_auth": {"method": "password", "username": "Merged@Example.com", "password": "target-a"},
+                "target_auth": {"method": "password", "username": "merged@example.com", "password": "target-a"},
             },
             {
                 "source_email": "b@example.com",
@@ -804,7 +804,7 @@ def test_provider_config_many_to_one_groups_same_effective_target_login_with_ali
                 "source_email": "a@example.com",
                 "target_email": "target-alias-a@example.com",
                 "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
-                "target_auth": {"method": "password", "username": "Merged@Example.com", "password": "target-a"},
+                "target_auth": {"method": "password", "username": "merged@example.com", "password": "target-a"},
             },
             {
                 "source_email": "b@example.com",
@@ -820,6 +820,38 @@ def test_provider_config_many_to_one_groups_same_effective_target_login_with_ali
     assert isinstance(parsed, ProviderMigrationConfig)
     assert parsed.accounts[0].target_email != parsed.accounts[1].target_email
     assert target_merge_group_key(parsed, parsed.accounts[0]) == target_merge_group_key(parsed, parsed.accounts[1])
+
+
+def test_provider_config_generic_imap_case_only_target_usernames_are_distinct(tmp_path: Path) -> None:
+    path = tmp_path / "many-to-one-case-targets.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {
+            "provider": "imap",
+            "host": "target.example.com",
+            "auth": {"method": "password"},
+        },
+        "migration": {"account_merge_mode": "many_to_one"},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "target-alias-a@example.com",
+                "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "CaseUser", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "target-alias-b@example.com",
+                "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "caseuser", "password": "target-b"},
+            },
+        ],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert target_merge_group_key(parsed, parsed.accounts[0]) != target_merge_group_key(parsed, parsed.accounts[1])
 
 
 def test_provider_config_many_to_one_rejects_mismatched_effective_target_login(tmp_path: Path) -> None:
@@ -1884,13 +1916,16 @@ class FakeTargetImap:
         existing_mailbox: str = "Archive",
         messages_by_mailbox: Optional[dict[str, int]] = None,
         permanent_flags: Optional[str] = None,
+        existing_flags: str = "\\Seen",
     ) -> None:
         self.appended: List[str] = []
         self.appended_flags: List[str] = []
+        self.stored_flags: List[tuple[bytes, str, str]] = []
         self.has_existing = has_existing
         self.existing_message_id = existing_message_id
         self.existing_body = existing_body
         self.existing_mailbox = existing_mailbox
+        self.existing_flags = existing_flags
         self.permanent_flags = permanent_flags
         self.messages = 0
         self.messages_by_mailbox = dict(messages_by_mailbox or {})
@@ -1936,10 +1971,22 @@ class FakeTargetImap:
         target = self._normalize_mailbox(mailbox)
         self.appended.append(target)
         self.appended_flags.append(flags)
+        if flags:
+            self.existing_flags = flags.strip("()")
         self.messages_by_mailbox[target] = self._message_count(target) + 1
         self.messages += 1
         self.has_existing = True
         self.existing_mailbox = target
+        return "OK", [b""]
+
+    def store(self, num: bytes, command: str, flags: str):
+        self.stored_flags.append((num, command, flags))
+        if flags:
+            current = [flag for flag in self.existing_flags.split() if flag]
+            for flag in flags.strip("()").split():
+                if flag not in current:
+                    current.append(flag)
+            self.existing_flags = " ".join(current)
         return "OK", [b""]
 
     def search(self, charset: Optional[str], *criteria):
@@ -1957,9 +2004,14 @@ class FakeTargetImap:
 
     def fetch(self, num: bytes, query: str):
         self.fetch_queries.append(query)
+        if "FLAGS" in query and "BODY" not in query and "RFC822" not in query:
+            return "OK", [b"99 (FLAGS (" + self.existing_flags.encode("ascii") + b"))"]
         return "OK", [(
             b"99 (RFC822.SIZE "
             + str(len(self.existing_body)).encode("ascii")
+            + b" FLAGS ("
+            + self.existing_flags.encode("ascii")
+            + b")"
             + b" BODY[] {"
             + str(len(self.existing_body)).encode("ascii")
             + b"}",
@@ -2028,6 +2080,10 @@ class StoredMessageTarget(FakeTargetImap):
             mailbox: list(bodies)
             for mailbox, bodies in (bodies_by_mailbox or {}).items()
         }
+        self.flags_by_mailbox = {
+            mailbox: ["\\Seen" for _body in bodies]
+            for mailbox, bodies in self.bodies_by_mailbox.items()
+        }
 
     def _message_count(self, mailbox: str) -> int:
         return len(self.bodies_by_mailbox.get(mailbox, []))
@@ -2041,6 +2097,7 @@ class StoredMessageTarget(FakeTargetImap):
         self.appended.append(target)
         self.appended_flags.append(flags)
         self.bodies_by_mailbox.setdefault(target, []).append(bytes(data))
+        self.flags_by_mailbox.setdefault(target, []).append(flags.strip("()") if flags else "")
         return "OK", [b""]
 
     def _message_id_for_body(self, body: bytes) -> str:
@@ -2068,7 +2125,14 @@ class StoredMessageTarget(FakeTargetImap):
         self.fetch_queries.append(query)
         index = int(num) - 1
         body = self.bodies_by_mailbox[self.selected_mailbox][index]
-        return "OK", [(num + f" (RFC822.SIZE {len(body)} BODY[] {{{len(body)}}}".encode("ascii"), body)]
+        flags = self.flags_by_mailbox.get(self.selected_mailbox, [""] * len(self.bodies_by_mailbox.get(self.selected_mailbox, [])))[index]
+        if "FLAGS" in query and "BODY" not in query and "RFC822" not in query:
+            return "OK", [num + b" (FLAGS (" + flags.encode("ascii") + b"))"]
+        return "OK", [(
+            num
+            + f" (RFC822.SIZE {len(body)} FLAGS ({flags}) BODY[] {{{len(body)}}}".encode("ascii"),
+            body,
+        )]
 
 
 class GenericSpecialUseTarget(StoredMessageTarget):
@@ -2280,6 +2344,91 @@ def test_provider_import_rejects_unsupported_imap_keywords_before_pending_journa
     assert not journal.exists() or '"status": "pending"' not in journal.read_text()
 
 
+def test_provider_import_merge_mode_restores_supported_imap_keywords_on_existing_match(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen $Forwarded NonJunk \\Recent"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    fake = FakeTargetImap(
+        has_existing=True,
+        existing_flags="",
+        permanent_flags="(\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded NonJunk \\*)",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.stored_flags == [(b"99", "+FLAGS.SILENT", "(\\Seen $Forwarded NonJunk)")]
+    journal = load_import_journal(account_dir, account)
+    assert journal[-1]["action"] == "existing"
+
+
+def test_provider_validation_rejects_missing_supported_imap_keyword(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen $Forwarded"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+    fake = FakeTargetImap(
+        has_existing=True,
+        existing_flags="\\Seen",
+        permanent_flags="(\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded \\*)",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("target IMAP flags missing" in item and "$FORWARDED" in item for item in report["failed"])
+
+
+def test_provider_validation_empty_mode_rejects_unjournaled_target_content(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    extra_body = b"Message-ID: <extra@example.com>\r\n\r\nextra"
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+    fake = StoredMessageTarget({"Archive": [body, extra_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("target_mode=empty" in item for item in report["failed"])
+
+
 def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_target(tmp_path: Path) -> None:
     config = _many_to_one_config()
     first, second = config.accounts
@@ -2357,6 +2506,54 @@ def test_provider_import_many_to_one_empty_mode_rejects_unjournaled_target_conte
             provider_import_account(config, second, tmp_path)
 
     assert fake.appended == []
+
+
+def test_provider_validation_many_to_one_empty_mode_rejects_unjournaled_group_target_content(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    extra_body = b"Message-ID: <extra@example.com>\r\n\r\nextra"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    (second_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "physical-b",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=second)) + "\n")
+    fake = StoredMessageTarget({"Archive": [first_body, second_body, extra_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("target_mode=empty" in item for item in report["failed"])
 
 
 def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_path: Path) -> None:

@@ -292,6 +292,13 @@ def _effective_auth_username(endpoint: ProviderEndpoint, account: MigrationAccou
     return username.strip()
 
 
+def auth_username_identity(endpoint: ProviderEndpoint, username: str) -> str:
+    username = username.strip()
+    if endpoint.provider == "gmail":
+        return username.lower()
+    return username
+
+
 @dataclasses.dataclass
 class ProviderMigrationConfig:
     source: ProviderEndpoint
@@ -346,7 +353,10 @@ class ProviderMigrationConfig:
                 raise ValueError(f"accounts[{idx}].target_email duplicates accounts[{seen_targets[target_key]}].target_email")
             seen_sources[source_key] = idx
             seen_targets[target_key] = idx
-            target_username_key = _effective_auth_username(self.target, account, role="target").lower()
+            target_username_key = auth_username_identity(
+                self.target,
+                _effective_auth_username(self.target, account, role="target"),
+            )
             target_usernames_by_target.setdefault(target_key, {}).setdefault(target_username_key, idx)
             target_labels_by_username.setdefault(target_username_key, {}).setdefault(target_key, idx)
         if not allow_target_duplicates:
