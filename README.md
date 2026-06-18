@@ -9,8 +9,7 @@ decommissioning decision. It works in explicit stages: export, audit, import,
 and validate. The same workflow supports normal mailbox moves and destructive
 target reset flows for DirectAdmin and cPanel hosted mail.
 
-It is not a hosted migration service. Final proof still requires live
-credentials, provider access, and operator review.
+It is not a hosted migration service.
 
 ## What It Supports
 
@@ -24,9 +23,6 @@ Provider-aware migrations support every combination of:
 That means Gmail to Gmail, Gmail to iCloud, Roundcube-backed IMAP to iCloud,
 DirectAdmin-hosted IMAP to Gmail, cPanel-hosted IMAP to another IMAP server,
 and many other source-target pairs use the same staged model.
-
-Roundcube is a webmail client, not a storage API. For Roundcube accounts, use
-the underlying IMAP host and mailbox credentials.
 
 Legacy generic IMAP mode supports same-address migrations and optional
 DirectAdmin/cPanel mailbox creation or reset before import. The reset path is
@@ -46,7 +42,7 @@ import journals. Those artifacts let you:
 
 ## Documentation
 
-Detailed operator docs live in [`/docs`](docs/README.md). Start there for
+Detailed docs are in [`/docs`](docs/README.md). Start there for
 provider caveats, DirectAdmin/cPanel reset safeguards, validation details, and
 official behavior references.
 
@@ -74,13 +70,13 @@ python3 imapsync_bulk_migrator.py --help
 
 ## Choose a Mode
 
-| Use case | Mode |
-| --- | --- |
-| Gmail, iCloud, or cross-account generic IMAP migrations | Provider config with `source` and `target` |
-| Roundcube-backed, DirectAdmin-hosted, or cPanel-hosted mailbox moves through IMAP | Provider config with `provider: "imap"` |
-| Same-address generic IMAP migration | Legacy config with `server` and `accounts` |
-| DirectAdmin/cPanel mailbox create or reset before import | Legacy import with panel flags |
-| Merge several source inboxes into one target inbox | Provider config with `account_merge_mode: "many_to_one"` |
+| Use case                                                                          | Mode                                                     |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Gmail, iCloud, or cross-account generic IMAP migrations                           | Provider config with `source` and `target`               |
+| Roundcube-backed, DirectAdmin-hosted, or cPanel-hosted mailbox moves through IMAP | Provider config with `provider: "imap"`                  |
+| Same-address generic IMAP migration                                               | Legacy config with `server` and `accounts`               |
+| DirectAdmin/cPanel mailbox create or reset before import                          | Legacy import with panel flags                           |
+| Merge several source inboxes into one target inbox                                | Provider config with `account_merge_mode: "many_to_one"` |
 
 ## Provider Workflow
 
