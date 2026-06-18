@@ -46,6 +46,11 @@ Supported providers are:
 - `icloud`: `imap.mail.me.com:993`; auth method `app_password`.
 - `imap`: generic IMAP with `password`, `app_password`, or `xoauth2`.
 
+For app-password auth, provider account prerequisites still apply. Gmail app
+passwords require 2-Step Verification and may be unavailable for Workspace,
+security-key-only, or Advanced Protection accounts. Apple app-specific
+passwords require Apple Account two-factor authentication.
+
 Known Gmail and iCloud IMAP hosts are rejected under provider `imap` so their
 provider-specific safeguards cannot be bypassed by accident.
 
@@ -72,7 +77,9 @@ default. Endpoint-level secrets are rejected so one login is not accidentally
 reused for every account. The explicit exception is many-to-one target mode
 when all accounts share one target mailbox.
 
-Provider auth accepts exactly one secret source per auth block:
+Provider auth accepts at most one secret source per auth block. The effective
+account auth must have a secret, but endpoint-level auth may omit the secret
+when account-level auth supplies it.
 
 - `password` for inline password/token values;
 - `password_file` for password or app-password files;
@@ -99,7 +106,9 @@ source migrations, each account needs
 `accounts[].gmail_full_visibility_verified=true`.
 
 For Gmail targets, import and validation require the same extension and All
-Mail checks. Multi-target Gmail migrations need
+Mail checks. For a single target account, set
+`target.gmail_full_visibility_verified=true` only after confirming the target is
+not hiding messages from IMAP. Multi-target Gmail migrations need
 `accounts[].target_gmail_full_visibility_verified=true`, unless the config is an
 explicit many-to-one migration into one shared Gmail target and the shared
 target endpoint has `target.gmail_full_visibility_verified=true`.
@@ -108,11 +117,26 @@ Gmail target imports restore non-system labels with `+X-GM-LABELS`. `Starred`
 and `Important` are handled as Gmail system labels rather than normal custom
 labels.
 
+For personal Gmail addresses, dotted `gmail.com` aliases and matching
+`googlemail.com` aliases are treated as the same mailbox for config validation,
+target grouping, endpoint binding, and journal binding. Use one target label
+spelling consistently in many-to-one configs to keep operator output easy to
+read.
+
+For Google Workspace accounts, password-only third-party IMAP, POP, and SMTP
+access is not a production assumption. Use OAuth/XOAUTH2 where Google permits
+IMAP access. For Workspace Gmail targets, Google directs migrations to
+supported Workspace migration options instead of IMAP upload. Treat this tool's
+Gmail target path as an operator-managed IMAP copy route, not Google's
+recommended migration path.
+
 ## iCloud
 
-iCloud uses app-specific passwords. The tool defaults the username to the local
-part of the target address when one is not configured. If that fails in your
-environment, configure the exact username required by Apple for the mailbox.
+iCloud uses app-specific passwords, which require Apple Account two-factor
+authentication before they can be generated. The tool defaults the username to
+the local part of the relevant iCloud account address when one is not
+configured. If that fails in your environment, configure the exact username
+required by Apple for the mailbox.
 
 iCloud does not expose Gmail-style cross-label identity. Physical copies in
 different folders are preserved as separate messages. The provider skips the
@@ -126,10 +150,14 @@ webmail UI. Use the underlying IMAP server and mailbox credentials.
 
 Generic IMAP exports every selectable mailbox. Special-use attributes such as
 `\All` and `\Flagged` are advisory for generic IMAP and are not treated as
-proof that a mailbox is virtual. During empty-target resume checks, generic
-target `\All` and `\Flagged` views are allowed only for messages already
-matched by committed journal rows from the same migration; unmatched messages
-still fail the empty-target gate.
+proof that a mailbox is virtual. Use the exact spelling and case returned by
+IMAP `LIST` for non-INBOX mailbox names in `folder_map` and review output;
+only `INBOX` is case-insensitive by the IMAP standard. During empty-target
+resume checks, generic target `\All` and `\Flagged` views are allowed only for
+messages already matched by committed journal rows or recoverable pending rows
+from the same migration; unmatched messages still fail the empty-target gate.
+A pending row is not production proof by itself: import must resolve it to
+committed, and validation must pass before decommissioning.
 
 ## Many-To-One Merges
 
@@ -327,7 +355,6 @@ Local config and secret paths are ignored by Git:
 - `*.token`
 - `prompt.md`
 - `prompts/`
-- `k.md`
 
 Prefer file or environment-backed secret sources. For provider mailbox auth,
 use `password_file`, `token_file`, or `env_var` when possible. For panel CLI
@@ -351,17 +378,28 @@ python3 verify_export.py
 
 - Live credentials are required for final proof.
 - Local tests and dry-runs cannot guarantee provider acceptance in production.
-- Gmail Workspace migrations should use XOAUTH2.
-- Workspace domain-wide IMAP migrations need OAuth setup outside this tool.
+- Workspace Gmail routes need OAuth/XOAUTH2 where Google permits IMAP access;
+  password-only third-party IMAP, POP, and SMTP access is not a production
+  assumption.
+- For Workspace Gmail targets, Google recommends supported migration options
+  instead of IMAP upload; this tool's Gmail target route is an operator-managed
+  IMAP copy path outside Google's recommended migration path.
+- Workspace domain-wide IMAP or Gmail API authorization, if used, must be set
+  up outside this tool.
 - Normal Gmail IMAP cannot prove that users disabled folder-size limits or label
   hiding.
 - Gmail app passwords are a personal-account fallback where Google still allows
-  them.
-- Gmail IMAP has documented transfer limits. Large Gmail-target imports may
-  require throttling, batching, or a Google-supported migration service.
+  them; they require 2-Step Verification and may be unavailable for Workspace,
+  security-key-only, or Advanced Protection accounts.
+- Gmail IMAP has documented transfer limits. Gmail-target imports may require
+  throttling or batching even when the operator accepts the IMAP copy route.
 - OAuth token acquisition and refresh are external to this tool.
-- iCloud requires app-specific passwords.
+- iCloud requires app-specific passwords and Apple Account two-factor
+  authentication.
 - IMAP UIDs are not preserved.
+- Provider imports preserve portable flags where the target supports them.
+  Unsupported IMAP keywords can stop an import before append, and Gmail targets
+  do not preserve `\Deleted` as an appended message flag.
 - Provider staged exports created by older versions may need to be rerun if they
   lack current account, endpoint, manifest, or journal bindings.
 - Legacy staged exports created by older versions may need to be rerun if they
@@ -376,7 +414,12 @@ python3 verify_export.py
 - Gmail XOAUTH2: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
 - Gmail IMAP extensions: https://developers.google.com/workspace/gmail/imap/imap-extensions
 - Gmail API IMAP settings: https://developers.google.com/workspace/gmail/api/reference/rest/v1/ImapSettings
-- Gmail sending and receiving limits: https://support.google.com/a/answer/1071518
+- Gmail dotted personal-address behavior: https://support.google.com/mail/answer/7436150
+- Gmail `gmail.com` and `googlemail.com` equivalence: https://support.google.com/mail/answer/10313
+- Google Workspace password-only access changes: https://workspaceupdates.googleblog.com/2023/09/winding-down-google-sync-and-less-secure-apps-support.html
+- Google Workspace IMAP data import: https://knowledge.workspace.google.com/admin/migrate/migrate-email-from-an-imap-account
+- Google Workspace data import overview: https://knowledge.workspace.google.com/admin/migrate/about-the-new-data-migration-service
+- Gmail bandwidth limits: https://support.google.com/a/answer/1071518
 - iCloud Mail settings: https://support.apple.com/en-us/102525
 - Apple app-specific passwords: https://support.apple.com/en-us/102654
 - DirectAdmin legacy API: https://docs.directadmin.com/developer/api/legacy-api.html

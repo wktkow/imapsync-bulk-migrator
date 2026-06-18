@@ -295,7 +295,11 @@ def _effective_auth_username(endpoint: ProviderEndpoint, account: MigrationAccou
 def auth_username_identity(endpoint: ProviderEndpoint, username: str) -> str:
     username = username.strip()
     if endpoint.provider == "gmail":
-        return username.lower()
+        identity = username.lower()
+        local, sep, domain = identity.partition("@")
+        if sep and domain in {"gmail.com", "googlemail.com"}:
+            return f"{local.replace('.', '')}@gmail.com"
+        return identity
     return username
 
 
@@ -340,13 +344,13 @@ class ProviderMigrationConfig:
         seen_sources: Dict[str, int] = {}
         seen_targets: Dict[str, int] = {}
         allow_target_duplicates = self.migration.account_merge_mode == "many_to_one"
-        unique_target_keys = {account.target_email.strip().lower() for account in self.accounts}
+        unique_target_keys = {auth_username_identity(self.target, account.target_email) for account in self.accounts}
         shared_single_target = allow_target_duplicates and len(unique_target_keys) == 1
         target_usernames_by_target: Dict[str, Dict[str, int]] = {}
         target_labels_by_username: Dict[str, Dict[str, int]] = {}
         for idx, account in enumerate(self.accounts):
-            source_key = account.source_email.strip().lower()
-            target_key = account.target_email.strip().lower()
+            source_key = auth_username_identity(self.source, account.source_email)
+            target_key = auth_username_identity(self.target, account.target_email)
             if source_key in seen_sources:
                 raise ValueError(f"accounts[{idx}].source_email duplicates accounts[{seen_sources[source_key]}].source_email")
             if target_key in seen_targets and not allow_target_duplicates:
@@ -359,17 +363,22 @@ class ProviderMigrationConfig:
             )
             target_usernames_by_target.setdefault(target_key, {}).setdefault(target_username_key, idx)
             target_labels_by_username.setdefault(target_username_key, {}).setdefault(target_key, idx)
-        if not allow_target_duplicates:
-            for username_key, target_indexes in sorted(target_labels_by_username.items()):
-                if len(target_indexes) > 1:
-                    details = ", ".join(
-                        f"accounts[{idx}]={target!r}"
-                        for target, idx in sorted(target_indexes.items(), key=lambda item: item[1])
-                    )
+        for username_key, target_indexes in sorted(target_labels_by_username.items()):
+            if len(target_indexes) > 1:
+                details = ", ".join(
+                    f"accounts[{idx}]={target!r}"
+                    for target, idx in sorted(target_indexes.items(), key=lambda item: item[1])
+                )
+                if allow_target_duplicates:
                     raise ValueError(
-                        f"effective target_auth.username {username_key!r} is reused by multiple target_email labels "
-                        f"({details}); set migration.account_merge_mode=many_to_one for intentional account merges"
+                        f"migration.account_merge_mode=many_to_one cannot reuse effective target_auth.username "
+                        f"{username_key!r} across different target_email labels ({details}); use the same "
+                        "target_email for accounts intentionally merging into that login"
                     )
+                raise ValueError(
+                    f"effective target_auth.username {username_key!r} is reused by multiple target_email labels "
+                    f"({details}); set migration.account_merge_mode=many_to_one for intentional account merges"
+                )
         if allow_target_duplicates:
             for target_key, username_indexes in sorted(target_usernames_by_target.items()):
                 if len(username_indexes) > 1:
@@ -406,7 +415,11 @@ class ProviderMigrationConfig:
                     )
                 expected_email = account.source_email if role == "source" else account.target_email
                 auth_username = auth.username or endpoint.auth.username
-                if endpoint.provider == "gmail" and auth_username and auth_username.strip().lower() != expected_email.strip().lower():
+                if (
+                    endpoint.provider == "gmail"
+                    and auth_username
+                    and auth_username_identity(endpoint, auth_username) != auth_username_identity(endpoint, expected_email)
+                ):
                     raise ValueError(
                         f"accounts[{idx}].{role}_auth.username must match {role}_email for Gmail "
                         f"({expected_email})"
@@ -468,7 +481,7 @@ class Config:
                 raise ValueError(f"accounts[{idx}].email must be a non-empty string")
             if not isinstance(password, str):
                 raise ValueError(f"accounts[{idx}].password must be a string (can be empty)")
-            email_key = email.strip().lower()
+            email_key = email.strip()
             if email_key in seen_accounts:
                 raise ValueError(f"accounts[{idx}].email duplicates accounts[{seen_accounts[email_key]}].email")
             seen_accounts[email_key] = idx

@@ -24,6 +24,11 @@ That means Gmail to Gmail, Gmail to iCloud, Roundcube-backed IMAP to iCloud,
 DirectAdmin-hosted IMAP to Gmail, cPanel-hosted IMAP to another IMAP server,
 and many other source-target pairs use the same staged model.
 
+Gmail routes are IMAP copy workflows. For Google Workspace Gmail targets,
+Google directs migrations to supported Workspace migration options instead of
+IMAP upload. Treat this tool's Workspace Gmail target path as a technical
+operator-managed copy route, not Google's recommended migration path.
+
 Legacy generic IMAP mode supports same-address migrations and optional
 DirectAdmin/cPanel mailbox creation or reset before import. The reset path is
 intended for server replacement and decommissioning projects where target
@@ -260,8 +265,8 @@ Here `a`, `b`, and `c` import into the target login `a@example.com`; `d` and
 `e` stay one-to-one. In hybrid configs, put target credentials on each account
 so unrelated one-to-one accounts do not accidentally reuse the merge target
 login. In `many_to_one` mode, imports are processed by target group; the
-important guarantee is that each distinct target login keeps its own journal
-and empty-target gate.
+important guarantee is that each distinct target login keeps its own
+empty-target gate, while journals remain account-local and target-bound.
 
 ## Legacy Panel Workflow
 
@@ -351,10 +356,25 @@ Do not retire a source server until all of these are true:
 - OAuth token acquisition and refresh are external to this project.
 - Staged exports contain full mailbox data; protect `exported/`, logs, configs,
   and secrets as sensitive data.
-- iCloud requires app-specific passwords.
-- Gmail Workspace migrations should use XOAUTH2; normal app-password access is
-  not a reliable Workspace migration strategy.
+- iCloud requires app-specific passwords, and Apple requires two-factor
+  authentication before those passwords can be generated.
+- Gmail app passwords, where Google still allows them, require 2-Step
+  Verification and may be unavailable for Workspace, security-key-only, or
+  Advanced Protection accounts.
+- Personal Gmail identities fold dotted `gmail.com` aliases and
+  `googlemail.com` aliases to the same mailbox for validation and merge
+  grouping.
+- Google Workspace does not support password-only third-party IMAP/POP/SMTP as
+  a production assumption; Workspace Gmail routes need OAuth/XOAUTH2 where
+  Google permits IMAP access.
+- For Google Workspace Gmail targets, Google recommends supported migration
+  options instead of IMAP upload. Use this tool's Gmail target route only after
+  explicitly accepting that it is an operator-managed IMAP copy outside
+  Google's recommended migration path.
 - IMAP UIDs are not preserved.
+- Provider imports preserve portable flags where the target supports them.
+  Unsupported IMAP keywords can stop an import, and Gmail targets do not
+  preserve `\Deleted` as an appended message flag.
 - Live credentials are required for final proof. Local tests and dry-runs cannot
   guarantee that every provider will accept every operation in production.
 

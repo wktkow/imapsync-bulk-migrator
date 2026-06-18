@@ -116,13 +116,67 @@ def provider_endpoint_state(endpoint: ProviderEndpoint, *, username: Optional[st
         "starttls": bool(endpoint.starttls),
     }
     if username is not None:
-        state["username"] = str(username).strip()
+        state["username"] = auth_username_identity(endpoint, str(username))
     return state
 
 
-def provider_endpoint_state_digest(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> str:
-    payload = json.dumps(provider_endpoint_state(endpoint, username=username), sort_keys=True, separators=(",", ":")).encode("utf-8")
+def _provider_endpoint_state_payload_digest(state: Dict[str, Any]) -> str:
+    payload = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_provider_endpoint_state_dict(state: Dict[str, Any]) -> Dict[str, Any]:
+    required = {"provider", "host", "port", "ssl", "starttls"}
+    if not required.issubset(state):
+        return dict(state)
+    try:
+        provider = str(state["provider"]).strip().lower()
+        host = str(state["host"]).strip().lower().rstrip(".")
+        port = int(state["port"])
+        use_ssl = bool(state["ssl"])
+        starttls = bool(state["starttls"])
+        endpoint = ProviderEndpoint(
+            provider=provider,
+            host=host,
+            port=port,
+            ssl=use_ssl,
+            starttls=starttls,
+        )
+    except Exception:
+        return dict(state)
+    canonical: Dict[str, Any] = {
+        "provider": provider,
+        "host": host,
+        "port": port,
+        "ssl": use_ssl,
+        "starttls": starttls,
+    }
+    if "username" in state:
+        canonical["username"] = auth_username_identity(endpoint, str(state["username"]))
+    return canonical
+
+
+def _provider_endpoint_state_matches(actual: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    return _canonical_provider_endpoint_state_dict(actual) == expected
+
+
+def _provider_endpoint_state_digest_matches(
+    actual_endpoint: Any,
+    actual_digest: Any,
+    expected_digest: str,
+) -> bool:
+    if not isinstance(actual_digest, str):
+        return False
+    digest = actual_digest.lower()
+    if digest == expected_digest:
+        return True
+    if isinstance(actual_endpoint, dict):
+        return digest == _provider_endpoint_state_payload_digest(actual_endpoint)
+    return False
+
+
+def provider_endpoint_state_digest(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> str:
+    return _provider_endpoint_state_payload_digest(provider_endpoint_state(endpoint, username=username))
 
 
 def provider_account_endpoint_state(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> Dict[str, Any]:
@@ -652,10 +706,49 @@ def _source_tokens(source_mailboxes: Iterable[str], gmail_labels: Iterable[str])
     return tokens
 
 
-def resolve_primary_mailbox(source_mailboxes: Iterable[str], gmail_labels: Iterable[str], folder_map: Dict[str, str]) -> str:
+def resolve_primary_mailbox(
+    source_mailboxes: Iterable[str],
+    gmail_labels: Iterable[str],
+    folder_map: Dict[str, str],
+    *,
+    source_provider: str = "gmail",
+) -> str:
     source_tokens = [str(value) for value in source_mailboxes if value]
     label_tokens = [str(value) for value in gmail_labels if value]
     tokens = _source_tokens(source_tokens, label_tokens)
+    provider = (source_provider or "imap").lower()
+    if provider == "imap":
+        physical_tokens = [token for token in source_tokens if not token.startswith("\\")]
+        attribute_lowers = {token.lower() for token in source_tokens if token.startswith("\\")}
+        for token in physical_tokens:
+            if token in folder_map:
+                return folder_map[token]
+        for token in source_tokens:
+            if token in folder_map:
+                return folder_map[token]
+
+        def mapped_attribute(default: str, *names: str) -> str:
+            for name in names:
+                if name in folder_map:
+                    return folder_map[name]
+            return default
+
+        if "\\sent" in attribute_lowers:
+            return mapped_attribute("Sent", "\\Sent", "Sent")
+        if "\\drafts" in attribute_lowers:
+            return mapped_attribute("Drafts", "\\Drafts", "Drafts")
+        if "\\trash" in attribute_lowers:
+            return mapped_attribute("Deleted Messages", "\\Trash", "Trash")
+        if "\\junk" in attribute_lowers:
+            return mapped_attribute("Junk", "\\Junk", "Junk")
+        if "\\all" in attribute_lowers:
+            return mapped_attribute("Archive", "\\All", "All Mail")
+        if "\\archive" in attribute_lowers:
+            return mapped_attribute("Archive", "\\Archive", "Archive")
+        for token in physical_tokens:
+            if token.upper() == "INBOX":
+                return folder_map.get(token, folder_map.get("INBOX", "INBOX"))
+            return token
     lowered = {token.lower(): token for token in tokens}
     gmail_label_lowers = {token.lower() for token in label_tokens}
 
@@ -792,13 +885,15 @@ def provider_manifest_digest(rows: List[Dict[str, Any]]) -> str:
 def latest_committed_journal_rows(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
-        if row.get("status") != "committed":
-            continue
         identity = str(row.get("canonical_id") or "")
         target_mailbox = str(row.get("target_mailbox") or "")
         if not identity or not target_mailbox:
             continue
-        latest[(identity, target_mailbox)] = row
+        key = (identity, target_mailbox)
+        if row.get("status") == "committed":
+            latest[key] = row
+        else:
+            latest.pop(key, None)
     return latest
 
 
@@ -810,6 +905,7 @@ def provider_export_state_issues(
     source_provider: Optional[str] = None,
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
+    target_endpoint: Optional[ProviderEndpoint] = None,
 ) -> List[str]:
     state_path = account_dir / "export-state.json"
     try:
@@ -827,6 +923,7 @@ def provider_export_state_issues(
             source_provider=source_provider,
             target_provider=target_provider,
             source_endpoint=source_endpoint,
+            target_endpoint=target_endpoint,
         )
     )
     if state.get("complete") is not True:
@@ -866,6 +963,7 @@ def provider_export_state_contract_issues(
     source_provider: Optional[str] = None,
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
+    target_endpoint: Optional[ProviderEndpoint] = None,
 ) -> List[str]:
     issues: List[str] = []
     if account is not None:
@@ -897,7 +995,7 @@ def provider_export_state_contract_issues(
         state_source_endpoint = state.get("source_endpoint")
         if not isinstance(state_source_endpoint, dict):
             issues.append("export-state source_endpoint is missing; rerun provider export with current version")
-        elif state_source_endpoint != expected_source_endpoint:
+        elif not _provider_endpoint_state_matches(state_source_endpoint, expected_source_endpoint):
             issues.append(
                 "export-state source_endpoint does not match config source endpoint: "
                 f"{state_source_endpoint} != {expected_source_endpoint}"
@@ -907,7 +1005,11 @@ def provider_export_state_contract_issues(
             if account is not None
             else provider_endpoint_state_digest(source_endpoint)
         )
-        if state.get("source_endpoint_sha256") != expected_source_endpoint_sha:
+        if not _provider_endpoint_state_digest_matches(
+            state_source_endpoint,
+            state.get("source_endpoint_sha256"),
+            expected_source_endpoint_sha,
+        ):
             issues.append("export-state source_endpoint_sha256 does not match config source endpoint")
     if target_provider is not None:
         state_target_provider = str(state.get("target_provider") or "").lower()
@@ -916,6 +1018,31 @@ def provider_export_state_contract_issues(
                 f"export-state target_provider does not match config target.provider "
                 f"{target_provider}: {state_target_provider or '<missing>'}"
             )
+    if target_endpoint is not None:
+        expected_target_endpoint = (
+            provider_account_endpoint_state(target_endpoint, account, role="target")
+            if account is not None
+            else provider_endpoint_state(target_endpoint)
+        )
+        state_target_endpoint = state.get("target_endpoint")
+        if not isinstance(state_target_endpoint, dict):
+            issues.append("export-state target_endpoint is missing; rerun provider export with current version")
+        elif not _provider_endpoint_state_matches(state_target_endpoint, expected_target_endpoint):
+            issues.append(
+                "export-state target_endpoint does not match config target endpoint: "
+                f"{state_target_endpoint} != {expected_target_endpoint}"
+            )
+        expected_target_endpoint_sha = (
+            provider_account_endpoint_state_digest(target_endpoint, account, role="target")
+            if account is not None
+            else provider_endpoint_state_digest(target_endpoint)
+        )
+        if not _provider_endpoint_state_digest_matches(
+            state_target_endpoint,
+            state.get("target_endpoint_sha256"),
+            expected_target_endpoint_sha,
+        ):
+            issues.append("export-state target_endpoint_sha256 does not match config target endpoint")
     return issues
 
 
@@ -927,6 +1054,7 @@ def require_complete_export_state(
     source_provider: Optional[str] = None,
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
+    target_endpoint: Optional[ProviderEndpoint] = None,
 ) -> None:
     issues = provider_export_state_issues(
         account_dir,
@@ -935,6 +1063,7 @@ def require_complete_export_state(
         source_provider=source_provider,
         target_provider=target_provider,
         source_endpoint=source_endpoint,
+        target_endpoint=target_endpoint,
     )
     if issues:
         raise RuntimeError("; ".join(issues))
@@ -1123,12 +1252,16 @@ def journal_target_endpoint_issues(
         target_endpoint = row.get("target_endpoint")
         if not isinstance(target_endpoint, dict):
             issues.append(f"journal {label} target_endpoint missing; rerun provider import with current version")
-        elif target_endpoint != expected_endpoint:
+        elif not _provider_endpoint_state_matches(target_endpoint, expected_endpoint):
             issues.append(
                 f"journal {label} target_endpoint does not match config target endpoint: "
                 f"{target_endpoint} != {expected_endpoint}"
             )
-        if row.get("target_endpoint_sha256") != expected_digest:
+        if not _provider_endpoint_state_digest_matches(
+            target_endpoint,
+            row.get("target_endpoint_sha256"),
+            expected_digest,
+        ):
             issues.append(f"journal {label} target_endpoint_sha256 does not match config target endpoint")
     return issues
 
@@ -1416,6 +1549,7 @@ def _finalize_export_record(record: Dict[str, Any], folder_map: Dict[str, str]) 
         list(record["source_mailboxes"]) + source_attributes,
         record["gmail_labels"],
         folder_map,
+        source_provider=str(record.get("source_provider") or "imap"),
     )
 
 
@@ -1478,6 +1612,7 @@ def provider_export_account(
             source_provider=config.source.provider,
             target_provider=config.target.provider,
             source_endpoint=config.source,
+            target_endpoint=config.target,
         )
         if state_contract_issues:
             raise RuntimeError("; ".join(state_contract_issues))
@@ -1496,6 +1631,7 @@ def provider_export_account(
                 source_provider=config.source.provider,
                 target_provider=config.target.provider,
                 source_endpoint=config.source,
+                target_endpoint=config.target,
             )
             if state_issues:
                 raise RuntimeError("; ".join(state_issues))
@@ -1511,6 +1647,8 @@ def provider_export_account(
                 "target_provider": config.target.provider,
                 "source_endpoint": provider_account_endpoint_state(config.source, account, role="source"),
                 "source_endpoint_sha256": provider_account_endpoint_state_digest(config.source, account, role="source"),
+                "target_endpoint": provider_account_endpoint_state(config.target, account, role="target"),
+                "target_endpoint_sha256": provider_account_endpoint_state_digest(config.target, account, role="target"),
                 "gmail_full_visibility_verified": gmail_full_visibility_attested(config.source, account)
                 if config.source.provider == "gmail"
                 else None,
@@ -1717,6 +1855,8 @@ def provider_export_account(
             "target_provider": config.target.provider,
             "source_endpoint": provider_account_endpoint_state(config.source, account, role="source"),
             "source_endpoint_sha256": provider_account_endpoint_state_digest(config.source, account, role="source"),
+            "target_endpoint": provider_account_endpoint_state(config.target, account, role="target"),
+            "target_endpoint_sha256": provider_account_endpoint_state_digest(config.target, account, role="target"),
             "gmail_full_visibility_verified": gmail_full_visibility_attested(config.source, account)
             if config.source.provider == "gmail"
             else None,
@@ -1752,17 +1892,41 @@ def provider_export_all(
     parallel_process_accounts("provider-export", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
 
 
-def _target_mailboxes_by_name(mailboxes: List[MailboxInfo]) -> Dict[str, MailboxInfo]:
-    return {m.name.lower(): m for m in mailboxes}
+def _target_mailbox_lookup_key(name: str, target_provider: str = "imap") -> str:
+    provider = (target_provider or "imap").lower()
+    stripped = str(name)
+    if provider == "gmail":
+        return stripped.lower()
+    if stripped.upper() == "INBOX":
+        return "INBOX"
+    return stripped
+
+
+def _target_mailboxes_by_name(mailboxes: List[MailboxInfo], *, target_provider: str = "imap") -> Dict[str, MailboxInfo]:
+    return {_target_mailbox_lookup_key(m.name, target_provider): m for m in mailboxes}
 
 
 def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target_provider: str = "imap") -> str:
-    by_name = _target_mailboxes_by_name(mailboxes)
-    desired_lower = desired.lower()
     provider = (target_provider or "imap").lower()
+    by_name = _target_mailboxes_by_name(mailboxes, target_provider=provider)
+    desired_name = str(desired)
+    desired_lower = desired_name.lower()
+    desired_key = _target_mailbox_lookup_key(desired, provider)
     gmail_special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important", "starred"}
-    if desired_lower in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
-        return by_name[desired.lower()].name
+    if desired_key in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
+        return by_name[desired_key].name
+    special_key_by_name = {
+        "Sent": "sent",
+        "Drafts": "drafts",
+        "Deleted Messages": "deleted messages",
+        "Trash": "trash",
+        "Junk": "junk",
+        "Spam": "spam",
+        "Archive": "archive",
+        "Important": "important",
+        "Starred": "starred",
+    }
+    special_key = special_key_by_name.get(desired_name)
     attr_map = {
         "sent": ("\\Sent",),
         "drafts": ("\\Drafts",),
@@ -1777,7 +1941,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         attr_map["archive"] = ("\\All", "\\Archive")
     else:
         attr_map["archive"] = ("\\Archive",)
-    attrs = attr_map.get(desired_lower)
+    attrs = attr_map.get(special_key or "")
     if attrs:
         for mailbox in mailboxes:
             if any(a.lower() in {attr.lower() for attr in attrs} for a in mailbox.attributes):
@@ -1806,10 +1970,11 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
     }
     candidates = {
         **(gmail_candidates if provider == "gmail" else generic_candidates),
-    }.get(desired_lower, [desired])
+    }.get(special_key or "", [desired])
     for candidate in candidates:
-        if candidate.lower() in by_name:
-            return by_name[candidate.lower()].name
+        candidate_key = _target_mailbox_lookup_key(candidate, provider)
+        if candidate_key in by_name:
+            return by_name[candidate_key].name
     return desired
 
 
@@ -2312,7 +2477,7 @@ def consume_target_match_num(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
 ) -> Optional[bytes]:
-    mailbox_key = mailbox.lower()
+    mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
         if num not in used:
@@ -2339,7 +2504,7 @@ def consume_target_gmail_msgid_match_num(
 ) -> Optional[bytes]:
     if not target_gmail_msgid:
         return None
-    mailbox_key = mailbox.lower()
+    mailbox_key = _target_mailbox_lookup_key(mailbox, "gmail")
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
         if num in used:
@@ -2366,7 +2531,7 @@ def consume_target_gmail_match_in_mailboxes(
     used_gmail_msgids: Optional[set[str]] = None,
 ) -> Optional[Tuple[str, bytes, str]]:
     for mailbox in mailboxes:
-        mailbox_key = mailbox.lower()
+        mailbox_key = _target_mailbox_lookup_key(mailbox, "gmail")
         used = used_by_mailbox.setdefault(mailbox_key, set())
         for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=False):
             if num in used:
@@ -2422,7 +2587,7 @@ def consume_target_match_with_gmail_labels(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
 ) -> Optional[set[str]]:
-    mailbox_key = mailbox.lower()
+    mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
         if num in used:
@@ -2444,7 +2609,7 @@ def gmail_expected_target_mailboxes_for_row(
     target_mailboxes: List[MailboxInfo],
 ) -> List[str]:
     names: List[str] = []
-    by_name = _target_mailboxes_by_name(target_mailboxes)
+    by_name = _target_mailboxes_by_name(target_mailboxes, target_provider="gmail")
     system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes)
 
     def add(name: str) -> None:
@@ -2462,7 +2627,7 @@ def gmail_expected_target_mailboxes_for_row(
             for name in system_by_key[system_key]:
                 add(name)
             continue
-        mailbox = by_name.get(label.lower())
+        mailbox = by_name.get(_target_mailbox_lookup_key(label, "gmail"))
         if mailbox is not None:
             add(mailbox.name)
     return names
@@ -2477,7 +2642,7 @@ def matching_gmail_msgids_for_row(
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
         for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
-            used = used_by_mailbox.setdefault(mailbox.lower(), set())
+            used = used_by_mailbox.setdefault(_target_mailbox_lookup_key(mailbox, "gmail"), set())
             if num in used:
                 continue
             used.add(num)
@@ -2496,7 +2661,7 @@ def target_gmail_labels_for_msgid(
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
         for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
-            used = used_by_mailbox.setdefault(mailbox.lower(), set())
+            used = used_by_mailbox.setdefault(_target_mailbox_lookup_key(mailbox, "gmail"), set())
             if num in used:
                 continue
             used.add(num)
@@ -2555,8 +2720,9 @@ def enforce_empty_target(
     target_provider: str = "imap",
     gmail_journal_msgids: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> None:
+    target_provider = (target_provider or "imap").lower()
     permitted_by_mailbox: Dict[str, List[Tuple[Dict[str, Any], Tuple[str, str]]]] = {}
-    by_name = _target_mailboxes_by_name(target_mailboxes)
+    by_name = _target_mailboxes_by_name(target_mailboxes, target_provider=target_provider)
     gmail_system_by_key = _gmail_system_mailboxes_by_key(target_mailboxes) if target_provider == "gmail" else {}
     gmail_all_mailboxes = gmail_all_mail_names(target_mailboxes) if target_provider == "gmail" else []
     gmail_journal_msgids = gmail_journal_msgids or {}
@@ -2580,14 +2746,14 @@ def enforce_empty_target(
                     if system_key in gmail_system_by_key:
                         permitted_names.extend(gmail_system_by_key[system_key])
                         continue
-                    mailbox = by_name.get(label.lower())
+                    mailbox = by_name.get(_target_mailbox_lookup_key(label, target_provider))
                     if mailbox is not None:
                         permitted_names.append(mailbox.name)
             else:
                 permitted_names.extend(generic_special_view_mailboxes_for_row(row, target_mailboxes))
             seen_permitted_names: set[str] = set()
             for name in permitted_names:
-                key_name = name.lower()
+                key_name = _target_mailbox_lookup_key(name, target_provider)
                 if key_name in seen_permitted_names:
                     continue
                 seen_permitted_names.add(key_name)
@@ -2600,7 +2766,8 @@ def enforce_empty_target(
             continue
         verified = 0
         used: Dict[str, set[bytes]] = {}
-        for permitted_row, journal_key in permitted_by_mailbox.get(mailbox.name.lower(), []):
+        mailbox_key = _target_mailbox_lookup_key(mailbox.name, target_provider)
+        for permitted_row, journal_key in permitted_by_mailbox.get(mailbox_key, []):
             target_gmail_msgid = gmail_journal_msgids.get(journal_key, "") if target_provider == "gmail" else ""
             if target_gmail_msgid:
                 matched = consume_target_gmail_msgid_match_num(
@@ -2645,7 +2812,8 @@ def translated_target_mailboxes_for_rows(
         source_key = (source_desired,)
         if isinstance(source_paths, dict) and isinstance(source_paths.get(source_desired), list):
             source_key = tuple(str(segment) for segment in source_paths[source_desired])
-        previous_source = translated_sources_by_target.setdefault(target_mailbox.lower(), source_key)
+        target_mailbox_key = _target_mailbox_lookup_key(target_mailbox, target_provider)
+        previous_source = translated_sources_by_target.setdefault(target_mailbox_key, source_key)
         if previous_source != source_key:
             raise RuntimeError(
                 f"target mailbox translation collision for {target_mailbox!r}: "
@@ -2702,6 +2870,7 @@ def _validated_group_stage(
         source_provider=config.source.provider,
         target_provider=config.target.provider,
         source_endpoint=config.source,
+        target_endpoint=config.target,
     )
     metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
     if metadata_issues:
@@ -2838,6 +3007,7 @@ def provider_import_account(
         source_provider=config.source.provider,
         target_provider=config.target.provider,
         source_endpoint=config.source,
+        target_endpoint=config.target,
     )
     metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
     if metadata_issues:
@@ -3239,6 +3409,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
             source_provider=config.source.provider,
             target_provider=config.target.provider,
             source_endpoint=config.source,
+            target_endpoint=config.target,
         )
     )
     identities = set()
@@ -3359,6 +3530,7 @@ def provider_validate_account(
             source_provider=config.source.provider,
             target_provider=config.target.provider,
             source_endpoint=config.source,
+            target_endpoint=config.target,
         )
     )
 

@@ -178,6 +178,7 @@ def setup_logging(log_directory: Path) -> Path:
     from datetime import datetime, timezone
     import logging
     import sys
+    import time
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     log_file = log_directory / f"run-{timestamp}.log"
@@ -191,6 +192,7 @@ def setup_logging(log_directory: Path) -> Path:
         fmt="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
+    formatter.converter = time.gmtime
 
     log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     os.fchmod(log_fd, 0o600)
@@ -813,7 +815,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_validate(acc: Account) -> None:
                 email = acc.email
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, imap_connection, list_all_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys, imap_connection, list_all_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
@@ -833,14 +835,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                             validation_errors.extend((email, issue) for issue in audit_issues)
                         return
                     current_target = _legacy_import_target_id(config.server, acc)
-                    pending_rows = [
-                        row
-                        for row in _load_legacy_import_journal(account_dir)
-                        if row.get("status") == "pending" and row.get("target") == current_target
-                    ]
-                    if pending_rows:
+                    unresolved_pending_keys = _unresolved_legacy_pending_keys(
+                        _load_legacy_import_journal(account_dir),
+                        current_target,
+                    )
+                    if unresolved_pending_keys:
                         with mismatches_lock:
-                            validation_errors.append((email, f"import journal has {len(pending_rows)} pending append(s); target state is uncertain"))
+                            validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
 
                     def marker_mailbox(folder_dir: Path) -> str:
                         marker_path = folder_dir / ".mailbox.json"

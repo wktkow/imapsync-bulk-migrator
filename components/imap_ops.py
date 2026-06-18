@@ -20,6 +20,7 @@ from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+_LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed"}
 
 
 def quote_mailbox_name(mailbox: str) -> str:
@@ -206,11 +207,12 @@ def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]
 
 
 def _legacy_import_target_id(server: ServerConfig, account: Account) -> str:
+    endpoint = legacy_server_endpoint(server)
     seed = {
-        "host": server.host,
-        "port": server.port,
-        "ssl": server.ssl,
-        "starttls": server.starttls,
+        "host": endpoint["host"],
+        "port": endpoint["port"],
+        "ssl": endpoint["ssl"],
+        "starttls": endpoint["starttls"],
         "account": account.email,
     }
     return hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
@@ -259,13 +261,29 @@ def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, u
     return False
 
 
-def _latest_legacy_committed_keys(rows: List[Dict[str, str]], target_id: str) -> set[str]:
-    latest: Dict[str, Dict[str, str]] = {}
+def _latest_legacy_status_by_key(rows: List[Dict[str, str]], target_id: str) -> Dict[str, str]:
+    latest: Dict[str, str] = {}
     for row in rows:
         key = row.get("key", "")
-        if row.get("status") == "committed" and key and row.get("target") == target_id:
-            latest[key] = row
-    return set(latest)
+        if key and row.get("target") == target_id:
+            latest[key] = row.get("status", "")
+    return latest
+
+
+def _latest_legacy_committed_keys(rows: List[Dict[str, str]], target_id: str) -> set[str]:
+    return {
+        key
+        for key, status in _latest_legacy_status_by_key(rows, target_id).items()
+        if status == "committed"
+    }
+
+
+def _unresolved_legacy_pending_keys(rows: List[Dict[str, str]], target_id: str) -> set[str]:
+    return {
+        key
+        for key, status in _latest_legacy_status_by_key(rows, target_id).items()
+        if status == "pending"
+    }
 
 
 def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
@@ -287,8 +305,15 @@ def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
                 needs_rewrite = True
                 break
             raise
-        if isinstance(row, dict):
-            rows.append({str(k): str(v) for k, v in row.items()})
+        if not isinstance(row, dict):
+            raise RuntimeError(f"import journal row {line_no} is not an object: {path}")
+        coerced = {str(k): str(v) for k, v in row.items()}
+        status = coerced.get("status", "")
+        if status not in _LEGACY_IMPORT_JOURNAL_STATUSES:
+            raise RuntimeError(
+                f"import journal row {line_no} has invalid status: {status or '<missing>'}: {path}"
+            )
+        rows.append(coerced)
     if needs_rewrite:
         _write_legacy_import_journal(account_dir, rows)
     return rows
@@ -492,11 +517,7 @@ def import_account(
     target_id = _legacy_import_target_id(server, account)
     journal_rows = _load_legacy_import_journal(account_dir)
     committed_keys = _latest_legacy_committed_keys(journal_rows, target_id)
-    pending_keys = {
-        row.get("key", "")
-        for row in journal_rows
-        if row.get("status") == "pending" and row.get("key") and row.get("target") == target_id
-    }
+    pending_keys = _unresolved_legacy_pending_keys(journal_rows, target_id)
 
     def _completed_zero_message_export(
         staged_marker_paths: set[str],

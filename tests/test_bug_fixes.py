@@ -834,6 +834,42 @@ class TestLegacyImportJournal:
         with pytest.raises(RuntimeError, match="pending append"):
             import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
 
+    def test_import_rejects_invalid_legacy_journal_status(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        key = _legacy_import_key(account_dir, eml, "INBOX", eml.read_bytes())
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "commited",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        with mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            with pytest.raises(RuntimeError, match="invalid status"):
+                import_account(account, server, in_root, ignore_errors=False)
+
+    def test_import_rejects_non_object_legacy_journal_row(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        (account_dir / "import.journal.jsonl").write_text("[]\n")
+
+        with mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            with pytest.raises(RuntimeError, match="not an object"):
+                import_account(account, server, in_root, ignore_errors=False)
+
     def test_import_ignore_errors_continues_but_raises_aggregate(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
@@ -916,6 +952,57 @@ class TestLegacyImportJournal:
         import_account(account, new_server, in_root, ignore_errors=False, imap_factory=fake_factory)
 
         assert fake_imap.append.call_count == 1
+
+    def test_import_recognizes_committed_journal_from_normalized_equivalent_target(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        data = eml.read_bytes()
+        key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        account = Account(email="user@example.com", password="pass")
+        old_spelling = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        equivalent_spelling = ServerConfig(host="IMAP.EXAMPLE.COM.", port=993, ssl=True)
+        assert _legacy_import_target_id(old_spelling, account) == _legacy_import_target_id(equivalent_spelling, account)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "status": "committed",
+            "target": _legacy_import_target_id(old_spelling, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        class ExistingMessageImap:
+            def __init__(self) -> None:
+                self.append_count = 0
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+
+            def append(self, *_args, **_kwargs):
+                self.append_count += 1
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = ExistingMessageImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[ExistingMessageImap]:
+            yield fake_imap
+
+        import_account(account, equivalent_spelling, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.append_count == 0
 
     def test_import_repairs_stale_committed_journal_for_current_target(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
@@ -1260,13 +1347,29 @@ class TestCliAndConfigHardening:
         duplicate.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [
-                {"email": "A@example.com", "password": "secret-a"},
+                {"email": "a@example.com", "password": "secret-a"},
                 {"email": "a@example.com", "password": "secret-b"},
             ],
         }))
 
         with pytest.raises(ValueError, match="duplicates"):
             Config.from_json_file(duplicate)
+
+    def test_legacy_config_allows_case_distinct_generic_imap_accounts(self, tmp_path: Path) -> None:
+        from components.models import Config
+
+        case_distinct = tmp_path / "case-distinct.json"
+        case_distinct.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "User@example.com", "password": "secret-a"},
+                {"email": "user@example.com", "password": "secret-b"},
+            ],
+        }))
+
+        config = Config.from_json_file(case_distinct)
+
+        assert [account.email for account in config.accounts] == ["User@example.com", "user@example.com"]
 
     def test_legacy_config_rejects_sanitized_account_path_collisions(self, tmp_path: Path) -> None:
         from components.models import Config
@@ -1344,6 +1447,20 @@ class TestCliAndConfigHardening:
         log_file = setup_logging(tmp_path / "logs")
 
         assert log_file.stat().st_mode & 0o777 == 0o600
+
+    def test_setup_logging_uses_utc_timestamps_for_z_suffix(self, tmp_path: Path) -> None:
+        import logging
+        import time
+
+        from components.main import setup_logging
+
+        setup_logging(tmp_path / "logs")
+        formatter = logging.getLogger().handlers[0].formatter
+        record = logging.LogRecord("test", logging.INFO, __file__, 1, "timestamp-check", (), None)
+        record.created = 0
+
+        assert formatter.converter is time.gmtime
+        assert formatter.format(record).startswith("1970-01-01T00:00:00Z")
 
     def test_legacy_validate_returns_failure_on_account_error(self, tmp_path: Path) -> None:
         from components.main import main
@@ -1580,6 +1697,84 @@ class TestCliAndConfigHardening:
             ])
 
         assert rc == 4
+
+    def test_legacy_validate_allows_pending_resolved_by_later_committed_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / "a@example.com"
+        mailbox_dir = account_dir / "INBOX"
+        data = (
+            b"From: sender@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Message-ID: <m@example.com>\r\n"
+            b"\r\n"
+            b"body"
+        )
+        eml = _write_legacy_message_fixture(mailbox_dir, data=data, source_server=server)
+        key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        target_id = _legacy_import_target_id(server, account)
+        journal_rows = [
+            {
+                "key": key,
+                "target": target_id,
+                "mailbox": "INBOX",
+                "path": "INBOX/u0000000001.eml",
+                "status": "pending",
+            },
+            {
+                "key": key,
+                "target": target_id,
+                "mailbox": "INBOX",
+                "path": "INBOX/u0000000001.eml",
+                "status": "committed",
+            },
+        ]
+        (account_dir / "import.journal.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in journal_rows)
+        )
+
+        class MatchingRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[MatchingRemote]:
+            yield MatchingRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
 
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
