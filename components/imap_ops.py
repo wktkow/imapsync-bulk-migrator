@@ -498,6 +498,37 @@ def import_account(
         if row.get("status") == "pending" and row.get("key") and row.get("target") == target_id
     }
 
+    def _completed_zero_message_export() -> bool:
+        state_path = account_dir / "export-state.json"
+        if not state_path.exists():
+            return False
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if state.get("complete") is not True:
+            return False
+        if state.get("account") not in {None, account.email}:
+            return False
+        mailboxes = state.get("mailboxes")
+        if not isinstance(mailboxes, list) or not mailboxes:
+            return False
+        for entry in mailboxes:
+            if not isinstance(entry, dict):
+                return False
+            path = str(entry.get("path") or "")
+            if not path:
+                return False
+            try:
+                message_count = int(entry.get("message_count"))
+            except Exception:
+                return False
+            if message_count != 0:
+                return False
+            if not (account_dir / path / ".mailbox.json").exists():
+                return False
+        return True
+
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
     for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
@@ -529,7 +560,9 @@ def import_account(
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
     if not any(entries for entries in per_folder.values()):
-        raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
+        if not _completed_zero_message_export():
+            raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
+        logging.info("[import] %s: completed zero-message export; importing empty mailbox structure only", account.email)
 
     # Choose IMAP context manager (injected or default)
     def _imap_ctx() -> AbstractContextManager[imaplib.IMAP4]:

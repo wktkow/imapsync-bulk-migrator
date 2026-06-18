@@ -691,13 +691,64 @@ class TestLegacyImportJournal:
         with pytest.raises(RuntimeError, match="no mailbox folders"):
             import_account(account, server, tmp_path, ignore_errors=False)
 
-    def test_import_rejects_staged_account_with_no_eml_files(self, tmp_path: Path) -> None:
+    def test_import_accepts_completed_zero_message_export(self, tmp_path: Path) -> None:
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest, import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
+        account = Account(email="user@example.com", password="pass")
+
+        class EmptyTarget:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.appended = 0
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected.append(mailbox)
+                return "OK", [b"0"]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake = EmptyTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[EmptyTarget]:
+            yield fake
+
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake.selected == ["INBOX"]
+        assert fake.appended == 0
+
+    def test_import_rejects_incomplete_staged_account_with_no_eml_files(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
 
         folder = tmp_path / "user@example.com" / "INBOX"
         folder.mkdir(parents=True)
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "complete": False,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
         account = Account(email="user@example.com", password="pass")
         server = ServerConfig(host="dummy", port=993, ssl=True)
 
