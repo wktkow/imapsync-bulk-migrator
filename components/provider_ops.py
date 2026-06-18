@@ -1835,12 +1835,69 @@ def _flags_for_append(flags: str) -> str:
     return f"({' '.join(filtered)})" if filtered else ""
 
 
-def _flags_for_provider_append(flags: str, *, target_provider: str) -> str:
+def target_permanent_flags(imap: imaplib.IMAP4) -> Optional[set[str]]:
+    response = getattr(imap, "response", None)
+    if not callable(response):
+        return None
+    try:
+        _status, data = response("PERMANENTFLAGS")
+    except Exception:
+        return None
+    values: List[str] = []
+    for part in data or []:
+        if part is None:
+            continue
+        if isinstance(part, (bytes, bytearray)):
+            values.append(bytes(part).decode("ascii", errors="ignore"))
+        else:
+            values.append(str(part))
+    raw = " ".join(values).strip()
+    if not raw:
+        return None
+    match = re.search(r"\((.*?)\)", raw)
+    if match:
+        raw = match.group(1)
+    return {token.upper() for token in _parse_parenthesized_words(raw)}
+
+
+def _flags_for_provider_append(
+    flags: str,
+    *,
+    target_provider: str,
+    permanent_flags: Optional[set[str]] = None,
+) -> str:
     portable = {"\\ANSWERED", "\\FLAGGED", "\\SEEN", "\\DRAFT"}
     if target_provider != "gmail":
         portable.add("\\DELETED")
     tokens = [tok for tok in flags.split() if tok.strip()]
-    filtered = [tok for tok in tokens if tok.strip().upper() in portable]
+    filtered: List[str] = []
+    unsupported: List[str] = []
+    wildcard = permanent_flags is None or "\\*" in permanent_flags
+    for token in tokens:
+        token = token.strip()
+        upper = token.upper()
+        if upper == "\\RECENT":
+            continue
+        if target_provider == "gmail" and upper == "\\DELETED":
+            continue
+        if upper in portable:
+            if permanent_flags is None or upper in permanent_flags:
+                filtered.append(token)
+            else:
+                unsupported.append(token)
+            continue
+        if not token.startswith("\\") or (permanent_flags is not None and upper in permanent_flags):
+            if wildcard or upper in (permanent_flags or set()):
+                filtered.append(token)
+            else:
+                unsupported.append(token)
+            continue
+        unsupported.append(token)
+    if unsupported:
+        raise RuntimeError(
+            "target does not support exported IMAP flag/keyword(s): "
+            + ", ".join(sorted(set(unsupported), key=str.upper))
+        )
     return f"({' '.join(filtered)})" if filtered else ""
 
 
@@ -2959,6 +3016,11 @@ def provider_import_account(
                 committed.add(key)
                 continue
             ensure_mailbox(imap, target_mailbox)
+            append_flags = _flags_for_provider_append(
+                str(row.get("flags") or ""),
+                target_provider=config.target.provider,
+                permanent_flags=target_permanent_flags(imap),
+            )
             limiter.wait_for(len(data))
             append_journal(
                 account_dir,
@@ -2968,7 +3030,7 @@ def provider_import_account(
             status, response = append_message(
                 imap,
                 target_mailbox,
-                _flags_for_provider_append(str(row.get("flags") or ""), target_provider=config.target.provider),
+                append_flags,
                 _internaldate_for_append(str(row.get("internaldate") or "")),
                 data,
             )

@@ -1883,12 +1883,15 @@ class FakeTargetImap:
         existing_body: bytes = b"Message-ID: <m1@example.com>\r\n\r\nbody",
         existing_mailbox: str = "Archive",
         messages_by_mailbox: Optional[dict[str, int]] = None,
+        permanent_flags: Optional[str] = None,
     ) -> None:
         self.appended: List[str] = []
+        self.appended_flags: List[str] = []
         self.has_existing = has_existing
         self.existing_message_id = existing_message_id
         self.existing_body = existing_body
         self.existing_mailbox = existing_mailbox
+        self.permanent_flags = permanent_flags
         self.messages = 0
         self.messages_by_mailbox = dict(messages_by_mailbox or {})
         self.selected_mailbox = ""
@@ -1924,9 +1927,15 @@ class FakeTargetImap:
         self.subscribed.append(self._normalize_mailbox(mailbox))
         return "OK", [b""]
 
+    def response(self, name: str):
+        if name.upper() == "PERMANENTFLAGS" and self.permanent_flags is not None:
+            return "OK", [self.permanent_flags.encode("ascii")]
+        return "OK", [None]
+
     def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
         target = self._normalize_mailbox(mailbox)
         self.appended.append(target)
+        self.appended_flags.append(flags)
         self.messages_by_mailbox[target] = self._message_count(target) + 1
         self.messages += 1
         self.has_existing = True
@@ -2008,8 +2017,13 @@ class FakeGmailTargetAllMailNotSelectable(FakeGmailTargetImap):
 
 
 class StoredMessageTarget(FakeTargetImap):
-    def __init__(self, bodies_by_mailbox: Optional[dict[str, List[bytes]]] = None) -> None:
-        super().__init__(has_existing=False, messages_by_mailbox={})
+    def __init__(
+        self,
+        bodies_by_mailbox: Optional[dict[str, List[bytes]]] = None,
+        *,
+        permanent_flags: Optional[str] = None,
+    ) -> None:
+        super().__init__(has_existing=False, messages_by_mailbox={}, permanent_flags=permanent_flags)
         self.bodies_by_mailbox = {
             mailbox: list(bodies)
             for mailbox, bodies in (bodies_by_mailbox or {}).items()
@@ -2025,6 +2039,7 @@ class StoredMessageTarget(FakeTargetImap):
     def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
         target = self._normalize_mailbox(mailbox)
         self.appended.append(target)
+        self.appended_flags.append(flags)
         self.bodies_by_mailbox.setdefault(target, []).append(bytes(data))
         return "OK", [b""]
 
@@ -2217,6 +2232,52 @@ def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_preserves_supported_imap_keywords(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen $Forwarded NonJunk \\Recent"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    fake = FakeTargetImap(permanent_flags="(\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded NonJunk \\*)")
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.appended_flags == ["(\\Seen $Forwarded NonJunk)"]
+
+
+def test_provider_import_rejects_unsupported_imap_keywords_before_pending_journal(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen $Forwarded"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    fake = FakeTargetImap(permanent_flags="(\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match=r"IMAP flag/keyword\(s\): \$Forwarded"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    assert not journal.exists() or '"status": "pending"' not in journal.read_text()
 
 
 def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_target(tmp_path: Path) -> None:
