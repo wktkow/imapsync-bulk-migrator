@@ -983,6 +983,31 @@ def test_provider_config_accepts_dotted_personal_gmail_source_auth_username(tmp_
     assert isinstance(parsed, ProviderMigrationConfig)
 
 
+def test_provider_config_strips_auth_username_whitespace(tmp_path: Path) -> None:
+    path = tmp_path / "spaced-gmail-source-auth.json"
+    path.write_text(json.dumps({
+        "source": {
+            "provider": "gmail",
+            "host": "imap.gmail.com",
+            "auth": {"method": "xoauth2", "password": "token"},
+            "gmail_full_visibility_verified": True,
+        },
+        "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password", "password": "target"}},
+        "accounts": [{
+            "source_email": "johnsmith@gmail.com",
+            "target_email": "target@example.com",
+            "source_auth": {"method": "xoauth2", "username": " john.smith@gmail.com ", "password": "token"},
+        }],
+    }))
+
+    parsed = load_config_file(path)
+
+    assert isinstance(parsed, ProviderMigrationConfig)
+    assert parsed.accounts[0].source_auth is not None
+    assert parsed.accounts[0].source_auth.username == "john.smith@gmail.com"
+    assert effective_auth(parsed.source, parsed.accounts[0], role="source")[0] == "john.smith@gmail.com"
+
+
 def test_provider_config_accepts_dotted_personal_gmail_target_auth_username(tmp_path: Path) -> None:
     path = tmp_path / "dotted-gmail-target-auth.json"
     path.write_text(json.dumps({

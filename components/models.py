@@ -538,7 +538,8 @@ def _optional_str(raw: Dict[str, Any], key: str, context: str) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise ValueError(f"{context}.{key} must be a string")
-    if not value.strip():
+    value = value.strip()
+    if not value:
         raise ValueError(f"{context}.{key} must be a non-empty string")
     return value
 
