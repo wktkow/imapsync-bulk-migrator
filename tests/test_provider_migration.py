@@ -3398,6 +3398,21 @@ def _journal_fixture(
     return journal_row
 
 
+def _journal_fixture_for_manifest_row(
+    config: ProviderMigrationConfig,
+    manifest_row: dict,
+    row: dict,
+    *,
+    account: Optional[MigrationAccount] = None,
+) -> dict:
+    return _journal_fixture(config, {
+        "content_sha256": manifest_row["content_sha256"],
+        "rfc822_size": manifest_row["rfc822_size"],
+        CONTENT_BINDING_FIELD: manifest_row[CONTENT_BINDING_FIELD],
+        **row,
+    }, account=account)
+
+
 def _mark_manifest_source_provider(row: dict, provider: str) -> dict:
     row["source_provider"] = provider
     return row
@@ -3525,7 +3540,7 @@ def test_provider_validation_rejects_missing_supported_imap_keyword(tmp_path: Pa
     _write_single_manifest_row(account_dir, row)
     (account_dir / row["metadata_path"]).write_text(json.dumps(row))
     _write_provider_export_state(account_dir)
-    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@icloud.com",
         "target_mailbox": "Archive",
@@ -3557,7 +3572,7 @@ def test_provider_validation_ignores_readonly_permanentflags_when_flags_present(
     _write_single_manifest_row(account_dir, row)
     (account_dir / row["metadata_path"]).write_text(json.dumps(row))
     _write_provider_export_state(account_dir)
-    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@icloud.com",
         "target_mailbox": "Archive",
@@ -3627,7 +3642,7 @@ def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_ta
         body=second_body,
     )
     first_row = json.loads((first_dir / "manifest.jsonl").read_text())
-    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "Archive",
@@ -3706,13 +3721,15 @@ def test_provider_validation_many_to_one_empty_mode_rejects_unjournaled_group_ta
         message_id="<b@example.com>",
         body=second_body,
     )
-    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    second_row = json.loads((second_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "Archive",
         "status": "committed",
     }, account=first)) + "\n")
-    (second_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (second_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, second_row, {
         "canonical_id": "physical-b",
         "target_account": target,
         "target_mailbox": "Archive",
@@ -3752,7 +3769,8 @@ def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_pat
         message_id="<shared@example.com>",
         body=shared_body,
     )
-    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "Archive",
@@ -3867,13 +3885,12 @@ def test_provider_validation_hybrid_many_to_one_checks_distinct_target_groups(tm
             message_id=f"<{account.source_email}>",
             body=bodies_by_source[account.source_email],
         )
-        (account_dir / f"import-{account.target_email}.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        manifest_row = json.loads((account_dir / "manifest.jsonl").read_text())
+        (account_dir / f"import-{account.target_email}.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, manifest_row, {
             "canonical_id": f"physical-{account.source_email[0]}",
             "target_account": account.target_email,
             "target_mailbox": "Archive",
             "status": "committed",
-            "content_sha256": hashlib.sha256(bodies_by_source[account.source_email]).hexdigest(),
-            "rfc822_size": len(bodies_by_source[account.source_email]),
         }, account=account)) + "\n")
     targets = {
         "a@example.com": StoredMessageTarget({
@@ -3974,7 +3991,8 @@ def test_provider_import_many_to_one_rejects_gmail_group_journal_missing_msgid(t
         message_id="<b@example.com>",
         body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
     )
-    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "[Gmail]/All Mail",
@@ -4014,7 +4032,8 @@ def test_provider_import_many_to_one_gmail_dedupes_cross_label_existing_message(
         body=shared_body,
         primary_mailbox="INBOX",
     )
-    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "[Gmail]/All Mail",
@@ -4067,7 +4086,8 @@ def test_provider_import_many_to_one_gmail_rejects_stale_group_target_msgid(tmp_
         body=b"Message-ID: <other@example.com>\r\n\r\nother",
         primary_mailbox="Archive",
     )
-    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
         "canonical_id": "physical-a",
         "target_account": target,
         "target_mailbox": "[Gmail]/All Mail",
@@ -5591,7 +5611,8 @@ def test_provider_import_empty_mode_permits_journaled_generic_all_view(tmp_path:
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target=account.target_email)
-    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": account.target_email,
         "target_mailbox": "Archive",
@@ -5621,7 +5642,8 @@ def test_provider_import_empty_mode_permits_journaled_generic_flagged_view(tmp_p
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target=account.target_email)
-    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": account.target_email,
         "target_mailbox": "Archive",
@@ -5796,7 +5818,8 @@ def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_pat
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -6044,6 +6067,30 @@ def test_provider_audit_and_offline_validate_reject_stale_journal_content(tmp_pa
     assert any("journal committed rfc822_size does not match manifest" in issue for issue in issues)
     assert not report["ok"]
     assert any("journal committed content_sha256 does not match manifest" in issue for issue in report["failed"])
+
+
+def test_provider_import_audit_and_validation_reject_stale_journal_content_binding(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    stale = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+        CONTENT_BINDING_FIELD: "0" * 64,
+    })
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(stale) + "\n")
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest" in issue for issue in issues)
+    assert not report["ok"]
+    assert any(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest" in issue for issue in report["failed"])
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=CONTENT_BINDING_FIELD):
+            provider_import_account(config, account, tmp_path)
 
 
 def test_provider_validation_requires_gmail_target_extensions(tmp_path: Path) -> None:
@@ -6989,7 +7036,7 @@ def test_provider_validation_rejects_missing_gmail_imap_flags(tmp_path: Path) ->
     row["gmail_labels"] = ["\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -7171,8 +7218,10 @@ def test_provider_validation_and_import_reject_duplicate_journaled_gmail_target_
         rows.append(row)
     (account_dir / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     _write_provider_export_state(account_dir, target="target@gmail.com")
+    rows = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    row_by_id = {row["canonical_id"]: row for row in rows}
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text("".join(
-        json.dumps(_journal_fixture(config, {
+        json.dumps(_journal_fixture_for_manifest_row(config, row_by_id[canonical_id], {
             "canonical_id": canonical_id,
             "target_account": "target@gmail.com",
             "target_mailbox": "INBOX",

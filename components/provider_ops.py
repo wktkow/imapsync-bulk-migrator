@@ -1496,6 +1496,8 @@ def committed_journal_manifest_content_issues(
             issues.append(f"journal committed content_sha256 does not match manifest: {label}")
         if journal_row.get("rfc822_size") != manifest_row.get("rfc822_size"):
             issues.append(f"journal committed rfc822_size does not match manifest: {label}")
+        if journal_row.get(CONTENT_BINDING_FIELD) != manifest_row.get(CONTENT_BINDING_FIELD):
+            issues.append(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest: {label}")
     return issues
 
 
@@ -3380,6 +3382,12 @@ def _validated_group_stage(
             f"invalid import journal for merge source {account.source_email}: "
             + "; ".join(journal_target_issues)
         )
+    journal_content_issues = committed_journal_manifest_content_issues(journal_rows, manifest_rows)
+    if journal_content_issues:
+        raise RuntimeError(
+            f"invalid import journal for merge source {account.source_email}: "
+            + "; ".join(journal_content_issues)
+        )
     if config.target.provider == "gmail":
         manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
         gmail_journal_issues: List[str] = []
@@ -3526,6 +3534,9 @@ def provider_import_account(
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
     if journal_target_issues:
         raise RuntimeError("invalid import journal: " + "; ".join(journal_target_issues))
+    journal_content_issues = committed_journal_manifest_content_issues(journal_rows, manifest_rows)
+    if journal_content_issues:
+        raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
     manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
     if config.target.provider == "gmail":
         invalid_gmail_msgid_issues = invalid_journal_target_gmail_msgid_issues(
