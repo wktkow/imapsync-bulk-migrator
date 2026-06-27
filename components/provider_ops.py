@@ -2099,6 +2099,7 @@ def _provider_flag_tokens(
     tokens = [tok for tok in flags.split() if tok.strip()]
     filtered: List[str] = []
     unsupported: List[str] = []
+    missing_permanent_flags = permanent_flags is None
     wildcard = permanent_flags is not None and "\\*" in permanent_flags
     for token in tokens:
         token = token.strip()
@@ -2114,7 +2115,9 @@ def _provider_flag_tokens(
                 unsupported.append(token)
             continue
         if not token.startswith("\\") or (permanent_flags is not None and upper in permanent_flags):
-            if wildcard or upper in (permanent_flags or set()):
+            if missing_permanent_flags and target_provider != "gmail":
+                filtered.append(token)
+            elif wildcard or upper in (permanent_flags or set()):
                 filtered.append(token)
             else:
                 unsupported.append(token)
@@ -2134,12 +2137,13 @@ def required_provider_flag_set(
     target_provider: str,
     permanent_flags: Optional[set[str]],
 ) -> set[str]:
+    del permanent_flags
     return {
         token.upper()
         for token in _provider_flag_tokens(
             flags,
             target_provider=target_provider,
-            permanent_flags=permanent_flags,
+            permanent_flags=None,
         )
     }
 
@@ -2616,17 +2620,23 @@ def consume_target_match(
     ) is not None
 
 
-def _target_gmail_label_keys(imap: imaplib.IMAP4, num: bytes) -> set[str]:
+def _target_gmail_label_and_flag_keys(imap: imaplib.IMAP4, num: bytes) -> Tuple[set[str], set[str]]:
     status, fetched = imap.fetch(num, "(X-GM-LABELS FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
     parsed = parse_provider_fetch_response(fetched or [])
     labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
-    labels.update(_gmail_label_key(token) for token in str(parsed.get("flags") or "").split())
-    return {label for label in labels if label}
+    flags = {token.upper() for token in str(parsed.get("flags") or "").split()}
+    labels.update(_gmail_label_key(token) for token in flags)
+    return {label for label in labels if label}, flags
 
 
-def consume_target_match_with_gmail_labels(
+def _target_gmail_label_keys(imap: imaplib.IMAP4, num: bytes) -> set[str]:
+    labels, _flags = _target_gmail_label_and_flag_keys(imap, num)
+    return labels
+
+
+def consume_target_match_with_gmail_state(
     imap: imaplib.IMAP4,
     mailbox: str,
     manifest_row: Dict[str, Any],
@@ -2634,7 +2644,7 @@ def consume_target_match_with_gmail_labels(
     *,
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
-) -> Optional[set[str]]:
+) -> Optional[Tuple[set[str], set[str]]]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
@@ -2647,7 +2657,7 @@ def consume_target_match_with_gmail_labels(
             if gmail_msgid:
                 used_gmail_msgids.add(gmail_msgid)
         used.add(num)
-        return _target_gmail_label_keys(imap, num)
+        return _target_gmail_label_and_flag_keys(imap, num)
     return None
 
 
@@ -2706,6 +2716,19 @@ def target_gmail_labels_for_msgid(
     mailboxes: List[str],
     target_gmail_msgid: str,
 ) -> Optional[set[str]]:
+    result = target_gmail_labels_and_flags_for_msgid(imap, row, mailboxes, target_gmail_msgid)
+    if result is None:
+        return None
+    labels, _flags = result
+    return labels
+
+
+def target_gmail_labels_and_flags_for_msgid(
+    imap: imaplib.IMAP4,
+    row: Dict[str, Any],
+    mailboxes: List[str],
+    target_gmail_msgid: str,
+) -> Optional[Tuple[set[str], set[str]]]:
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
         for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
@@ -2714,7 +2737,7 @@ def target_gmail_labels_for_msgid(
                 continue
             used.add(num)
             if _target_gmail_msgid(imap, num) == target_gmail_msgid:
-                return _target_gmail_label_keys(imap, num)
+                return _target_gmail_label_and_flag_keys(imap, num)
     return None
 
 
@@ -3777,19 +3800,21 @@ def provider_validate_account(
                             matching_gmail_msgids = matching_gmail_msgids_for_row(imap, row, expected_mailboxes)
                             journal_target_gmail_msgid = target_gmail_msgid_by_id.get(identity, "")
                             primary_actual_labels: Optional[set[str]] = None
+                            primary_actual_flags: Optional[set[str]] = None
                             if journal_target_gmail_msgid:
                                 if journal_target_gmail_msgid not in matching_gmail_msgids:
                                     report["remote_missing"].append(identity)
                                     continue
-                                primary_actual_labels = target_gmail_labels_for_msgid(
+                                primary_actual_state = target_gmail_labels_and_flags_for_msgid(
                                     imap,
                                     row,
                                     [target_mailbox],
                                     journal_target_gmail_msgid,
                                 )
-                                if primary_actual_labels is None:
+                                if primary_actual_state is None:
                                     report["remote_missing"].append(identity)
                                     continue
+                                primary_actual_labels, primary_actual_flags = primary_actual_state
                                 extra_gmail_msgids = matching_gmail_msgids - committed_target_gmail_msgids
                             else:
                                 extra_gmail_msgids = matching_gmail_msgids if len(matching_gmail_msgids) > 1 else set()
@@ -3803,8 +3828,9 @@ def provider_validate_account(
                                 })
                             if journal_target_gmail_msgid:
                                 actual_labels = primary_actual_labels
+                                actual_flags = primary_actual_flags
                             else:
-                                actual_labels = consume_target_match_with_gmail_labels(
+                                actual_state = consume_target_match_with_gmail_state(
                                     imap,
                                     target_mailbox,
                                     row,
@@ -3812,7 +3838,9 @@ def provider_validate_account(
                                     create_if_missing=False,
                                     used_gmail_msgids=used_target_gmail_msgids,
                                 )
-                            if actual_labels is None:
+                                actual_labels = actual_state[0] if actual_state is not None else None
+                                actual_flags = actual_state[1] if actual_state is not None else None
+                            if actual_labels is None or actual_flags is None:
                                 report["remote_missing"].append(identity)
                                 continue
                             expected_labels = {
@@ -3826,6 +3854,21 @@ def provider_validate_account(
                                 report["failed"].append(
                                     f"target Gmail labels missing for {identity} in {target_mailbox}: "
                                     + ", ".join(missing_labels)
+                                )
+                            try:
+                                required_flags = required_provider_flag_set(
+                                    str(row.get("flags") or ""),
+                                    target_provider=config.target.provider,
+                                    permanent_flags=None,
+                                )
+                            except Exception as exc:
+                                report["failed"].append(f"target Gmail flag validation failed for {identity}: {exc}")
+                                continue
+                            missing_flags = sorted(required_flags - actual_flags)
+                            if missing_flags:
+                                report["failed"].append(
+                                    f"target Gmail flags missing for {identity} in {target_mailbox}: "
+                                    + ", ".join(missing_flags)
                                 )
                         else:
                             target_num = consume_target_match_num(

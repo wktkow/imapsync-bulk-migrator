@@ -2792,6 +2792,28 @@ def test_provider_import_preserves_supported_imap_keywords(tmp_path: Path) -> No
     assert fake.appended_flags == ["(\\Seen $Forwarded NonJunk)"]
 
 
+def test_provider_import_allows_keywords_when_permanentflags_absent(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen $Forwarded NonJunk \\Recent"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    fake = FakeTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.appended_flags == ["(\\Seen $Forwarded NonJunk)"]
+
+
 def test_provider_import_rejects_unsupported_imap_keywords_before_pending_journal(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -2874,6 +2896,37 @@ def test_provider_validation_rejects_missing_supported_imap_keyword(tmp_path: Pa
 
     assert not report["ok"]
     assert any("target IMAP flags missing" in item and "$FORWARDED" in item for item in report["failed"])
+
+
+def test_provider_validation_ignores_readonly_permanentflags_when_flags_present(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "\\Seen \\Answered"
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+    fake = FakeTargetImap(
+        has_existing=True,
+        existing_flags="\\Seen \\Answered",
+        permanent_flags="()",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert report["ok"]
 
 
 def test_provider_validation_empty_mode_rejects_unjournaled_target_content(tmp_path: Path) -> None:
@@ -6074,6 +6127,75 @@ def test_provider_validation_checks_gmail_target_labels(tmp_path: Path) -> None:
     @contextlib.contextmanager
     def matching_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
         yield matching_labels
+
+    with mock.patch("components.provider_ops.imap_connection", matching_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert report["ok"]
+
+
+def test_provider_validation_rejects_missing_gmail_imap_flags(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@example.com", password="gmail-token"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _mark_manifest_source_provider(row, "gmail")
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["flags"] = "\\Seen \\Answered"
+    row["gmail_labels"] = ["\\Inbox"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })) + "\n")
+    missing_flags = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1},
+        gmail_labels=["\\Inbox"],
+        gmail_flags="",
+    )
+
+    @contextlib.contextmanager
+    def missing_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield missing_flags
+
+    with mock.patch("components.provider_ops.imap_connection", missing_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("target Gmail flags missing" in item and "\\ANSWERED" in item for item in report["failed"])
+
+    matching_flags = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1},
+        gmail_labels=["\\Inbox"],
+        gmail_flags="\\Seen \\Answered",
+    )
+
+    @contextlib.contextmanager
+    def matching_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield matching_flags
 
     with mock.patch("components.provider_ops.imap_connection", matching_connection):
         _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
