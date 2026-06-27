@@ -719,8 +719,8 @@ def import_account(
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
         marker = folder_dir / ".mailbox.json"
+        _raise_if_symlink(marker, "legacy mailbox marker")
         if marker.exists():
-            _raise_if_symlink(marker, "legacy mailbox marker")
             staged_marker_paths.add(folder_dir.name)
             with contextlib.suppress(Exception):
                 marker_meta = json.loads(_read_file_no_symlink(marker, "legacy mailbox marker").decode("utf-8"))
@@ -739,8 +739,8 @@ def import_account(
             expected_size: Optional[int] = None
             expected_hash: Optional[str] = None
             mailbox_meta = default_mailbox
+            _raise_if_symlink(meta_path, "legacy message metadata")
             if meta_path.exists():
-                _raise_if_symlink(meta_path, "legacy message metadata")
                 meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
                 if not isinstance(meta, dict):
                     raise RuntimeError(f"{meta_path}: message metadata is not an object")

@@ -5177,6 +5177,51 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_legacy_import_rejects_broken_symlinked_message_metadata_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(folder)
+        meta_path = eml.with_suffix(".json")
+        meta_path.unlink()
+        try:
+            meta_path.symlink_to(tmp_path / "missing.json")
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy message metadata"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_legacy_import_rejects_broken_symlinked_mailbox_marker_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder)
+        marker = folder / ".mailbox.json"
+        marker.write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        marker.unlink()
+        try:
+            marker.symlink_to(tmp_path / "missing-mailbox.json")
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy mailbox marker"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_verify_export_detects_text_part_concatenation_with_rfc822_attachment(self, tmp_path: Path) -> None:
         from verify_export import analyze_message
 
