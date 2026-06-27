@@ -151,10 +151,18 @@ def _open_provider_private_file(path: Path, flags: int) -> int:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        return os.open(path, flags, PRIVATE_FILE_MODE)
+        fd = os.open(path, flags, PRIVATE_FILE_MODE)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
             raise RuntimeError(f"refusing to use symlinked provider file: {path}") from exc
+        raise
+    try:
+        stat_result = os.fstat(fd)
+        if getattr(stat_result, "st_nlink", 1) > 1:
+            raise RuntimeError(f"refusing to use hard-linked provider file: {path}")
+        return fd
+    except Exception:
+        os.close(fd)
         raise
 
 

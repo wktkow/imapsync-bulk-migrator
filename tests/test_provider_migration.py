@@ -172,6 +172,25 @@ def test_provider_append_journal_rejects_symlinked_journal(tmp_path: Path) -> No
     assert victim.read_text(encoding="utf-8") == "outside\n"
 
 
+def test_provider_append_journal_rejects_hard_linked_journal(tmp_path: Path) -> None:
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    victim = tmp_path / "victim-hardlink.jsonl"
+    victim.write_text("outside\n", encoding="utf-8")
+    journal = account_dir / "import-target@example.com.journal.jsonl"
+    try:
+        os.link(victim, journal)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"hard link creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="hard-linked provider file"):
+        append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+    assert victim.read_text(encoding="utf-8") == "outside\n"
+    assert os.stat(victim).st_ino == os.stat(journal).st_ino
+
+
 def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
