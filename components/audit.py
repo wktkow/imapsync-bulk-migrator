@@ -290,13 +290,17 @@ def audit_account(
                 count_mismatched = set()
                 for mbox in remote_mailboxes:
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
+                    key = sanitize_for_path(mbox)
                     if status != "OK":
+                        count_mismatched.add(key)
+                        issues.append(f"{account.email}:{key}: remote mailbox could not be selected: {mbox!r}")
                         continue
                     status, data = imap.uid("search", "ALL")
                     if status != "OK":
+                        count_mismatched.add(key)
+                        issues.append(f"{account.email}:{key}: remote mailbox UID search failed: {mbox!r}")
                         continue
                     num = len((data[0] or b"").split()) if data else 0
-                    key = sanitize_for_path(mbox)
                     previous = remote_mailbox_by_key.get(key)
                     if previous is not None and previous != mbox:
                         count_mismatched.add(key)
