@@ -134,6 +134,22 @@ def test_provider_atomic_json_refuses_preexisting_temp_symlink(tmp_path: Path) -
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
 
 
+def test_provider_atomic_json_allows_symlinked_ancestor_with_real_account_dir(tmp_path: Path) -> None:
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    linked_root = tmp_path / "linked-root"
+    try:
+        linked_root.symlink_to(real_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    account_dir = linked_root / "source@example.com"
+
+    _atomic_json(account_dir / "export-state.json", {"complete": False})
+
+    assert not account_dir.is_symlink()
+    assert (real_root / "source@example.com" / "export-state.json").exists()
+
+
 def test_provider_append_journal_rejects_symlinked_journal(tmp_path: Path) -> None:
     account_dir = tmp_path / "source@example.com"
     account_dir.mkdir()

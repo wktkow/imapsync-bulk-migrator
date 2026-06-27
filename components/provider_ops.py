@@ -102,27 +102,18 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
 
 
 def ensure_private_dir(path: Path) -> None:
-    _raise_if_provider_path_component_symlink(path, "directory")
+    _raise_if_provider_path_symlink(path, "directory")
     path.mkdir(parents=True, exist_ok=True)
-    _raise_if_provider_path_component_symlink(path, "directory")
+    _raise_if_provider_path_symlink(path, "directory")
     if not path.is_dir():
         raise RuntimeError(f"provider directory path is not a directory: {path}")
     with contextlib.suppress(Exception):
         os.chmod(path, PRIVATE_DIR_MODE)
 
 
-def _raise_if_provider_path_component_symlink(path: Path, label: str) -> None:
-    current = path
-    candidates: List[Path] = []
-    while True:
-        candidates.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    for candidate in reversed(candidates):
-        if candidate.is_symlink():
-            raise RuntimeError(f"refusing to use symlinked provider {label}: {candidate}")
+def _raise_if_provider_path_symlink(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked provider {label}: {path}")
 
 
 def _open_provider_private_file(path: Path, flags: int) -> int:
@@ -1339,7 +1330,7 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
 
 
 def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any]]) -> None:
-    _raise_if_provider_path_component_symlink(account_dir, "account directory")
+    _raise_if_provider_path_symlink(account_dir, "account directory")
     expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
     expected_metadata = _manifest_relative_paths(account_dir, rows, "metadata_path")
     for root_name, suffix, expected in (
@@ -1347,7 +1338,7 @@ def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any
         ("metadata", "*.json", expected_metadata),
     ):
         root = account_dir / root_name
-        _raise_if_provider_path_component_symlink(root, "artifact directory")
+        _raise_if_provider_path_symlink(root, "artifact directory")
         if not root.exists():
             continue
         for path in sorted(root.rglob(suffix)):
