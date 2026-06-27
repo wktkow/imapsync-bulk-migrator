@@ -4763,6 +4763,49 @@ class TestRound7ConfirmedBugs:
 
         assert victim.read_text() == ""
 
+    def test_verify_export_detects_text_part_concatenation_with_rfc822_attachment(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "text-part-concat-with-attachment.eml"
+        payload = (
+            b"Message-ID: <outer@example.com>\r\n"
+            b"From: outer@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Subject: attached message\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+            b"\r\n"
+            b"--b\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"body before corruption\r\n"
+            b"Message-ID: <second@example.com>\r\n"
+            b"From: second@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"\r\n"
+            b"second body\r\n"
+            b"--b\r\n"
+            b"Content-Type: message/rfc822\r\n"
+            b"Content-Disposition: attachment; filename=\"attached.eml\"\r\n"
+            b"\r\n"
+            b"Message-ID: <inner@example.com>\r\n"
+            b"From: inner@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"\r\n"
+            b"inner body\r\n"
+            b"--b--\r\n"
+        )
+        eml_path.write_bytes(payload)
+        json_path = tmp_path / "text-part-concat-with-attachment.json"
+        json_path.write_text(json.dumps(_legacy_integrity_metadata(payload)))
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert error is None
+        assert analysis is not None
+        assert "message/rfc822" in analysis["content_types"]
+        assert analysis["multiple_messages_detected"] is True
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256

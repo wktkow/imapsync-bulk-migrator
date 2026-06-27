@@ -72,6 +72,28 @@ def _starts_with_rfc822_header_block(msg_text):
     )
 
 
+def _decoded_text_payload(part):
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        raw_payload = part.get_payload()
+        return raw_payload if isinstance(raw_payload, str) else ''
+    charset = part.get_content_charset() or 'utf-8'
+    try:
+        return payload.decode(charset, errors='ignore')
+    except LookupError:
+        return payload.decode('utf-8', errors='ignore')
+
+
+def _non_encapsulated_text_has_rfc822_header_block(part):
+    if part.get_content_type() == 'message/rfc822':
+        return False
+    if part.is_multipart():
+        return any(_non_encapsulated_text_has_rfc822_header_block(child) for child in part.iter_parts())
+    if part.get_content_maintype() != 'text':
+        return False
+    return _has_later_rfc822_header_block('\n\n' + _decoded_text_payload(part))
+
+
 def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None):
     """Analyze a single exported message"""
     try:
@@ -95,7 +117,10 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
         has_encapsulated_rfc822 = any(part.get_content_type() == 'message/rfc822' for part in parts)
         later_rfc822_header_block = _has_later_rfc822_header_block(msg_text)
         if has_encapsulated_rfc822:
-            later_rfc822_header_block = _starts_with_rfc822_header_block(msg.epilogue or '')
+            later_rfc822_header_block = (
+                _starts_with_rfc822_header_block(msg.epilogue or '')
+                or _non_encapsulated_text_has_rfc822_header_block(msg)
+            )
         
         # Read metadata
         if not json_path.exists():
