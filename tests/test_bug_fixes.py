@@ -5743,6 +5743,27 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_direct_import_rejects_missing_legacy_message_sidecar_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <missing-sidecar-import@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        eml.with_suffix(".json").unlink()
+
+        with pytest.raises(RuntimeError, match="missing message metadata"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_direct_import_rejects_original_mailbox_without_marker_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

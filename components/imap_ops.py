@@ -773,30 +773,29 @@ def import_account(
             expected_hash: Optional[str] = None
             mailbox_meta = default_mailbox
             _raise_if_symlink(meta_path, "legacy message metadata")
-            if meta_path.exists():
-                meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
-                if not isinstance(meta, dict):
-                    raise RuntimeError(f"{meta_path}: message metadata is not an object")
-                expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
-                flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
-                account_meta = meta.get("account")
-                if not isinstance(account_meta, str) or not account_meta.strip():
-                    raise RuntimeError(f"{meta_path}: missing account metadata")
-                if account_meta != account.email:
-                    raise RuntimeError(f"{meta_path}: account metadata mismatch (account={account.email} meta={account_meta})")
-                mbox = meta.get("mailbox")
-                if not isinstance(mbox, str) or not mbox.strip():
-                    raise RuntimeError(f"{meta_path}: missing mailbox metadata")
-                if sanitize_for_path(mbox) != folder_dir.name:
-                    raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
-                if marker_mailbox_present:
-                    if mbox != default_mailbox:
-                        raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
-                elif mbox != folder_dir.name:
-                    raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
-                mailbox_meta = mbox
-            elif not marker_mailbox_present:
-                raise RuntimeError(f"{eml_path}: missing mailbox metadata")
+            if not meta_path.exists():
+                raise RuntimeError(f"{eml_path}: missing message metadata")
+            meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
+            if not isinstance(meta, dict):
+                raise RuntimeError(f"{meta_path}: message metadata is not an object")
+            expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
+            flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
+            account_meta = meta.get("account")
+            if not isinstance(account_meta, str) or not account_meta.strip():
+                raise RuntimeError(f"{meta_path}: missing account metadata")
+            if account_meta != account.email:
+                raise RuntimeError(f"{meta_path}: account metadata mismatch (account={account.email} meta={account_meta})")
+            mbox = meta.get("mailbox")
+            if not isinstance(mbox, str) or not mbox.strip():
+                raise RuntimeError(f"{meta_path}: missing mailbox metadata")
+            if sanitize_for_path(mbox) != folder_dir.name:
+                raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
+            if marker_mailbox_present:
+                if mbox != default_mailbox:
+                    raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
+            elif mbox != folder_dir.name:
+                raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
+            mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
