@@ -505,6 +505,31 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     logging.info("[export] %s: completed", account.email)
 
 
+def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object]) -> Tuple[Optional[int], Optional[str]]:
+    expected_size_raw = meta.get("rfc822_size")
+    expected_size: Optional[int] = None
+    if expected_size_raw is not None:
+        if type(expected_size_raw) is not int or expected_size_raw < 0:
+            raise RuntimeError(f"{meta_path}: invalid rfc822_size metadata")
+        expected_size = expected_size_raw
+    expected_hash_raw = meta.get("content_sha256")
+    expected_hash: Optional[str] = None
+    if expected_hash_raw is not None:
+        expected_hash = str(expected_hash_raw).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise RuntimeError(f"{meta_path}: invalid content_sha256 metadata")
+    return expected_size, expected_hash
+
+
+def _require_legacy_payload_integrity(eml_path: Path, data: bytes, expected_size: Optional[int], expected_hash: Optional[str]) -> None:
+    if expected_size is not None and len(data) != expected_size:
+        raise RuntimeError(f"{eml_path}: rfc822_size mismatch (metadata={expected_size} actual={len(data)})")
+    if expected_hash is not None:
+        actual_hash = hashlib.sha256(data).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(f"{eml_path}: content_sha256 mismatch")
+
+
 def import_account(
     account: Account,
     server: ServerConfig,
@@ -578,7 +603,7 @@ def import_account(
         return True
 
     # Build worklist before opening IMAP connection
-    per_folder: Dict[str, List[Tuple[Path, str, Optional[str]]]] = {}
+    per_folder: Dict[str, List[Tuple[Path, str, Optional[str], Optional[int], Optional[str]]]] = {}
     staged_marker_paths: set[str] = set()
     staged_markers: Dict[str, Dict[str, object]] = {}
     for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
@@ -600,16 +625,21 @@ def import_account(
             meta_path = eml_path.with_suffix(".json")
             flags = ""
             internaldate = None
+            expected_size: Optional[int] = None
+            expected_hash: Optional[str] = None
             mailbox_meta = default_mailbox
             if meta_path.exists():
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
+                    if not isinstance(meta, dict):
+                        raise RuntimeError(f"{meta_path}: message metadata is not an object")
+                    expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
                     flags = str(meta.get("flags", ""))
                     internaldate = meta.get("internaldate") or None
                     mbox = meta.get("mailbox")
                     if isinstance(mbox, str) and mbox.strip():
                         mailbox_meta = mbox
-            per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate))
+            per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
     if not any(entries for entries in per_folder.values()):
@@ -676,10 +706,11 @@ def import_account(
                         raise RuntimeError(f"cannot select or create mailbox {mailbox}")
                 subscribe_mailbox(imap, mailbox)
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
-                for eml_path, flags, internaldate in entries:
+                for eml_path, flags, internaldate, expected_size, expected_hash in entries:
                     _raise_if_stopped(stop_event, f"legacy import {account.email}")
                     with open(eml_path, "rb") as f:
                         data = f.read()
+                    _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
                     flags_str = ""
                     if flags:
                         raw_tokens = [tok for tok in (flags.split()) if tok and tok.strip()]
