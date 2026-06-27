@@ -4266,3 +4266,34 @@ class TestRound4ConfirmedBugs:
         assert "message/rfc822" in analysis["content_types"]
         assert analysis["attachment_count"] == 1
         assert analysis["multiple_messages_detected"] is False
+
+    def test_strict_audit_rejects_boolean_message_counts(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="INBOX",
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": True}))
+        state_path = tmp_path / "user@example.com" / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"][0]["message_count"] = True
+        state_path.write_text(json.dumps(state))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("export-state mailbox 'INBOX' has invalid message_count" in issue for issue in issues)
+        assert any("mailbox marker has invalid message_count" in issue for issue in issues)

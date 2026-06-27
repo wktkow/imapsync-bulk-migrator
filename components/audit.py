@@ -123,7 +123,7 @@ def _legacy_export_state_issues(
         if not isinstance(path, str) or path != expected_path:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} path mismatch")
             path = expected_path
-        if not isinstance(message_count, int) or message_count < 0:
+        if type(message_count) is not int or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
         previous_mailbox = state_mailbox_by_path.get(path)
@@ -228,7 +228,9 @@ def audit_account(
             try:
                 marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
                 expected_count = marker.get("message_count") if isinstance(marker, dict) else None
-                if isinstance(expected_count, int) and expected_count != len(emls):
+                if type(expected_count) is not int or expected_count < 0:
+                    issues.append(f"{account.email}:{folder}: mailbox marker has invalid message_count")
+                elif expected_count != len(emls):
                     issues.append(f"{account.email}:{folder}: mailbox marker count mismatch (marker={expected_count} eml={len(emls)})")
                 mailbox_name = marker.get("mailbox") if isinstance(marker, dict) else None
                 if isinstance(mailbox_name, str) and mailbox_name and sanitize_for_path(mailbox_name) != folder:
