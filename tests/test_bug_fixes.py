@@ -5256,6 +5256,99 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    @pytest.mark.parametrize("bad_size", [True, 1.0])
+    def test_provider_metadata_manifest_rejects_json_type_drift(self, tmp_path: Path, bad_size: object) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.provider_ops import metadata_manifest_issues
+
+        account_dir = tmp_path / "source@example.com"
+        (account_dir / "metadata").mkdir(parents=True)
+        body = b"x"
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "target_account": "target@example.com",
+            "primary_mailbox": "INBOX",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": 1,
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-1.eml",
+            "metadata_path": "metadata/provider-1.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        metadata = dict(row)
+        metadata["rfc822_size"] = bad_size
+        (account_dir / "metadata/provider-1.json").write_text(json.dumps(metadata))
+
+        issues = metadata_manifest_issues(account_dir, [row])
+
+        assert any("provider-1: metadata rfc822_size differs from manifest" in issue for issue in issues)
+
+    def test_provider_import_rejects_type_drifted_metadata_before_target_contact(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import (
+            provider_account_endpoint_state,
+            provider_account_endpoint_state_digest,
+            provider_import_account,
+            provider_manifest_digest,
+        )
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        account_dir = tmp_path / "source@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"x"
+        (account_dir / "messages/provider-1.eml").write_bytes(body)
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "primary_mailbox": "INBOX",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": 1,
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-1.eml",
+            "metadata_path": "metadata/provider-1.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        metadata = dict(row)
+        metadata["rfc822_size"] = True
+        (account_dir / "metadata/provider-1.json").write_text(json.dumps(metadata))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": source.provider,
+            "target_provider": target.provider,
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+            "source_endpoint": provider_account_endpoint_state(source, account, role="source"),
+            "source_endpoint_sha256": provider_account_endpoint_state_digest(source, account, role="source"),
+            "target_endpoint": provider_account_endpoint_state(target, account, role="target"),
+            "target_endpoint_sha256": provider_account_endpoint_state_digest(target, account, role="target"),
+        }))
+
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            with pytest.raises(RuntimeError, match="metadata rfc822_size differs from manifest"):
+                provider_import_account(config, account, tmp_path)
+
     def test_verify_export_rejects_missing_legacy_mailbox_metadata(
         self,
         tmp_path: Path,

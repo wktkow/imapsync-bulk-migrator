@@ -116,6 +116,20 @@ def _raise_if_provider_path_symlink(path: Path, label: str) -> None:
         raise RuntimeError(f"refusing to use symlinked provider {label}: {path}")
 
 
+def _json_values_match(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        if set(left) != set(right):
+            return False
+        return all(_json_values_match(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return False
+        return all(_json_values_match(left_item, right_item) for left_item, right_item in zip(left, right))
+    return left == right
+
+
 def _open_provider_private_file(path: Path, flags: int) -> int:
     if path.is_symlink():
         raise RuntimeError(f"refusing to use symlinked provider file: {path}")
@@ -1278,7 +1292,7 @@ def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, r
                 issues.append(f"{identity}: metadata {key} missing from metadata")
             elif key not in row:
                 issues.append(f"{identity}: metadata {key} absent from manifest")
-            elif metadata[key] != row[key]:
+            elif not _json_values_match(metadata[key], row[key]):
                 issues.append(f"{identity}: metadata {key} differs from manifest")
     return issues
 
