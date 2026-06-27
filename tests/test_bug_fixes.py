@@ -2094,6 +2094,47 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
+    def test_legacy_validate_rejects_malformed_import_journal_without_repair(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        folder = account_dir / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <journal-malformed@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=source,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        journal = account_dir / "import.journal.jsonl"
+        original_journal = json.dumps({"key": "k", "target": "target", "status": "committed"}) + "\n{\"key\":"
+        journal.write_text(original_journal)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        assert journal.read_text() == original_journal
+
     def test_legacy_validate_allows_pending_resolved_by_later_committed_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main

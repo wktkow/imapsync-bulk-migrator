@@ -898,7 +898,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         return
                     current_target = _legacy_import_target_id(config.server, acc)
                     unresolved_pending_keys = _unresolved_legacy_pending_keys(
-                        _load_legacy_import_journal(account_dir),
+                        _load_legacy_import_journal(account_dir, repair_trailing=False),
                         current_target,
                     )
                     if unresolved_pending_keys:

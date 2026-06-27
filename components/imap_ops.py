@@ -330,7 +330,7 @@ def _unresolved_legacy_pending_keys(rows: List[Dict[str, str]], target_id: str) 
     }
 
 
-def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
+def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = True) -> List[Dict[str, str]]:
     path = _legacy_import_journal_path(account_dir)
     rows: List[Dict[str, str]] = []
     _raise_if_symlink(path, "legacy import journal")
@@ -345,11 +345,11 @@ def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            if line_no == len(lines):
+            if repair_trailing and line_no == len(lines):
                 logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
                 needs_rewrite = True
                 break
-            raise
+            raise RuntimeError(f"import journal row {line_no} is malformed: {path}") from None
         if not isinstance(row, dict):
             raise RuntimeError(f"import journal row {line_no} is not an object: {path}")
         coerced = {str(k): str(v) for k, v in row.items()}
