@@ -576,7 +576,7 @@ def _valid_legacy_flag_token(token: str) -> bool:
         return False
     if token == "\\" or "\\" in token[1:]:
         return False
-    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in token):
+    if any(ord(ch) <= 32 or ord(ch) >= 127 for ch in token):
         return False
     return not any(ch in '(){}%*"]' for ch in token)
 
