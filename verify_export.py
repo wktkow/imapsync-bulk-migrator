@@ -192,6 +192,13 @@ def verify_account(account_path):
         
         # Process all .eml files in folder
         eml_files = list(folder_path.glob("*.eml"))
+        json_files = [path for path in folder_path.glob("*.json") if path.name != ".mailbox.json"]
+        eml_stems = {path.stem for path in eml_files}
+        json_stems = {path.stem for path in json_files}
+        orphan_metadata = sorted(json_stems - eml_stems)
+        if orphan_metadata:
+            errors.append(f"{folder_name}: {len(orphan_metadata)} metadata file(s) without .eml counterpart")
+            folder_errors += 1
         for eml_file in eml_files:
             json_file = eml_file.with_suffix('.json')
             

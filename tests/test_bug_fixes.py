@@ -4267,6 +4267,28 @@ class TestRound4ConfirmedBugs:
         assert analysis["attachment_count"] == 1
         assert analysis["multiple_messages_detected"] is False
 
+    def test_verify_export_rejects_orphan_message_sidecar(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        inbox = tmp_path / "exported" / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        payload = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        (inbox / "u0000000001.eml").write_bytes(payload)
+        (inbox / "u0000000001.json").write_text(json.dumps({
+            "content_sha256": hashlib.sha256(payload).hexdigest(),
+            "rfc822_size": len(payload),
+        }))
+        (inbox / "u0000000002.json").write_text(json.dumps({
+            "content_sha256": hashlib.sha256(b"missing").hexdigest(),
+            "rfc822_size": len(b"missing"),
+        }))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert stats["errors"] == 1
+        assert main() == 1
+
     def test_strict_audit_rejects_boolean_message_counts(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig
