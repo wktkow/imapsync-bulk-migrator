@@ -12,7 +12,21 @@ SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.@+-]+")
 def sanitize_for_path(name: str) -> str:
     name = name.strip().replace(os.sep, "_").replace("/", "_")
     name = SANITIZE_PATTERN.sub("_", name)
-    return name[:200] if len(name) > 200 else name
+    name = name[:200] if len(name) > 200 else name
+    if name in {"", ".", ".."}:
+        return "_"
+    return name
+
+
+_IMAP_ATOM_SPECIALS = set('(){ %*"\\]')
+
+
+def quote_imap_search_value(value: str) -> str:
+    """Return an IMAP search string safe for imaplib's raw argument joining."""
+    if value and not any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _IMAP_ATOM_SPECIALS for ch in value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
 
 
 def encode_imap_utf7(value: str) -> str:
@@ -111,4 +125,3 @@ def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
         raise RuntimeError(
             f"Insufficient free disk space at {probe}: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
         )
-

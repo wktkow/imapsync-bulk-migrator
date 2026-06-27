@@ -102,8 +102,9 @@ class ProviderEndpoint:
         if provider not in {"gmail", "icloud", "imap"}:
             raise ValueError(f"{context}.provider must be one of: gmail, icloud, imap")
         host = raw.get("host")
-        if not host or not isinstance(host, str):
+        if not isinstance(host, str) or not host.strip():
             raise ValueError(f"{context}.host must be a non-empty string")
+        host = host.strip()
         port = _int_value(raw.get("port", 993), f"{context}.port", min_value=1, max_value=65535)
         use_ssl = _bool_value(raw.get("ssl", True), f"{context}.ssl")
         starttls = _bool_value(raw.get("starttls", False), f"{context}.starttls")
@@ -189,10 +190,12 @@ class MigrationAccount:
             raise ValueError(f"accounts[{index}] must be an object")
         source_email = raw.get("source_email")
         target_email = raw.get("target_email")
-        if not source_email or not isinstance(source_email, str):
+        if not isinstance(source_email, str) or not source_email.strip():
             raise ValueError(f"accounts[{index}].source_email must be a non-empty string")
-        if not target_email or not isinstance(target_email, str):
+        if not isinstance(target_email, str) or not target_email.strip():
             raise ValueError(f"accounts[{index}].target_email must be a non-empty string")
+        source_email = source_email.strip()
+        target_email = target_email.strip()
         return MigrationAccount(
             source_email=source_email,
             target_email=target_email,
@@ -477,8 +480,9 @@ class Config:
                 raise ValueError(f"accounts[{idx}] must be an object")
             email = item.get("email")
             password = item.get("password")
-            if not email or not isinstance(email, str):
+            if not isinstance(email, str) or not email.strip():
                 raise ValueError(f"accounts[{idx}].email must be a non-empty string")
+            email = email.strip()
             if not isinstance(password, str):
                 raise ValueError(f"accounts[{idx}].password must be a string (can be empty)")
             email_key = email.strip()
@@ -495,8 +499,9 @@ def _server_config_from_dict(raw: Any, *, context: str) -> ServerConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config must include '{context}' object" if context == "server" else f"{context} must be an object")
     host = raw.get("host")
-    if not host or not isinstance(host, str):
+    if not isinstance(host, str) or not host.strip():
         raise ValueError(f"{context}.host must be a non-empty string")
+    host = host.strip()
     host_key = host.strip().lower().rstrip(".")
     known_provider_hosts = {"imap.gmail.com": "gmail", "imap.mail.me.com": "icloud"}
     if host_key in known_provider_hosts:
