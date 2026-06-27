@@ -3722,6 +3722,33 @@ def test_provider_validation_many_to_one_reports_cross_source_canonical_id_colli
     assert any("merge group canonical_id collision: provider-shared" in item for item in report["failed"])
 
 
+def test_provider_audit_many_to_one_reports_cross_source_canonical_id_collision(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+
+    ok, issues = provider_audit_all(config, tmp_path, max_workers=1)
+
+    assert not ok
+    assert any("merge group canonical_id collision: provider-shared" in issue for issue in issues)
+
+
 def test_provider_import_many_to_one_empty_mode_rejects_unjournaled_target_content(tmp_path: Path) -> None:
     config = _many_to_one_config()
     first, second = config.accounts

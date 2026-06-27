@@ -4038,6 +4038,41 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     return account.email, issues
 
 
+def provider_merge_group_identity_collision_issues(config: ProviderMigrationConfig, in_root: Path) -> List[str]:
+    if not provider_account_merge_enabled(config):
+        return []
+    grouped: Dict[Tuple[str, str], List[MigrationAccount]] = {}
+    for account in config.accounts:
+        grouped.setdefault(target_merge_group_key(config, account), []).append(account)
+    issues: List[str] = []
+    for group_accounts in grouped.values():
+        if len(group_accounts) < 2:
+            continue
+        owners_by_identity: Dict[str, str] = {}
+        target_label = group_accounts[0].target_email
+        for account in group_accounts:
+            account_dir = account_export_dir(in_root, account)
+            if account_dir.is_symlink() or not account_dir.exists():
+                continue
+            try:
+                manifest_rows = load_manifest(account_dir)
+            except Exception:
+                continue
+            for row in manifest_rows:
+                identity = str(row.get("canonical_id") or "")
+                if not identity:
+                    continue
+                previous_owner = owners_by_identity.get(identity)
+                if previous_owner is None:
+                    owners_by_identity[identity] = account.source_email
+                elif previous_owner != account.source_email:
+                    issues.append(
+                        f"{target_label}: merge group canonical_id collision: "
+                        f"{identity} in {previous_owner} and {account.source_email}"
+                    )
+    return issues
+
+
 def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     if in_root.is_symlink():
@@ -4053,6 +4088,7 @@ def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_wo
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="provider-audit") as ex:
         for result in ex.map(worker, config.accounts):
             issues.extend(result)
+    issues.extend(provider_merge_group_identity_collision_issues(config, in_root))
     return len(issues) == 0, issues
 
 
