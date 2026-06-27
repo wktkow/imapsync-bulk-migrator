@@ -3082,12 +3082,7 @@ class GenericSpecialUseTarget(StoredMessageTarget):
         ]
 
 
-def _write_manifest_fixture(root: Path) -> Path:
-    account_dir = root / "source@example.com"
-    (account_dir / "messages").mkdir(parents=True)
-    (account_dir / "metadata").mkdir()
-    eml = account_dir / "messages" / "gmail-123.eml"
-    eml.write_bytes(b"Message-ID: <m1@example.com>\r\n\r\nbody")
+def _default_manifest_fixture_row() -> dict:
     row = {
         "canonical_id": "gmail-123",
         "source_provider": "gmail",
@@ -3103,6 +3098,16 @@ def _write_manifest_fixture(root: Path) -> Path:
         "metadata_path": "metadata/gmail-123.json",
     }
     row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+    return row
+
+
+def _write_manifest_fixture(root: Path) -> Path:
+    account_dir = root / "source@example.com"
+    (account_dir / "messages").mkdir(parents=True)
+    (account_dir / "metadata").mkdir()
+    eml = account_dir / "messages" / "gmail-123.eml"
+    eml.write_bytes(b"Message-ID: <m1@example.com>\r\n\r\nbody")
+    row = _default_manifest_fixture_row()
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir)
@@ -3242,7 +3247,17 @@ def _journal_fixture(
     account: Optional[MigrationAccount] = None,
 ) -> dict:
     account = account or config.accounts[0]
-    return {**provider_target_journal_binding(config, account), **row}
+    journal_row = {**provider_target_journal_binding(config, account), **row}
+    if journal_row.get("canonical_id") == "gmail-123":
+        manifest_row = _default_manifest_fixture_row()
+        manifest_row["source_provider"] = config.source.provider
+        manifest_row["source_account"] = account.source_email
+        manifest_row["target_account"] = account.target_email
+        journal_row.setdefault("content_sha256", manifest_row["content_sha256"])
+        journal_row.setdefault("rfc822_size", manifest_row["rfc822_size"])
+        manifest_row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(manifest_row)
+        journal_row.setdefault(CONTENT_BINDING_FIELD, manifest_row[CONTENT_BINDING_FIELD])
+    return journal_row
 
 
 def _mark_manifest_source_provider(row: dict, provider: str) -> dict:
@@ -3719,6 +3734,8 @@ def test_provider_validation_hybrid_many_to_one_checks_distinct_target_groups(tm
             "target_account": account.target_email,
             "target_mailbox": "Archive",
             "status": "committed",
+            "content_sha256": hashlib.sha256(bodies_by_source[account.source_email]).hexdigest(),
+            "rfc822_size": len(bodies_by_source[account.source_email]),
         }, account=account)) + "\n")
     targets = {
         "a@example.com": StoredMessageTarget({
@@ -5867,6 +5884,30 @@ def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
     assert report["committed"] == 1
 
 
+def test_provider_audit_and_offline_validate_reject_stale_journal_content(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    stale = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "content_sha256": "0" * 64,
+        "rfc822_size": 1,
+        CONTENT_BINDING_FIELD: "0" * 64,
+    })
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(stale) + "\n")
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any("journal committed content_sha256 does not match manifest" in issue for issue in issues)
+    assert any("journal committed rfc822_size does not match manifest" in issue for issue in issues)
+    assert not report["ok"]
+    assert any("journal committed content_sha256 does not match manifest" in issue for issue in report["failed"])
+
+
 def test_provider_validation_requires_gmail_target_extensions(tmp_path: Path) -> None:
     class NoGmailExtensionTarget(FakeGmailTargetImap):
         def capability(self):
@@ -6864,11 +6905,13 @@ def test_provider_validation_accepts_journaled_gmail_target_ids_for_identical_so
             "eml_path": eml_path,
             "metadata_path": metadata_path,
         }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
         (account_dir / eml_path).write_bytes(body)
         (account_dir / metadata_path).write_text(json.dumps(row))
         rows.append(row)
     (account_dir / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
     _write_provider_export_state(account_dir, target="target@gmail.com")
+    row_by_id = {row["canonical_id"]: row for row in rows}
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text("".join(
         json.dumps(_journal_fixture(config, {
             "canonical_id": canonical_id,
@@ -6876,6 +6919,9 @@ def test_provider_validation_accepts_journaled_gmail_target_ids_for_identical_so
             "target_mailbox": "INBOX",
             "status": "committed",
             "target_gmail_msgid": target_gmail_msgid,
+            "content_sha256": row_by_id[canonical_id]["content_sha256"],
+            "rfc822_size": row_by_id[canonical_id]["rfc822_size"],
+            CONTENT_BINDING_FIELD: row_by_id[canonical_id][CONTENT_BINDING_FIELD],
         })) + "\n"
         for canonical_id, target_gmail_msgid in (("gmail-111", "9001"), ("gmail-222", "9002"))
     ))

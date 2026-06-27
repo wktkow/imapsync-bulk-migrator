@@ -1439,6 +1439,29 @@ def committed_journal_target_mailbox_issues(
     return issues
 
 
+def committed_journal_manifest_content_issues(
+    rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+) -> List[str]:
+    manifest_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    issues: List[str] = []
+    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(rows).items():
+        manifest_row = manifest_by_id.get(identity)
+        label = f"{identity} in {target_mailbox or '<missing>'}"
+        if manifest_row is None:
+            issues.append(f"journal committed identity not in manifest: {identity}")
+            continue
+        if journal_row.get("content_sha256") != manifest_row.get("content_sha256"):
+            issues.append(f"journal committed content_sha256 does not match manifest: {label}")
+        if journal_row.get("rfc822_size") != manifest_row.get("rfc822_size"):
+            issues.append(f"journal committed rfc822_size does not match manifest: {label}")
+    return issues
+
+
 def journal_target_endpoint_issues(
     rows: List[Dict[str, Any]],
     *,
@@ -3677,7 +3700,9 @@ def _journal_row(
         "action": action,
         "flags": row.get("flags") or "",
         "internaldate": row.get("internaldate") or "",
+        "content_sha256": row.get("content_sha256"),
         "rfc822_size": int(row.get("rfc822_size") or 0),
+        CONTENT_BINDING_FIELD: row.get(CONTENT_BINDING_FIELD),
         "timestamp": _utc_now(),
     }
     if target_gmail_msgid:
@@ -3725,6 +3750,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     else:
         issues.extend(journal_row_issues(journal_rows, account))
         issues.extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
+        issues.extend(committed_journal_manifest_content_issues(journal_rows, rows))
         if config.target.provider == "gmail":
             issues.extend(invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
     if config.target.provider == "gmail":
@@ -3849,6 +3875,7 @@ def provider_validate_account(
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
+    report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
     committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
     for row in journal_rows:
         if row.get("status") != "pending":
