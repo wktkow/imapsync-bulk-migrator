@@ -653,6 +653,18 @@ def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -
     return flags, internaldate
 
 
+def _validate_legacy_uid_metadata(meta_path: Path, eml_path: Path, meta: Dict[str, object]) -> None:
+    stem = eml_path.stem
+    if not (stem.startswith("u") and stem[1:].isdigit()):
+        return
+    uid_in_name = int(stem[1:])
+    uid_meta = meta.get("uid")
+    if "uid" in meta and type(uid_meta) is not int:
+        raise RuntimeError(f"{meta_path}: invalid uid metadata")
+    if isinstance(uid_meta, int) and uid_meta != uid_in_name:
+        raise RuntimeError(f"{meta_path}: uid mismatch (name={uid_in_name} meta={uid_meta})")
+
+
 def import_account(
     account: Account,
     server: ServerConfig,
@@ -792,6 +804,7 @@ def import_account(
             meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
             if not isinstance(meta, dict):
                 raise RuntimeError(f"{meta_path}: message metadata is not an object")
+            _validate_legacy_uid_metadata(meta_path, eml_path, meta)
             expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
             flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
             account_meta = meta.get("account")

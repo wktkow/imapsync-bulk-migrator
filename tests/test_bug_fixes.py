@@ -8039,6 +8039,45 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    @pytest.mark.parametrize(
+        ("uid_value", "message"),
+        [
+            (2, "uid mismatch"),
+            ("1", "invalid uid metadata"),
+        ],
+    )
+    def test_direct_import_rejects_legacy_uid_metadata_before_connect(
+        self,
+        tmp_path: Path,
+        uid_value: object,
+        message: str,
+    ) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            uid=1,
+            mailbox="INBOX",
+            data=b"Message-ID: <uid-mismatch@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["uid"] = uid_value
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match=message):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_verify_export_rejects_invalid_legacy_delivery_metadata(
         self,
         tmp_path: Path,
