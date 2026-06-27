@@ -1856,6 +1856,44 @@ class TestCliAndConfigHardening:
         assert "Choose only one control panel integration" in error_text
         assert "Input directory does not exist" not in error_text
 
+    @pytest.mark.parametrize(
+        ("backend_flag", "wrong_dry_run", "expected_error"),
+        [
+            ("--auto-provision-da", "--cpanel-dry-run", "--cpanel-dry-run requires --auto-provision-cpanel"),
+            ("--auto-provision-cpanel", "--da-dry-run", "--da-dry-run requires --auto-provision-da"),
+        ],
+    )
+    def test_main_rejects_wrong_backend_dry_run_before_input_checks(
+        self,
+        tmp_path: Path,
+        backend_flag: str,
+        wrong_dry_run: str,
+        expected_error: str,
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.logging.error") as log_error:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "missing-input"),
+                "--log-dir", str(tmp_path / f"logs-{backend_flag[2:]}"),
+                "--min-free-gb", "0",
+                backend_flag,
+                wrong_dry_run,
+            ])
+
+        assert rc == 2
+        error_text = " ".join(str(call) for call in log_error.call_args_list)
+        assert expected_error in error_text
+        assert "Input directory does not exist" not in error_text
+
     def test_main_free_space_check_uses_requested_output_not_cwd(self, tmp_path: Path) -> None:
         from components.main import main
 

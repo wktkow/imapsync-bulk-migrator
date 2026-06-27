@@ -513,6 +513,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
         logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
         return 2
+    if bool(getattr(args, "da_dry_run", False)) and not use_da_panel:
+        logging.error("--da-dry-run requires --auto-provision-da")
+        return 2
+    if bool(getattr(args, "cpanel_dry_run", False)) and not use_cpanel:
+        logging.error("--cpanel-dry-run requires --auto-provision-cpanel")
+        return 2
     panel_dry_run_requested = (
         args.mode == "import"
         and not is_provider_config
