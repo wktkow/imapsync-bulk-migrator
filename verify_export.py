@@ -124,7 +124,7 @@ def analyze_message(
         # Read the email
         with open(eml_path, 'rb') as f:
             msg_bytes = f.read()
-        if not msg_bytes:
+        if not msg_bytes and content_binding != "provider":
             return None, 'empty file'
         
         # Check for multiple messages concatenated (look for multiple RFC822 headers).
@@ -172,7 +172,8 @@ def analyze_message(
             integrity_errors.append('missing content_sha256 metadata')
         expected_size = metadata.get('rfc822_size')
         if expected_size is not None:
-            if type(expected_size) is not int or expected_size <= 0:
+            min_size = 0 if content_binding == "provider" else 1
+            if type(expected_size) is not int or expected_size < min_size:
                 integrity_errors.append('invalid rfc822_size metadata')
             elif len(msg_bytes) != expected_size:
                 integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
