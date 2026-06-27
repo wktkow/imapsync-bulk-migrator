@@ -234,7 +234,9 @@ def audit_account(
                 elif expected_count != len(emls):
                     issues.append(f"{account.email}:{folder}: mailbox marker count mismatch (marker={expected_count} eml={len(emls)})")
                 mailbox_name = marker.get("mailbox") if isinstance(marker, dict) else None
-                if isinstance(mailbox_name, str) and mailbox_name and sanitize_for_path(mailbox_name) != folder:
+                if not isinstance(mailbox_name, str) or not mailbox_name.strip():
+                    issues.append(f"{account.email}:{folder}: mailbox marker missing mailbox")
+                elif sanitize_for_path(mailbox_name) != folder:
                     issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")

@@ -2140,6 +2140,19 @@ class TestAuditHardening:
 
         assert any("mailbox marker count mismatch" in issue for issue in issues)
 
+    def test_audit_account_flags_mailbox_marker_missing_mailbox(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"message_count": 0}))
+
+        _email, issues = audit_account(account, tmp_path, server=None, check_remote=False)
+
+        assert any("mailbox marker missing mailbox" in issue for issue in issues)
+
     def test_strict_audit_flags_corrupt_message_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
