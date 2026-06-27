@@ -39,18 +39,30 @@ def quote_mailbox_name(mailbox: str) -> str:
 
 
 def ensure_private_dir(path: Path) -> None:
-    if path.is_symlink():
+    if _legacy_symlink_component(path) is not None:
         raise RuntimeError(f"refusing to use symlinked directory: {path}")
     path.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
+    if _legacy_symlink_component(path) is not None:
         raise RuntimeError(f"refusing to use symlinked directory: {path}")
     with contextlib.suppress(Exception):
         os.chmod(path, PRIVATE_DIR_MODE)
 
 
 def _raise_if_symlink(path: Path, label: str) -> None:
-    if path.is_symlink():
+    if _legacy_symlink_component(path) is not None:
         raise RuntimeError(f"refusing to use symlinked {label}: {path}")
+
+
+def _legacy_symlink_component(path: Path) -> Optional[Path]:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return current
+        if not current.exists():
+            break
+    return None
 
 
 def _read_file_no_symlink(path: Path, label: str) -> bytes:

@@ -22,7 +22,7 @@ from .cpanel_ensure import ensure_accounts_exist_cpanel
 from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
-from .imap_ops import archive_legacy_import_journal_for_reset, export_account, import_account
+from .imap_ops import _legacy_symlink_component, archive_legacy_import_journal_for_reset, export_account, import_account
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config, ProviderMigrationConfig, load_config_file
 from .provider_ops import (
@@ -453,7 +453,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             except RuntimeError as exc:
                 logging.error("%s", exc)
                 return 2
-        elif input_root.is_symlink():
+        elif _legacy_symlink_component(input_root) is not None:
             logging.error("Input directory is a symlink: %s", input_root)
             return 2
         if not input_root.exists():
@@ -475,7 +475,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             except RuntimeError as exc:
                 logging.error("%s", exc)
                 return 2
-        elif output_root.is_symlink():
+        elif _legacy_symlink_component(output_root) is not None:
             logging.error("Output directory is a symlink: %s", output_root)
             return 2
 

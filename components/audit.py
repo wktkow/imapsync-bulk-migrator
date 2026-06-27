@@ -12,6 +12,7 @@ from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
 from .imap_ops import (
     _imap_append_wire_bytes,
+    _legacy_symlink_component,
     _validate_legacy_delivery_metadata,
     imap_connection,
     legacy_server_endpoint,
@@ -474,7 +475,7 @@ def audit_export(
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
-    if in_root.is_symlink():
+    if _legacy_symlink_component(in_root) is not None:
         return False, [f"audit root is a symlink: {in_root}"]
     issues_accum: List[str] = []
     expected_source_server = config.source_server if config.source_server is not None else None
