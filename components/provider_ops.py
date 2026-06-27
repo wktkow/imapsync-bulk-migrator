@@ -1801,7 +1801,7 @@ def provider_export_account(
             if row.get("canonical_id")
         }
         try:
-            existing_state = json.loads((account_dir / "export-state.json").read_text(encoding="utf-8"))
+            existing_state = json.loads(_read_provider_private_file(account_dir / "export-state.json"))
         except Exception as exc:
             raise RuntimeError(f"export-state missing or invalid for existing manifest: {exc}") from exc
         if not isinstance(existing_state, dict):

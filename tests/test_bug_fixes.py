@@ -5285,6 +5285,64 @@ class TestRound7ConfirmedBugs:
             with pytest.raises(RuntimeError, match="symlinked provider account directory"):
                 provider_export_account(config, account, out_root)
 
+    def test_provider_export_rejects_symlinked_resume_state_before_source_contact(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import provider_export_account
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        account_dir = tmp_path / "exported" / "source@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <resume@example.com>\r\n\r\nbody"
+        (account_dir / "messages/provider-1.eml").write_bytes(body)
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "primary_mailbox": "INBOX",
+            "message_id_header": "<resume@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-1.eml",
+            "metadata_path": "metadata/provider-1.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / "metadata/provider-1.json").write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        outside_state = tmp_path / "outside-state.json"
+        outside_state.write_text(json.dumps({
+            "source_provider": source.provider,
+            "target_provider": target.provider,
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": False,
+        }))
+        try:
+            (account_dir / "export-state.json").symlink_to(outside_state)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+            with pytest.raises(RuntimeError, match="symlinked provider file"):
+                provider_export_account(config, account, tmp_path / "exported")
+
+        assert (account_dir / "export-state.json").is_symlink()
+
     @pytest.mark.parametrize("bad_size", [True, 1.0])
     def test_provider_metadata_manifest_rejects_json_type_drift(self, tmp_path: Path, bad_size: object) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
