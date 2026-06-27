@@ -287,6 +287,7 @@ def audit_account(
                 remote_mailboxes = list_all_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
                 remote_mailbox_by_key: Dict[str, str] = {}
+                count_mismatched = set()
                 for mbox in remote_mailboxes:
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
                     if status != "OK":
@@ -296,9 +297,16 @@ def audit_account(
                         continue
                     num = len((data[0] or b"").split()) if data else 0
                     key = sanitize_for_path(mbox)
+                    previous = remote_mailbox_by_key.get(key)
+                    if previous is not None and previous != mbox:
+                        count_mismatched.add(key)
+                        issues.append(
+                            f"{account.email}:{key}: remote mailbox name collision after sanitizing: "
+                            f"{previous!r} and {mbox!r}"
+                        )
+                        continue
                     remote_counts[key] = num
                     remote_mailbox_by_key[key] = mbox
-                count_mismatched = set()
                 identity_candidates: List[Tuple[Path, str, str]] = []
                 for folder_dir in folder_dirs:
                     folder = folder_dir.name
