@@ -6628,6 +6628,32 @@ class TestRound7ConfirmedBugs:
         assert rc == 2
         assert not (outside / "exported" / "user@example.com").exists()
 
+    def test_main_rejects_legacy_file_output_root_before_connectivity(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        out_root = tmp_path / "exported"
+        out_root.write_text("not a directory\n", encoding="utf-8")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")), \
+            mock.patch("components.main.export_account", side_effect=AssertionError("export should not run")):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(out_root),
+                "--log-dir", str(tmp_path / "logs-export-file"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+
     def test_strict_audit_rejects_symlinked_input_root(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig
@@ -6823,6 +6849,36 @@ class TestRound7ConfirmedBugs:
         assert rc == 2
 
     @pytest.mark.parametrize("mode", ["import", "validate"])
+    def test_main_rejects_legacy_file_input_root_before_connectivity(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        in_root = tmp_path / "exported"
+        in_root.write_text("not a directory\n", encoding="utf-8")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / f"logs-file-root-{mode}"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+
+    @pytest.mark.parametrize("mode", ["import", "validate"])
     def test_main_rejects_legacy_symlinked_staged_account_before_connectivity(
         self,
         tmp_path: Path,
@@ -6852,6 +6908,37 @@ class TestRound7ConfirmedBugs:
                 "--config", str(config_path),
                 "--input-dir", str(in_root),
                 "--log-dir", str(tmp_path / f"logs-account-{mode}"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+
+    @pytest.mark.parametrize("mode", ["import", "validate"])
+    def test_main_rejects_legacy_file_staged_account_before_connectivity(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        in_root = tmp_path / "exported"
+        in_root.mkdir()
+        (in_root / "user@example.com").write_text("not a directory\n", encoding="utf-8")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / f"logs-account-file-{mode}"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
             ])

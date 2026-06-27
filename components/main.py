@@ -303,7 +303,10 @@ def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
         if account_dir.is_symlink():
             issues.append(f"{acc.email}: account directory is a symlink: {account_dir}")
             continue
-        if not account_dir.exists() or not account_dir.is_dir():
+        if not account_dir.exists():
+            continue
+        if not account_dir.is_dir():
+            issues.append(f"{acc.email}: account path is not a directory: {account_dir}")
             continue
         for path in sorted(account_dir.rglob("*")):
             if path.is_symlink():
@@ -505,13 +508,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not input_root.exists():
             logging.error("Input directory does not exist: %s", input_root)
             return 2
+        if not input_root.is_dir():
+            logging.error("Input directory is not a directory: %s", input_root)
+            return 2
         if not is_provider_config and args.mode in {"import", "validate"}:
             assert isinstance(config, Config)
             symlink_issues = _legacy_staged_symlink_issues(input_root, config)
             if symlink_issues:
-                logging.error("Input directory contains symlinked staged data:")
+                logging.error("Input directory failed local staged preflight:")
                 for issue in symlink_issues:
-                    logging.error("[staged-symlink] %s", issue)
+                    logging.error("[staged-local] %s", issue)
                 return 2
     if args.mode == "export":
         output_root = Path(args.output_dir)
@@ -530,6 +536,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
         elif _legacy_symlink_component(output_root) is not None:
             logging.error("Output directory is a symlink: %s", output_root)
+            return 2
+        elif output_root.exists() and not output_root.is_dir():
+            logging.error("Output directory is not a directory: %s", output_root)
             return 2
 
     try:
