@@ -184,10 +184,10 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optio
 
 def setup_logging(log_directory: Path) -> Path:
     """Initialize root logger with file + stdout handlers and return log path."""
-    if log_directory.is_symlink():
+    if _legacy_symlink_component(log_directory) is not None:
         raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
     log_directory.mkdir(parents=True, exist_ok=True)
-    if log_directory.is_symlink():
+    if _legacy_symlink_component(log_directory) is not None:
         raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
     import logging
     import sys

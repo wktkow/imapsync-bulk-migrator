@@ -1838,6 +1838,25 @@ class TestCliAndConfigHardening:
 
         assert log_file.stat().st_mode & 0o777 == 0o600
 
+    def test_setup_logging_rejects_symlinked_log_directory_ancestor(self, tmp_path: Path) -> None:
+        from components.main import setup_logging
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        log_dir = link / "logs"
+        assert not log_dir.is_symlink()
+
+        with pytest.raises(RuntimeError, match="symlinked log directory"):
+            setup_logging(log_dir)
+
+        assert not (outside / "logs").exists()
+
     def test_setup_logging_does_not_follow_symlinked_log_file(
         self,
         tmp_path: Path,
