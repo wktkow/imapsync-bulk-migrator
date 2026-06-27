@@ -960,7 +960,7 @@ class TestLegacyImportJournal:
         with pytest.raises(
             RuntimeError,
             match=(
-                "no staged \\.eml files|mailbox metadata mismatch|"
+                "invalid legacy export-state|no staged \\.eml files|mailbox metadata mismatch|"
                 "failed to parse mailbox marker|mailbox marker is not an object|"
                 "mailbox marker has invalid message_count"
             ),
@@ -1017,7 +1017,7 @@ class TestLegacyImportJournal:
         with pytest.raises(
             RuntimeError,
             match=(
-                "no staged \\.eml files|mailbox metadata mismatch|"
+                "invalid legacy export-state|no staged \\.eml files|mailbox metadata mismatch|"
                 "failed to parse mailbox marker|mailbox marker is not an object|"
                 "mailbox marker has invalid message_count|mailbox marker count mismatch"
             ),
@@ -5882,6 +5882,36 @@ class TestRound7ConfirmedBugs:
         folder = tmp_path / "user@example.com" / "INBOX"
         _write_legacy_message_fixture(folder, source_server=source_server)
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with pytest.raises(RuntimeError, match="source_server does not match config source_server"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("target.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+                source_server=wrong_source,
+            )
+
+    def test_direct_zero_message_import_rejects_wrong_source_export_state_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account, legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, ServerConfig
+
+        source_server = ServerConfig("source.example.com")
+        wrong_source = ServerConfig("wrong-source.example.com")
+        account_dir = tmp_path / "user@example.com"
+        folder = account_dir / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(source_server),
+            "source_server_sha256": legacy_server_endpoint_digest(source_server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
 
         with pytest.raises(RuntimeError, match="source_server does not match config source_server"):
             import_account(
