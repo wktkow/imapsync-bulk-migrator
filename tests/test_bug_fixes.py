@@ -4381,6 +4381,30 @@ class TestRound2ConfirmedBugs:
         assert main() == 1
         assert "is a symlink" in capsys.readouterr().out
 
+    def test_verify_export_main_rejects_broken_account_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import main
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        inbox = account_dir / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}])
+        try:
+            (tmp_path / "exported" / "broken@example.com").symlink_to(tmp_path / "missing-account", target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        monkeypatch.chdir(tmp_path)
+
+        assert main() == 1
+        output = capsys.readouterr().out
+        assert "broken@example.com" in output
+        assert "account path is a symlink" in output
+
     def test_verify_export_rejects_symlinked_mailbox_marker(
         self,
         tmp_path: Path,

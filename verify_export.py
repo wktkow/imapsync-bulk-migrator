@@ -599,6 +599,21 @@ def main():
 
     # Process each account
     for account_path in sorted(export_dir.iterdir()):
+        if account_path.is_symlink():
+            print(f"\n=== Verifying {account_path.name} ===")
+            print(f"\n⚠️  1 errors found:")
+            print(f"  account path is a symlink: {account_path}")
+            all_stats.append({
+                'account': account_path.name,
+                'total_messages': 0,
+                'messages_with_attachments': 0,
+                'total_attachments': 0,
+                'folders': 0,
+                'errors': 1,
+                'multiple_message_files': 0,
+            })
+            total_errors += 1
+            continue
         if not account_path.is_dir():
             continue
         
