@@ -3424,7 +3424,7 @@ class TestBug10MultiMessageDetection:
         json_path = tmp_path / "test.json"
         # No json metadata needed for this test
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert error is None
         assert analysis is not None
@@ -3449,7 +3449,7 @@ class TestBug10MultiMessageDetection:
         eml_path.write_bytes(eml_content)
         json_path = tmp_path / "test.json"
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert error is None
         assert analysis is not None
@@ -3487,7 +3487,7 @@ class TestBug10MultiMessageDetection:
         eml_path.write_bytes(eml_content)
         json_path = tmp_path / "test.json"
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert error is None
         assert analysis["multiple_messages_detected"] is False
@@ -3510,7 +3510,7 @@ class TestBug10MultiMessageDetection:
         eml_path.write_bytes(eml_content)
         json_path = tmp_path / "test.json"
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert error is None
         assert analysis is not None
@@ -3529,7 +3529,7 @@ class TestBug10MultiMessageDetection:
             "rfc822_size": len(b"original"),
         }))
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert analysis is None
         assert error is not None
@@ -3556,7 +3556,7 @@ class TestBug10MultiMessageDetection:
         )
         json_path = tmp_path / "test.json"
 
-        analysis, error = analyze_message(eml_path, json_path)
+        analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
         assert error is None
         assert analysis is not None
@@ -4028,7 +4028,7 @@ class TestRound2ConfirmedBugs:
             b"body"
         )
 
-        analysis, error = analyze_message(eml_path, tmp_path / "mixed.json")
+        analysis, error = analyze_message(eml_path, tmp_path / "mixed.json", require_metadata=False)
 
         assert error is None
         assert analysis is not None
@@ -4162,3 +4162,35 @@ class TestRound3ConfirmedBugs:
 
         with mock.patch("builtins.input", return_value="2,abc"):
             assert prompt_select_from_list(["one", "two"], "Available") == [1]
+
+
+class TestRound4ConfirmedBugs:
+    def test_verify_export_rejects_missing_message_sidecar(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        inbox = tmp_path / "exported" / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / "u0000000001.eml").write_bytes(
+            b"Message-ID: <m@example.com>\r\n"
+            b"From: a@example.com\r\n"
+            b"To: b@example.com\r\n"
+            b"\r\n"
+            b"body"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert stats["errors"] == 1
+        assert main() == 1
+
+    def test_verify_export_rejects_zero_byte_message(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "empty.eml"
+        eml_path.write_bytes(b"")
+
+        analysis, error = analyze_message(eml_path, tmp_path / "empty.json", require_metadata=False)
+
+        assert analysis is None
+        assert error == "empty file"

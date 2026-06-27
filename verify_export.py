@@ -47,12 +47,14 @@ def _has_later_rfc822_header_block(msg_text):
         idx = max(end + 1, idx + 1)
     return False
 
-def analyze_message(eml_path, json_path):
+def analyze_message(eml_path, json_path, *, require_metadata=True):
     """Analyze a single exported message"""
     try:
         # Read the email
         with open(eml_path, 'rb') as f:
             msg_bytes = f.read()
+        if not msg_bytes:
+            return None, 'empty file'
         
         # Check for multiple messages concatenated (look for multiple RFC822 headers).
         # Only count headers in the top-level header block (before the first blank line)
@@ -66,10 +68,15 @@ def analyze_message(eml_path, json_path):
         msg = BytesParser(policy=default_policy).parsebytes(msg_bytes)
         
         # Read metadata
-        metadata = {}
-        if json_path.exists():
+        if not json_path.exists():
+            if require_metadata:
+                return None, 'missing metadata sidecar'
+            metadata = {}
+        else:
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
+            if not isinstance(metadata, dict):
+                return None, 'metadata json is not an object'
         
         integrity_errors = []
         expected_hash = metadata.get('content_sha256')
@@ -80,12 +87,16 @@ def analyze_message(eml_path, json_path):
                 actual_hash = hashlib.sha256(msg_bytes).hexdigest()
                 if actual_hash != expected_hash.lower():
                     integrity_errors.append('content_sha256 mismatch')
+        elif require_metadata:
+            integrity_errors.append('missing content_sha256 metadata')
         expected_size = metadata.get('rfc822_size')
         if expected_size is not None:
-            if not isinstance(expected_size, int):
+            if type(expected_size) is not int or expected_size <= 0:
                 integrity_errors.append('invalid rfc822_size metadata')
             elif len(msg_bytes) != expected_size:
                 integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
+        elif require_metadata:
+            integrity_errors.append('missing rfc822_size metadata')
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
@@ -153,7 +164,8 @@ def verify_account(account_path):
         folder_errors = 0
         
         # Process all .eml files in folder
-        for eml_file in folder_path.glob("*.eml"):
+        eml_files = list(folder_path.glob("*.eml"))
+        for eml_file in eml_files:
             json_file = eml_file.with_suffix('.json')
             
             analysis, error = analyze_message(eml_file, json_file)
@@ -174,7 +186,7 @@ def verify_account(account_path):
             # Check for multiple messages in single file
             if analysis['multiple_messages_detected']:
                 multiple_message_files.append(f"{folder_name}/{eml_file.name} (Return-Path: {analysis['return_path_count']}, Message-ID: {analysis['message_id_count']})")
-        if folder_messages == 0 and not (folder_path / ".mailbox.json").exists():
+        if not eml_files and not (folder_path / ".mailbox.json").exists():
             errors.append(f"{folder_name}: no .eml files found and no mailbox marker present")
             folder_errors += 1
         
