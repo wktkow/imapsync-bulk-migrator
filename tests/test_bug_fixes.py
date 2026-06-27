@@ -5256,6 +5256,35 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_provider_export_rejects_symlinked_account_directory_before_source_contact(self, tmp_path: Path) -> None:
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import provider_export_account
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        out_root = tmp_path / "exported"
+        real_account_dir = tmp_path / "real-account"
+        real_account_dir.mkdir()
+        out_root.mkdir()
+        try:
+            (out_root / "source@example.com").symlink_to(real_account_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+            with pytest.raises(RuntimeError, match="symlinked provider account directory"):
+                provider_export_account(config, account, out_root)
+
     @pytest.mark.parametrize("bad_size", [True, 1.0])
     def test_provider_metadata_manifest_rejects_json_type_drift(self, tmp_path: Path, bad_size: object) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
