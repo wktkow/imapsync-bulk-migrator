@@ -4713,6 +4713,90 @@ class TestRound2ConfirmedBugs:
         assert stats["total_messages"] == 1
         assert main() == 0
 
+    def test_verify_export_rejects_provider_account_directory_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "wrong@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <provider-wrong-dir@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        row = {
+            "canonical_id": "provider-wrong-dir",
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "target_account": "target@example.com",
+            "primary_mailbox": "Archive",
+            "message_id_header": "<provider-wrong-dir@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-wrong-dir.eml",
+            "metadata_path": "metadata/provider-wrong-dir.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / row["eml_path"]).write_bytes(body)
+        (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+        }))
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 1
+        assert "provider-wrong-dir: source_account source@example.com does not match provider account directory wrong@example.com" in output
+
+    def test_verify_export_accepts_sanitized_provider_account_directory(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "a_b@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <provider-sanitized@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        row = {
+            "canonical_id": "provider-sanitized",
+            "source_provider": "imap",
+            "source_account": "a/b@example.com",
+            "target_account": "target@example.com",
+            "primary_mailbox": "Archive",
+            "message_id_header": "<provider-sanitized@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-sanitized.eml",
+            "metadata_path": "metadata/provider-sanitized.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / row["eml_path"]).write_bytes(body)
+        (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "source_account": "a/b@example.com",
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+        }))
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 0
+
     def test_verify_export_accepts_provider_zero_byte_message(self, tmp_path: Path) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
         from components.provider_ops import provider_manifest_digest

@@ -384,6 +384,40 @@ def expected_legacy_account_for_sidecars(account_path):
     return account_path.name
 
 
+def provider_account_directory_binding_issues(account_path, rows):
+    account_name = account_path.name
+
+    def matches_directory(value):
+        return isinstance(value, str) and value and (
+            value == account_name or sanitize_for_path(value) == account_name
+        )
+
+    issues = []
+    for idx, row in enumerate(rows, 1):
+        identity = str(row.get("canonical_id") or f"row {idx}")
+        source_account = row.get("source_account")
+        if not matches_directory(source_account):
+            label = source_account if isinstance(source_account, str) and source_account else "<missing>"
+            issues.append(
+                f"{identity}: source_account {label} does not match provider account directory {account_name}"
+            )
+
+    state_path = account_path / "export-state.json"
+    if state_path.exists() and not state_path.is_symlink():
+        try:
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+        if isinstance(state, dict) and "source_account" in state and not matches_directory(state.get("source_account")):
+            label = state.get("source_account")
+            label = label if isinstance(label, str) and label else "<missing>"
+            issues.append(
+                f"export-state source_account {label} does not match provider account directory {account_name}"
+            )
+    return issues
+
+
 def verify_provider_account(account_path):
     """Verify a provider-layout account export."""
     account_name = account_path.name
@@ -403,6 +437,7 @@ def verify_provider_account(account_path):
         rows = []
 
     if rows:
+        errors.extend(provider_account_directory_binding_issues(account_path, rows))
         errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
         errors.extend(manifest_integrity_issues(rows))
         errors.extend(provider_delivery_metadata_issues(rows))
