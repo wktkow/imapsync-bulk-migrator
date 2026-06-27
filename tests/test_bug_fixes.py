@@ -5563,6 +5563,39 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_strict_audit_rejects_symlinked_legacy_export_state_without_reading_target(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <state-symlink@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        state_path = folder.parent / "export-state.json"
+        state_path.unlink()
+        outside_state = tmp_path / "outside-state.json"
+        outside_state.write_text("{bad json")
+        try:
+            state_path.symlink_to(outside_state)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("export-state is a symlink" in issue for issue in issues)
+        assert not any("export-state missing or invalid" in issue for issue in issues)
+
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest

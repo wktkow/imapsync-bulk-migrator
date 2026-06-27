@@ -88,6 +88,8 @@ def _legacy_export_state_issues(
 ) -> List[str]:
     issues: List[str] = []
     state_path = account_dir / "export-state.json"
+    if state_path.is_symlink():
+        return [f"{account.email}: export-state is a symlink"]
     if not state_path.exists():
         if require_state:
             issues.append(f"{account.email}: export-state missing; rerun legacy export before destructive reset")
