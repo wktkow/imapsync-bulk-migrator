@@ -30,8 +30,7 @@ import urllib.parse
 try:
     import requests
 except Exception:  # pragma: no cover
-    print("This script requires the 'requests' package. Install via: pip install -r requirements.txt", file=sys.stderr)
-    sys.exit(2)
+    requests = None  # type: ignore
 
 
 @dataclass
@@ -50,8 +49,10 @@ class DirectAdminClient:
     """
 
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout_sec: int = 20) -> None:
+        if requests is None:  # type: ignore
+            raise RuntimeError("DirectAdmin indexer requires the 'requests' package. Install via: pip install -r requirements.txt")
         self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
+        self.session = requests.Session()  # type: ignore[union-attr]
         self.session.auth = (username, password)
         self.session.verify = verify_ssl
         self.timeout_sec = timeout_sec
