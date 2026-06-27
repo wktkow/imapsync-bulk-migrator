@@ -6978,6 +6978,49 @@ class TestRound7ConfirmedBugs:
         assert rc == 2
         assert not (outside / "exported" / "user@example.com").exists()
 
+    def test_main_rejects_legacy_nested_output_symlink_before_preflight_side_effects(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        out_root = tmp_path / "exported"
+        account_dir = out_root / "user@example.com"
+        victim = tmp_path / "outside-inbox"
+        victim.mkdir()
+        account_dir.mkdir(parents=True)
+        try:
+            (account_dir / "INBOX").symlink_to(victim, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        events: List[str] = []
+
+        def record_free_space(*_args, **_kwargs) -> None:
+            events.append("free-space")
+
+        def record_imapsync_check() -> None:
+            events.append("imapsync")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", record_free_space), \
+            mock.patch("components.utils.ensure_imapsync_available", record_imapsync_check), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")), \
+            mock.patch("components.main.export_account", side_effect=AssertionError("export should not run")):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(out_root),
+                "--log-dir", str(tmp_path / "logs-nested-export-symlink"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+        assert events == []
+        assert not (account_dir / "export-state.json").exists()
+
     def test_main_rejects_legacy_file_output_root_before_connectivity(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -7410,7 +7453,7 @@ class TestRound7ConfirmedBugs:
             yield EmptyInbox()
 
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
-            with pytest.raises(RuntimeError, match="symlinked directory"):
+            with pytest.raises(RuntimeError, match="output path is a symlink"):
                 export_account(
                     Account("user@example.com", "secret"),
                     ServerConfig("imap.example.com"),
@@ -7420,6 +7463,31 @@ class TestRound7ConfirmedBugs:
 
         assert (victim / "stale.eml").exists()
         assert not (victim / ".mailbox.json").exists()
+
+    def test_legacy_export_rejects_preexisting_nested_output_symlink_before_source_contact(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        out_root = tmp_path / "exported"
+        account_dir = out_root / "user@example.com"
+        victim = tmp_path / "outside-inbox"
+        victim.mkdir()
+        account_dir.mkdir(parents=True)
+        try:
+            (account_dir / "INBOX").symlink_to(victim, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+            with pytest.raises(RuntimeError, match="output path is a symlink"):
+                export_account(
+                    Account("user@example.com", "secret"),
+                    ServerConfig("imap.example.com"),
+                    out_root,
+                    ignore_errors=False,
+                )
+
+        assert not (account_dir / "export-state.json").exists()
 
     def test_legacy_import_rejects_symlinked_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
@@ -7865,7 +7933,7 @@ class TestRound7ConfirmedBugs:
             yield OneMessageInbox()
 
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
-            with pytest.raises(RuntimeError, match="unsafe temporary file"):
+            with pytest.raises(RuntimeError, match="output path is a symlink"):
                 export_account(
                     Account("user@example.com", "secret"),
                     ServerConfig("imap.example.com"),

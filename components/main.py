@@ -22,7 +22,13 @@ from .cpanel_ensure import ensure_accounts_exist_cpanel
 from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
-from .imap_ops import _legacy_symlink_component, archive_legacy_import_journal_for_reset, export_account, import_account
+from .imap_ops import (
+    _legacy_symlink_component,
+    archive_legacy_import_journal_for_reset,
+    export_account,
+    import_account,
+    legacy_export_output_symlink_issues,
+)
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config, ProviderMigrationConfig, load_config_file
 from .provider_ops import (
@@ -657,6 +663,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif output_root.exists() and not output_root.is_dir():
             logging.error("Output directory is not a directory: %s", output_root)
             return 2
+        elif not is_provider_config:
+            assert isinstance(config, Config)
+            output_symlink_issues = legacy_export_output_symlink_issues(output_root, config.accounts)
+            if output_symlink_issues:
+                logging.error("Legacy export output failed local preflight:")
+                for issue in output_symlink_issues:
+                    logging.error("[export-local] %s", issue)
+                return 2
 
     free_space_preflight_path: Optional[Path] = None
     if args.mode == "export":

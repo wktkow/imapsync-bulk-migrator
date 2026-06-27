@@ -454,6 +454,25 @@ def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> No
             path.unlink()
 
 
+def legacy_export_output_symlink_issues(out_root: Path, accounts: List[Account]) -> List[str]:
+    issues: List[str] = []
+    for account in accounts:
+        account_dir = out_root / sanitize_for_path(account.email)
+        if not account_dir.exists():
+            continue
+        if account_dir.is_symlink() or _legacy_symlink_component(account_dir) is not None:
+            issues.append(f"{account.email}: account output path is a symlink: {account_dir}")
+            continue
+        if not account_dir.is_dir():
+            issues.append(f"{account.email}: account output path is not a directory: {account_dir}")
+            continue
+        for path in sorted(account_dir.rglob("*")):
+            if path.is_symlink():
+                rel = path.relative_to(account_dir).as_posix()
+                issues.append(f"{account.email}: output path is a symlink: {rel}")
+    return issues
+
+
 def export_account(account: Account, server: ServerConfig, out_root: Path, ignore_errors: bool, *, stop_event: Optional[object] = None) -> None:
     """Export all messages for an account into `out_root/<email>/<folder>/`.
 
@@ -461,6 +480,9 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     """
     _raise_if_symlink(out_root, "legacy export root")
     account_dir = out_root / sanitize_for_path(account.email)
+    nested_symlink_issues = legacy_export_output_symlink_issues(out_root, [account])
+    if nested_symlink_issues:
+        raise RuntimeError("invalid legacy export output path: " + "; ".join(nested_symlink_issues))
     ensure_private_dir(account_dir)
     logging.info("[export] %s: starting", account.email)
     state_path = account_dir / "export-state.json"
