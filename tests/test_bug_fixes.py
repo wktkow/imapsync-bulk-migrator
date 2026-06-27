@@ -3863,3 +3863,186 @@ print("ok")
 
         assert _legacy_remote_has_message(fake, "INBOX", message, set())
         assert fake.criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"')
+
+
+class TestRound2ConfirmedBugs:
+    def _legacy_zero_message_import_fixture(self, tmp_path: Path) -> tuple[Path, Path]:
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import ServerConfig
+
+        server = ServerConfig("source.example.com")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        in_root = tmp_path / "exported"
+        inbox = in_root / "a@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (in_root / "a@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "a@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
+        return config_path, in_root
+
+    def test_panel_setup_failure_stays_fatal_with_ignore_errors(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path, in_root = self._legacy_zero_message_import_fixture(tmp_path)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--ignore-errors",
+            ])
+
+        assert rc == 3
+        import_mock.assert_not_called()
+
+    def test_audit_reports_remote_mailbox_count_failures(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        inbox = tmp_path / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
+
+        class UnselectableRemote:
+            selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "RemoteOnly"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                if self.selected == "RemoteOnly":
+                    return "NO", [b"cannot select"]
+                return "OK", [b"0"]
+
+            def uid(self, command: str, arg: str):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[UnselectableRemote]:
+            yield UnselectableRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")]),
+                1,
+                check_remote=True,
+            )
+
+        assert not ok
+        assert any("remote mailbox could not be selected" in issue for issue in issues)
+
+    def test_validate_reports_remote_only_uncountable_mailboxes(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path, in_root = self._legacy_zero_message_import_fixture(tmp_path)
+
+        class UncountableRemote:
+            selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\HasNoChildren) "/" "RemoteOnly"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                if self.selected == "RemoteOnly":
+                    return "NO", [b"cannot select"]
+                return "OK", [b"0"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[UncountableRemote]:
+            yield UncountableRemote()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_directadmin_indexer_accepts_empty_domain_success_shapes(self) -> None:
+        from directadmin_indexer import DirectAdminClient
+
+        for payload in ((None, {}), (None, {"error": ["0"]}), ({"error": "0"}, None), ([], None)):
+            client = object.__new__(DirectAdminClient)
+            client._get = lambda *_args, _payload=payload, **_kwargs: _payload
+            assert client.list_domains() == []
+
+    def test_verify_export_counts_duplicate_headers_case_insensitively(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "mixed.eml"
+        eml_path.write_bytes(
+            b"message-id: <one@example.com>\r\n"
+            b"Message-Id: <two@example.com>\r\n"
+            b"From: a@example.com\r\n"
+            b"\r\n"
+            b"body"
+        )
+
+        analysis, error = analyze_message(eml_path, tmp_path / "mixed.json")
+
+        assert error is None
+        assert analysis is not None
+        assert analysis["message_id_count"] == 2
+        assert analysis["multiple_messages_detected"] is True
+
+    def test_verify_export_fails_empty_account_directory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        account_dir.mkdir(parents=True)
+
+        stats = verify_account(account_dir)
+        monkeypatch.chdir(tmp_path)
+
+        assert stats["errors"] == 1
+        assert main() == 1
