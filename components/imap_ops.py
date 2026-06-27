@@ -8,7 +8,6 @@ import re
 import ssl
 import time
 from contextlib import AbstractContextManager
-from email.utils import parsedate_to_datetime
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
@@ -24,6 +23,11 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed"}
+_IMAP_INTERNALDATE_RE = re.compile(
+    r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
+    r'\d{4} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d [+-]\d{4}$'
+)
 
 
 def quote_mailbox_name(mailbox: str) -> str:
@@ -574,6 +578,10 @@ def _valid_legacy_flag_token(token: str) -> bool:
     return not any(ch in '(){}%*"][' for ch in token)
 
 
+def _valid_legacy_internaldate(value: str) -> bool:
+    return bool(_IMAP_INTERNALDATE_RE.fullmatch(value))
+
+
 def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -> Tuple[str, Optional[str]]:
     errors: List[str] = []
     flags_raw = meta.get("flags", "")
@@ -596,13 +604,10 @@ def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -
             parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
             if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
                 errors.append("invalid internaldate metadata")
+            elif _valid_legacy_internaldate(parse_value):
+                internaldate = stripped
             else:
-                try:
-                    parsedate_to_datetime(parse_value)
-                except Exception:
-                    errors.append("invalid internaldate metadata")
-                else:
-                    internaldate = stripped
+                errors.append("invalid internaldate metadata")
     if errors:
         raise RuntimeError(f"{label}: " + "; ".join(errors))
     return flags, internaldate
