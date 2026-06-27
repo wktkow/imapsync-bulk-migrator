@@ -384,6 +384,7 @@ def _provider_cli_staged_validation_issues(
             root,
             check_target=False,
             write_report=False,
+            allow_unresolved_pending=(mode == "import"),
         )
         keys = ("duplicates", "failed", "missing") if mode == "validate" else ("duplicates", "failed")
         for key in keys:

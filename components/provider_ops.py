@@ -4117,6 +4117,7 @@ def provider_validate_account(
     *,
     check_target: bool = False,
     write_report: bool = True,
+    allow_unresolved_pending: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     account_dir = account_export_dir(in_root, account)
     report: Dict[str, Any] = {
@@ -4173,15 +4174,16 @@ def provider_validate_account(
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
     report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
     committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
-    for row in journal_rows:
-        if row.get("status") != "pending":
-            continue
-        identity = str(row.get("canonical_id") or "")
-        target_mailbox = str(row.get("target_mailbox") or "")
-        if (identity, target_mailbox) not in committed_journal_keys:
-            report["failed"].append(
-                f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
-            )
+    if not allow_unresolved_pending:
+        for row in journal_rows:
+            if row.get("status") != "pending":
+                continue
+            identity = str(row.get("canonical_id") or "")
+            target_mailbox = str(row.get("target_mailbox") or "")
+            if (identity, target_mailbox) not in committed_journal_keys:
+                report["failed"].append(
+                    f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
+                )
 
     identity_issues, manifest_id_counts = manifest_identity_issues(manifest_rows)
     for issue in identity_issues:

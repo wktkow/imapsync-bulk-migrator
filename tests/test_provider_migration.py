@@ -9038,6 +9038,45 @@ def test_main_rejects_provider_validate_missing_commit_before_connectivity(tmp_p
     assert not (account_dir / "validation-target@icloud.com.json").exists()
 
 
+def test_main_allows_provider_import_pending_journal_to_recovery_path(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / "provider-root-pending-import"
+    account_dir = _write_manifest_fixture(root)
+    config = load_config_file(config_path)
+    assert isinstance(config, ProviderMigrationConfig)
+    append_journal(account_dir, config.accounts[0], _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": config.accounts[0].target_email,
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }))
+    events: List[str] = []
+
+    def record_connectivity(*_args, **_kwargs) -> None:
+        events.append("connectivity")
+
+    def record_import(*_args, **_kwargs) -> None:
+        events.append("import")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.provider_test_accounts", record_connectivity), \
+        mock.patch("components.main.provider_import_all", record_import):
+        rc = main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-pending-import"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 0
+    assert events == ["connectivity", "import"]
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 
