@@ -5042,6 +5042,102 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_strict_audit_rejects_missing_original_mailbox_marker(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "Sent_Items"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="Sent Items",
+            data=b"Message-ID: <sent@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("missing mailbox marker for original mailbox Sent Items" in issue for issue in issues)
+
+    def test_verify_export_rejects_missing_original_mailbox_marker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "Sent_Items"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="Sent Items",
+            data=b"Message-ID: <sent@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 1
+        assert "Sent_Items/u0000000001.eml: missing mailbox marker for original mailbox Sent Items" in output
+        assert main() == 1
+
+    def test_strict_audit_rejects_marker_sidecar_original_mailbox_mismatch(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "A_B"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="A/B",
+            data=b"Message-ID: <alias@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "A_B", "message_count": 1}))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("mailbox metadata mismatch (marker=A_B meta=A/B)" in issue for issue in issues)
+
+    def test_verify_export_rejects_marker_sidecar_original_mailbox_mismatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "A_B"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="A/B",
+            data=b"Message-ID: <alias@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "A_B", "message_count": 1}))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 1
+        assert "A_B/u0000000001.eml: mailbox metadata mismatch (marker=A_B meta=A/B)" in output
+        assert main() == 1
+
     def test_legacy_export_rejects_symlinked_output_root_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig

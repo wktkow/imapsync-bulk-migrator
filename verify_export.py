@@ -105,7 +105,16 @@ def _non_encapsulated_text_has_rfc822_header_block(part):
     return _has_later_rfc822_header_block('\n\n' + _decoded_text_payload(part))
 
 
-def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None, content_binding="legacy"):
+def analyze_message(
+    eml_path,
+    json_path,
+    *,
+    require_metadata=True,
+    folder_name=None,
+    content_binding="legacy",
+    mailbox_marker_present=True,
+    mailbox_marker_mailbox=None,
+):
     """Analyze a single exported message"""
     try:
         eml_path = Path(eml_path)
@@ -206,6 +215,10 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
                 integrity_errors.append('missing mailbox metadata')
             elif sanitize_for_path(mailbox) != folder_name:
                 integrity_errors.append(f'mailbox metadata mismatch (folder={folder_name} meta={mailbox})')
+            elif mailbox_marker_mailbox is not None and mailbox != mailbox_marker_mailbox:
+                integrity_errors.append(f'mailbox metadata mismatch (marker={mailbox_marker_mailbox} meta={mailbox})')
+            elif not mailbox_marker_present and mailbox != folder_name:
+                integrity_errors.append(f'missing mailbox marker for original mailbox {mailbox}')
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
@@ -474,6 +487,17 @@ def verify_account(account_path):
         folder_messages = 0
         folder_attachments = 0
         folder_errors = 0
+        mailbox_marker = folder_path / ".mailbox.json"
+        mailbox_marker_present = mailbox_marker.exists() or mailbox_marker.is_symlink()
+        mailbox_marker_mailbox = None
+        if mailbox_marker.exists() and not mailbox_marker.is_symlink():
+            try:
+                marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
+                mailbox = marker.get("mailbox") if isinstance(marker, dict) else None
+                if isinstance(mailbox, str) and mailbox.strip() and sanitize_for_path(mailbox) == folder_name:
+                    mailbox_marker_mailbox = mailbox
+            except Exception:
+                pass
         
         # Process all .eml files in folder
         eml_files = list(folder_path.glob("*.eml"))
@@ -501,7 +525,13 @@ def verify_account(account_path):
                     folder_errors += 1
                 continue
             
-            analysis, error = analyze_message(eml_file, json_file, folder_name=folder_name)
+            analysis, error = analyze_message(
+                eml_file,
+                json_file,
+                folder_name=folder_name,
+                mailbox_marker_present=mailbox_marker_present,
+                mailbox_marker_mailbox=mailbox_marker_mailbox,
+            )
             
             if error:
                 errors.append(f"{folder_name}/{eml_file.name}: {error}")
@@ -519,7 +549,6 @@ def verify_account(account_path):
             # Check for multiple messages in single file
             if analysis['multiple_messages_detected']:
                 multiple_message_files.append(f"{folder_name}/{eml_file.name} (Return-Path: {analysis['return_path_count']}, Message-ID: {analysis['message_id_count']})")
-        mailbox_marker = folder_path / ".mailbox.json"
         if mailbox_marker.is_symlink() or mailbox_marker.exists():
             marker_errors = analyze_mailbox_marker(mailbox_marker, folder_name, len(eml_files))
             errors.extend(marker_errors)

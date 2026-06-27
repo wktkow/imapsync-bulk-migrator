@@ -243,6 +243,8 @@ def audit_account(
         emls = list(folder_dir.glob("*.eml"))
         jsons = [p for p in folder_dir.glob("*.json") if p.name != ".mailbox.json"]
         mailbox_marker = folder_dir / ".mailbox.json"
+        mailbox_marker_present = mailbox_marker.exists() or mailbox_marker.is_symlink()
+        marker_mailbox: Optional[str] = None
         if not emls and not mailbox_marker.exists():
             issues.append(f"{account.email}:{folder}: no .eml files found")
         if mailbox_marker.is_symlink():
@@ -260,6 +262,8 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}: mailbox marker missing mailbox")
                 elif sanitize_for_path(mailbox_name) != folder:
                     issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
+                else:
+                    marker_mailbox = mailbox_name
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")
         eml_stems = {p.stem for p in emls}
@@ -299,6 +303,16 @@ def audit_account(
                 issues.append(
                     f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
                     f"(folder={folder} meta={mailbox_meta})"
+                )
+            elif marker_mailbox is not None and mailbox_meta != marker_mailbox:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
+                    f"(marker={marker_mailbox} meta={mailbox_meta})"
+                )
+            elif not mailbox_marker_present and mailbox_meta != folder:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: missing mailbox marker "
+                    f"for original mailbox {mailbox_meta}"
                 )
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
