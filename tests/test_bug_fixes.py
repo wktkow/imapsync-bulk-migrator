@@ -5462,6 +5462,52 @@ class TestRound7ConfirmedBugs:
             with pytest.raises(RuntimeError, match="missing or invalid primary_mailbox"):
                 provider_import_account(config, account, tmp_path)
 
+    def test_audit_remote_identity_matches_imap_append_wire_bytes(self, tmp_path: Path) -> None:
+        import imaplib
+
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account = Account("user@example.com", "secret")
+        body = b"Message-ID: <audit-wire@example.com>\nFrom: a\nTo: b\n\nbody\n"
+        stored = imaplib.MapCRLF.sub(imaplib.CRLF, body)
+        folder = tmp_path / account.email / "INBOX"
+        _write_legacy_message_fixture(folder, data=body, source_server=server)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        class NormalizedAuditRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, criterion: str):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                assert criteria == ("HEADER", "Message-ID", "<audit-wire@example.com>")
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(stored), len(stored)), stored)]
+
+        @contextlib.contextmanager
+        def fake_connection(_server, _account):
+            yield NormalizedAuditRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [account], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert ok, issues
+
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest

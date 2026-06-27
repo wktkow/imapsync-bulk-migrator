@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
 from .imap_ops import (
+    _imap_append_wire_bytes,
     _validate_legacy_delivery_metadata,
     imap_connection,
     legacy_server_endpoint,
@@ -33,8 +34,14 @@ def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set
     if status != "OK":
         return False
     message_id = _message_id_header(data)
-    expected_hash = hashlib.sha256(data).hexdigest()
-    expected_size = len(data)
+    variants = [data]
+    append_data = _imap_append_wire_bytes(data)
+    if append_data != data:
+        variants.append(append_data)
+    expected_identities = {
+        (len(candidate), hashlib.sha256(candidate).hexdigest())
+        for candidate in variants
+    }
     if message_id:
         status, search_data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
     else:
@@ -51,7 +58,8 @@ def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             body = bytes(part[1])
-            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+            body_identity = (len(body), hashlib.sha256(body).hexdigest())
+            if body_identity in expected_identities:
                 if used_nums is not None:
                     used_nums.add(num)
                 return True
