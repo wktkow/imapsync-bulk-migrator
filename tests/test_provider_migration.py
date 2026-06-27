@@ -2300,6 +2300,8 @@ def test_provider_export_rerun_prunes_stale_manifest_rows(tmp_path: Path) -> Non
         provider_export_account(config, account, tmp_path)
 
     assert (account_dir / "manifest.jsonl").read_text() == ""
+    assert not list((account_dir / "messages").glob("*.eml"))
+    assert not list((account_dir / "metadata").glob("*.json"))
     state = json.loads((account_dir / "export-state.json").read_text())
     assert state["complete"] is True
     assert state["canonical_messages"] == 0
@@ -7394,6 +7396,22 @@ def test_provider_audit_rejects_metadata_that_differs_from_manifest(tmp_path: Pa
     assert not report["ok"]
     assert any("metadata source_account differs from manifest" in issue for issue in report["failed"])
     assert any("metadata target_account differs from manifest" in issue for issue in report["failed"])
+
+
+def test_provider_audit_and_validation_reject_orphan_provider_artifacts(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "messages" / "stale.eml").write_bytes(b"stale")
+    (account_dir / "metadata" / "stale.json").write_text(json.dumps({"stale": True}))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any("unmanifested provider message artifact: messages/stale.eml" in issue for issue in issues)
+    assert any("unmanifested provider metadata artifact: metadata/stale.json" in issue for issue in issues)
+    assert any("unmanifested provider message artifact: messages/stale.eml" in item for item in report["failed"])
+    assert any("unmanifested provider metadata artifact: metadata/stale.json" in item for item in report["failed"])
 
 
 def test_provider_audit_and_validation_reject_metadata_extra_null_key(tmp_path: Path) -> None:

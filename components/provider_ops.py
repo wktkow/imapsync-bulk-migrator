@@ -1244,6 +1244,54 @@ def manifest_payload_issues(account_dir: Path, rows: List[Dict[str, Any]]) -> Li
     return issues
 
 
+def _manifest_relative_paths(account_dir: Path, rows: List[Dict[str, Any]], key: str) -> set[str]:
+    root = account_dir.resolve()
+    paths: set[str] = set()
+    for row in rows:
+        try:
+            paths.add(_manifest_path(account_dir, row, key).relative_to(root).as_posix())
+        except Exception:
+            continue
+    return paths
+
+
+def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any]]) -> List[str]:
+    issues: List[str] = []
+    expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
+    expected_metadata = _manifest_relative_paths(account_dir, rows, "metadata_path")
+    for root_name, suffix, expected, label in (
+        ("messages", "*.eml", expected_messages, "message"),
+        ("metadata", "*.json", expected_metadata, "metadata"),
+    ):
+        root = account_dir / root_name
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob(suffix)):
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(account_dir).as_posix()
+            if rel_path not in expected:
+                issues.append(f"unmanifested provider {label} artifact: {rel_path}")
+    return issues
+
+
+def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
+    expected_metadata = _manifest_relative_paths(account_dir, rows, "metadata_path")
+    for root_name, suffix, expected in (
+        ("messages", "*.eml", expected_messages),
+        ("metadata", "*.json", expected_metadata),
+    ):
+        root = account_dir / root_name
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob(suffix)):
+            if not path.is_file():
+                continue
+            if path.relative_to(account_dir).as_posix() not in expected:
+                path.unlink()
+
+
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
     issues: List[str] = []
     for idx, row in enumerate(rows, 1):
@@ -1936,6 +1984,7 @@ def provider_export_account(
 
     final_records = active_export_records()
     persist_export_records(account_dir, final_records, config.migration.folder_map)
+    _prune_provider_artifact_orphans(account_dir, list(final_records.values()))
     final_manifest_rows = load_manifest(account_dir)
     _atomic_json(
         account_dir / "export-state.json",
@@ -3539,6 +3588,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     issues.extend(manifest_source_provider_issues(rows, config.source.provider))
     issues.extend(manifest_integrity_issues(rows))
     issues.extend(metadata_manifest_issues(account_dir, rows, require_present=False))
+    issues.extend(_provider_artifact_orphan_issues(account_dir, rows))
     issues.extend(gmail_target_decommission_issues(config.target, account))
     manifest_ids = {str(row.get("canonical_id") or "") for row in rows if row.get("canonical_id")}
     try:
@@ -3664,6 +3714,7 @@ def provider_validate_account(
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
     report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
     report["failed"].extend(manifest_payload_issues(account_dir, manifest_rows))
+    report["failed"].extend(_provider_artifact_orphan_issues(account_dir, manifest_rows))
     report["failed"].extend(gmail_target_decommission_issues(config.target, account))
 
     journal_issues = journal_row_issues(journal_rows, account)
