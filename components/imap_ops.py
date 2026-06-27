@@ -696,6 +696,8 @@ def import_account(
                 return False
             if marker_meta.get("mailbox") != mailbox:
                 return False
+            if sanitize_for_path(mailbox) != path:
+                return False
             marker_count = marker_meta.get("message_count")
             if type(marker_count) is not int:
                 return False
@@ -722,12 +724,15 @@ def import_account(
         _raise_if_symlink(marker, "legacy mailbox marker")
         if marker.exists():
             staged_marker_paths.add(folder_dir.name)
+            marker_meta = None
             with contextlib.suppress(Exception):
                 marker_meta = json.loads(_read_file_no_symlink(marker, "legacy mailbox marker").decode("utf-8"))
-                if isinstance(marker_meta, dict):
-                    staged_markers[folder_dir.name] = marker_meta
+            if isinstance(marker_meta, dict):
+                staged_markers[folder_dir.name] = marker_meta
                 marker_mailbox = marker_meta.get("mailbox")
                 if isinstance(marker_mailbox, str) and marker_mailbox.strip():
+                    if sanitize_for_path(marker_mailbox) != folder_dir.name:
+                        raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
                     mailbox_meta = marker_mailbox
             per_folder.setdefault(mailbox_meta, [])
         default_mailbox = mailbox_meta
@@ -748,6 +753,10 @@ def import_account(
                 flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
                 mbox = meta.get("mailbox")
                 if isinstance(mbox, str) and mbox.strip():
+                    if sanitize_for_path(mbox) != folder_dir.name:
+                        raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
+                    if mbox != default_mailbox:
+                        raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
                     mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:

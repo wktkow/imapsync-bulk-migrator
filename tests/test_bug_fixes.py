@@ -796,7 +796,7 @@ class TestLegacyImportJournal:
         account = Account(email="user@example.com", password="pass")
         server = ServerConfig(host="dummy", port=993, ssl=True)
 
-        with pytest.raises(RuntimeError, match="no staged \\.eml files"):
+        with pytest.raises(RuntimeError, match="no staged \\.eml files|mailbox metadata mismatch"):
             import_account(account, server, tmp_path, ignore_errors=False)
 
     @pytest.mark.parametrize(
@@ -846,7 +846,7 @@ class TestLegacyImportJournal:
         }))
         account = Account(email="user@example.com", password="pass")
 
-        with pytest.raises(RuntimeError, match="no staged \\.eml files"):
+        with pytest.raises(RuntimeError, match="no staged \\.eml files|mailbox metadata mismatch"):
             import_account(account, server, tmp_path, ignore_errors=False)
 
     def test_import_rejects_pending_journal_entry(self, tmp_path: Path) -> None:
@@ -5260,6 +5260,47 @@ class TestRound7ConfirmedBugs:
             pytest.skip(f"symlink creation unavailable: {exc}")
 
         with pytest.raises(RuntimeError, match="symlinked legacy mailbox marker"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_legacy_import_rejects_sidecar_mailbox_folder_mismatch_before_connect(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(folder, mailbox="INBOX")
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["mailbox"] = "Archive"
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match="mailbox metadata mismatch"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_legacy_import_rejects_zero_message_marker_folder_mismatch_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com"
+        folder = account_dir / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Archive", "message_count": 0}))
+        _write_verify_export_state(account_dir, [{"mailbox": "Archive", "path": "INBOX", "message_count": 0}])
+
+        with pytest.raises(RuntimeError, match="mailbox metadata mismatch"):
             import_account(
                 Account("user@example.com", "secret"),
                 ServerConfig("imap.example.com"),
