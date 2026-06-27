@@ -3088,8 +3088,10 @@ def _validated_group_stage(
 ) -> Tuple[Path, List[Dict[str, Any]], List[Dict[str, Any]]]:
     if account is current_account or account.source_email == current_account.source_email:
         account_dir = account_export_dir(in_root, current_account)
+        _raise_if_provider_path_symlink(account_dir, "account directory")
         return account_dir, current_manifest_rows, current_journal_rows
     account_dir = account_export_dir(in_root, account)
+    _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_accounts(manifest_rows, account)
@@ -3228,6 +3230,7 @@ def provider_import_account(
     limiter: Optional[RateLimiter] = None,
 ) -> None:
     account_dir = account_export_dir(in_root, account)
+    _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_accounts(manifest_rows, account)
@@ -3635,6 +3638,8 @@ def _journal_row(
 def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAccount, in_root: Path) -> Tuple[str, List[str]]:
     issues: List[str] = []
     account_dir = account_export_dir(in_root, account)
+    if account_dir.is_symlink():
+        return account.email, [f"refusing to use symlinked provider account directory: {account_dir}"]
     if not account_dir.exists():
         return account.email, [f"account export directory missing: {account_dir}"]
     try:
@@ -3758,6 +3763,9 @@ def provider_validate_account(
         "ok": False,
     }
     try:
+        if account_dir.is_symlink():
+            report["failed"].append(f"refusing to use symlinked provider account directory: {account_dir}")
+            return account.email, report
         journal_rows = load_import_journal(account_dir, account)
         manifest_rows = load_manifest(account_dir)
     except Exception as exc:

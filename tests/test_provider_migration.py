@@ -168,6 +168,28 @@ def test_provider_append_journal_rejects_symlinked_journal(tmp_path: Path) -> No
     assert victim.read_text(encoding="utf-8") == "outside\n"
 
 
+def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    outside_root = tmp_path / "outside"
+    outside_account_dir = _write_manifest_fixture(outside_root)
+    account_dir = tmp_path / "source@example.com"
+    try:
+        account_dir.symlink_to(outside_account_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any("symlinked provider account directory" in issue for issue in audit_issues)
+    assert any("symlinked provider account directory" in issue for issue in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider account directory"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_prune_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
     account_dir = tmp_path / "source@example.com"
     outside = tmp_path / "outside-messages"
