@@ -8803,6 +8803,32 @@ def test_main_rejects_provider_symlinked_input_root_ancestor_before_connectivity
     assert rc == 2
 
 
+def test_main_rejects_provider_symlinked_output_root_before_connectivity(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    outside = tmp_path / "outside-output"
+    outside.mkdir()
+    out_root = tmp_path / "exported"
+    try:
+        out_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main([
+            "--mode", "export",
+            "--config", str(config_path),
+            "--output-dir", str(out_root),
+            "--log-dir", str(tmp_path / "logs-export"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 2
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 

@@ -6390,6 +6390,37 @@ class TestRound7ConfirmedBugs:
 
         assert not (outside / "user@example.com").exists()
 
+    def test_main_rejects_legacy_symlinked_output_root_before_connectivity(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside-output"
+        outside.mkdir()
+        out_root = tmp_path / "exported"
+        try:
+            out_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(out_root),
+                "--log-dir", str(tmp_path / "logs-export"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+        assert not (outside / "user@example.com").exists()
+
     def test_strict_audit_rejects_symlinked_input_root(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig

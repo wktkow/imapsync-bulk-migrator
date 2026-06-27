@@ -443,6 +443,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not input_root.exists():
             logging.error("Input directory does not exist: %s", input_root)
             return 2
+    if args.mode == "export":
+        output_root = Path(args.output_dir)
+        if is_provider_config:
+            try:
+                _raise_if_provider_path_symlink(output_root, "export root")
+            except RuntimeError as exc:
+                logging.error("%s", exc)
+                return 2
+        elif output_root.is_symlink():
+            logging.error("Output directory is a symlink: %s", output_root)
+            return 2
 
     try:
         if (
