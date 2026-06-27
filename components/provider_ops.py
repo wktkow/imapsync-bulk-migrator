@@ -634,7 +634,6 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
             )
             if (
                 isinstance(body, (bytes, bytearray))
-                and body
                 and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
             ):
                 msg_bytes = bytes(body) if msg_bytes is None else msg_bytes + bytes(body)
@@ -663,7 +662,7 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
         "message_bytes": msg_bytes,
         "flags": group(r"FLAGS\s+\((.*?)\)") or "",
         "internaldate": group(r'INTERNALDATE\s+"([^"]+)"') or "",
-        "rfc822_size": int(size_raw) if size_raw else (len(msg_bytes) if msg_bytes else 0),
+        "rfc822_size": int(size_raw) if size_raw else (len(msg_bytes) if msg_bytes is not None else 0),
         "gmail_msgid": group(r"X-GM-MSGID\s+(\d+)") or "",
         "gmail_thrid": group(r"X-GM-THRID\s+(\d+)") or "",
         "gmail_labels": labels,
@@ -1187,7 +1186,7 @@ def manifest_integrity_issues(rows: List[Dict[str, Any]]) -> List[str]:
         if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
             issues.append(f"{identity}: missing or invalid content_sha256")
         expected_size = row.get("rfc822_size")
-        if type(expected_size) is not int or expected_size <= 0:
+        if type(expected_size) is not int or expected_size < 0:
             issues.append(f"{identity}: missing or invalid rfc822_size")
         binding_issue = provider_content_binding_issue(row)
         if binding_issue:
@@ -1236,7 +1235,7 @@ def require_provider_delivery_metadata(rows: List[Dict[str, Any]]) -> None:
 def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
     identity = str(row.get("canonical_id") or "<missing>")
     expected_size = row.get("rfc822_size")
-    if type(expected_size) is not int or expected_size <= 0:
+    if type(expected_size) is not int or expected_size < 0:
         raise RuntimeError(f"{identity}: missing or invalid rfc822_size")
     if len(data) != expected_size:
         raise RuntimeError(f"{identity}: rfc822_size mismatch (manifest={expected_size} actual={len(data)})")
@@ -1956,7 +1955,7 @@ def provider_export_account(
                         "did not return X-GM-MSGID"
                     )
                 msg_bytes = parsed.get("message_bytes")
-                if not isinstance(msg_bytes, bytes) or not msg_bytes:
+                if not isinstance(msg_bytes, bytes):
                     raise RuntimeError(f"body fetch returned no message bytes in {mailbox.name} for UID {uid}")
                 identity, sha256, message_id = canonical_identity(
                     parsed,

@@ -1665,6 +1665,12 @@ def test_list_and_gmail_fetch_parsers() -> None:
     assert "{9}" not in literal_label["gmail_labels"]
     assert literal_label["rfc822_size"] == 35
 
+    empty_body = parse_provider_fetch_response([
+        (b'1 (UID 8 RFC822.SIZE 0 FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {0}', b""),
+    ])
+    assert empty_body["message_bytes"] == b""
+    assert empty_body["rfc822_size"] == 0
+
     quoted_literal_marker_label = parse_provider_fetch_response([
         (b'1 (RFC822.SIZE 10 X-GM-LABELS ("{9}" "Project A"))', b""),
     ])
@@ -2603,6 +2609,23 @@ class FakeSourceNoBodyImap(FakeSourceImap):
         raise AssertionError(command)
 
 
+class FakeSourceZeroByteImap(FakeSourceImap):
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = args[-1]
+            meta = (
+                b'1 (UID 1 RFC822.SIZE 0 FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                b"X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS (\\Inbox))"
+            )
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            self.body_fetches += 1
+            return "OK", [(meta + b" BODY[] {0}", b"")]
+        raise AssertionError(command)
+
+
 class FakeSourceUidValidityChangedImap(FakeSourceImap):
     def __init__(self) -> None:
         super().__init__()
@@ -2649,6 +2672,30 @@ def test_provider_export_fails_when_body_fetch_has_no_message_bytes(tmp_path: Pa
     with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
         with pytest.raises(RuntimeError, match="no message bytes"):
             provider_export_account(config, account, tmp_path)
+
+
+def test_provider_migrates_zero_octet_message(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    source = FakeSourceZeroByteImap()
+    target = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_connection(*_args, **kwargs):
+        yield source if kwargs.get("role") == "source" else target
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        provider_export_account(config, account, tmp_path)
+        provider_import_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    eml_path = account_dir / row["eml_path"]
+
+    assert row["rfc822_size"] == 0
+    assert row["content_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert eml_path.read_bytes() == b""
+    assert target.bodies_by_mailbox["INBOX"] == [b""]
 
 
 def test_provider_export_fails_when_uidvalidity_changes(tmp_path: Path) -> None:

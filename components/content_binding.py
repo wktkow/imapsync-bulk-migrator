@@ -20,7 +20,7 @@ def _required_content_fields(record: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(expected_hash, str) or not _HEX_SHA256.fullmatch(expected_hash):
         raise ValueError("missing or invalid content_sha256")
     expected_size = record.get("rfc822_size")
-    if type(expected_size) is not int or expected_size <= 0:
+    if type(expected_size) is not int or expected_size < 0:
         raise ValueError("missing or invalid rfc822_size")
     return {
         "content_sha256": expected_hash.lower(),
