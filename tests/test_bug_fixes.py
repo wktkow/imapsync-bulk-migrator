@@ -5396,6 +5396,72 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_provider_manifest_rejects_non_string_primary_mailbox_before_import(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import (
+            provider_account_endpoint_state,
+            provider_account_endpoint_state_digest,
+            provider_audit_account,
+            provider_import_account,
+            provider_manifest_digest,
+        )
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        account_dir = tmp_path / "source@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <bad-primary@example.com>\r\n\r\nbody"
+        (account_dir / "messages/provider-1.eml").write_bytes(body)
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "primary_mailbox": ["Archive"],
+            "message_id_header": "<bad-primary@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-1.eml",
+            "metadata_path": "metadata/provider-1.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / "metadata/provider-1.json").write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": source.provider,
+            "target_provider": target.provider,
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+            "source_endpoint": provider_account_endpoint_state(source, account, role="source"),
+            "source_endpoint_sha256": provider_account_endpoint_state_digest(source, account, role="source"),
+            "target_endpoint": provider_account_endpoint_state(target, account, role="target"),
+            "target_endpoint_sha256": provider_account_endpoint_state_digest(target, account, role="target"),
+        }))
+
+        _email, issues = provider_audit_account(config, account, tmp_path)
+
+        assert any("provider-1: missing or invalid primary_mailbox" in issue for issue in issues)
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            with pytest.raises(RuntimeError, match="missing or invalid primary_mailbox"):
+                provider_import_account(config, account, tmp_path)
+
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest

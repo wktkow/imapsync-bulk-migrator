@@ -1134,6 +1134,25 @@ def manifest_identity_issues(rows: List[Dict[str, Any]]) -> Tuple[List[str], Dic
     return issues, counts
 
 
+def manifest_schema_issues(rows: List[Dict[str, Any]]) -> List[str]:
+    issues: List[str] = []
+    for idx, row in enumerate(rows, 1):
+        identity_raw = row.get("canonical_id")
+        identity = identity_raw if isinstance(identity_raw, str) and identity_raw.strip() else f"row {idx}"
+        if not isinstance(identity_raw, str) or not identity_raw.strip():
+            issues.append(f"{identity}: missing canonical_id")
+        primary_mailbox = row.get("primary_mailbox")
+        if not isinstance(primary_mailbox, str) or not primary_mailbox.strip():
+            issues.append(f"{identity}: missing or invalid primary_mailbox")
+    return issues
+
+
+def require_manifest_schema(rows: List[Dict[str, Any]]) -> None:
+    issues = manifest_schema_issues(rows)
+    if issues:
+        raise RuntimeError("invalid manifest schema: " + "; ".join(issues))
+
+
 def require_unique_manifest_identities(rows: List[Dict[str, Any]]) -> None:
     issues, _counts = manifest_identity_issues(rows)
     if issues:
@@ -3122,6 +3141,7 @@ def _validated_group_stage(
     account_dir = account_export_dir(in_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
+    require_manifest_schema(manifest_rows)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_accounts(manifest_rows, account)
     require_manifest_source_provider(manifest_rows, config.source.provider)
@@ -3261,6 +3281,7 @@ def provider_import_account(
     account_dir = account_export_dir(in_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
+    require_manifest_schema(manifest_rows)
     require_unique_manifest_identities(manifest_rows)
     require_manifest_accounts(manifest_rows, account)
     require_manifest_source_provider(manifest_rows, config.source.provider)
@@ -3687,6 +3708,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         )
     )
     identities = set()
+    issues.extend(manifest_schema_issues(rows))
     issues.extend(manifest_account_issues(rows, account))
     issues.extend(manifest_source_provider_issues(rows, config.source.provider))
     issues.extend(manifest_integrity_issues(rows))
@@ -3734,8 +3756,6 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
                     issues.append(f"{identity}: missing {rel_key}")
             except Exception as exc:
                 issues.append(f"{identity}: invalid {rel_key}: {exc}")
-        if not row.get("primary_mailbox"):
-            issues.append(f"{identity}: missing primary_mailbox")
         eml_rel = row.get("eml_path")
         eml_path: Optional[Path] = None
         with contextlib.suppress(Exception):
@@ -3817,6 +3837,7 @@ def provider_validate_account(
         require_manifest_accounts(manifest_rows, account)
     except Exception as exc:
         report["failed"].append(str(exc))
+    report["failed"].extend(manifest_schema_issues(manifest_rows))
     report["failed"].extend(manifest_source_provider_issues(manifest_rows, config.source.provider))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
     report["failed"].extend(provider_delivery_metadata_issues(manifest_rows))
