@@ -830,6 +830,12 @@ def import_account(
     if not any(entries for entries in per_folder.values()):
         if not _completed_zero_message_export(staged_marker_paths, staged_markers):
             raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
+    if pending_keys:
+        raise RuntimeError(
+            f"legacy import journal has {len(pending_keys)} pending append(s); "
+            "target state is uncertain, inspect the mailbox before retrying"
+        )
+    if not any(entries for entries in per_folder.values()):
         logging.info("[import] %s: completed zero-message export; importing empty mailbox structure only", account.email)
 
     # Choose IMAP context manager (injected or default)

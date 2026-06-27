@@ -393,6 +393,30 @@ def _provider_cli_staged_validation_issues(
     return issues
 
 
+def _legacy_pending_import_journal_issues(root: Path, config: Config) -> List[str]:
+    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys
+
+    issues: List[str] = []
+    for account in config.accounts:
+        account_dir = root / sanitize_for_path(account.email)
+        if not account_dir.exists():
+            continue
+        try:
+            pending_keys = _unresolved_legacy_pending_keys(
+                _load_legacy_import_journal(account_dir, repair_trailing=False),
+                _legacy_import_target_id(config.server, account),
+            )
+        except Exception as exc:
+            issues.append(f"{account.email}: import journal load failed: {exc}")
+            continue
+        if pending_keys:
+            issues.append(
+                f"{account.email}: import journal has {len(pending_keys)} pending append(s); "
+                "target state is uncertain"
+            )
+    return issues
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with legacy and provider-aware workflows.",
@@ -605,6 +629,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         logging.error("[staged-audit] %s", issue)
                     return 4
                 legacy_staged_audit_completed = True
+            if not (args.mode == "import" and bool(getattr(args, "reset", False))):
+                pending_journal_issues = _legacy_pending_import_journal_issues(input_root, config)
+                if pending_journal_issues:
+                    logging.error("Input directory has unresolved legacy import journal entries:")
+                    for issue in pending_journal_issues:
+                        logging.error("[staged-journal] %s", issue)
+                    return 4
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:

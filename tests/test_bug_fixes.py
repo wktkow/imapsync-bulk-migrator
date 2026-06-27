@@ -1038,6 +1038,7 @@ class TestLegacyImportJournal:
         target_id = _legacy_import_target_id(server, account)
         fake_imap = mock.MagicMock()
         fake_imap.select.return_value = ("OK", [b""])
+        entered_imap = False
         (account_dir / "import.journal.jsonl").write_text(json.dumps({
             "key": key,
             "status": "pending",
@@ -1048,10 +1049,13 @@ class TestLegacyImportJournal:
 
         @contextlib.contextmanager
         def fake_factory(*_args, **_kwargs) -> Iterator:
+            nonlocal entered_imap
+            entered_imap = True
             yield fake_imap
 
         with pytest.raises(RuntimeError, match="pending append"):
             import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+        assert entered_imap is False
 
     def test_import_retries_after_clean_append_no(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
@@ -2490,6 +2494,104 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
         assert opened is False
+
+    def test_legacy_validate_rejects_pending_journal_before_connectivity_test(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        mailbox_dir = account_dir / "INBOX"
+        data = b"Message-ID: <pending-connectivity@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(mailbox_dir, data=data, source_server=server)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": _legacy_import_key(account_dir, eml, "INBOX", data),
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+        events: List[str] = []
+
+        def record_free_space(*_args, **_kwargs) -> None:
+            events.append("free-space")
+
+        def record_imapsync_check() -> None:
+            events.append("imapsync")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", record_free_space), \
+            mock.patch("components.utils.ensure_imapsync_available", record_imapsync_check), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-pending-connectivity"),
+                "--min-free-gb", "0",
+            ])
+
+        assert rc == 4
+        assert events == []
+
+    def test_legacy_import_rejects_pending_journal_before_connectivity_test(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        mailbox_dir = account_dir / "INBOX"
+        data = b"Message-ID: <pending-import-connectivity@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(mailbox_dir, data=data, source_server=source)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": _legacy_import_key(account_dir, eml, "INBOX", data),
+            "target": _legacy_import_target_id(target, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+        events: List[str] = []
+
+        def record_free_space(*_args, **_kwargs) -> None:
+            events.append("free-space")
+
+        def record_imapsync_check() -> None:
+            events.append("imapsync")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", record_free_space), \
+            mock.patch("components.utils.ensure_imapsync_available", record_imapsync_check), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")), \
+            mock.patch("components.main.import_account", side_effect=AssertionError("import should not run")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-pending-import-connectivity"),
+                "--min-free-gb", "0",
+            ])
+
+        assert rc == 4
+        assert events == []
 
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
