@@ -5,6 +5,7 @@ including attachments, message integrity, and folder structure.
 """
 
 import json
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -36,6 +37,24 @@ def analyze_message(eml_path, json_path):
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
         
+        integrity_errors = []
+        expected_hash = metadata.get('content_sha256')
+        if expected_hash is not None:
+            if not isinstance(expected_hash, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected_hash):
+                integrity_errors.append('invalid content_sha256 metadata')
+            else:
+                actual_hash = hashlib.sha256(msg_bytes).hexdigest()
+                if actual_hash != expected_hash.lower():
+                    integrity_errors.append('content_sha256 mismatch')
+        expected_size = metadata.get('rfc822_size')
+        if expected_size is not None:
+            if not isinstance(expected_size, int):
+                integrity_errors.append('invalid rfc822_size metadata')
+            elif len(msg_bytes) != expected_size:
+                integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
+        if integrity_errors:
+            return None, '; '.join(integrity_errors)
+
         # Analyze message
         analysis = {
             'size_bytes': len(msg_bytes),
