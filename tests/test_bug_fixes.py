@@ -824,7 +824,7 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[NoAppendImap]:
             yield NoAppendImap()
 
-        with pytest.raises(RuntimeError, match="empty message file"):
+        with pytest.raises(RuntimeError, match="invalid rfc822_size metadata"):
             import_account(
                 Account("user@example.com", "secret"),
                 ServerConfig("imap.example.com"),
@@ -1144,14 +1144,16 @@ class TestLegacyImportJournal:
             folder = account_dir / mailbox
             folder.mkdir(parents=True)
             eml = folder / "u0000000001.eml"
-            eml.write_bytes(f"Message-ID: <{mailbox.lower()}@example.com>\r\n\r\nbody".encode("ascii"))
-            eml.with_suffix(".json").write_text(json.dumps({
-                "account": "user@example.com",
-                "mailbox": mailbox,
-                "uid": 1,
-                "flags": "",
-                "internaldate": "",
-            }))
+            data = f"Message-ID: <{mailbox.lower()}@example.com>\r\n\r\nbody".encode("ascii")
+            eml.write_bytes(data)
+            eml.with_suffix(".json").write_text(json.dumps(_legacy_integrity_metadata(
+                data,
+                account="user@example.com",
+                mailbox=mailbox,
+                uid=1,
+                flags="",
+                internaldate="",
+            )))
 
         server = ServerConfig(host="dummy", port=993, ssl=True)
         account = Account(email="user@example.com", password="pass")
@@ -1572,15 +1574,17 @@ class TestBug6CreateExceptionLogged:
         acc_dir = tmp_path / "user@example.com" / "NonExistent"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a\n\nbody")
+        data = b"From: a\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({
-            "account": "user@example.com",
-            "mailbox": "NonExistent",
-            "uid": 1,
-            "flags": "",
-            "internaldate": "",
-        }))
+        meta.write_text(json.dumps(_legacy_integrity_metadata(
+            data,
+            account="user@example.com",
+            mailbox="NonExistent",
+            uid=1,
+            flags="",
+            internaldate="",
+        )))
 
         fake_imap = mock.MagicMock()
         # First select fails, create fails, second select fails → RuntimeError
@@ -5756,6 +5760,43 @@ class TestRound7ConfirmedBugs:
         eml.with_suffix(".json").unlink()
 
         with pytest.raises(RuntimeError, match="missing message metadata"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    @pytest.mark.parametrize(
+        ("removed_field", "error"),
+        [
+            ("rfc822_size", "invalid rfc822_size metadata"),
+            ("content_sha256", "invalid content_sha256 metadata"),
+            ("content_binding_sha256", "missing content_binding_sha256"),
+        ],
+    )
+    def test_direct_import_rejects_missing_legacy_integrity_metadata_before_connect(
+        self,
+        tmp_path: Path,
+        removed_field: str,
+        error: str,
+    ) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <missing-integrity-import@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        del meta[removed_field]
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match=error):
             import_account(
                 Account("user@example.com", "secret"),
                 ServerConfig("imap.example.com"),

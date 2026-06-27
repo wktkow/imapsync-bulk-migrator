@@ -6,6 +6,7 @@ Validates that the type fixes are correct at runtime and don't alter behavior.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -16,6 +17,20 @@ import imaplib
 import pytest
 
 from components.models import Account, ServerConfig
+from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+
+
+def _legacy_import_metadata(data: bytes, **extra: object) -> dict:
+    meta = {
+        "account": "user@example.com",
+        "mailbox": "INBOX",
+        "uid": 1,
+        "rfc822_size": len(data),
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+        **extra,
+    }
+    meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -127,15 +142,10 @@ class TestImapFactoryTyping:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({
-            "account": "user@example.com",
-            "mailbox": "INBOX",
-            "uid": 1,
-            "flags": "",
-            "internaldate": "",
-        }))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -181,16 +191,11 @@ class TestFlagsAlwaysStr:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
         # Empty flags and no internaldate
-        meta.write_text(json.dumps({
-            "account": "user@example.com",
-            "mailbox": "INBOX",
-            "uid": 1,
-            "flags": "",
-            "internaldate": "",
-        }))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -217,15 +222,10 @@ class TestFlagsAlwaysStr:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({
-            "account": "user@example.com",
-            "mailbox": "INBOX",
-            "uid": 1,
-            "flags": "\\Recent",
-            "internaldate": "",
-        }))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="\\Recent", internaldate="")))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])

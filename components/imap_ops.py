@@ -567,18 +567,16 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
 
 def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object]) -> Tuple[Optional[int], Optional[str]]:
     expected_size_raw = meta.get("rfc822_size")
-    expected_size: Optional[int] = None
-    if expected_size_raw is not None:
-        if type(expected_size_raw) is not int or expected_size_raw <= 0:
-            raise RuntimeError(f"{meta_path}: invalid rfc822_size metadata")
-        expected_size = expected_size_raw
+    if type(expected_size_raw) is not int or expected_size_raw <= 0:
+        raise RuntimeError(f"{meta_path}: invalid rfc822_size metadata")
+    expected_size = expected_size_raw
     expected_hash_raw = meta.get("content_sha256")
-    expected_hash: Optional[str] = None
-    if expected_hash_raw is not None:
-        expected_hash = str(expected_hash_raw).lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
-            raise RuntimeError(f"{meta_path}: invalid content_sha256 metadata")
-    binding_issue = legacy_content_binding_issue(meta, required=False)
+    if not isinstance(expected_hash_raw, str):
+        raise RuntimeError(f"{meta_path}: invalid content_sha256 metadata")
+    expected_hash = expected_hash_raw.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise RuntimeError(f"{meta_path}: invalid content_sha256 metadata")
+    binding_issue = legacy_content_binding_issue(meta, required=True)
     if binding_issue:
         raise RuntimeError(f"{meta_path}: {binding_issue}")
     return expected_size, expected_hash
