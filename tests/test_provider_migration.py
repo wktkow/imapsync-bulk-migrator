@@ -5375,6 +5375,25 @@ def test_provider_import_audit_and_validation_require_manifest_integrity_metadat
         provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_audit_and_validation_reject_boolean_manifest_size(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["rfc822_size"] = True
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir)
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("missing or invalid rfc822_size" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert any("missing or invalid rfc822_size" in issue for issue in report["failed"])
+
+    with pytest.raises(RuntimeError, match="invalid manifest integrity metadata"):
+        provider_import_account(config, account, tmp_path)
+
+
 def test_provider_validation_rejects_incomplete_export_state(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
