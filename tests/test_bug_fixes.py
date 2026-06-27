@@ -6765,6 +6765,50 @@ class TestRound7ConfirmedBugs:
         assert rc == 2
         assert not (outside / "user@example.com").exists()
 
+    def test_main_rejects_legacy_hidden_symlinked_output_root_before_preflight_side_effects(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside-output"
+        outside.mkdir()
+        link_root = tmp_path / "exported"
+        try:
+            link_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        out_root = tmp_path / "missing" / ".." / "exported"
+        assert not out_root.exists()
+        assert not out_root.is_symlink()
+        events: List[str] = []
+
+        def record_free_space(*_args, **_kwargs) -> None:
+            events.append("free-space")
+
+        def record_imapsync_check() -> None:
+            events.append("imapsync")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", record_free_space), \
+            mock.patch("components.utils.ensure_imapsync_available", record_imapsync_check), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(out_root),
+                "--log-dir", str(tmp_path / "logs-hidden-export"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+        assert events == []
+        assert not (tmp_path / "missing").exists()
+        assert not (outside / "user@example.com").exists()
+
     def test_main_rejects_legacy_symlinked_output_root_ancestor_before_connectivity(self, tmp_path: Path) -> None:
         from components.main import main
 

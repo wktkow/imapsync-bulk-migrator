@@ -8888,6 +8888,49 @@ def test_main_rejects_provider_symlinked_output_root_before_connectivity(tmp_pat
     assert rc == 2
 
 
+def test_main_rejects_provider_hidden_symlinked_output_root_before_preflight_side_effects(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    outside = tmp_path / "outside-hidden-output"
+    outside.mkdir()
+    link_root = tmp_path / "provider-exported"
+    try:
+        link_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    out_root = tmp_path / "missing-provider-root" / ".." / "provider-exported"
+    assert not out_root.exists()
+    assert not out_root.is_symlink()
+    events: List[str] = []
+
+    def record_free_space(*_args, **_kwargs) -> None:
+        events.append("free-space")
+
+    def record_connectivity(*_args, **_kwargs) -> None:
+        events.append("connectivity")
+
+    def record_export(*_args, **_kwargs) -> None:
+        events.append("export")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path", record_free_space), \
+        mock.patch("components.main.provider_test_accounts", record_connectivity), \
+        mock.patch("components.main.provider_export_all", record_export):
+        rc = main([
+            "--mode", "export",
+            "--config", str(config_path),
+            "--output-dir", str(out_root),
+            "--log-dir", str(tmp_path / "logs-provider-hidden-export"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 2
+    assert events == []
+    assert not (tmp_path / "missing-provider-root").exists()
+
+
 @pytest.mark.parametrize("mode", ["export", "import", "validate"])
 def test_main_rejects_provider_symlinked_account_dir_before_connectivity(
     tmp_path: Path,

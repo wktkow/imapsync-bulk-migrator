@@ -57,11 +57,14 @@ def _legacy_symlink_component(path: Path) -> Optional[Path]:
     absolute = path if path.is_absolute() else Path.cwd() / path
     current = Path(absolute.anchor)
     for part in absolute.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            current = current.parent
+            continue
         current = current / part
         if current.is_symlink():
             return current
-        if not current.exists():
-            break
     return None
 
 
