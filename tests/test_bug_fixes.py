@@ -24,6 +24,7 @@ def _legacy_integrity_metadata(data: bytes, **extra: object) -> dict:
     from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
 
     meta = {
+        "account": "user@example.com",
         **extra,
         "rfc822_size": len(data),
         "content_sha256": hashlib.sha256(data).hexdigest(),
@@ -60,6 +61,7 @@ def _write_legacy_message_fixture(
     eml.write_bytes(data)
     meta = _legacy_integrity_metadata(
         data,
+        account=folder.parent.name,
         mailbox=mailbox,
         uid=uid,
         flags="\\Seen",
@@ -803,7 +805,7 @@ class TestLegacyImportJournal:
 
         folder = tmp_path / "user@example.com" / "INBOX"
         eml = _write_legacy_message_fixture(folder, data=b"")
-        eml.with_suffix(".json").write_text(json.dumps({"mailbox": "INBOX", "uid": 1}))
+        eml.with_suffix(".json").write_text(json.dumps({"account": "user@example.com", "mailbox": "INBOX", "uid": 1}))
 
         class NoAppendImap:
             def select(self, mailbox: str, readonly: bool = False):
@@ -1144,6 +1146,7 @@ class TestLegacyImportJournal:
             eml = folder / "u0000000001.eml"
             eml.write_bytes(f"Message-ID: <{mailbox.lower()}@example.com>\r\n\r\nbody".encode("ascii"))
             eml.with_suffix(".json").write_text(json.dumps({
+                "account": "user@example.com",
                 "mailbox": mailbox,
                 "uid": 1,
                 "flags": "",
@@ -1571,7 +1574,13 @@ class TestBug6CreateExceptionLogged:
         eml = acc_dir / "u0000000001.eml"
         eml.write_bytes(b"From: a\n\nbody")
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({"mailbox": "NonExistent", "uid": 1, "flags": "", "internaldate": ""}))
+        meta.write_text(json.dumps({
+            "account": "user@example.com",
+            "mailbox": "NonExistent",
+            "uid": 1,
+            "flags": "",
+            "internaldate": "",
+        }))
 
         fake_imap = mock.MagicMock()
         # First select fails, create fails, second select fails → RuntimeError
@@ -5636,6 +5645,87 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("export-state is a symlink" in issue for issue in issues)
         assert not any("export-state missing or invalid" in issue for issue in issues)
+
+    def test_strict_audit_rejects_cross_account_legacy_message_pair(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account_a_folder = tmp_path / "a@example.com" / "INBOX"
+        account_b_folder = tmp_path / "b@example.com" / "INBOX"
+        account_a_eml = _write_legacy_message_fixture(
+            account_a_folder,
+            data=b"Message-ID: <a@example.com>\r\nFrom: a\r\nTo: target\r\n\r\nbody-a",
+            source_server=server,
+        )
+        account_b_eml = _write_legacy_message_fixture(
+            account_b_folder,
+            data=b"Message-ID: <b@example.com>\r\nFrom: b\r\nTo: target\r\n\r\nbody-b",
+            source_server=server,
+        )
+        (account_a_folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        account_a_eml.write_bytes(account_b_eml.read_bytes())
+        account_a_eml.with_suffix(".json").write_text(account_b_eml.with_suffix(".json").read_text())
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("a@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("account metadata mismatch (account=a@example.com meta=b@example.com)" in issue for issue in issues)
+
+    def test_direct_import_rejects_cross_account_legacy_sidecar_before_connect(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "a@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <wrong-account@example.com>\r\nFrom: b\r\nTo: a\r\n\r\nbody",
+        )
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["account"] = "b@example.com"
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match="account metadata mismatch"):
+            import_account(
+                Account("a@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_verify_export_rejects_cross_account_legacy_sidecar(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "a@example.com"
+        folder = account_dir / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <verify-account@example.com>\r\nFrom: b\r\nTo: a\r\n\r\nbody",
+        )
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["account"] = "b@example.com"
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 1
+        assert "account metadata mismatch (account=a@example.com meta=b@example.com)" in output
 
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export

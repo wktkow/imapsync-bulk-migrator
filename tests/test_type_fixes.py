@@ -129,7 +129,13 @@ class TestImapFactoryTyping:
         eml = acc_dir / "u0000000001.eml"
         eml.write_bytes(b"From: a@b.com\n\nbody")
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "", "internaldate": ""}))
+        meta.write_text(json.dumps({
+            "account": "user@example.com",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "flags": "",
+            "internaldate": "",
+        }))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -178,7 +184,13 @@ class TestFlagsAlwaysStr:
         eml.write_bytes(b"From: a@b.com\n\nbody")
         meta = acc_dir / "u0000000001.json"
         # Empty flags and no internaldate
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "", "internaldate": ""}))
+        meta.write_text(json.dumps({
+            "account": "user@example.com",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "flags": "",
+            "internaldate": "",
+        }))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -207,7 +219,13 @@ class TestFlagsAlwaysStr:
         eml = acc_dir / "u0000000001.eml"
         eml.write_bytes(b"From: a@b.com\n\nbody")
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "\\Recent", "internaldate": ""}))
+        meta.write_text(json.dumps({
+            "account": "user@example.com",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "flags": "\\Recent",
+            "internaldate": "",
+        }))
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])

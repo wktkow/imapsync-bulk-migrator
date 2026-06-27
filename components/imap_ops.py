@@ -527,6 +527,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         meta_path = folder_dir / f"{base}.json"
                         _secure_atomic_write_bytes(eml_path, msg_bytes)
                         meta = {
+                            "account": account.email,
                             "mailbox": mailbox,
                             "uid": int(uid),
                             "flags": flags or "",
@@ -775,6 +776,11 @@ def import_account(
                     raise RuntimeError(f"{meta_path}: message metadata is not an object")
                 expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
                 flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
+                account_meta = meta.get("account")
+                if not isinstance(account_meta, str) or not account_meta.strip():
+                    raise RuntimeError(f"{meta_path}: missing account metadata")
+                if account_meta != account.email:
+                    raise RuntimeError(f"{meta_path}: account metadata mismatch (account={account.email} meta={account_meta})")
                 mbox = meta.get("mailbox")
                 if isinstance(mbox, str) and mbox.strip():
                     if sanitize_for_path(mbox) != folder_dir.name:

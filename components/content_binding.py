@@ -46,6 +46,7 @@ def _content_binding_sha256(kind: str, fields: Mapping[str, Any]) -> str:
 
 def legacy_content_binding_sha256(meta: Mapping[str, Any]) -> str:
     fields = _required_content_fields(meta)
+    _add_optional_text(fields, meta, "account")
     _add_optional_text(fields, meta, "mailbox")
     _add_optional_int(fields, meta, "uid")
     _add_optional_text(fields, meta, "flags")

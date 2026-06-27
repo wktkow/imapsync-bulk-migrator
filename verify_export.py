@@ -111,6 +111,7 @@ def analyze_message(
     *,
     require_metadata=True,
     folder_name=None,
+    expected_account=None,
     content_binding="legacy",
     mailbox_marker_present=True,
     mailbox_marker_mailbox=None,
@@ -185,6 +186,12 @@ def analyze_message(
             binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
         if binding_issue:
             integrity_errors.append(binding_issue)
+        if content_binding == "legacy" and expected_account is not None:
+            account_meta = metadata.get('account')
+            if not isinstance(account_meta, str) or not account_meta.strip():
+                integrity_errors.append('missing account metadata')
+            elif account_meta != expected_account:
+                integrity_errors.append(f'account metadata mismatch (account={expected_account} meta={account_meta})')
         if 'uid' in metadata:
             uid = metadata.get('uid')
             if type(uid) is not int:
@@ -533,6 +540,7 @@ def verify_account(account_path):
                 eml_file,
                 json_file,
                 folder_name=folder_name,
+                expected_account=account_name,
                 mailbox_marker_present=mailbox_marker_present,
                 mailbox_marker_mailbox=mailbox_marker_mailbox,
             )

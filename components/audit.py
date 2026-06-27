@@ -309,6 +309,15 @@ def audit_account(
             if not isinstance(meta, dict):
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: message metadata is not an object")
                 continue
+            account_meta = meta.get("account")
+            if not isinstance(account_meta, str) or not account_meta.strip():
+                if require_integrity_metadata:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing account metadata")
+            elif account_meta != account.email:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: account metadata mismatch "
+                    f"(account={account.email} meta={account_meta})"
+                )
             mailbox_meta = meta.get("mailbox")
             if not isinstance(mailbox_meta, str) or not mailbox_meta.strip():
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: missing mailbox metadata")
