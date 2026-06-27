@@ -51,8 +51,16 @@ def _raise_if_symlink(path: Path, label: str) -> None:
 
 def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
     ensure_private_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        fd = os.open(tmp, flags, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ELOOP, errno.EMLINK} or tmp.is_symlink():
+            raise RuntimeError(f"refusing to use unsafe temporary file: {tmp}") from exc
+        raise
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(payload)

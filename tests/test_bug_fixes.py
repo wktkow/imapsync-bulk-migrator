@@ -4896,6 +4896,62 @@ class TestRound7ConfirmedBugs:
 
         assert out.read_text() == "raced\n"
 
+    def test_legacy_export_refuses_preexisting_temp_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        out_root = tmp_path / "exported"
+        inbox = out_root / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        victim = tmp_path / "victim.eml"
+        victim.write_bytes(b"original")
+        try:
+            (inbox / ".u0000000001.eml.123.456.tmp").symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        monkeypatch.setattr("components.imap_ops.os.getpid", lambda: 123)
+        monkeypatch.setattr("components.imap_ops.time.time_ns", lambda: 456)
+
+        class OneMessageInbox:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+                    )]
+                raise AssertionError(f"unexpected uid command: {command}")
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[OneMessageInbox]:
+            yield OneMessageInbox()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="unsafe temporary file"):
+                export_account(
+                    Account("user@example.com", "secret"),
+                    ServerConfig("imap.example.com"),
+                    out_root,
+                    ignore_errors=False,
+                )
+
+        assert victim.read_bytes() == b"original"
+        assert not (inbox / "u0000000001.eml").exists()
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
