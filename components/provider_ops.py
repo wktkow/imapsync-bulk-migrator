@@ -333,6 +333,10 @@ def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     return False
 
 
+def is_virtual_target_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
+    return is_virtual_source_mailbox(provider, mailbox)
+
+
 def mailbox_path_segments(mailbox_name: str, delimiter: str) -> List[str]:
     if delimiter and delimiter in mailbox_name:
         return [segment for segment in mailbox_name.split(delimiter) if segment]
@@ -2865,6 +2869,8 @@ def enforce_empty_target(
                 permitted_by_mailbox.setdefault(key_name, []).append((row, key))
     for mailbox in target_mailboxes:
         if is_noselect(mailbox):
+            continue
+        if is_virtual_target_mailbox(target_provider, mailbox):
             continue
         count = target_message_count(imap, mailbox.name)
         if count <= 0:

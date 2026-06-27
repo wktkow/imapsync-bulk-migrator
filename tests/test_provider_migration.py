@@ -7184,6 +7184,30 @@ def test_provider_import_empty_mode_rejects_populated_target(tmp_path: Path) -> 
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_empty_mode_ignores_icloud_vip_virtual_target_view(tmp_path: Path) -> None:
+    class TargetWithIcloudVipView(FakeTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Archive) "/" "Archive"',
+                b'(\\HasNoChildren) "/" "VIP"',
+            ]
+
+    config = _provider_config()
+    account = config.accounts[0]
+    _write_manifest_fixture(tmp_path)
+    fake = TargetWithIcloudVipView(messages_by_mailbox={"VIP": 1})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[TargetWithIcloudVipView]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+
+
 def test_provider_import_empty_mode_rejects_populated_unrelated_target_folder(tmp_path: Path) -> None:
     class TargetWithUnrelatedFolder(FakeTargetImap):
         def list(self):
