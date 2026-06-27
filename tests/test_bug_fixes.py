@@ -6946,6 +6946,51 @@ class TestRound7ConfirmedBugs:
         assert rc == 2
 
     @pytest.mark.parametrize("mode", ["import", "validate"])
+    def test_main_rejects_legacy_wrong_source_export_state_before_connectivity(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        expected_source = ServerConfig("expected-source.example.com")
+        actual_source = ServerConfig("actual-source.example.com")
+        config_path = tmp_path / "import.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {
+                "host": expected_source.host,
+                "port": expected_source.port,
+                "ssl": expected_source.ssl,
+                "starttls": expected_source.starttls,
+            },
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        in_root = tmp_path / "exported"
+        folder = in_root / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <wrong-source-cli@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=actual_source,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / f"logs-wrong-source-{mode}"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 4
+
+    @pytest.mark.parametrize("mode", ["import", "validate"])
     def test_main_rejects_legacy_symlinked_staged_mailbox_before_connectivity(
         self,
         tmp_path: Path,

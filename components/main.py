@@ -452,6 +452,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     is_provider_config = isinstance(config, ProviderMigrationConfig)
     use_da_panel = bool(getattr(args, "auto_provision_da", False))
     use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
+    legacy_staged_audit_completed = False
     if (
         not is_provider_config
         and args.mode != "import"
@@ -519,6 +520,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for issue in symlink_issues:
                     logging.error("[staged-local] %s", issue)
                 return 2
+            if not use_da_panel and not use_cpanel:
+                try:
+                    logging.info("Running strict local staged export audit before connectivity...")
+                    ok, staged_audit_issues = audit_export(
+                        input_root,
+                        config,
+                        int(args.max_workers),
+                        check_remote=False,
+                        require_integrity_metadata=True,
+                    )
+                except Exception as exc:
+                    logging.error("Staged export audit failed before connectivity: %s", exc)
+                    return 4
+                if not ok:
+                    logging.error(
+                        "Refusing %s because staged export audit found %d issue(s)",
+                        args.mode,
+                        len(staged_audit_issues),
+                    )
+                    for issue in staged_audit_issues:
+                        logging.error("[staged-audit] %s", issue)
+                    return 4
+                legacy_staged_audit_completed = True
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:
@@ -906,7 +930,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             check_free_space_for_path(in_root, min_free_gb)
             panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
-            if not panel_dry_run:
+            if not panel_dry_run and not legacy_staged_audit_completed:
                 try:
                     logging.info("Running strict local staged export audit before import...")
                     ok, staged_audit_issues = audit_export(
