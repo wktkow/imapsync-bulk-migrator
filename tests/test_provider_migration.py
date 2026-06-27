@@ -1222,8 +1222,8 @@ def test_provider_config_generic_imap_case_only_target_usernames_are_distinct(tm
     assert target_merge_group_key(parsed, parsed.accounts[0]) != target_merge_group_key(parsed, parsed.accounts[1])
 
 
-def test_provider_config_many_to_one_rejects_shared_endpoint_secret_for_case_distinct_generic_targets(tmp_path: Path) -> None:
-    path = tmp_path / "case-distinct-generic-targets.json"
+def test_provider_config_many_to_one_rejects_shared_endpoint_secret_for_distinct_generic_targets(tmp_path: Path) -> None:
+    path = tmp_path / "distinct-generic-targets.json"
     path.write_text(json.dumps({
         "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
         "target": {
@@ -1235,12 +1235,12 @@ def test_provider_config_many_to_one_rejects_shared_endpoint_secret_for_case_dis
         "accounts": [
             {
                 "source_email": "a@example.com",
-                "target_email": "User@example.com",
+                "target_email": "first@example.com",
                 "source_auth": {"method": "password", "username": "a@example.com", "password": "source-a"},
             },
             {
                 "source_email": "b@example.com",
-                "target_email": "user@example.com",
+                "target_email": "second@example.com",
                 "source_auth": {"method": "password", "username": "b@example.com", "password": "source-b"},
             },
         ],
@@ -1340,6 +1340,29 @@ def test_provider_config_rejects_sanitized_account_path_collisions(tmp_path: Pat
 
     with pytest.raises(ValueError, match="path collision"):
         load_config_file(path)
+
+    case_only = tmp_path / "provider-case-collision.json"
+    case_only.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password"}},
+        "accounts": [
+            {
+                "source_email": "User@example.com",
+                "target_email": "first@target.example.com",
+                "source_auth": {"method": "password", "username": "User@example.com", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "first", "password": "target-a"},
+            },
+            {
+                "source_email": "user@example.com",
+                "target_email": "second@target.example.com",
+                "source_auth": {"method": "password", "username": "user@example.com", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "second", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="case-insensitive"):
+        load_config_file(case_only)
 
 
 def test_xoauth2_payload_generation() -> None:

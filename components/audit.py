@@ -18,7 +18,7 @@ from .imap_ops import (
     list_all_mailboxes,
     quote_mailbox_name,
 )
-from .utils import quote_imap_search_value, sanitize_for_path
+from .utils import quote_imap_search_value, sanitize_for_path, sanitized_path_key
 
 
 def _message_id_header(data: bytes) -> str:
@@ -116,7 +116,7 @@ def _legacy_export_state_issues(
         return issues
     staged_by_path = {folder_dir.name: folder_dir for folder_dir in folder_dirs}
     state_paths: set[str] = set()
-    state_mailbox_by_path: Dict[str, str] = {}
+    state_mailbox_by_path: Dict[str, Tuple[str, str]] = {}
     for idx, raw in enumerate(raw_mailboxes, 1):
         if not isinstance(raw, dict):
             issues.append(f"{account.email}: export-state mailbox entry {idx} is not an object")
@@ -134,14 +134,16 @@ def _legacy_export_state_issues(
         if type(message_count) is not int or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
-        previous_mailbox = state_mailbox_by_path.get(path)
+        collision_key = sanitized_path_key(mailbox)
+        previous_mailbox = state_mailbox_by_path.get(collision_key)
         if previous_mailbox is not None:
             issues.append(
                 f"{account.email}: export-state mailbox path collision after sanitizing: "
-                f"{previous_mailbox!r} and {mailbox!r} both map to {path!r}"
+                f"{previous_mailbox[0]!r} -> {previous_mailbox[1]!r} and {mailbox!r} -> {path!r} "
+                "alias on case-insensitive filesystems"
             )
             continue
-        state_mailbox_by_path[path] = mailbox
+        state_mailbox_by_path[collision_key] = (mailbox, path)
         state_paths.add(path)
         folder_dir = staged_by_path.get(path)
         if folder_dir is None:
@@ -337,31 +339,35 @@ def audit_account(
             with imap_connection(server, account) as imap:
                 remote_mailboxes = list_all_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
-                remote_mailbox_by_key: Dict[str, str] = {}
+                remote_mailbox_by_key: Dict[str, Tuple[str, str]] = {}
+                remote_mailbox_by_path: Dict[str, str] = {}
                 count_mismatched = set()
                 for mbox in remote_mailboxes:
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
-                    key = sanitize_for_path(mbox)
+                    path = sanitize_for_path(mbox)
+                    key = sanitized_path_key(mbox)
                     if status != "OK":
-                        count_mismatched.add(key)
-                        issues.append(f"{account.email}:{key}: remote mailbox could not be selected: {mbox!r}")
+                        count_mismatched.add(path)
+                        issues.append(f"{account.email}:{path}: remote mailbox could not be selected: {mbox!r}")
                         continue
                     status, data = imap.uid("search", "ALL")
                     if status != "OK":
-                        count_mismatched.add(key)
-                        issues.append(f"{account.email}:{key}: remote mailbox UID search failed: {mbox!r}")
+                        count_mismatched.add(path)
+                        issues.append(f"{account.email}:{path}: remote mailbox UID search failed: {mbox!r}")
                         continue
                     num = len((data[0] or b"").split()) if data else 0
                     previous = remote_mailbox_by_key.get(key)
-                    if previous is not None and previous != mbox:
-                        count_mismatched.add(key)
+                    if previous is not None and previous[0] != mbox:
+                        count_mismatched.update({previous[1], path})
                         issues.append(
                             f"{account.email}:{key}: remote mailbox name collision after sanitizing: "
-                            f"{previous!r} and {mbox!r}"
+                            f"{previous[0]!r} -> {previous[1]!r} and {mbox!r} -> {path!r} "
+                            "alias on case-insensitive filesystems"
                         )
                         continue
-                    remote_counts[key] = num
-                    remote_mailbox_by_key[key] = mbox
+                    remote_counts[path] = num
+                    remote_mailbox_by_key[key] = (mbox, path)
+                    remote_mailbox_by_path[path] = mbox
                 identity_candidates: List[Tuple[Path, str, str]] = []
                 for folder_dir in folder_dirs:
                     folder = folder_dir.name
@@ -374,7 +380,7 @@ def audit_account(
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
                     elif local_count > 0:
-                        mailbox = remote_mailbox_by_key.get(folder, _folder_mailbox_name(folder_dir))
+                        mailbox = remote_mailbox_by_path.get(folder, _folder_mailbox_name(folder_dir))
                         for eml_path in sorted(folder_dir.glob("*.eml")):
                             identity_candidates.append((eml_path, folder, mailbox))
                 for folder_name, rcount in remote_counts.items():

@@ -129,6 +129,26 @@ class TestBug5SanitizeCollisionDetection:
             subdirs = [p.name for p in account_dir.iterdir() if p.is_dir()]
             assert "Sent_Items" not in subdirs
 
+    def test_case_only_collision_raises_before_writing(self, tmp_path: Path) -> None:
+        """Case-only mailbox names alias on common case-insensitive filesystems."""
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        fake_imap = mock.MagicMock()
+        fake_imap.list.return_value = (
+            "OK",
+            [b'(\\HasNoChildren) "/" "Folder"', b'(\\HasNoChildren) "/" "folder"'],
+        )
+
+        with mock.patch("components.imap_ops.imap_connection") as mock_conn:
+            mock_conn.return_value.__enter__ = mock.MagicMock(return_value=fake_imap)
+            mock_conn.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="case-insensitive"):
+                export_account(account, server, tmp_path, ignore_errors=False)
+
     def test_no_collision_passes(self) -> None:
         """Distinct mailbox names that don't collide should not trigger an error."""
         from components.utils import sanitize_for_path
@@ -1379,7 +1399,7 @@ class TestCliAndConfigHardening:
         with pytest.raises(ValueError, match="duplicates"):
             Config.from_json_file(duplicate)
 
-    def test_legacy_config_allows_case_distinct_generic_imap_accounts(self, tmp_path: Path) -> None:
+    def test_legacy_config_rejects_case_only_account_path_collisions(self, tmp_path: Path) -> None:
         from components.models import Config
 
         case_distinct = tmp_path / "case-distinct.json"
@@ -1391,9 +1411,8 @@ class TestCliAndConfigHardening:
             ],
         }))
 
-        config = Config.from_json_file(case_distinct)
-
-        assert [account.email for account in config.accounts] == ["User@example.com", "user@example.com"]
+        with pytest.raises(ValueError, match="case-insensitive"):
+            Config.from_json_file(case_distinct)
 
     def test_legacy_config_rejects_sanitized_account_path_collisions(self, tmp_path: Path) -> None:
         from components.models import Config

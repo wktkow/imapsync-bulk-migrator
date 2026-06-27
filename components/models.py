@@ -3,9 +3,9 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .utils import sanitize_for_path
+from .utils import sanitize_for_path, sanitized_path_key
 
 
 @dataclasses.dataclass
@@ -15,15 +15,18 @@ class Account:
 
 
 def _reject_sanitized_path_collisions(values: List[str], *, context: str) -> None:
-    seen: Dict[str, str] = {}
+    seen: Dict[str, Tuple[str, str]] = {}
     for value in values:
-        key = sanitize_for_path(value)
+        path = sanitize_for_path(value)
+        key = sanitized_path_key(value)
         previous = seen.get(key)
-        if previous is not None and previous != value:
+        if previous is not None and previous[0] != value:
             raise ValueError(
-                f"{context} path collision after sanitizing: {previous!r} and {value!r} both map to {key!r}"
+                f"{context} path collision after sanitizing: "
+                f"{previous[0]!r} -> {previous[1]!r} and {value!r} -> {path!r} "
+                "alias on case-insensitive filesystems"
             )
-        seen[key] = value
+        seen[key] = (value, path)
 
 
 @dataclasses.dataclass

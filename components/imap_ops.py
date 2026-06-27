@@ -17,7 +17,7 @@ import imaplib
 
 from .models import Account, ServerConfig
 from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue, legacy_content_binding_sha256
-from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
+from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path, sanitized_path_key
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -450,16 +450,19 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         # Detect sanitize_for_path collisions before writing any data.
         # Two distinct mailbox names that map to the same directory would
         # silently overwrite each other's messages.
-        seen_paths: Dict[str, str] = {}  # sanitized_name -> original mailbox
+        seen_paths: Dict[str, Tuple[str, str]] = {}  # filesystem key -> (original mailbox, sanitized path)
         for mb in mailboxes:
-            key = sanitize_for_path(mb)
-            if key in seen_paths and seen_paths[key] != mb:
+            path = sanitize_for_path(mb)
+            key = sanitized_path_key(mb)
+            previous = seen_paths.get(key)
+            if previous is not None and previous[0] != mb:
                 raise RuntimeError(
                     f"Mailbox name collision for account {account.email}: "
-                    f"'{seen_paths[key]}' and '{mb}' both map to directory '{key}'. "
+                    f"'{previous[0]}' -> '{previous[1]}' and '{mb}' -> '{path}' "
+                    "alias on case-insensitive filesystems. "
                     f"Cannot export without data loss."
                 )
-            seen_paths[key] = mb
+            seen_paths[key] = (mb, path)
 
         for mailbox in mailboxes:
             _raise_if_stopped(stop_event, f"legacy export {account.email}")

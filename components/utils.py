@@ -18,6 +18,10 @@ def sanitize_for_path(name: str) -> str:
     return name
 
 
+def sanitized_path_key(name: str) -> str:
+    return sanitize_for_path(name).casefold()
+
+
 _IMAP_ATOM_SPECIALS = set('(){ %*"\\]')
 
 
