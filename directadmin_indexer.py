@@ -401,7 +401,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     server = ServerSettings(
         host=args.imap_host,
         port=int(args.imap_port),
-        ssl=bool(args.imap_ssl),
+        ssl=bool(args.imap_ssl) and not bool(args.imap_starttls),
         starttls=bool(args.imap_starttls),
     )
     payload = build_config(server, all_emails, default_password=default_password)

@@ -4347,3 +4347,62 @@ class TestRound4ConfirmedBugs:
         assert not ok
         assert any("export-state mailbox 'INBOX' has invalid message_count" in issue for issue in issues)
         assert any("mailbox marker has invalid message_count" in issue for issue in issues)
+
+
+class TestRound6ConfirmedBugs:
+    def test_indexer_starttls_generates_loadable_config(self, tmp_path: Path) -> None:
+        from components.models import Config
+        from cpanel_indexer import ServerSettings as CPanelServerSettings
+        from cpanel_indexer import build_config as build_cpanel_config
+        from cpanel_indexer import parse_args as parse_cpanel_args
+        from directadmin_indexer import ServerSettings as DirectAdminServerSettings
+        from directadmin_indexer import build_config as build_directadmin_config
+        from directadmin_indexer import parse_args as parse_directadmin_args
+
+        directadmin_args = parse_directadmin_args([
+            "--url", "https://panel.example.com:2222",
+            "--username", "admin",
+            "--password", "secret",
+            "--imap-host", "mail.example.com",
+            "--imap-starttls",
+        ])
+        directadmin_server = DirectAdminServerSettings(
+            host=directadmin_args.imap_host,
+            port=directadmin_args.imap_port,
+            ssl=bool(directadmin_args.imap_ssl) and not bool(directadmin_args.imap_starttls),
+            starttls=bool(directadmin_args.imap_starttls),
+        )
+        directadmin_config_path = tmp_path / "directadmin.json"
+        directadmin_config_path.write_text(json.dumps(build_directadmin_config(
+            directadmin_server,
+            ["user@example.com"],
+            default_password="secret",
+        )))
+
+        cpanel_args = parse_cpanel_args([
+            "--url", "https://panel.example.com:2083",
+            "--username", "admin",
+            "--password", "secret",
+            "--imap-host", "mail.example.com",
+            "--imap-starttls",
+        ])
+        cpanel_server = CPanelServerSettings(
+            host=cpanel_args.imap_host,
+            port=cpanel_args.imap_port,
+            ssl=bool(cpanel_args.imap_ssl) and not bool(cpanel_args.imap_starttls),
+            starttls=bool(cpanel_args.imap_starttls),
+        )
+        cpanel_config_path = tmp_path / "cpanel.json"
+        cpanel_config_path.write_text(json.dumps(build_cpanel_config(
+            cpanel_server,
+            ["user@example.com"],
+            default_password="secret",
+        )))
+
+        directadmin_config = Config.from_json_file(directadmin_config_path)
+        cpanel_config = Config.from_json_file(cpanel_config_path)
+
+        assert directadmin_config.server.ssl is False
+        assert directadmin_config.server.starttls is True
+        assert cpanel_config.server.ssl is False
+        assert cpanel_config.server.starttls is True
