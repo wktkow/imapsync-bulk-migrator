@@ -497,6 +497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     use_da_panel = bool(getattr(args, "auto_provision_da", False))
     use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
     legacy_staged_audit_completed = False
+    free_space_checked_paths: Set[Path] = set()
     if (
         not is_provider_config
         and args.mode != "import"
@@ -621,6 +622,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif output_root.exists() and not output_root.is_dir():
             logging.error("Output directory is not a directory: %s", output_root)
             return 2
+
+    free_space_preflight_path: Optional[Path] = None
+    if args.mode == "export":
+        free_space_preflight_path = Path(args.output_dir)
+    elif args.mode in {"import", "validate"} and not panel_dry_run_requested:
+        panel_import_will_preflight = (
+            not is_provider_config
+            and args.mode == "import"
+            and (use_da_panel or use_cpanel)
+        )
+        if not panel_import_will_preflight:
+            free_space_preflight_path = Path(args.input_dir)
+    if free_space_preflight_path is not None:
+        try:
+            check_free_space_for_path(free_space_preflight_path, min_free_gb)
+        except Exception as exc:
+            logging.error("Free-space check failed before connectivity: %s", exc)
+            return 2
+        free_space_checked_paths.add(free_space_preflight_path)
 
     try:
         if (
@@ -853,7 +873,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.mode == "export":
                 out_root = Path(args.output_dir)
                 out_root.mkdir(parents=True, exist_ok=True)
-                check_free_space_for_path(out_root, min_free_gb)
+                if out_root not in free_space_checked_paths:
+                    check_free_space_for_path(out_root, min_free_gb)
                 provider_export_all(
                     config,
                     out_root,
@@ -876,7 +897,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
+                if in_root not in free_space_checked_paths:
+                    check_free_space_for_path(in_root, min_free_gb)
                 provider_import_all(
                     config,
                     in_root,
@@ -894,7 +916,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
+                if in_root not in free_space_checked_paths:
+                    check_free_space_for_path(in_root, min_free_gb)
                 ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers))
                 if ok:
                     logging.info("Provider validation successful.")
@@ -931,7 +954,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             out_root.mkdir(parents=True, exist_ok=True)
             # Ensure destination filesystem has enough free space
-            check_free_space_for_path(out_root, min_free_gb)
+            if out_root not in free_space_checked_paths:
+                check_free_space_for_path(out_root, min_free_gb)
             try:
                 payload_path = config_path.parent / "import.pass.config.json"
                 if not payload_path.exists():
@@ -985,7 +1009,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
+            if in_root not in free_space_checked_paths:
+                check_free_space_for_path(in_root, min_free_gb)
             panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
             if not panel_dry_run and not legacy_staged_audit_completed:
                 try:
@@ -1055,7 +1080,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
+            if in_root not in free_space_checked_paths:
+                check_free_space_for_path(in_root, min_free_gb)
             mismatches: List[Tuple[str, str, int, int]] = []
             validation_errors: List[Tuple[str, str]] = []
             mismatches_lock = threading.Lock()

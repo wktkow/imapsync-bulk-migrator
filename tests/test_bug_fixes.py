@@ -1925,6 +1925,48 @@ class TestCliAndConfigHardening:
 
         assert rc == 0
 
+    @pytest.mark.parametrize("mode", ["export", "import", "validate"])
+    def test_main_checks_legacy_free_space_before_connectivity(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / f"{mode}.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        output_dir = tmp_path / "exported-output"
+        input_dir = tmp_path / "exported-input"
+        input_dir.mkdir()
+        events: List[str] = []
+
+        def fail_free_space(*_args, **_kwargs):
+            events.append("free-space")
+            raise RuntimeError("low disk")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.main.check_free_space_for_path", fail_free_space), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--output-dir", str(output_dir),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / f"logs-free-space-{mode}"),
+                "--min-free-gb", "1000",
+                "--max-workers", "1",
+                "--no-audit-after-export",
+            ])
+
+        assert rc == 2
+        assert events == ["free-space"]
+
     def test_setup_logging_creates_private_log_file(self, tmp_path: Path) -> None:
         from components.main import setup_logging
 

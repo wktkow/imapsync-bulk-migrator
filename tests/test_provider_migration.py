@@ -8743,6 +8743,45 @@ def test_main_routes_provider_modes_with_expected_connectivity_roles(
     assert roles_seen == [expected_roles]
 
 
+@pytest.mark.parametrize("mode", ["export", "import", "validate"])
+def test_main_checks_provider_free_space_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    output_dir = tmp_path / "provider-output"
+    input_dir = tmp_path / "provider-input"
+    if mode in {"import", "validate"}:
+        _write_manifest_fixture(input_dir)
+    events: List[str] = []
+
+    def fail_free_space(*_args, **_kwargs):
+        events.append("free-space")
+        raise RuntimeError("low disk")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path", fail_free_space), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")), \
+        mock.patch("components.main.provider_export_all", side_effect=AssertionError("export should not run")), \
+        mock.patch("components.main.provider_import_all", side_effect=AssertionError("import should not run")), \
+        mock.patch("components.main.provider_validate_all", side_effect=AssertionError("validate should not run")):
+        rc = main([
+            "--mode", mode,
+            "--config", str(config_path),
+            "--output-dir", str(output_dir),
+            "--input-dir", str(input_dir),
+            "--log-dir", str(tmp_path / f"logs-provider-free-space-{mode}"),
+            "--min-free-gb", "1000",
+            "--max-workers", "1",
+            "--no-audit-after-export",
+        ])
+
+    assert rc == 2
+    assert events == ["free-space"]
+
+
 @pytest.mark.parametrize("mode", ["import", "validate"])
 def test_main_rejects_provider_symlinked_input_root_before_connectivity(
     tmp_path: Path,
