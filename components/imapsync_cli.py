@@ -36,6 +36,8 @@ def run_imapsync_justconnect(host: str, port: int, ssl_enabled: bool, starttls: 
             args.append("--ssl1")
         elif starttls:
             args.append("--tls1")
+        else:
+            args.extend(["--nossl1", "--notls1"])
 
         logging.debug("Running imapsync justconnect: %s", " ".join(args))
         res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, text=True, timeout=timeout_sec + 10)
