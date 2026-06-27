@@ -1715,7 +1715,13 @@ def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise RuntimeError(f"manifest row {row.get('canonical_id') or '<unknown>'}: unsafe {key}: {value!r}")
     root = account_dir.resolve()
-    candidate = (account_dir / rel_path).resolve()
+    candidate = account_dir / rel_path
+    current = account_dir
+    for part in rel_path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"manifest row {row.get('canonical_id') or '<unknown>'}: symlinked {key}: {value!r}")
+    candidate = candidate.resolve()
     try:
         candidate.relative_to(root)
     except ValueError as exc:

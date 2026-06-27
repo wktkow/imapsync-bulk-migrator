@@ -5349,6 +5349,75 @@ class TestRound7ConfirmedBugs:
             with pytest.raises(RuntimeError, match="metadata rfc822_size differs from manifest"):
                 provider_import_account(config, account, tmp_path)
 
+    def test_provider_import_rejects_symlinked_manifest_payload_before_target_contact(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import (
+            provider_account_endpoint_state,
+            provider_account_endpoint_state_digest,
+            provider_import_account,
+            provider_manifest_digest,
+        )
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        account_dir = tmp_path / "source@example.com"
+        messages_dir = account_dir / "messages"
+        metadata_dir = account_dir / "metadata"
+        messages_dir.mkdir(parents=True)
+        metadata_dir.mkdir()
+        body = b"Message-ID: <provider@example.com>\r\n\r\nbody"
+        real_payload = messages_dir / "real.eml"
+        real_payload.write_bytes(body)
+        try:
+            (messages_dir / "provider-1.eml").symlink_to(real_payload)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "primary_mailbox": "INBOX",
+            "message_id_header": "<provider@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": "messages/provider-1.eml",
+            "metadata_path": "metadata/provider-1.json",
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (metadata_dir / "provider-1.json").write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": source.provider,
+            "target_provider": target.provider,
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+            "source_endpoint": provider_account_endpoint_state(source, account, role="source"),
+            "source_endpoint_sha256": provider_account_endpoint_state_digest(source, account, role="source"),
+            "target_endpoint": provider_account_endpoint_state(target, account, role="target"),
+            "target_endpoint_sha256": provider_account_endpoint_state_digest(target, account, role="target"),
+        }))
+
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+            with pytest.raises(RuntimeError, match="symlinked eml_path"):
+                provider_import_account(config, account, tmp_path)
+
     def test_verify_export_rejects_missing_legacy_mailbox_metadata(
         self,
         tmp_path: Path,
