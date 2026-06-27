@@ -724,6 +724,108 @@ class TestLegacyImportJournal:
 
         assert fake_imap.append_count == 1
 
+    def test_import_rerun_skips_lf_only_message_after_imaplib_normalization(self, tmp_path: Path) -> None:
+        import imaplib
+
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com" / "INBOX"
+        data = b"Message-ID: <lf-only@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody\n"
+        _write_legacy_message_fixture(account_dir, data=data)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        class NormalizingAppendImap:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.stored: List[bytes] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [str(len(self.stored)).encode("ascii")]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.append_count += 1
+                self.stored.append(imaplib.MapCRLF.sub(imaplib.CRLF, payload))
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                return "OK", [b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))]
+
+            def fetch(self, num: bytes, query: str):
+                body = self.stored[int(num) - 1]
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = NormalizingAppendImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[NormalizingAppendImap]:
+            yield fake_imap
+
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.append_count == 1
+        assert fake_imap.stored == [imaplib.MapCRLF.sub(imaplib.CRLF, data)]
+
+    def test_import_recognizes_existing_raw_committed_key_for_lf_only_message(self, tmp_path: Path) -> None:
+        import imaplib
+
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com"
+        folder = account_dir / "INBOX"
+        data = b"Message-ID: <legacy-key@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody\n"
+        eml = _write_legacy_message_fixture(folder, data=data)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        raw_key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": raw_key,
+            "status": "committed",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        class ExistingNormalizedMessageImap:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.stored = imaplib.MapCRLF.sub(imaplib.CRLF, data)
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
+
+            def append(self, *_args, **_kwargs):
+                self.append_count += 1
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = ExistingNormalizedMessageImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[ExistingNormalizedMessageImap]:
+            yield fake_imap
+
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+
+        assert fake_imap.append_count == 0
+
     def test_import_rejects_empty_staged_account_directory(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
@@ -4107,6 +4209,26 @@ print("ok")
 
         assert _legacy_remote_has_message(fake, "INBOX", message, set())
         assert fake.criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"')
+
+    def test_validate_remote_identity_matches_imaplib_append_wire_bytes(self) -> None:
+        import imaplib
+
+        from components.main import _legacy_remote_has_message
+
+        message = b"Message-ID: <wire@example.com>\nFrom: a\nTo: b\n\nbody\n"
+        stored = imaplib.MapCRLF.sub(imaplib.CRLF, message)
+
+        class NormalizedRemote:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(stored), len(stored)), stored)]
+
+        assert _legacy_remote_has_message(NormalizedRemote(), "INBOX", message, set())
 
 
 class TestRound2ConfirmedBugs:

@@ -149,8 +149,9 @@ def _message_id_header(data: bytes) -> str:
 
 
 def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
-    from .imap_ops import quote_mailbox_name
+    from .imap_ops import _imap_append_wire_bytes, quote_mailbox_name
 
+    data = _imap_append_wire_bytes(data)
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False

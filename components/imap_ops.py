@@ -264,6 +264,10 @@ def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: by
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
+def _imap_append_wire_bytes(data: bytes) -> bytes:
+    return imaplib.MapCRLF.sub(imaplib.CRLF, data)
+
+
 def _message_id_header(data: bytes) -> str:
     with contextlib.suppress(Exception):
         msg = BytesParser(policy=default_policy).parsebytes(data)
@@ -272,6 +276,7 @@ def _message_id_header(data: bytes) -> str:
 
 
 def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, used_nums: set[bytes]) -> bool:
+    data = _imap_append_wire_bytes(data)
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
@@ -829,6 +834,7 @@ def import_account(
                     _raise_if_stopped(stop_event, f"legacy import {account.email}")
                     data = _read_file_no_symlink(eml_path, "legacy message file")
                     _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
+                    append_data = _imap_append_wire_bytes(data)
                     flags_str = ""
                     if flags:
                         raw_tokens = [tok for tok in (flags.split()) if tok and tok.strip()]
@@ -845,8 +851,11 @@ def import_account(
                     else:
                         import imaplib as _imaplib
                         date_time = _imaplib.Time2Internaldate(time.time())
-                    import_key = _legacy_import_key(account_dir, eml_path, mailbox, data)
-                    if import_key in committed_keys:
+                    import_key = _legacy_import_key(account_dir, eml_path, mailbox, append_data)
+                    legacy_raw_key = _legacy_import_key(account_dir, eml_path, mailbox, data)
+                    committed_key_present = import_key in committed_keys or legacy_raw_key in committed_keys
+                    pending_key_present = import_key in pending_keys or legacy_raw_key in pending_keys
+                    if committed_key_present:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
                         if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
                             logging.info("[import] %s: skipping verified committed %s", account.email, eml_path)
@@ -856,7 +865,7 @@ def import_account(
                             account.email,
                             eml_path,
                         )
-                    if import_key in pending_keys:
+                    if pending_key_present:
                         raise RuntimeError(
                             f"legacy import journal has pending append for {eml_path}; "
                             "target state is uncertain, inspect the mailbox before retrying"
@@ -870,7 +879,7 @@ def import_account(
                         "path": rel_path,
                         "timestamp": str(int(time.time())),
                     })
-                    status, _ = imap.append(quote_mailbox_name(mailbox), flags_str, date_time, data)
+                    status, _ = imap.append(quote_mailbox_name(mailbox), flags_str, date_time, append_data)
                     if status != "OK":
                         _append_legacy_import_journal(account_dir, {
                             "key": import_key,
