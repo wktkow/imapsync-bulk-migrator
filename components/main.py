@@ -456,6 +456,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         logging.error("--auto-provision-da, --auto-provision-cpanel, and --reset are only valid with --mode import")
         return 2
+    if use_da_panel and use_cpanel:
+        logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
+        return 2
+    if is_provider_config and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False))):
+        logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
+        return 2
+    if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
+        logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
+        return 2
     panel_dry_run_requested = (
         args.mode == "import"
         and not is_provider_config
@@ -540,15 +549,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     da_password: Optional[str] = None
     cpanel_client: Optional[CPanelClient] = None
     panel_reset_failed_accounts: set[str] = set()
-    if use_da_panel and use_cpanel:
-        logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
-        return 2
-    if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
-        logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
-        return 2
-    if is_provider_config and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False))):
-        logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
-        return 2
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
         invalid_panel_accounts = _invalid_panel_account_emails(config)

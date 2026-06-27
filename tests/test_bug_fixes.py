@@ -1800,6 +1800,62 @@ class TestCliAndConfigHardening:
 
         assert rc == 2
 
+    @pytest.mark.parametrize("extra_args", [[], ["--reset-confirm", "YES"]])
+    def test_main_rejects_reset_without_panel_before_confirm_or_input(
+        self,
+        tmp_path: Path,
+        extra_args: List[str],
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.logging.error") as log_error:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "missing-input"),
+                "--log-dir", str(tmp_path / "logs-reset-no-panel"),
+                "--min-free-gb", "0",
+                "--reset",
+                *extra_args,
+            ])
+
+        assert rc == 2
+        error_text = " ".join(str(call) for call in log_error.call_args_list)
+        assert "--reset requires --auto-provision-da or --auto-provision-cpanel" in error_text
+        assert "--reset-confirm must match" not in error_text
+        assert "Input directory does not exist" not in error_text
+
+    def test_main_rejects_multiple_panel_backends_before_input_checks(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.logging.error") as log_error:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "missing-input"),
+                "--log-dir", str(tmp_path / "logs-panel-conflict"),
+                "--min-free-gb", "0",
+                "--auto-provision-da",
+                "--auto-provision-cpanel",
+            ])
+
+        assert rc == 2
+        error_text = " ".join(str(call) for call in log_error.call_args_list)
+        assert "Choose only one control panel integration" in error_text
+        assert "Input directory does not exist" not in error_text
+
     def test_main_free_space_check_uses_requested_output_not_cwd(self, tmp_path: Path) -> None:
         from components.main import main
 
