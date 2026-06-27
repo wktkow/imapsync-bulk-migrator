@@ -4406,3 +4406,51 @@ class TestRound6ConfirmedBugs:
         assert directadmin_config.server.starttls is True
         assert cpanel_config.server.ssl is False
         assert cpanel_config.server.starttls is True
+
+    def test_remote_audit_rejects_missing_empty_mailbox(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account_dir = tmp_path / "user@example.com"
+        projects = account_dir / "Projects"
+        projects.mkdir(parents=True)
+        (projects / ".mailbox.json").write_text(json.dumps({"mailbox": "Projects", "message_count": 0}))
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "mailboxes": [{"mailbox": "Projects", "path": "Projects", "message_count": 0}],
+        }))
+
+        class RemoteMissingProjects:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def uid(self, command: str, arg: str):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[RemoteMissingProjects]:
+            yield RemoteMissingProjects()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any("Projects: missing remotely or not selectable but local has 0 messages" in issue for issue in issues)

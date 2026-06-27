@@ -331,7 +331,7 @@ def audit_account(
                     folder = folder_dir.name
                     local_count = len(list(folder_dir.glob("*.eml")))
                     remote_count = remote_counts.get(folder, -1)
-                    if remote_count < 0 and local_count > 0:
+                    if remote_count < 0:
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
                     elif remote_count >= 0 and local_count != remote_count:
