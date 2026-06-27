@@ -66,6 +66,8 @@ def analyze_message(eml_path, json_path, *, require_metadata=True):
         
         # Parse the email
         msg = BytesParser(policy=default_policy).parsebytes(msg_bytes)
+        parts = list(msg.walk()) if msg.is_multipart() else [msg]
+        has_encapsulated_rfc822 = any(part.get_content_type() == 'message/rfc822' for part in parts)
         
         # Read metadata
         if not json_path.exists():
@@ -113,14 +115,18 @@ def analyze_message(eml_path, json_path, *, require_metadata=True):
             'flags': metadata.get('flags', ''),
             'mailbox': metadata.get('mailbox', ''),
             'content_types': [],
-            'multiple_messages_detected': return_path_count > 1 or message_id_count > 1 or _has_later_rfc822_header_block(msg_text),
+            'multiple_messages_detected': (
+                return_path_count > 1
+                or message_id_count > 1
+                or (not has_encapsulated_rfc822 and _has_later_rfc822_header_block(msg_text))
+            ),
             'return_path_count': return_path_count,
             'message_id_count': message_id_count
         }
         
         # Check for attachments and content types
         if msg.is_multipart():
-            for part in msg.walk():
+            for part in parts:
                 content_type = part.get_content_type()
                 analysis['content_types'].append(content_type)
                 

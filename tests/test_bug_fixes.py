@@ -4223,3 +4223,46 @@ class TestRound4ConfirmedBugs:
         assert any(needle in issue for issue in marker_issues)
         assert stats["errors"] == 1
         assert main() == 1
+
+    def test_verify_export_allows_message_rfc822_attachment(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "with-attached-eml.eml"
+        payload = (
+            b"Message-ID: <outer@example.com>\r\n"
+            b"From: outer@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Subject: attached message\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b"Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+            b"\r\n"
+            b"--b\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"See attached.\r\n"
+            b"--b\r\n"
+            b"Content-Type: message/rfc822\r\n"
+            b"Content-Disposition: attachment; filename=\"attached.eml\"\r\n"
+            b"\r\n"
+            b"Message-ID: <inner@example.com>\r\n"
+            b"From: inner@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Subject: inner\r\n"
+            b"\r\n"
+            b"inner body\r\n"
+            b"--b--\r\n"
+        )
+        eml_path.write_bytes(payload)
+        json_path = tmp_path / "with-attached-eml.json"
+        json_path.write_text(json.dumps({
+            "content_sha256": hashlib.sha256(payload).hexdigest(),
+            "rfc822_size": len(payload),
+        }))
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert error is None
+        assert analysis is not None
+        assert "message/rfc822" in analysis["content_types"]
+        assert analysis["attachment_count"] == 1
+        assert analysis["multiple_messages_detected"] is False
