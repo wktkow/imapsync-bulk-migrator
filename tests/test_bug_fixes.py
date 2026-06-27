@@ -5149,3 +5149,53 @@ class TestRound7ConfirmedBugs:
 
         assert stats["errors"] == 1
         assert main() == 1
+
+    def test_direct_import_allows_left_bracket_in_flag_keyword(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            uid=1,
+            mailbox="INBOX",
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["flags"] = "project[2024"
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        class AppendTarget:
+            appended_flags: List[str] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.appended_flags.append(flags)
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", [b""]
+
+        target = AppendTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[AppendTarget]:
+            yield target
+
+        import_account(
+            Account("user@example.com", "secret"),
+            ServerConfig("imap.example.com"),
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+        )
+
+        assert target.appended_flags == ["(project[2024)"]
