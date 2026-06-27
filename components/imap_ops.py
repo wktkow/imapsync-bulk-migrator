@@ -15,7 +15,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 import imaplib
 
 from .models import Account, ServerConfig
-from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
+from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -238,7 +238,7 @@ def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, u
         return False
     message_id = _message_id_header(data)
     if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+        status, search_data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
     else:
         status, search_data = imap.search(None, "ALL")
     if status != "OK" or not search_data or not search_data[0]:

@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from .executor import parallel_process_accounts
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
-from .utils import decode_imap_utf7, encode_imap_utf7, sanitize_for_path
+from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -2421,7 +2421,7 @@ def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row
     if status != "OK":
         return []
     if message_id:
-        status, data = imap.search(None, "HEADER", "Message-ID", message_id)
+        status, data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
     else:
         status, data = imap.search(None, "ALL")
     if status != "OK" or not data or not data[0]:

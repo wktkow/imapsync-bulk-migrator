@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple, Set
 
 from .models import Account, Config, ServerConfig
 from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
-from .utils import sanitize_for_path
+from .utils import quote_imap_search_value, sanitize_for_path
 
 
 def _message_id_header(data: bytes) -> str:
@@ -28,7 +28,7 @@ def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set
     expected_hash = hashlib.sha256(data).hexdigest()
     expected_size = len(data)
     if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+        status, search_data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
     else:
         status, search_data = imap.search(None, "ALL")
     if status != "OK" or not search_data or not search_data[0]:

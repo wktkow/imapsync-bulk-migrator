@@ -32,7 +32,7 @@ from .provider_ops import (
     provider_test_accounts,
     provider_validate_all,
 )
-from .utils import check_environment, sanitize_for_path
+from .utils import check_environment, quote_imap_search_value, sanitize_for_path
 from .utils import check_free_space_for_path
 
 
@@ -151,7 +151,7 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optio
     expected_hash = hashlib.sha256(data).hexdigest()
     expected_size = len(data)
     if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
+        status, search_data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
     else:
         status, search_data = imap.search(None, "ALL")
     if status != "OK" or not search_data or not search_data[0]:
