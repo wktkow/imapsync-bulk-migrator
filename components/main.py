@@ -33,7 +33,7 @@ from .provider_ops import (
     provider_test_accounts,
     provider_validate_all,
 )
-from .utils import check_environment, quote_imap_search_value, sanitize_for_path
+from .utils import check_environment, quote_imap_search_value, sanitize_for_path, sanitized_path_key
 from .utils import check_free_space_for_path
 
 
@@ -933,6 +933,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
+                    remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
                     with imap_connection(config.server, acc) as imap:
                         mailboxes = list_all_mailboxes(imap)
                         for mailbox in mailboxes:
@@ -945,10 +946,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     raise RuntimeError(f"search failed: {mailbox}")
                                 num = len((data[0] or b"").split()) if data else 0
                                 key = sanitize_for_path(mailbox)
-                                if key in remote_mailboxes and remote_mailboxes[key] != mailbox:
-                                    raise RuntimeError(f"Remote mailbox name collision after sanitizing: {remote_mailboxes[key]!r} and {mailbox!r}")
+                                alias_key = sanitized_path_key(mailbox)
+                                previous = remote_mailboxes_by_alias_key.get(alias_key)
+                                if previous is not None and previous[0] != mailbox:
+                                    previous_mailbox, previous_path = previous
+                                    remote_counts[previous_path] = -1
+                                    remote_counts[key] = -1
+                                    remote_mailboxes.setdefault(previous_path, previous_mailbox)
+                                    remote_mailboxes[key] = mailbox
+                                    with mismatches_lock:
+                                        validation_errors.append((
+                                            email,
+                                            f"{alias_key}: remote mailbox name collision after sanitizing: "
+                                            f"{previous_mailbox!r} and {mailbox!r}",
+                                        ))
+                                    continue
                                 remote_counts[key] = num
                                 remote_mailboxes[key] = mailbox
+                                remote_mailboxes_by_alias_key[alias_key] = (mailbox, key)
                             except Exception:
                                 key = sanitize_for_path(mailbox)
                                 remote_counts[key] = -1

@@ -2082,6 +2082,64 @@ class TestCliAndConfigHardening:
 
         assert rc == 0
 
+    def test_legacy_validate_rejects_case_only_remote_mailbox_collision(self, tmp_path: Path) -> None:
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.main import main
+        from components.models import ServerConfig
+
+        source_server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": source_server.host, "port": source_server.port, "ssl": source_server.ssl, "starttls": source_server.starttls},
+            "source_server": {"host": source_server.host, "port": source_server.port, "ssl": source_server.ssl, "starttls": source_server.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        folder = input_dir / "a@example.com" / "Folder"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Folder", "message_count": 0}))
+        (input_dir / "a@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "a@example.com",
+            "source_server": legacy_server_endpoint(source_server),
+            "source_server_sha256": legacy_server_endpoint_digest(source_server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "Folder", "path": "Folder", "message_count": 0}],
+        }))
+
+        class CaseOnlyCollisionRemote:
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "Folder"',
+                    b'(\\HasNoChildren) "/" "folder"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CaseOnlyCollisionRemote]:
+            yield CaseOnlyCollisionRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
     def test_legacy_validate_fails_when_account_export_dir_is_missing_even_if_remote_empty(self, tmp_path: Path) -> None:
         from components.main import main
 
