@@ -439,6 +439,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
 
     Writes one .eml per message and a .json with mailbox/uid/flags/internaldate.
     """
+    _raise_if_symlink(out_root, "legacy export root")
     account_dir = out_root / sanitize_for_path(account.email)
     ensure_private_dir(account_dir)
     logging.info("[export] %s: starting", account.email)
@@ -648,6 +649,7 @@ def import_account(
     If a provisioning context is provided and initial login fails, a one-time
     lazy POP account creation is attempted before retrying login.
     """
+    _raise_if_symlink(in_root, "legacy import root")
     account_dir = in_root / sanitize_for_path(account.email)
     _raise_if_symlink(account_dir, "legacy account directory")
     if not account_dir.exists():

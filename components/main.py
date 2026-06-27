@@ -730,6 +730,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.mode == "export":
             assert isinstance(config, Config)
             out_root = Path(args.output_dir)
+            if out_root.is_symlink():
+                logging.error("Output directory is a symlink: %s", out_root)
+                return 2
             out_root.mkdir(parents=True, exist_ok=True)
             # Ensure destination filesystem has enough free space
             check_free_space_for_path(out_root, min_free_gb)
@@ -780,6 +783,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.mode == "import":
             assert isinstance(config, Config)
             in_root = Path(args.input_dir)
+            if in_root.is_symlink():
+                logging.error("Input directory is a symlink: %s", in_root)
+                return 2
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
@@ -999,6 +1005,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.mode == "audit":
             assert isinstance(config, Config)
             in_root = Path(args.input_dir)
+            if in_root.is_symlink():
+                logging.error("Input directory is a symlink: %s", in_root)
+                return 2
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2

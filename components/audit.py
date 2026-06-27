@@ -429,6 +429,8 @@ def audit_export(
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+    if in_root.is_symlink():
+        return False, [f"audit root is a symlink: {in_root}"]
     issues_accum: List[str] = []
     expected_source_server = config.source_server if config.source_server is not None else None
     if expected_source_server is None and not require_integrity_metadata:

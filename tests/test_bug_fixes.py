@@ -4887,6 +4887,74 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_legacy_export_rejects_symlinked_output_root_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        outside = tmp_path / "outside-output"
+        outside.mkdir()
+        out_root = tmp_path / "exported"
+        try:
+            out_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("IMAP should not be opened")):
+            with pytest.raises(RuntimeError, match="symlinked legacy export root"):
+                export_account(
+                    Account("user@example.com", "secret"),
+                    ServerConfig("imap.example.com"),
+                    out_root,
+                    ignore_errors=False,
+                )
+
+        assert not (outside / "user@example.com").exists()
+
+    def test_strict_audit_rejects_symlinked_input_root(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        outside = tmp_path / "outside-input"
+        _write_legacy_message_fixture(outside / "user@example.com" / "INBOX", source_server=server)
+        in_root = tmp_path / "exported"
+        try:
+            in_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        ok, issues = audit_export(
+            in_root,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("audit root is a symlink" in issue for issue in issues)
+
+    def test_legacy_import_rejects_symlinked_input_root_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        outside = tmp_path / "outside-input"
+        _write_legacy_message_fixture(outside / "user@example.com" / "INBOX")
+        in_root = tmp_path / "exported"
+        try:
+            in_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy import root"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                in_root,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_legacy_export_rejects_symlinked_mailbox_directory(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
