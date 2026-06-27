@@ -1267,6 +1267,27 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
     return issues
 
 
+def committed_journal_target_mailbox_issues(
+    rows: List[Dict[str, Any]],
+    expected_target_by_id: Dict[str, str],
+) -> List[str]:
+    issues: List[str] = []
+    for row in latest_committed_journal_rows(rows).values():
+        identity = str(row.get("canonical_id") or "")
+        if not identity:
+            continue
+        expected_target = expected_target_by_id.get(identity)
+        if not expected_target:
+            continue
+        target_mailbox = str(row.get("target_mailbox") or "")
+        if target_mailbox != expected_target:
+            issues.append(
+                f"journal committed identity in wrong target mailbox: {identity} "
+                f"expected {expected_target!r} got {target_mailbox!r}"
+            )
+    return issues
+
+
 def journal_target_endpoint_issues(
     rows: List[Dict[str, Any]],
     *,
@@ -3163,6 +3184,12 @@ def provider_import_account(
             target_mailboxes,
             target_provider=config.target.provider,
         )
+        committed_target_issues = committed_journal_target_mailbox_issues(
+            journal_rows,
+            target_mailbox_by_identity,
+        )
+        if committed_target_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(committed_target_issues))
         if config.target.provider == "gmail":
             target_issues = gmail_target_readiness_issues(capabilities, target_mailboxes)
             target_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))

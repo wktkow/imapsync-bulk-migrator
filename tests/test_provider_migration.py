@@ -5412,6 +5412,29 @@ def test_provider_import_merge_mode_reimports_stale_committed_journal_row(tmp_pa
     assert report["committed"] == 1
 
 
+def test_provider_import_merge_mode_rejects_wrong_mailbox_committed_journal_row(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+    })) + "\n")
+    fake = FakeTargetImap(has_existing=False)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="wrong target mailbox"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+
+
 def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
