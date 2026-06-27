@@ -1144,6 +1144,12 @@ def manifest_schema_issues(rows: List[Dict[str, Any]]) -> List[str]:
         primary_mailbox = row.get("primary_mailbox")
         if not isinstance(primary_mailbox, str) or not primary_mailbox.strip():
             issues.append(f"{identity}: missing or invalid primary_mailbox")
+        for field in ("source_mailboxes", "gmail_labels"):
+            value = row.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                issues.append(f"{identity}: invalid {field}")
     return issues
 
 

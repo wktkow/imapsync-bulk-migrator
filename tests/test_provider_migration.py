@@ -6108,6 +6108,37 @@ def test_provider_import_audit_and_validation_reject_boolean_manifest_size(tmp_p
         provider_import_account(config, account, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gmail_labels", "Project A"),
+        ("source_mailboxes", "Archive"),
+        ("gmail_labels", ["Project A", 42]),
+    ],
+)
+def test_provider_manifest_rejects_malformed_structured_fields_before_import(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row[field] = value
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir)
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any(f"invalid {field}" in issue for issue in issues)
+    assert any(f"invalid {field}" in issue for issue in report["failed"])
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=f"invalid {field}"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_validation_rejects_incomplete_export_state(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
