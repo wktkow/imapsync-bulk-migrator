@@ -13,6 +13,40 @@ from email.parser import BytesParser
 from email.policy import default as default_policy
 import re
 
+
+def _has_later_rfc822_header_block(msg_text):
+    lines = msg_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    try:
+        first_blank = next(idx for idx, line in enumerate(lines) if line == '')
+    except StopIteration:
+        return False
+    idx = first_blank + 1
+    while idx < len(lines):
+        line = lines[idx]
+        if not re.match(r'^(?:Return-Path|Message-ID):', line, flags=re.IGNORECASE):
+            idx += 1
+            continue
+        context = '\n'.join(lines[max(first_blank + 1, idx - 3):idx]).lower()
+        if 'forwarded' in context:
+            idx += 1
+            continue
+        header_names = set()
+        end = idx
+        while end < len(lines) and lines[end] != '':
+            match = re.match(r'^([A-Za-z][A-Za-z0-9-]*):', lines[end])
+            if match:
+                header_names.add(match.group(1).lower())
+            end += 1
+        if 'message-id' in header_names and (
+            'return-path' in header_names
+            or 'from' in header_names
+            or 'to' in header_names
+            or 'date' in header_names
+        ):
+            return True
+        idx = max(end + 1, idx + 1)
+    return False
+
 def analyze_message(eml_path, json_path):
     """Analyze a single exported message"""
     try:
@@ -68,7 +102,7 @@ def analyze_message(eml_path, json_path):
             'flags': metadata.get('flags', ''),
             'mailbox': metadata.get('mailbox', ''),
             'content_types': [],
-            'multiple_messages_detected': return_path_count > 1 or message_id_count > 1,
+            'multiple_messages_detected': return_path_count > 1 or message_id_count > 1 or _has_later_rfc822_header_block(msg_text),
             'return_path_count': return_path_count,
             'message_id_count': message_id_count
         }
