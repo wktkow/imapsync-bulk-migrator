@@ -1869,6 +1869,7 @@ def provider_export_account(
     stop_event: Optional[object] = None,
     limiter: Optional[RateLimiter] = None,
 ) -> None:
+    _raise_if_provider_path_symlink(out_root, "export root")
     account_dir = account_export_dir(out_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     messages: Dict[str, Dict[str, Any]] = {}
@@ -2197,7 +2198,9 @@ def provider_export_all(
     stop_event: Optional[object] = None,
 ) -> None:
     max_workers = _require_max_workers(max_workers)
+    _raise_if_provider_path_symlink(out_root, "export root")
     out_root.mkdir(parents=True, exist_ok=True)
+    _raise_if_provider_path_symlink(out_root, "export root")
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
@@ -3485,6 +3488,7 @@ def provider_import_account(
     stop_event: Optional[object] = None,
     limiter: Optional[RateLimiter] = None,
 ) -> None:
+    _raise_if_provider_path_symlink(in_root, "import root")
     account_dir = account_export_dir(in_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
@@ -3836,6 +3840,7 @@ def provider_import_all(
     stop_event: Optional[object] = None,
 ) -> None:
     max_workers = _require_max_workers(max_workers)
+    _raise_if_provider_path_symlink(in_root, "import root")
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
@@ -3909,6 +3914,8 @@ def _journal_row(
 
 def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAccount, in_root: Path) -> Tuple[str, List[str]]:
     issues: List[str] = []
+    if in_root.is_symlink():
+        return account.email, [f"refusing to use symlinked provider audit root: {in_root}"]
     account_dir = account_export_dir(in_root, account)
     if account_dir.is_symlink():
         return account.email, [f"refusing to use symlinked provider account directory: {account_dir}"]
@@ -4001,6 +4008,8 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
 
 def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
+    if in_root.is_symlink():
+        return False, [f"refusing to use symlinked provider audit root: {in_root}"]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> List[str]:
@@ -4034,6 +4043,9 @@ def provider_validate_account(
         "exported": 0,
         "ok": False,
     }
+    if in_root.is_symlink():
+        report["failed"].append(f"refusing to use symlinked provider validate root: {in_root}")
+        return account.email, report
     try:
         if account_dir.is_symlink():
             report["failed"].append(f"refusing to use symlinked provider account directory: {account_dir}")
@@ -4385,6 +4397,8 @@ def provider_validate_account(
 
 def provider_validate_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
+    if in_root.is_symlink():
+        return False, [f"refusing to use symlinked provider validate root: {in_root}"]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> Dict[str, Any]:

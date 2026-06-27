@@ -38,7 +38,9 @@ from components.provider_ops import (
     parse_list_line,
     parse_provider_fetch_response,
     provider_audit_account,
+    provider_audit_all,
     provider_export_account,
+    provider_export_all,
     provider_import_account,
     provider_import_all,
     provider_manifest_digest,
@@ -190,6 +192,68 @@ def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> Non
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match="symlinked provider account directory"):
             provider_import_account(config, account, tmp_path)
+
+
+def test_provider_export_rejects_symlinked_output_root_before_source_contact(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    out_root = tmp_path / "exported"
+    try:
+        out_root.symlink_to(outside_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider export root"):
+            provider_export_account(config, account, out_root)
+        with pytest.raises(RuntimeError, match="symlinked provider export root"):
+            provider_export_all(config, out_root, max_workers=1, ignore_errors=False)
+
+    assert not (outside_root / account.source_email).exists()
+
+
+def test_provider_import_rejects_symlinked_input_root_before_target_contact(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    outside_root = tmp_path / "outside"
+    _write_manifest_fixture(outside_root)
+    in_root = tmp_path / "exported"
+    try:
+        in_root.symlink_to(outside_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider import root"):
+            provider_import_account(config, account, in_root)
+        with pytest.raises(RuntimeError, match="symlinked provider import root"):
+            provider_import_all(config, in_root, max_workers=1, ignore_errors=False)
+
+
+def test_provider_audit_and_validate_reject_symlinked_input_root(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    outside_root = tmp_path / "outside"
+    _write_manifest_fixture(outside_root)
+    in_root = tmp_path / "exported"
+    try:
+        in_root.symlink_to(outside_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, in_root)
+    audit_ok, audit_all_issues = provider_audit_all(config, in_root, max_workers=1)
+    _name, report = provider_validate_account(config, account, in_root, check_target=True)
+    validate_ok, validate_all_issues = provider_validate_all(config, in_root, max_workers=1)
+
+    assert any("symlinked provider audit root" in issue for issue in audit_issues)
+    assert not audit_ok
+    assert any("symlinked provider audit root" in issue for issue in audit_all_issues)
+    assert any("symlinked provider validate root" in issue for issue in report["failed"])
+    assert not validate_ok
+    assert any("symlinked provider validate root" in issue for issue in validate_all_issues)
 
 
 @pytest.mark.parametrize(
