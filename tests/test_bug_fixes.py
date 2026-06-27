@@ -4806,6 +4806,31 @@ class TestRound7ConfirmedBugs:
         assert "message/rfc822" in analysis["content_types"]
         assert analysis["multiple_messages_detected"] is True
 
+    def test_verify_export_accepts_sanitized_account_directory_state(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from verify_export import main, verify_account
+
+        account_dir = tmp_path / "exported" / "a_b@example.com"
+        inbox = account_dir / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "a/b@example.com",
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 0
+        assert main() == 0
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256

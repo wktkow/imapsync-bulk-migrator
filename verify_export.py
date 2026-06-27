@@ -246,7 +246,7 @@ def analyze_export_state(account_path, folder_counts):
     if state.get("complete") is not True:
         issues.append("export-state is not complete")
     account = state.get("account")
-    if not isinstance(account, str) or account != account_path.name:
+    if not isinstance(account, str) or (account != account_path.name and sanitize_for_path(account) != account_path.name):
         issues.append(f"export-state account mismatch (state={account!r} path={account_path.name!r})")
     mailboxes = state.get("mailboxes")
     if not isinstance(mailboxes, list):
