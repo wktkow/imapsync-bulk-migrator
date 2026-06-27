@@ -75,15 +75,14 @@ def resolve_secret(auth: AuthConfig) -> str:
         if value is None:
             raise RuntimeError(f"environment variable {auth.env_var} is not set")
     elif auth.token_file:
-        value = Path(auth.token_file).read_text(encoding="utf-8")
+        value = Path(auth.token_file).read_text(encoding="utf-8").rstrip("\r\n")
     elif auth.password_file:
-        value = Path(auth.password_file).read_text(encoding="utf-8")
+        value = Path(auth.password_file).read_text(encoding="utf-8").rstrip("\r\n")
     elif auth.password is not None:
         value = auth.password
     else:
         raise RuntimeError(f"no secret configured for auth method {auth.method}")
-    value = value.strip()
-    if not value:
+    if value == "":
         raise RuntimeError(f"empty secret configured for auth method {auth.method}")
     return value
 

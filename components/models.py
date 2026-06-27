@@ -60,7 +60,7 @@ class AuthConfig:
         auth = AuthConfig(
             method=method,
             username=_optional_str(raw, "username", f"{context}.auth"),
-            password=_optional_str(raw, "password", f"{context}.auth"),
+            password=_optional_secret_str(raw, "password", f"{context}.auth"),
             password_file=_optional_path_str(raw, "password_file", f"{context}.auth", base_dir),
             token_file=_optional_path_str(raw, "token_file", f"{context}.auth", base_dir),
             env_var=_optional_str(raw, "env_var", f"{context}.auth"),
@@ -550,6 +550,17 @@ def _optional_str(raw: Dict[str, Any], key: str, context: str) -> Optional[str]:
         raise ValueError(f"{context}.{key} must be a string")
     value = value.strip()
     if not value:
+        raise ValueError(f"{context}.{key} must be a non-empty string")
+    return value
+
+
+def _optional_secret_str(raw: Dict[str, Any], key: str, context: str) -> Optional[str]:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{context}.{key} must be a string")
+    if value == "":
         raise ValueError(f"{context}.{key} must be a non-empty string")
     return value
 

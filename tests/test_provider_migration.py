@@ -1331,6 +1331,52 @@ def test_provider_secret_files_must_not_be_empty(tmp_path: Path) -> None:
         resolve_secret(AuthConfig(method="xoauth2", token_file=str(secret)))
 
 
+def test_provider_inline_password_preserves_boundary_spaces() -> None:
+    auth = AuthConfig.from_dict(
+        {"method": "password", "username": "user@example.com", "password": " pass with spaces "},
+        context="target",
+    )
+
+    assert auth is not None
+    assert auth.password == " pass with spaces "
+    assert resolve_secret(auth) == " pass with spaces "
+
+
+def test_provider_password_file_preserves_boundary_spaces(tmp_path: Path) -> None:
+    secret = tmp_path / "password.txt"
+    secret.write_text(" pass with spaces \n")
+
+    assert resolve_secret(AuthConfig(method="password", password_file=str(secret))) == " pass with spaces "
+
+
+def test_provider_imap_login_receives_untrimmed_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: List[Tuple[str, str]] = []
+
+    class FakeIMAP:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def login(self, username: str, password: str):
+            captured.append((username, password))
+            return "OK", [b""]
+
+        def logout(self):
+            return "OK", [b""]
+
+    monkeypatch.setattr("components.provider_ops.imaplib.IMAP4_SSL", FakeIMAP)
+    endpoint = ProviderEndpoint(
+        provider="imap",
+        host="mail.example.com",
+        auth=AuthConfig(method="password", username="user@example.com", password=" pass with spaces "),
+    )
+    account = MigrationAccount(source_email="user@example.com", target_email="target@example.com")
+
+    with imap_connection(endpoint, account, role="source"):
+        pass
+
+    assert captured == [("user@example.com", " pass with spaces ")]
+
+
 def test_account_auth_override_preserves_endpoint_username() -> None:
     endpoint = ProviderEndpoint(
         provider="imap",
