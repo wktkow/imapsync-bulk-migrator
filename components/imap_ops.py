@@ -806,6 +806,8 @@ def import_account(
                     raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
             elif mbox != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
+            data = _read_file_no_symlink(eml_path, "legacy message file")
+            _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
             mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:

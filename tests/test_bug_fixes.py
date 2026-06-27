@@ -5160,27 +5160,14 @@ class TestRound3ConfirmedBugs:
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
         ])
 
-        class AppendTarget:
-            appended = 0
-
-            def select(self, mailbox: str, readonly: bool = False):
-                return "OK", [b"0"]
-
-            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
-                self.appended += 1
-                return "OK", [b""]
-
-            def subscribe(self, mailbox: str):
-                return "OK", [b""]
-
-            def logout(self):
-                return "OK", []
-
-        target = AppendTarget()
+        opened = False
 
         @contextlib.contextmanager
-        def fake_factory(*_args, **_kwargs) -> Iterator[AppendTarget]:
-            yield target
+        def fake_factory(*_args, **_kwargs) -> Iterator[object]:
+            nonlocal opened
+            opened = True
+            raise AssertionError("IMAP should not be opened")
+            yield object()
 
         with pytest.raises(RuntimeError, match="rfc822_size mismatch|content_sha256 mismatch"):
             import_account(
@@ -5191,7 +5178,7 @@ class TestRound3ConfirmedBugs:
                 imap_factory=fake_factory,
             )
 
-        assert target.appended == 0
+        assert opened is False
 
     def test_verify_export_fails_empty_root_and_unmarked_empty_mailbox(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from verify_export import main, verify_account
