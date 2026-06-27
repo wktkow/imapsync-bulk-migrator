@@ -271,7 +271,9 @@ def audit_account(
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
                 uid_meta = meta.get("uid")
-                if isinstance(uid_meta, int) and uid_meta != uid_in_name:
+                if "uid" in meta and type(uid_meta) is not int:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid uid metadata")
+                elif isinstance(uid_meta, int) and uid_meta != uid_in_name:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
             if require_integrity_metadata:
                 expected_hash = meta.get("content_sha256")
