@@ -8,7 +8,7 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
-from .content_binding import legacy_content_binding_issue
+from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
 from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
 from .utils import quote_imap_search_value, sanitize_for_path
@@ -275,23 +275,35 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid uid metadata")
                 elif isinstance(uid_meta, int) and uid_meta != uid_in_name:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
-            if require_integrity_metadata:
-                expected_hash = meta.get("content_sha256")
-                expected_size = meta.get("rfc822_size")
-                if not isinstance(expected_hash, str) or not expected_hash:
-                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
-                if type(expected_size) is not int:
-                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
-                binding_issue = legacy_content_binding_issue(meta)
+            integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
+            if require_integrity_metadata or integrity_keys_present:
+                expected_hash_raw = meta.get("content_sha256")
+                expected_size_raw = meta.get("rfc822_size")
+                expected_hash: Optional[str] = None
+                expected_size: Optional[int] = None
+                if expected_hash_raw is None:
+                    if require_integrity_metadata:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
+                elif not isinstance(expected_hash_raw, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash_raw):
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid content_sha256 metadata")
+                else:
+                    expected_hash = expected_hash_raw.lower()
+                if expected_size_raw is None:
+                    if require_integrity_metadata:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
+                elif type(expected_size_raw) is not int or expected_size_raw < 0:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid rfc822_size metadata")
+                else:
+                    expected_size = expected_size_raw
+                binding_issue = legacy_content_binding_issue(meta, required=require_integrity_metadata)
                 if binding_issue:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: {binding_issue}")
-                if isinstance(expected_hash, str) and expected_hash and type(expected_size) is int:
+                if expected_hash is not None or expected_size is not None:
                     try:
                         data = eml_path.read_bytes()
-                        actual_hash = hashlib.sha256(data).hexdigest()
-                        if actual_hash != expected_hash:
+                        if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: content_sha256 mismatch")
-                        if len(data) != expected_size:
+                        if expected_size is not None and len(data) != expected_size:
                             issues.append(
                                 f"{account.email}:{folder}:{eml_path.name}: rfc822_size mismatch "
                                 f"(metadata={expected_size} actual={len(data)})"

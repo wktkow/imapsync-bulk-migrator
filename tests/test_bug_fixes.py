@@ -2251,6 +2251,28 @@ class TestAuditHardening:
         assert any("content_sha256 mismatch" in issue for issue in issues)
         assert any("rfc822_size mismatch" in issue for issue in issues)
 
+    def test_default_audit_honors_present_message_integrity_metadata(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        account = Account(email="a@example.com", password="secret")
+        inbox = tmp_path / "a@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            inbox,
+            data=b"Message-ID: <m@example.com>\r\n\r\none",
+        )
+        eml.write_bytes(b"Message-ID: <m@example.com>\r\n\r\ntwo")
+
+        _email, issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=False,
+        )
+
+        assert any("content_sha256 mismatch" in issue for issue in issues)
+
     def test_audit_account_flags_trailing_imap_fetch_wrapper(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
