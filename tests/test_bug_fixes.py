@@ -1154,6 +1154,10 @@ class TestLegacyImportJournal:
                 flags="",
                 internaldate="",
             )))
+        _write_verify_export_state(account_dir, [
+            {"mailbox": "Bad", "path": "Bad", "message_count": 1},
+            {"mailbox": "Good", "path": "Good", "message_count": 1},
+        ])
 
         server = ServerConfig(host="dummy", port=993, ssl=True)
         account = Account(email="user@example.com", password="pass")
@@ -1585,6 +1589,9 @@ class TestBug6CreateExceptionLogged:
             flags="",
             internaldate="",
         )))
+        _write_verify_export_state(acc_dir.parent, [
+            {"mailbox": "NonExistent", "path": "NonExistent", "message_count": 1},
+        ])
 
         fake_imap = mock.MagicMock()
         # First select fails, create fails, second select fails → RuntimeError
@@ -5074,6 +5081,9 @@ class TestRound3ConfirmedBugs:
             _legacy_integrity_metadata(b"original", mailbox="INBOX", uid=1)
         ))
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        _write_verify_export_state(folder.parent, [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+        ])
 
         class AppendTarget:
             appended = 0
@@ -5803,6 +5813,65 @@ class TestRound7ConfirmedBugs:
                 tmp_path,
                 ignore_errors=False,
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_missing_legacy_export_state_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (folder.parent / "export-state.json").unlink()
+
+        with pytest.raises(RuntimeError, match="export-state missing"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_incomplete_legacy_export_state_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        state_path = folder.parent / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["complete"] = False
+        state_path.write_text(json.dumps(state))
+
+        with pytest.raises(RuntimeError, match="export-state is not complete"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_wrong_source_legacy_export_state_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        source_server = ServerConfig("source.example.com")
+        wrong_source = ServerConfig("wrong-source.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder, source_server=source_server)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with pytest.raises(RuntimeError, match="source_server does not match config source_server"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("target.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+                source_server=wrong_source,
             )
 
     def test_direct_import_rejects_original_mailbox_without_marker_before_connect(self, tmp_path: Path) -> None:

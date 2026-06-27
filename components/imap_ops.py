@@ -661,6 +661,7 @@ def import_account(
     stop_event: Optional[object] = None,
     da_context: Optional[Tuple[object, int]] = None,
     provision_context: Optional[Tuple[object, int, str]] = None,
+    source_server: Optional[ServerConfig] = None,
 ) -> None:
     """Import all messages for an account from `in_root/<email>/...`.
 
@@ -813,6 +814,19 @@ def import_account(
         if not _completed_zero_message_export(staged_marker_paths, staged_markers):
             raise RuntimeError(f"Input account directory has no staged .eml files: {account_dir}")
         logging.info("[import] %s: completed zero-message export; importing empty mailbox structure only", account.email)
+    else:
+        from .audit import _legacy_export_state_issues
+
+        export_state_issues = _legacy_export_state_issues(
+            account,
+            account_dir,
+            folder_dirs,
+            require_state=True,
+            expected_source_server=source_server,
+            require_source_server_binding=source_server is not None,
+        )
+        if export_state_issues:
+            raise RuntimeError("invalid legacy export-state: " + "; ".join(export_state_issues))
 
     # Choose IMAP context manager (injected or default)
     def _imap_ctx() -> AbstractContextManager[imaplib.IMAP4]:

@@ -86,6 +86,7 @@ def _legacy_export_state_issues(
     *,
     require_state: bool,
     expected_source_server: Optional[ServerConfig] = None,
+    require_source_server_binding: bool = True,
 ) -> List[str]:
     issues: List[str] = []
     state_path = account_dir / "export-state.json"
@@ -122,7 +123,7 @@ def _legacy_export_state_issues(
             )
         if source_server_sha256 != expected_digest:
             issues.append(f"{account.email}: export-state source_server_sha256 does not match config source_server")
-    elif require_state:
+    elif require_state and require_source_server_binding:
         issues.append(f"{account.email}: config source_server missing; cannot bind staged export to source endpoint")
     raw_mailboxes = state.get("mailboxes")
     if not isinstance(raw_mailboxes, list):

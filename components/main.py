@@ -900,6 +900,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     stop_event=stop_event,
                     da_context=da_ctx,
                     provision_context=provision_ctx,
+                    source_server=config.source_server,
                 )
 
             import_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]

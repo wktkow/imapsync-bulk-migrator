@@ -33,6 +33,18 @@ def _legacy_import_metadata(data: bytes, **extra: object) -> dict:
     return meta
 
 
+def _write_export_state(account_dir: Path) -> None:
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "schema_version": 1,
+        "account": account_dir.name,
+        "complete": True,
+        "completed_at": 0,
+        "mailboxes": [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+        ],
+    }))
+
+
 # ---------------------------------------------------------------------------
 # RC1: list_all_mailboxes handles non-bytes items in imap.list() response
 # ---------------------------------------------------------------------------
@@ -146,6 +158,7 @@ class TestImapFactoryTyping:
         eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
         meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
+        _write_export_state(acc_dir.parent)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -196,6 +209,7 @@ class TestFlagsAlwaysStr:
         meta = acc_dir / "u0000000001.json"
         # Empty flags and no internaldate
         meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
+        _write_export_state(acc_dir.parent)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -226,6 +240,7 @@ class TestFlagsAlwaysStr:
         eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
         meta.write_text(json.dumps(_legacy_import_metadata(data, flags="\\Recent", internaldate="")))
+        _write_export_state(acc_dir.parent)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
