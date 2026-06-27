@@ -3663,6 +3663,65 @@ def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_ta
     assert '"action": "appended"' in second_journal
 
 
+def test_provider_import_many_to_one_rejects_cross_source_canonical_id_collision_before_target_contact(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="merge group canonical_id collision: provider-shared"):
+            provider_import_account(config, second, tmp_path)
+
+
+def test_provider_validation_many_to_one_reports_cross_source_canonical_id_collision_without_target_contact(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="provider-shared",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")) as conn:
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+
+    assert conn.call_count == 0
+    assert not report["ok"]
+    assert any("merge group canonical_id collision: provider-shared" in item for item in report["failed"])
+
+
 def test_provider_import_many_to_one_empty_mode_rejects_unjournaled_target_content(tmp_path: Path) -> None:
     config = _many_to_one_config()
     first, second = config.accounts

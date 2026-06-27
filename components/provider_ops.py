@@ -3423,6 +3423,25 @@ def validated_merge_group_stages(
     return stages
 
 
+def require_merge_group_unique_manifest_identities(
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+) -> None:
+    owners_by_identity: Dict[str, str] = {}
+    collisions: List[str] = []
+    for group_account, _account_dir, manifest_rows, _journal_rows in stages:
+        for row in manifest_rows:
+            identity = str(row.get("canonical_id") or "")
+            if not identity:
+                continue
+            previous_owner = owners_by_identity.get(identity)
+            if previous_owner is None:
+                owners_by_identity[identity] = group_account.source_email
+            elif previous_owner != group_account.source_email:
+                collisions.append(f"{identity} in {previous_owner} and {group_account.source_email}")
+    if collisions:
+        raise RuntimeError("merge group canonical_id collision: " + "; ".join(collisions))
+
+
 def require_merge_group_target_translation_safe(
     stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
     target_mailboxes: List[MailboxInfo],
@@ -3560,6 +3579,16 @@ def provider_import_account(
     used_target_nums: Dict[str, set[bytes]] = {}
     used_target_gmail_msgids: set[str] = set()
     target_binding = provider_target_journal_binding(config, account)
+    merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
+    if provider_account_merge_enabled(config):
+        merge_group_stages = validated_merge_group_stages(
+            config,
+            in_root,
+            account,
+            manifest_rows,
+            journal_rows,
+        )
+        require_merge_group_unique_manifest_identities(merge_group_stages)
 
     with imap_connection(config.target, account, role="target") as imap:
         capabilities: List[str] = []
@@ -3571,15 +3600,7 @@ def provider_import_account(
                     "IMAP server did not advertise X-GM-EXT-1"
                 )
         target_mailboxes = list_mailboxes(imap)
-        merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
-        if provider_account_merge_enabled(config):
-            merge_group_stages = validated_merge_group_stages(
-                config,
-                in_root,
-                account,
-                manifest_rows,
-                journal_rows,
-            )
+        if merge_group_stages is not None:
             require_merge_group_target_translation_safe(
                 merge_group_stages,
                 target_mailboxes,
@@ -4121,6 +4142,21 @@ def provider_validate_account(
     by_id = {str(row.get("canonical_id")): row for row in manifest_rows if row.get("canonical_id")}
     manifest_ids = set(by_id)
     expected_content_identities_by_id = manifest_payload_content_identities(account_dir, manifest_rows)
+    merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
+    merge_group_stage_error: Optional[str] = None
+    if provider_account_merge_enabled(config):
+        try:
+            merge_group_stages = validated_merge_group_stages(
+                config,
+                in_root,
+                account,
+                manifest_rows,
+                journal_rows,
+            )
+            require_merge_group_unique_manifest_identities(merge_group_stages)
+        except Exception as exc:
+            merge_group_stage_error = str(exc)
+            report["failed"].append(merge_group_stage_error)
     journal_gmail_msgid_missing = (
         missing_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids)
         if config.target.provider == "gmail"
@@ -4183,7 +4219,7 @@ def provider_validate_account(
         report["failed"].extend(journal_gmail_msgid_missing)
         report["committed"] = sum(1 for identity in manifest_ids if committed_by_id.get(identity, 0) > 0)
 
-    if check_target:
+    if check_target and merge_group_stage_error is None:
         try:
             with imap_connection(config.target, account, role="target") as imap:
                 capabilities: List[str] = []
@@ -4192,15 +4228,7 @@ def provider_validate_account(
                     if "X-GM-EXT-1" not in capabilities:
                         raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
-                merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
-                if provider_account_merge_enabled(config):
-                    merge_group_stages = validated_merge_group_stages(
-                        config,
-                        in_root,
-                        account,
-                        manifest_rows,
-                        journal_rows,
-                    )
+                if merge_group_stages is not None:
                     require_merge_group_target_translation_safe(
                         merge_group_stages,
                         target_mailboxes,
