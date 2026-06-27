@@ -53,6 +53,21 @@ def _raise_if_symlink(path: Path, label: str) -> None:
         raise RuntimeError(f"refusing to use symlinked {label}: {path}")
 
 
+def _read_file_no_symlink(path: Path, label: str) -> bytes:
+    _raise_if_symlink(path, label)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
+        raise
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
 def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
     ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -703,9 +718,10 @@ def import_account(
         mailbox_meta = folder_dir.name
         marker = folder_dir / ".mailbox.json"
         if marker.exists():
+            _raise_if_symlink(marker, "legacy mailbox marker")
             staged_marker_paths.add(folder_dir.name)
             with contextlib.suppress(Exception):
-                marker_meta = json.loads(marker.read_text(encoding="utf-8"))
+                marker_meta = json.loads(_read_file_no_symlink(marker, "legacy mailbox marker").decode("utf-8"))
                 if isinstance(marker_meta, dict):
                     staged_markers[folder_dir.name] = marker_meta
                 marker_mailbox = marker_meta.get("mailbox")
@@ -714,6 +730,7 @@ def import_account(
             per_folder.setdefault(mailbox_meta, [])
         default_mailbox = mailbox_meta
         for eml_path in sorted(folder_dir.glob("*.eml")):
+            _raise_if_symlink(eml_path, "legacy message file")
             meta_path = eml_path.with_suffix(".json")
             flags = ""
             internaldate = None
@@ -721,15 +738,15 @@ def import_account(
             expected_hash: Optional[str] = None
             mailbox_meta = default_mailbox
             if meta_path.exists():
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                    if not isinstance(meta, dict):
-                        raise RuntimeError(f"{meta_path}: message metadata is not an object")
-                    expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
-                    flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
-                    mbox = meta.get("mailbox")
-                    if isinstance(mbox, str) and mbox.strip():
-                        mailbox_meta = mbox
+                _raise_if_symlink(meta_path, "legacy message metadata")
+                meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
+                if not isinstance(meta, dict):
+                    raise RuntimeError(f"{meta_path}: message metadata is not an object")
+                expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
+                flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
+                mbox = meta.get("mailbox")
+                if isinstance(mbox, str) and mbox.strip():
+                    mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")
@@ -799,8 +816,7 @@ def import_account(
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
                 for eml_path, flags, internaldate, expected_size, expected_hash in entries:
                     _raise_if_stopped(stop_event, f"legacy import {account.email}")
-                    with open(eml_path, "rb") as f:
-                        data = f.read()
+                    data = _read_file_no_symlink(eml_path, "legacy message file")
                     _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
                     flags_str = ""
                     if flags:

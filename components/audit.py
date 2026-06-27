@@ -164,6 +164,8 @@ def _legacy_export_state_issues(
 def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     """Perform lightweight sanity checks on a single exported .eml file."""
     issues: List[str] = []
+    if eml_path.is_symlink():
+        return [f"{eml_path}: message file is a symlink"]
     try:
         data = eml_path.read_bytes()
     except Exception as exc:
@@ -243,7 +245,9 @@ def audit_account(
         mailbox_marker = folder_dir / ".mailbox.json"
         if not emls and not mailbox_marker.exists():
             issues.append(f"{account.email}:{folder}: no .eml files found")
-        if mailbox_marker.exists():
+        if mailbox_marker.is_symlink():
+            issues.append(f"{account.email}:{folder}: mailbox marker is a symlink")
+        elif mailbox_marker.exists():
             try:
                 marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
                 expected_count = marker.get("message_count") if isinstance(marker, dict) else None
@@ -266,11 +270,19 @@ def audit_account(
             issues.append(f"{account.email}:{folder}: {len(missing_meta)} message(s) missing .json metadata")
         if missing_eml:
             issues.append(f"{account.email}:{folder}: {len(missing_eml)} metadata file(s) without .eml counterpart")
+        symlink_jsons = {p for p in jsons if p.is_symlink()}
+        for json_path in sorted(symlink_jsons):
+            issues.append(f"{account.email}:{folder}:{json_path.name}: message metadata is a symlink")
         for eml_path in emls:
+            eml_is_symlink = eml_path.is_symlink()
             issues.extend(_audit_eml_file(eml_path, folder))
             stem = eml_path.stem
             meta_path = eml_path.with_suffix(".json")
             if not meta_path.exists():
+                continue
+            if meta_path.is_symlink():
+                if meta_path not in symlink_jsons:
+                    issues.append(f"{account.email}:{folder}:{meta_path.name}: message metadata is a symlink")
                 continue
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -322,7 +334,7 @@ def audit_account(
                 binding_issue = legacy_content_binding_issue(meta, required=require_integrity_metadata)
                 if binding_issue:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: {binding_issue}")
-                if expected_hash is not None or expected_size is not None:
+                if not eml_is_symlink and (expected_hash is not None or expected_size is not None):
                     try:
                         data = eml_path.read_bytes()
                         if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
