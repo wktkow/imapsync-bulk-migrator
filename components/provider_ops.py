@@ -132,9 +132,12 @@ def _canonical_provider_endpoint_state_dict(state: Dict[str, Any]) -> Dict[str, 
     try:
         provider = str(state["provider"]).strip().lower()
         host = str(state["host"]).strip().lower().rstrip(".")
-        port = int(state["port"])
-        use_ssl = bool(state["ssl"])
-        starttls = bool(state["starttls"])
+        port_raw = state["port"]
+        use_ssl = state["ssl"]
+        starttls = state["starttls"]
+        if type(port_raw) is not int or type(use_ssl) is not bool or type(starttls) is not bool:
+            return dict(state)
+        port = port_raw
         endpoint = ProviderEndpoint(
             provider=provider,
             host=host,
@@ -168,8 +171,6 @@ def _provider_endpoint_state_digest_matches(
     if not isinstance(actual_digest, str):
         return False
     digest = actual_digest.lower()
-    if digest == expected_digest:
-        return True
     if isinstance(actual_endpoint, dict):
         return digest == _provider_endpoint_state_payload_digest(actual_endpoint)
     return False

@@ -4507,6 +4507,31 @@ def test_provider_audit_and_validation_reject_malformed_gmail_source_endpoint_ho
     assert any("export-state source_endpoint" in issue for issue in report["failed"])
 
 
+@pytest.mark.parametrize("refresh_digest", [False, True])
+def test_provider_audit_and_validation_reject_source_endpoint_string_booleans(
+    tmp_path: Path,
+    refresh_digest: bool,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    state = json.loads((account_dir / "export-state.json").read_text())
+    source_endpoint = dict(state["source_endpoint"])
+    source_endpoint["ssl"] = "false"
+    state["source_endpoint"] = source_endpoint
+    if refresh_digest:
+        state["source_endpoint_sha256"] = hashlib.sha256(
+            json.dumps(source_endpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    (account_dir / "export-state.json").write_text(json.dumps(state))
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any("export-state source_endpoint" in issue for issue in audit_issues)
+    assert any("export-state source_endpoint" in issue for issue in report["failed"])
+
+
 def test_provider_audit_and_validation_reject_target_endpoint_mismatch(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
