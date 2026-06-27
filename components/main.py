@@ -315,6 +315,27 @@ def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
     return issues
 
 
+def _provider_staged_symlink_issues(account_dir: Path, account_label: str) -> List[str]:
+    issues: List[str] = []
+    stack = [account_dir]
+    while stack:
+        current = stack.pop()
+        try:
+            children = sorted(current.iterdir())
+        except OSError as exc:
+            rel = current.relative_to(account_dir).as_posix() if current != account_dir else "."
+            issues.append(f"{account_label}: failed to read staged provider path {rel}: {exc}")
+            continue
+        for child in children:
+            rel = child.relative_to(account_dir).as_posix()
+            if child.is_symlink():
+                issues.append(f"{account_label}: staged provider path is a symlink: {rel}")
+                continue
+            if child.is_dir():
+                stack.append(child)
+    return issues
+
+
 def _provider_cli_local_root_issues(
     root: Path,
     config: ProviderMigrationConfig,
@@ -342,6 +363,9 @@ def _provider_cli_local_root_issues(
             continue
         if account_dir.exists() and not account_dir.is_dir():
             issues.append(f"{account.source_email}: provider account path is not a directory: {account_dir}")
+            continue
+        if account_dir.exists():
+            issues.extend(_provider_staged_symlink_issues(account_dir, account.source_email))
     return issues
 
 

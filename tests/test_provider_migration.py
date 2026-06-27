@@ -8892,6 +8892,41 @@ def test_main_rejects_provider_file_root_before_connectivity(
     assert rc == 2
 
 
+@pytest.mark.parametrize("mode", ["export", "import", "validate"])
+def test_main_rejects_provider_symlinked_manifest_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / f"provider-root-manifest-{mode}"
+    account_dir = root / "source@example.com"
+    account_dir.mkdir(parents=True)
+    outside_manifest = tmp_path / f"outside-manifest-{mode}.jsonl"
+    outside_manifest.write_text("", encoding="utf-8")
+    try:
+        (account_dir / "manifest.jsonl").symlink_to(outside_manifest)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    args = [
+        "--mode", mode,
+        "--config", str(config_path),
+        "--output-dir", str(root if mode == "export" else tmp_path / f"unused-output-manifest-{mode}"),
+        "--input-dir", str(root if mode != "export" else tmp_path / f"unused-input-manifest-{mode}"),
+        "--log-dir", str(tmp_path / f"logs-manifest-{mode}"),
+        "--min-free-gb", "0",
+        "--max-workers", "1",
+        "--no-audit-after-export",
+    ]
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main(args)
+
+    assert rc == 2
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 
