@@ -8,6 +8,7 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
+from .content_binding import legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
 from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
 from .utils import quote_imap_search_value, sanitize_for_path
@@ -277,9 +278,12 @@ def audit_account(
                 expected_size = meta.get("rfc822_size")
                 if not isinstance(expected_hash, str) or not expected_hash:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
-                if not isinstance(expected_size, int):
+                if type(expected_size) is not int:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
-                if isinstance(expected_hash, str) and expected_hash and isinstance(expected_size, int):
+                binding_issue = legacy_content_binding_issue(meta)
+                if binding_issue:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: {binding_issue}")
+                if isinstance(expected_hash, str) and expected_hash and type(expected_size) is int:
                     try:
                         data = eml_path.read_bytes()
                         actual_hash = hashlib.sha256(data).hexdigest()

@@ -17,6 +17,7 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
+from .content_binding import CONTENT_BINDING_FIELD, provider_content_binding_issue, provider_content_binding_sha256
 from .executor import parallel_process_accounts
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
 from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
@@ -1153,6 +1154,9 @@ def manifest_integrity_issues(rows: List[Dict[str, Any]]) -> List[str]:
         expected_size = row.get("rfc822_size")
         if type(expected_size) is not int or expected_size <= 0:
             issues.append(f"{identity}: missing or invalid rfc822_size")
+        binding_issue = provider_content_binding_issue(row)
+        if binding_issue:
+            issues.append(f"{identity}: {binding_issue}")
     return issues
 
 
@@ -1175,6 +1179,9 @@ def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
     actual_hash = hashlib.sha256(data).hexdigest()
     if actual_hash.lower() != expected_hash.lower():
         raise RuntimeError(f"{identity}: content_sha256 mismatch")
+    binding_issue = provider_content_binding_issue(row)
+    if binding_issue:
+        raise RuntimeError(f"{identity}: {binding_issue}")
 
 
 def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, require_present: bool = True) -> List[str]:
@@ -1581,6 +1588,7 @@ def _finalize_export_record(record: Dict[str, Any], folder_map: Dict[str, str]) 
 def persist_export_records(account_dir: Path, records: Dict[str, Dict[str, Any]], folder_map: Dict[str, str]) -> None:
     for record in records.values():
         _finalize_export_record(record, folder_map)
+        record[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(record)
         _atomic_json(account_dir / str(record["metadata_path"]), record)
     _write_jsonl(account_dir / "manifest.jsonl", sorted(records.values(), key=lambda row: str(row["canonical_id"])))
 

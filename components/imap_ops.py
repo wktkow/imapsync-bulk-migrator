@@ -15,6 +15,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 import imaplib
 
 from .models import Account, ServerConfig
+from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue, legacy_content_binding_sha256
 from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
 
 
@@ -476,6 +477,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "rfc822_size": len(msg_bytes),
                             "content_sha256": hashlib.sha256(msg_bytes).hexdigest(),
                         }
+                        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
                         _secure_atomic_json(meta_path, meta)
                 _remove_stale_export_files(folder_dir, expected_stems)
             except Exception as exc:
@@ -518,6 +520,9 @@ def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object])
         expected_hash = str(expected_hash_raw).lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise RuntimeError(f"{meta_path}: invalid content_sha256 metadata")
+    binding_issue = legacy_content_binding_issue(meta, required=False)
+    if binding_issue:
+        raise RuntimeError(f"{meta_path}: {binding_issue}")
     return expected_size, expected_hash
 
 

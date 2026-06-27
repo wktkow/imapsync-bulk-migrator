@@ -20,6 +20,18 @@ from unittest import mock
 import pytest
 
 
+def _legacy_integrity_metadata(data: bytes, **extra: object) -> dict:
+    from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+
+    meta = {
+        **extra,
+        "rfc822_size": len(data),
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+    return meta
+
+
 def _write_legacy_message_fixture(
     folder: Path,
     *,
@@ -35,14 +47,14 @@ def _write_legacy_message_fixture(
     folder.mkdir(parents=True, exist_ok=True)
     eml = folder / f"u{uid:010d}.eml"
     eml.write_bytes(data)
-    eml.with_suffix(".json").write_text(json.dumps({
-        "mailbox": mailbox,
-        "uid": uid,
-        "flags": "\\Seen",
-        "internaldate": "01-Jan-2024 00:00:00 +0000",
-        "rfc822_size": len(data),
-        "content_sha256": hashlib.sha256(data).hexdigest(),
-    }))
+    meta = _legacy_integrity_metadata(
+        data,
+        mailbox=mailbox,
+        uid=uid,
+        flags="\\Seen",
+        internaldate="01-Jan-2024 00:00:00 +0000",
+    )
+    eml.with_suffix(".json").write_text(json.dumps(meta))
     account_dir = folder.parent
     state_path = account_dir / "export-state.json"
     state = {
@@ -2135,12 +2147,7 @@ class TestAuditHardening:
         data = b"From: a\r\nTo: b\r\n\r\nbody"
         eml = inbox / "u0000000001.eml"
         eml.write_bytes(data)
-        eml.with_suffix(".json").write_text(json.dumps({
-            "mailbox": "INBOX",
-            "uid": 1,
-            "rfc822_size": len(data),
-            "content_sha256": hashlib.sha256(data).hexdigest(),
-        }))
+        eml.with_suffix(".json").write_text(json.dumps(_legacy_integrity_metadata(data, mailbox="INBOX", uid=1)))
 
         _email, issues = audit_account(
             account,
@@ -3524,10 +3531,7 @@ class TestBug10MultiMessageDetection:
         eml_path = tmp_path / "test.eml"
         eml_path.write_bytes(b"Message-ID: <m@example.com>\r\n\r\ncorrupted")
         json_path = tmp_path / "test.json"
-        json_path.write_text(json.dumps({
-            "content_sha256": hashlib.sha256(b"original").hexdigest(),
-            "rfc822_size": len(b"original"),
-        }))
+        json_path.write_text(json.dumps(_legacy_integrity_metadata(b"original")))
 
         analysis, error = analyze_message(eml_path, json_path, require_metadata=False)
 
@@ -3535,6 +3539,24 @@ class TestBug10MultiMessageDetection:
         assert error is not None
         assert "content_sha256 mismatch" in error
         assert "rfc822_size mismatch" in error
+
+    def test_verify_export_requires_content_binding_metadata(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        payload = b"Message-ID: <m@example.com>\r\n\r\nbody"
+        eml_path = tmp_path / "test.eml"
+        eml_path.write_bytes(payload)
+        json_path = tmp_path / "test.json"
+        json_path.write_text(json.dumps({
+            "content_sha256": hashlib.sha256(payload).hexdigest(),
+            "rfc822_size": len(payload),
+        }))
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert analysis is None
+        assert error is not None
+        assert "missing content_binding_sha256" in error
 
     def test_concatenated_message_after_body_is_detected(self, tmp_path: Path) -> None:
         from verify_export import analyze_message
@@ -4059,12 +4081,9 @@ class TestRound3ConfirmedBugs:
         folder = tmp_path / "user@example.com" / "Sent_Items"
         folder.mkdir(parents=True)
         (folder / "u0000000001.eml").write_bytes(data)
-        (folder / "u0000000001.json").write_text(json.dumps({
-            "mailbox": "Sent Items",
-            "uid": 1,
-            "rfc822_size": len(data),
-            "content_sha256": hashlib.sha256(data).hexdigest(),
-        }))
+        (folder / "u0000000001.json").write_text(json.dumps(
+            _legacy_integrity_metadata(data, mailbox="Sent Items", uid=1)
+        ))
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Sent Items", "message_count": 1}))
         (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
             "schema_version": 1,
@@ -4089,6 +4108,27 @@ class TestRound3ConfirmedBugs:
         assert not ok
         assert any("export-state mailbox path collision" in issue for issue in issues)
 
+    def test_strict_audit_rejects_content_binding_mismatch(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(folder)
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["content_binding_sha256"] = "0" * 64
+        meta_path.write_text(json.dumps(meta))
+
+        _email, issues = audit_account(
+            Account(email="user@example.com", password="secret"),
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("content_binding_sha256 mismatch" in issue for issue in issues)
+
     def test_direct_import_rejects_sidecar_integrity_mismatch(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
@@ -4097,12 +4137,9 @@ class TestRound3ConfirmedBugs:
         folder.mkdir(parents=True)
         data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\ncorrupted"
         (folder / "u0000000001.eml").write_bytes(data)
-        (folder / "u0000000001.json").write_text(json.dumps({
-            "mailbox": "INBOX",
-            "uid": 1,
-            "rfc822_size": len(b"original"),
-            "content_sha256": hashlib.sha256(b"original").hexdigest(),
-        }))
+        (folder / "u0000000001.json").write_text(json.dumps(
+            _legacy_integrity_metadata(b"original", mailbox="INBOX", uid=1)
+        ))
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
 
         class AppendTarget:
@@ -4254,10 +4291,7 @@ class TestRound4ConfirmedBugs:
         )
         eml_path.write_bytes(payload)
         json_path = tmp_path / "with-attached-eml.json"
-        json_path.write_text(json.dumps({
-            "content_sha256": hashlib.sha256(payload).hexdigest(),
-            "rfc822_size": len(payload),
-        }))
+        json_path.write_text(json.dumps(_legacy_integrity_metadata(payload)))
 
         analysis, error = analyze_message(eml_path, json_path)
 
@@ -4274,14 +4308,8 @@ class TestRound4ConfirmedBugs:
         inbox.mkdir(parents=True)
         payload = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
         (inbox / "u0000000001.eml").write_bytes(payload)
-        (inbox / "u0000000001.json").write_text(json.dumps({
-            "content_sha256": hashlib.sha256(payload).hexdigest(),
-            "rfc822_size": len(payload),
-        }))
-        (inbox / "u0000000002.json").write_text(json.dumps({
-            "content_sha256": hashlib.sha256(b"missing").hexdigest(),
-            "rfc822_size": len(b"missing"),
-        }))
+        (inbox / "u0000000001.json").write_text(json.dumps(_legacy_integrity_metadata(payload)))
+        (inbox / "u0000000002.json").write_text(json.dumps(_legacy_integrity_metadata(b"missing")))
         monkeypatch.chdir(tmp_path)
 
         stats = verify_account(tmp_path / "exported" / "user@example.com")

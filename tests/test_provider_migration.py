@@ -10,6 +10,7 @@ from unittest import mock
 
 import pytest
 
+from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
 from components.models import (
     AuthConfig,
     MigrationAccount,
@@ -2623,6 +2624,7 @@ def _write_manifest_fixture(root: Path) -> Path:
         "eml_path": "messages/gmail-123.eml",
         "metadata_path": "metadata/gmail-123.json",
     }
+    row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir)
@@ -2662,6 +2664,7 @@ def _write_provider_account_fixture(
         "eml_path": eml_rel,
         "metadata_path": meta_rel,
     }
+    row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
     (account_dir / meta_rel).write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(
@@ -2690,6 +2693,13 @@ def _write_provider_export_state(
         for line in account_dir.joinpath("manifest.jsonl").read_text().splitlines()
         if line.strip()
     ]
+    for row in manifest_rows:
+        _refresh_provider_binding(row)
+    account_dir.joinpath("manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in manifest_rows))
+    for row in manifest_rows:
+        metadata_path = row.get("metadata_path")
+        if isinstance(metadata_path, str) and metadata_path:
+            account_dir.joinpath(metadata_path).write_text(json.dumps(row))
     source_provider = str(manifest_rows[0].get("source_provider") or "imap") if manifest_rows else "imap"
     if target.endswith("@gmail.com"):
         target_provider = "gmail"
@@ -2733,7 +2743,16 @@ def _write_provider_export_state(
     }))
 
 
-def _write_single_manifest_row(account_dir: Path, row: dict) -> None:
+def _refresh_provider_binding(row: dict) -> None:
+    try:
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+    except ValueError:
+        pass
+
+
+def _write_single_manifest_row(account_dir: Path, row: dict, *, refresh_binding: bool = True) -> None:
+    if refresh_binding:
+        _refresh_provider_binding(row)
     (account_dir / str(row["metadata_path"])).write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
 
@@ -5450,6 +5469,25 @@ def test_provider_import_audit_and_validation_require_manifest_integrity_metadat
     assert any("missing or invalid rfc822_size" in issue for issue in report["failed"])
 
     with pytest.raises(RuntimeError, match="invalid manifest integrity metadata"):
+        provider_import_account(config, account, tmp_path)
+
+
+def test_provider_import_audit_and_validation_reject_content_binding_mismatch(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row[CONTENT_BINDING_FIELD] = "0" * 64
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    assert any("content_binding_sha256 mismatch" in issue for issue in issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert any("content_binding_sha256 mismatch" in issue for issue in report["failed"])
+
+    with pytest.raises(RuntimeError, match="content_binding_sha256 mismatch"):
         provider_import_account(config, account, tmp_path)
 
 

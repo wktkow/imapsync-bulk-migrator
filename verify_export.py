@@ -13,6 +13,8 @@ from email.parser import BytesParser
 from email.policy import default as default_policy
 import re
 
+from components.content_binding import legacy_content_binding_issue
+
 
 def _has_later_rfc822_header_block(msg_text):
     lines = msg_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
@@ -99,6 +101,9 @@ def analyze_message(eml_path, json_path, *, require_metadata=True):
                 integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
         elif require_metadata:
             integrity_errors.append('missing rfc822_size metadata')
+        binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
+        if binding_issue:
+            integrity_errors.append(binding_issue)
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
