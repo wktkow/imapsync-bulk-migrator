@@ -2008,6 +2008,35 @@ def test_provider_export_resume_rewrites_corrupt_existing_payload(tmp_path: Path
     assert updated_row["content_sha256"] == hashlib.sha256(original_payload).hexdigest()
 
 
+def test_provider_export_incomplete_resume_refetches_self_consistent_payload(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    eml_path = account_dir / row["eml_path"]
+    source_payload = b"Message-ID: <m1@example.com>\r\n\r\nbody"
+    local_payload = b"Message-ID: <m1@example.com>\r\n\r\nhack"
+    eml_path.write_bytes(local_payload)
+    row["content_sha256"] = hashlib.sha256(local_payload).hexdigest()
+    row["rfc822_size"] = len(local_payload)
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, complete=False)
+    fake = FakeSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    updated_row = json.loads((account_dir / "manifest.jsonl").read_text())
+    assert fake.body_fetches == 1
+    assert eml_path.read_bytes() == source_payload
+    assert updated_row["content_sha256"] == hashlib.sha256(source_payload).hexdigest()
+    assert updated_row[CONTENT_BINDING_FIELD] == provider_content_binding_sha256(updated_row)
+
+
 class FakeSourceChangedMetadataNoBody(FakeSourceImap):
     def uid(self, command: str, *args):
         if command == "search":

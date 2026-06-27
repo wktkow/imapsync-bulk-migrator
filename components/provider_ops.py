@@ -1647,6 +1647,7 @@ def provider_export_account(
     messages: Dict[str, Dict[str, Any]] = {}
     manifest_path = account_dir / "manifest.jsonl"
     preserve_complete_state_until_ready = False
+    trusted_payload_identities: set[str] = set()
     active_identities: set[str] = set()
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     if manifest_path.exists():
@@ -1698,6 +1699,7 @@ def provider_export_account(
             if state_issues:
                 raise RuntimeError("; ".join(state_issues))
             preserve_complete_state_until_ready = True
+            trusted_payload_identities.update(messages)
 
     def write_in_progress_state() -> None:
         _atomic_json(
@@ -1799,7 +1801,7 @@ def provider_export_account(
                     raise RuntimeError(f"metadata fetch failed in {mailbox.name} for UID {uid}: {meta_data}")
                 pre_parsed = parse_provider_fetch_response(meta_data or [])
                 identity_hint = f"gmail-{pre_parsed.get('gmail_msgid')}" if pre_parsed.get("gmail_msgid") else ""
-                if identity_hint and identity_hint in messages:
+                if identity_hint and identity_hint in messages and identity_hint in trusted_payload_identities:
                     try:
                         existing_eml_path = _manifest_path(account_dir, messages[identity_hint], "eml_path")
                     except Exception:
@@ -1885,7 +1887,8 @@ def provider_export_account(
                     write_payload = not eml_path.exists()
                     if not write_payload:
                         try:
-                            require_manifest_payload_matches(record, eml_path.read_bytes())
+                            existing_payload = eml_path.read_bytes()
+                            require_manifest_payload_matches(record, existing_payload)
                         except Exception as exc:
                             logging.warning(
                                 "[provider-export] %s: replacing invalid existing payload for %s: %s",
@@ -1894,6 +1897,8 @@ def provider_export_account(
                                 exc,
                             )
                             write_payload = True
+                        else:
+                            write_payload = existing_payload != msg_bytes
                     if write_payload:
                         _atomic_bytes(eml_path, msg_bytes)
                     record.setdefault("source_provider", config.source.provider)
@@ -1906,6 +1911,7 @@ def provider_export_account(
                     record["rfc822_size"] = int(parsed.get("rfc822_size") or len(msg_bytes))
                     _refresh_export_delivery_metadata(record, parsed)
                     record.setdefault("exported_at", _utc_now())
+                trusted_payload_identities.add(identity)
                 record = messages[identity]
                 update_membership(identity, mailbox, uid, uidvalidity, parsed)
                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
