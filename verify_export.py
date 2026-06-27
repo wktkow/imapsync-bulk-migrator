@@ -205,6 +205,66 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
     return issues
 
 
+def analyze_export_state(account_path, folder_counts):
+    state_path = account_path / "export-state.json"
+    if not state_path.exists():
+        return ["export-state missing"]
+    try:
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+    except Exception as e:
+        return [f"export-state failed to parse: {e}"]
+    if not isinstance(state, dict):
+        return ["export-state json is not an object"]
+
+    issues = []
+    if state.get("complete") is not True:
+        issues.append("export-state is not complete")
+    account = state.get("account")
+    if not isinstance(account, str) or account != account_path.name:
+        issues.append(f"export-state account mismatch (state={account!r} path={account_path.name!r})")
+    mailboxes = state.get("mailboxes")
+    if not isinstance(mailboxes, list):
+        issues.append("export-state mailboxes is not a list")
+        return issues
+
+    seen_paths = set()
+    state_paths = set()
+    for idx, entry in enumerate(mailboxes, 1):
+        if not isinstance(entry, dict):
+            issues.append(f"export-state mailbox entry {idx} is not an object")
+            continue
+        mailbox = entry.get("mailbox")
+        path = entry.get("path")
+        message_count = entry.get("message_count")
+        label = mailbox if isinstance(mailbox, str) and mailbox else f"entry {idx}"
+        if not isinstance(mailbox, str) or not mailbox.strip():
+            issues.append(f"export-state mailbox {idx} missing mailbox")
+        if not isinstance(path, str) or not path.strip():
+            issues.append(f"export-state mailbox {label!r} missing path")
+            continue
+        if path in seen_paths:
+            issues.append(f"export-state mailbox path collision: {path}")
+            continue
+        seen_paths.add(path)
+        state_paths.add(path)
+        if isinstance(mailbox, str) and mailbox.strip() and sanitize_for_path(mailbox) != path:
+            issues.append(f"export-state mailbox {mailbox!r} path mismatch (path={path})")
+        if type(message_count) is not int or message_count < 0:
+            issues.append(f"export-state mailbox {label!r} has invalid message_count")
+        elif path in folder_counts and message_count != folder_counts[path]:
+            issues.append(
+                f"export-state mailbox {label!r} count mismatch "
+                f"(state={message_count} eml={folder_counts[path]})"
+            )
+        if path not in folder_counts:
+            issues.append(f"export-state mailbox {label!r} path missing from folders: {path}")
+
+    for folder_name in sorted(set(folder_counts) - state_paths):
+        issues.append(f"export-state missing mailbox folder: {folder_name}")
+    return issues
+
+
 def verify_account(account_path):
     """Verify all messages in an account"""
     account_name = account_path.name
@@ -217,6 +277,7 @@ def verify_account(account_path):
     folder_stats = {}
     multiple_message_files = []
     mailbox_folders_found = 0
+    folder_counts = {}
     
     # Walk through all folders
     for folder_path in account_path.iterdir():
@@ -231,6 +292,7 @@ def verify_account(account_path):
         
         # Process all .eml files in folder
         eml_files = list(folder_path.glob("*.eml"))
+        folder_counts[folder_name] = len(eml_files)
         json_files = [path for path in folder_path.glob("*.json") if path.name != ".mailbox.json"]
         eml_stems = {path.stem for path in eml_files}
         json_stems = {path.stem for path in json_files}
@@ -277,6 +339,8 @@ def verify_account(account_path):
 
     if mailbox_folders_found == 0:
         errors.append("no mailbox folders found")
+    state_errors = analyze_export_state(account_path, folder_counts)
+    errors.extend(state_errors)
     
     # Print summary
     print(f"Total messages: {total_messages}")

@@ -32,6 +32,17 @@ def _legacy_integrity_metadata(data: bytes, **extra: object) -> dict:
     return meta
 
 
+def _write_verify_export_state(account_dir: Path, mailboxes: list[dict]) -> None:
+    account_dir.mkdir(parents=True, exist_ok=True)
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "schema_version": 1,
+        "account": account_dir.name,
+        "complete": True,
+        "completed_at": 0,
+        "mailboxes": mailboxes,
+    }))
+
+
 def _write_legacy_message_fixture(
     folder: Path,
     *,
@@ -4093,6 +4104,7 @@ class TestRound2ConfirmedBugs:
 
         account_dir = tmp_path / "exported" / "user@example.com"
         account_dir.mkdir(parents=True)
+        _write_verify_export_state(account_dir, [])
 
         stats = verify_account(account_dir)
         monkeypatch.chdir(tmp_path)
@@ -4216,6 +4228,7 @@ class TestRound3ConfirmedBugs:
         account_dir = tmp_path / "exported" / "user@example.com"
         mailbox_dir = account_dir / "INBOX"
         mailbox_dir.mkdir(parents=True)
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}])
         stats = verify_account(account_dir)
 
         assert stats["errors"] == 1
@@ -4245,6 +4258,7 @@ class TestRound4ConfirmedBugs:
             b"\r\n"
             b"body"
         )
+        _write_verify_export_state(inbox.parent, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
         monkeypatch.chdir(tmp_path)
 
         stats = verify_account(tmp_path / "exported" / "user@example.com")
@@ -4283,6 +4297,7 @@ class TestRound4ConfirmedBugs:
         inbox.mkdir(parents=True)
         marker_path = inbox / ".mailbox.json"
         marker_path.write_text(marker_text)
+        _write_verify_export_state(inbox.parent, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}])
         monkeypatch.chdir(tmp_path)
 
         marker_issues = analyze_mailbox_marker(marker_path, "INBOX", 0)
@@ -4341,6 +4356,7 @@ class TestRound4ConfirmedBugs:
         (inbox / "u0000000001.eml").write_bytes(payload)
         (inbox / "u0000000001.json").write_text(json.dumps(_legacy_integrity_metadata(payload)))
         (inbox / "u0000000002.json").write_text(json.dumps(_legacy_integrity_metadata(b"missing")))
+        _write_verify_export_state(inbox.parent, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
         monkeypatch.chdir(tmp_path)
 
         stats = verify_account(tmp_path / "exported" / "user@example.com")
@@ -4496,6 +4512,7 @@ class TestRound6ConfirmedBugs:
         folder = tmp_path / "exported" / "user@example.com" / "Archive"
         folder.mkdir(parents=True)
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Sent", "message_count": 0}))
+        _write_verify_export_state(folder.parent, [{"mailbox": "Archive", "path": "Archive", "message_count": 0}])
         monkeypatch.chdir(tmp_path)
 
         stats = verify_account(tmp_path / "exported" / "user@example.com")
@@ -4517,11 +4534,50 @@ class TestRound6ConfirmedBugs:
             data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
         )
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Archive", "message_count": 1}))
+        _write_verify_export_state(folder.parent, [{"mailbox": "Archive", "path": "Archive", "message_count": 1}])
         monkeypatch.chdir(tmp_path)
 
         stats = verify_account(tmp_path / "exported" / "user@example.com")
 
         assert eml.exists()
+        assert stats["errors"] == 1
+        assert main() == 1
+
+    def test_verify_export_requires_export_state(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (folder.parent / "export-state.json").unlink()
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert eml.exists()
+        assert stats["errors"] == 1
+        assert main() == 1
+
+    def test_verify_export_rejects_incomplete_export_state(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        state_path = folder.parent / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["complete"] = False
+        state_path.write_text(json.dumps(state))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
         assert stats["errors"] == 1
         assert main() == 1
 
