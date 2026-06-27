@@ -429,12 +429,12 @@ class ProviderMigrationConfig:
                 expected_email = account.source_email if role == "source" else account.target_email
                 auth_username = auth.username or endpoint.auth.username
                 if (
-                    endpoint.provider == "gmail"
+                    endpoint.provider in {"gmail", "icloud"}
                     and auth_username
                     and auth_username_identity(endpoint, auth_username) != auth_username_identity(endpoint, expected_email)
                 ):
                     raise ValueError(
-                        f"accounts[{idx}].{role}_auth.username must match {role}_email for Gmail "
+                        f"accounts[{idx}].{role}_auth.username must match {role}_email for {endpoint.provider} "
                         f"({expected_email})"
                     )
             if self.source.provider == "gmail" and multi_account and not account.gmail_full_visibility_verified:

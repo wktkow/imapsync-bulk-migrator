@@ -324,6 +324,33 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="username must match source_email"):
         load_config_file(wrong_gmail_user)
 
+    wrong_source_icloud_user = tmp_path / "wrong-source-icloud-user.json"
+    wrong_source_icloud_user.write_text(json.dumps({
+        "source": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "other", "password": "x"}},
+        "target": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "x"}},
+        "accounts": [{"source_email": "source@icloud.com", "target_email": "target@example.com"}],
+    }))
+    with pytest.raises(ValueError, match="username must match source_email"):
+        load_config_file(wrong_source_icloud_user)
+
+    wrong_target_icloud_user = tmp_path / "wrong-target-icloud-user.json"
+    wrong_target_icloud_user.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password", "password": "x"}},
+        "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "wrongtarget", "password": "x"}},
+        "accounts": [{"source_email": "source@example.com", "target_email": "target@icloud.com"}],
+    }))
+    with pytest.raises(ValueError, match="username must match target_email"):
+        load_config_file(wrong_target_icloud_user)
+
+    icloud_username_aliases = tmp_path / "icloud-username-aliases.json"
+    icloud_username_aliases.write_text(json.dumps({
+        "source": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "source", "password": "x"}},
+        "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "target@me.com", "password": "x"}},
+        "accounts": [{"source_email": "source@icloud.com", "target_email": "target@icloud.com"}],
+    }))
+    parsed_aliases = load_config_file(icloud_username_aliases)
+    assert isinstance(parsed_aliases, ProviderMigrationConfig)
+
     icloud_xoauth = tmp_path / "icloud-xoauth.json"
     icloud_xoauth.write_text(json.dumps({
         "source": {"provider": "gmail", "host": "imap.gmail.com", "auth": {"method": "xoauth2", "password": "x"}},
@@ -577,7 +604,7 @@ def test_provider_config_supports_requested_imap_routes(tmp_path: Path) -> None:
         },
         "imap-to-icloud": {
             "source": {"provider": "imap", "host": "mail.example.com", "ssl": False, "starttls": True, "auth": {"method": "password", "username": "imap-login", "password": "imap-secret"}},
-            "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "icloud-login", "password": "icloud-secret"}},
+            "target": {"provider": "icloud", "host": "imap.mail.me.com", "auth": {"method": "app_password", "username": "user", "password": "icloud-secret"}},
             "accounts": [{"source_email": "user@example.com", "target_email": "user@icloud.com"}],
         },
     }
@@ -752,7 +779,7 @@ def test_provider_config_treats_roundcube_as_generic_imap(tmp_path: Path) -> Non
         "target": {
             "provider": "icloud",
             "host": "imap.mail.me.com",
-            "auth": {"method": "app_password", "username": "icloud-user", "password": "icloud-secret"},
+            "auth": {"method": "app_password", "username": "user", "password": "icloud-secret"},
         },
         "accounts": [{"source_email": "user@example.com", "target_email": "user@icloud.com"}],
     }))
