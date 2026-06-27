@@ -728,6 +728,7 @@ def import_account(
     for folder_dir in folder_dirs:
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
+        marker_mailbox_present = False
         marker = folder_dir / ".mailbox.json"
         _raise_if_symlink(marker, "legacy mailbox marker")
         eml_paths = sorted(folder_dir.glob("*.eml"))
@@ -753,10 +754,12 @@ def import_account(
                         f"{marker}: mailbox marker count mismatch (marker={expected_count} eml={len(eml_paths)})"
                     )
                 marker_mailbox = marker_meta.get("mailbox")
-                if isinstance(marker_mailbox, str) and marker_mailbox.strip():
-                    if sanitize_for_path(marker_mailbox) != folder_dir.name:
-                        raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
-                    mailbox_meta = marker_mailbox
+                if not isinstance(marker_mailbox, str) or not marker_mailbox.strip():
+                    raise RuntimeError(f"{marker}: mailbox marker missing mailbox")
+                if sanitize_for_path(marker_mailbox) != folder_dir.name:
+                    raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
+                mailbox_meta = marker_mailbox
+                marker_mailbox_present = True
             else:
                 raise RuntimeError(f"{marker}: mailbox marker is not an object")
             per_folder.setdefault(mailbox_meta, [])
@@ -782,12 +785,18 @@ def import_account(
                 if account_meta != account.email:
                     raise RuntimeError(f"{meta_path}: account metadata mismatch (account={account.email} meta={account_meta})")
                 mbox = meta.get("mailbox")
-                if isinstance(mbox, str) and mbox.strip():
-                    if sanitize_for_path(mbox) != folder_dir.name:
-                        raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
+                if not isinstance(mbox, str) or not mbox.strip():
+                    raise RuntimeError(f"{meta_path}: missing mailbox metadata")
+                if sanitize_for_path(mbox) != folder_dir.name:
+                    raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
+                if marker_mailbox_present:
                     if mbox != default_mailbox:
                         raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
-                    mailbox_meta = mbox
+                elif mbox != folder_dir.name:
+                    raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
+                mailbox_meta = mbox
+            elif not marker_mailbox_present:
+                raise RuntimeError(f"{eml_path}: missing mailbox metadata")
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))
     if not per_folder:
         raise RuntimeError(f"Input account directory has no mailbox folders: {account_dir}")

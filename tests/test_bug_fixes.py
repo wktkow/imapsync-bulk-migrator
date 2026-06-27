@@ -5697,6 +5697,72 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_direct_import_rejects_legacy_marker_missing_mailbox_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <marker-missing-mailbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"message_count": 1}))
+
+        with pytest.raises(RuntimeError, match="mailbox marker missing mailbox"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_legacy_sidecar_missing_mailbox_before_connect(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <sidecar-missing-mailbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        del meta["mailbox"]
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match="missing mailbox metadata"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_original_mailbox_without_marker_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "Sent_Items"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="Sent Items",
+            data=b"Message-ID: <import-sent-items@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+
+        with pytest.raises(RuntimeError, match="missing mailbox marker for original mailbox Sent Items"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_strict_audit_rejects_symlinked_legacy_export_state_without_reading_target(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig
