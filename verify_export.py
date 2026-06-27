@@ -365,6 +365,25 @@ def analyze_export_state(account_path, folder_counts):
     return issues
 
 
+def expected_legacy_account_for_sidecars(account_path):
+    state_path = account_path / "export-state.json"
+    if state_path.is_symlink() or not state_path.exists():
+        return account_path.name
+    try:
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+    except Exception:
+        return account_path.name
+    if not isinstance(state, dict):
+        return account_path.name
+    account = state.get("account")
+    if isinstance(account, str) and account and (
+        account == account_path.name or sanitize_for_path(account) == account_path.name
+    ):
+        return account
+    return account_path.name
+
+
 def verify_provider_account(account_path):
     """Verify a provider-layout account export."""
     account_name = account_path.name
@@ -474,6 +493,7 @@ def verify_account(account_path):
         return verify_provider_account(account_path)
 
     account_name = account_path.name
+    expected_account = expected_legacy_account_for_sidecars(account_path)
     print(f"\n=== Verifying {account_name} ===")
     
     total_messages = 0
@@ -540,7 +560,7 @@ def verify_account(account_path):
                 eml_file,
                 json_file,
                 folder_name=folder_name,
-                expected_account=account_name,
+                expected_account=expected_account,
                 mailbox_marker_present=mailbox_marker_present,
                 mailbox_marker_mailbox=mailbox_marker_mailbox,
             )

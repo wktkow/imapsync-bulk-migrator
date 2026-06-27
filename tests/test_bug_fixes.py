@@ -5727,6 +5727,29 @@ class TestRound7ConfirmedBugs:
         assert stats["errors"] == 1
         assert "account metadata mismatch (account=a@example.com meta=b@example.com)" in output
 
+    def test_verify_export_accepts_sanitized_legacy_account_sidecars(self, tmp_path: Path) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "a_b@example.com"
+        inbox = account_dir / "INBOX"
+        inbox.mkdir(parents=True)
+        body = b"Message-ID: <sanitized-account@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        (inbox / "u0000000001.eml").write_bytes(body)
+        (inbox / "u0000000001.json").write_text(json.dumps(
+            _legacy_integrity_metadata(body, account="a/b@example.com", mailbox="INBOX", uid=1)
+        ))
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "a/b@example.com",
+            "complete": True,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}],
+        }))
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 0
+
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
