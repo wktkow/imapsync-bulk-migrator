@@ -4831,6 +4831,50 @@ class TestRound7ConfirmedBugs:
         assert stats["errors"] == 0
         assert main() == 0
 
+    def test_panel_reset_checks_free_space_before_panel_mutation(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        events: List[str] = []
+
+        def fail_free_space(*_args, **_kwargs):
+            events.append("free-space")
+            raise RuntimeError("low disk")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", fail_free_space), \
+            mock.patch("components.main.audit_export") as audit_mock, \
+            mock.patch("components.main.CPanelClient") as client_cls, \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel") as reset_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "1000",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 2
+        assert events == ["free-space"]
+        audit_mock.assert_not_called()
+        client_cls.assert_not_called()
+        reset_mock.assert_not_called()
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256

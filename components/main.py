@@ -447,6 +447,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ", ".join(missing_account_dirs),
                 )
                 return 2
+            try:
+                check_free_space_for_path(staged_root, min_free_gb)
+            except Exception as exc:
+                logging.error("[panel] Free-space check failed before panel changes: %s", exc)
+                return 2
             audit_for_reset = bool(getattr(args, "reset", False))
             try:
                 logging.info(
