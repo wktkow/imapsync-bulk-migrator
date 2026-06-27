@@ -4328,6 +4328,60 @@ class TestRound2ConfirmedBugs:
         assert "provider-1: invalid flags metadata" in output
         assert "provider-1: invalid internaldate metadata" in output
 
+    def test_verify_export_rejects_symlinked_legacy_message_and_sidecar(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        folder = account_dir / "INBOX"
+        folder.mkdir(parents=True)
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        outside_eml = tmp_path / "outside.eml"
+        outside_json = tmp_path / "outside.json"
+        outside_eml.write_bytes(data)
+        outside_json.write_text(json.dumps(_legacy_integrity_metadata(data, mailbox="INBOX", uid=1)))
+        try:
+            (folder / "u0000000001.eml").symlink_to(outside_eml)
+            (folder / "u0000000001.json").symlink_to(outside_json)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 2
+        assert "INBOX/u0000000001.eml: message file is a symlink" in output
+        assert "INBOX/u0000000001.json: metadata sidecar is a symlink" in output
+
+    def test_verify_export_rejects_symlinked_mailbox_marker(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        folder = account_dir / "Archive"
+        folder.mkdir(parents=True)
+        outside_marker = tmp_path / "outside-mailbox.json"
+        outside_marker.write_text(json.dumps({"mailbox": "Archive", "message_count": 0}))
+        try:
+            (folder / ".mailbox.json").symlink_to(outside_marker)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        _write_verify_export_state(account_dir, [{"mailbox": "Archive", "path": "Archive", "message_count": 0}])
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 1
+        assert "Archive: mailbox marker is a symlink" in output
+
 
 class TestRound3ConfirmedBugs:
     def test_strict_audit_rejects_duplicate_export_state_paths(self, tmp_path: Path) -> None:

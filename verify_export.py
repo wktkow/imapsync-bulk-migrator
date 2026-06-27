@@ -108,6 +108,10 @@ def _non_encapsulated_text_has_rfc822_header_block(part):
 def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None, content_binding="legacy"):
     """Analyze a single exported message"""
     try:
+        eml_path = Path(eml_path)
+        json_path = Path(json_path)
+        if eml_path.is_symlink():
+            return None, 'message file is a symlink'
         # Read the email
         with open(eml_path, 'rb') as f:
             msg_bytes = f.read()
@@ -138,6 +142,8 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
             if require_metadata:
                 return None, 'missing metadata sidecar'
             metadata = {}
+        elif json_path.is_symlink():
+            return None, 'metadata sidecar is a symlink'
         else:
             with open(json_path, 'r') as f:
                 metadata = json.load(f)
@@ -248,6 +254,8 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
 
 
 def analyze_mailbox_marker(marker_path, folder_name, eml_count):
+    if Path(marker_path).is_symlink():
+        return [f"{folder_name}: mailbox marker is a symlink"]
     try:
         with open(marker_path, 'r') as f:
             marker = json.load(f)
@@ -271,6 +279,8 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
 
 def analyze_export_state(account_path, folder_counts):
     state_path = account_path / "export-state.json"
+    if state_path.is_symlink():
+        return ["export-state is a symlink"]
     if not state_path.exists():
         return ["export-state missing"]
     try:
@@ -422,6 +432,20 @@ def verify_provider_account(account_path):
 
 def verify_account(account_path):
     """Verify all messages in an account"""
+    if account_path.is_symlink():
+        account_name = account_path.name
+        print(f"\n=== Verifying {account_name} ===")
+        print(f"\n⚠️  1 errors found:")
+        print(f"  account path is a symlink: {account_path}")
+        return {
+            'account': account_name,
+            'total_messages': 0,
+            'messages_with_attachments': 0,
+            'total_attachments': 0,
+            'folders': 0,
+            'errors': 1,
+            'multiple_message_files': 0,
+        }
     if (account_path / "manifest.jsonl").exists():
         return verify_provider_account(account_path)
 
@@ -439,6 +463,9 @@ def verify_account(account_path):
     
     # Walk through all folders
     for folder_path in account_path.iterdir():
+        if folder_path.is_symlink():
+            errors.append(f"{folder_path.name}: mailbox path is a symlink")
+            continue
         if not folder_path.is_dir():
             continue
         mailbox_folders_found += 1
@@ -454,12 +481,25 @@ def verify_account(account_path):
         json_files = [path for path in folder_path.glob("*.json") if path.name != ".mailbox.json"]
         eml_stems = {path.stem for path in eml_files}
         json_stems = {path.stem for path in json_files}
+        symlink_jsons = {path for path in json_files if path.is_symlink()}
         orphan_metadata = sorted(json_stems - eml_stems)
         if orphan_metadata:
             errors.append(f"{folder_name}: {len(orphan_metadata)} metadata file(s) without .eml counterpart")
             folder_errors += 1
+        for json_file in sorted(symlink_jsons):
+            errors.append(f"{folder_name}/{json_file.name}: metadata sidecar is a symlink")
+            folder_errors += 1
         for eml_file in eml_files:
             json_file = eml_file.with_suffix('.json')
+            if eml_file.is_symlink():
+                errors.append(f"{folder_name}/{eml_file.name}: message file is a symlink")
+                folder_errors += 1
+                continue
+            if json_file.is_symlink():
+                if json_file not in symlink_jsons:
+                    errors.append(f"{folder_name}/{json_file.name}: metadata sidecar is a symlink")
+                    folder_errors += 1
+                continue
             
             analysis, error = analyze_message(eml_file, json_file, folder_name=folder_name)
             
@@ -480,7 +520,7 @@ def verify_account(account_path):
             if analysis['multiple_messages_detected']:
                 multiple_message_files.append(f"{folder_name}/{eml_file.name} (Return-Path: {analysis['return_path_count']}, Message-ID: {analysis['message_id_count']})")
         mailbox_marker = folder_path / ".mailbox.json"
-        if mailbox_marker.exists():
+        if mailbox_marker.is_symlink() or mailbox_marker.exists():
             marker_errors = analyze_mailbox_marker(mailbox_marker, folder_name, len(eml_files))
             errors.extend(marker_errors)
             folder_errors += len(marker_errors)
