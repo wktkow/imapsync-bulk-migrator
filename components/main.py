@@ -1024,7 +1024,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not bool(getattr(args, "no_audit_after_export", False)):
                 try:
                     logging.info("Running export audit (%s)...", "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
-                    ok, audit_issues = audit_export(out_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
+                    ok, audit_issues = audit_export(
+                        out_root,
+                        config,
+                        int(args.max_workers),
+                        check_remote=not bool(getattr(args, "audit_offline", False)),
+                        require_integrity_metadata=True,
+                    )
                     if ok:
                         logging.info("Audit passed: exported data looks consistent for all accounts")
                     else:
@@ -1308,7 +1314,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             check_free_space_for_path(in_root, min_free_gb)
             try:
                 logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
-                ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
+                ok, audit_issues = audit_export(
+                    in_root,
+                    config,
+                    int(args.max_workers),
+                    check_remote=not bool(getattr(args, "audit_offline", False)),
+                    require_integrity_metadata=True,
+                )
                 if ok:
                     logging.info("Audit passed: exported data looks consistent for all accounts")
                     return 0

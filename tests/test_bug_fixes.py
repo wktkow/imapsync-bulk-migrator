@@ -3106,6 +3106,40 @@ class TestAuditHardening:
 
         assert any("content_sha256 mismatch" in issue for issue in issues)
 
+    def test_main_legacy_audit_requires_message_integrity_metadata(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        folder = input_dir / "a@example.com" / "INBOX"
+        data = b"Message-ID: <audit-integrity@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(folder, data=data)
+        eml.with_suffix(".json").write_text(json.dumps({
+            "account": "a@example.com",
+            "mailbox": "INBOX",
+            "uid": 1,
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"):
+            rc = main([
+                "--mode", "audit",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-audit-integrity"),
+                "--min-free-gb", "0",
+                "--audit-offline",
+            ])
+
+        assert rc == 4
+
     def test_audit_account_flags_trailing_imap_fetch_wrapper(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
