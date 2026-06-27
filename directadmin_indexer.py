@@ -110,6 +110,10 @@ class DirectAdminClient:
                 # Some variants nest under "domains"
                 if "domains" in json_obj and isinstance(json_obj["domains"], list):
                     return [str(d) for d in json_obj["domains"]]
+                if err in {"0", "false", "False"}:
+                    return []
+            elif isinstance(json_obj, list):
+                return [str(d) for d in json_obj]
         if kv is not None:
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
@@ -118,7 +122,7 @@ class DirectAdminClient:
             # Expect keys like list[]=domain
             items = kv.get("list[]") or kv.get("list")
             if items is None:
-                raise RuntimeError("Unable to parse domains response from API")
+                return []
             return [str(d) for d in items]
         raise RuntimeError("Unable to parse domains response from API")
 
