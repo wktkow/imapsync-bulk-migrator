@@ -174,6 +174,9 @@ def verify_account(account_path):
             # Check for multiple messages in single file
             if analysis['multiple_messages_detected']:
                 multiple_message_files.append(f"{folder_name}/{eml_file.name} (Return-Path: {analysis['return_path_count']}, Message-ID: {analysis['message_id_count']})")
+        if folder_messages == 0 and not (folder_path / ".mailbox.json").exists():
+            errors.append(f"{folder_name}: no .eml files found and no mailbox marker present")
+            folder_errors += 1
         
         if folder_messages > 0:
             folder_stats[folder_name] = {
@@ -249,6 +252,9 @@ def main():
         total_attachments += stats['total_attachments']
         total_errors += stats['errors']
         total_multiple_message_files += stats['multiple_message_files']
+    if not all_stats:
+        print("⚠️  No account directories found in exported/")
+        total_errors += 1
     
     # Overall summary
     print(f"\n{'='*50}")
