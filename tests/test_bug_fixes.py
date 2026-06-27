@@ -4875,6 +4875,27 @@ class TestRound7ConfirmedBugs:
         client_cls.assert_not_called()
         reset_mock.assert_not_called()
 
+    def test_indexer_write_json_no_overwrite_survives_publish_race(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import directadmin_indexer
+
+        out = tmp_path / "export.pass.config.json"
+        real_link = directadmin_indexer.os.link
+
+        def racing_link(src: str, dst: str) -> None:
+            Path(dst).write_text("raced\n")
+            real_link(src, dst)
+
+        monkeypatch.setattr(directadmin_indexer.os, "link", racing_link)
+
+        with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+            directadmin_indexer.write_json({"accounts": []}, str(out), overwrite=False)
+
+        assert out.read_text() == "raced\n"
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256

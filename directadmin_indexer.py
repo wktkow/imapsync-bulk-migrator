@@ -246,9 +246,6 @@ def build_config(server: ServerSettings, emails: List[str], default_password: st
 
 
 def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
-    path_exists = os.path.exists(out_path)
-    if path_exists and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)")
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
@@ -258,7 +255,14 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.write("\n")
-        os.replace(str(tmp), str(out))
+        if overwrite:
+            os.replace(str(tmp), str(out))
+        else:
+            try:
+                os.link(str(tmp), str(out))
+            except FileExistsError as exc:
+                raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
+            tmp.unlink()
         os.chmod(out, 0o600)
     except Exception:
         try:
