@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -21,6 +22,8 @@ from components.models import (
 )
 from components.provider_ops import (
     MailboxInfo,
+    _atomic_json,
+    _prune_provider_artifact_orphans,
     build_xoauth2_payload,
     consume_target_match_num,
     effective_auth,
@@ -28,6 +31,7 @@ from components.provider_ops import (
     gmail_labels_for_restore,
     imap_connection,
     list_mailboxes,
+    append_journal,
     load_import_journal,
     load_manifest,
     parse_list_line,
@@ -92,6 +96,78 @@ def _generic_target_config(*, target_mode: str = "empty") -> ProviderMigrationCo
         accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
         migration=MigrationSettings(target_mode=target_mode),
     )
+
+
+def test_provider_atomic_json_rejects_symlinked_account_dir(tmp_path: Path) -> None:
+    export_root = tmp_path / "export"
+    outside = tmp_path / "outside"
+    export_root.mkdir()
+    outside.mkdir()
+    account_dir = export_root / "source@example.com"
+    try:
+        account_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="symlinked provider directory"):
+        _atomic_json(account_dir / "export-state.json", {"complete": False})
+
+    assert not (outside / "export-state.json").exists()
+
+
+def test_provider_atomic_json_refuses_preexisting_temp_symlink(tmp_path: Path) -> None:
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not overwrite", encoding="utf-8")
+    path = account_dir / "export-state.json"
+    temp_path = account_dir / f".{path.name}.{os.getpid()}.123456.tmp"
+    try:
+        temp_path.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with mock.patch("components.provider_ops.time.time_ns", return_value=123456):
+        with pytest.raises(RuntimeError, match="unsafe provider temporary file|symlinked provider file"):
+            _atomic_json(path, {"complete": False})
+
+    assert victim.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_provider_append_journal_rejects_symlinked_journal(tmp_path: Path) -> None:
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    victim = tmp_path / "victim.jsonl"
+    victim.write_text("outside\n", encoding="utf-8")
+    journal = account_dir / "import-target@example.com.journal.jsonl"
+    try:
+        journal.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="symlinked provider file"):
+        append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+    assert victim.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_provider_prune_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
+    account_dir = tmp_path / "source@example.com"
+    outside = tmp_path / "outside-messages"
+    account_dir.mkdir()
+    outside.mkdir()
+    stale = outside / "stale.eml"
+    stale.write_bytes(b"do not delete")
+    try:
+        (account_dir / "messages").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="symlinked provider artifact directory"):
+        _prune_provider_artifact_orphans(account_dir, [])
+
+    assert stale.exists()
 
 
 def _many_to_one_config(*, target_mode: str = "empty") -> ProviderMigrationConfig:

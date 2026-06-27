@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import imaplib
 import json
@@ -100,9 +101,40 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
 
 
 def ensure_private_dir(path: Path) -> None:
+    _raise_if_provider_path_component_symlink(path, "directory")
     path.mkdir(parents=True, exist_ok=True)
+    _raise_if_provider_path_component_symlink(path, "directory")
+    if not path.is_dir():
+        raise RuntimeError(f"provider directory path is not a directory: {path}")
     with contextlib.suppress(Exception):
         os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def _raise_if_provider_path_component_symlink(path: Path, label: str) -> None:
+    current = path
+    candidates: List[Path] = []
+    while True:
+        candidates.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for candidate in reversed(candidates):
+        if candidate.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked provider {label}: {candidate}")
+
+
+def _open_provider_private_file(path: Path, flags: int) -> int:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked provider file: {path}")
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        return os.open(path, flags, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked provider file: {path}") from exc
+        raise
 
 
 def provider_endpoint_state(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> Dict[str, Any]:
@@ -804,28 +836,20 @@ def _safe_identity(identity: str) -> str:
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
-    ensure_private_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
-        with contextlib.suppress(Exception):
-            os.chmod(path, PRIVATE_FILE_MODE)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+    _atomic_bytes(path, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
     ensure_private_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        fd = _open_provider_private_file(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise RuntimeError(f"refusing to use unsafe provider temporary file: {tmp}") from exc
+        raise
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
@@ -842,8 +866,15 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     ensure_private_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        fd = _open_provider_private_file(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            raise RuntimeError(f"refusing to use unsafe provider temporary file: {tmp}") from exc
+        raise
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             for row in rows:
@@ -1276,6 +1307,7 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
 
 
 def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    _raise_if_provider_path_component_symlink(account_dir, "account directory")
     expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
     expected_metadata = _manifest_relative_paths(account_dir, rows, "metadata_path")
     for root_name, suffix, expected in (
@@ -1283,9 +1315,12 @@ def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any
         ("metadata", "*.json", expected_metadata),
     ):
         root = account_dir / root_name
+        _raise_if_provider_path_component_symlink(root, "artifact directory")
         if not root.exists():
             continue
         for path in sorted(root.rglob(suffix)):
+            if path.is_symlink():
+                raise RuntimeError(f"refusing to prune symlinked provider artifact: {path}")
             if not path.is_file():
                 continue
             if path.relative_to(account_dir).as_posix() not in expected:
@@ -1615,7 +1650,7 @@ def load_import_journal(
 def append_journal(account_dir: Path, account: MigrationAccount, row: Dict[str, Any]) -> None:
     path = _journal_path(account_dir, account)
     ensure_private_dir(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    fd = _open_provider_private_file(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
