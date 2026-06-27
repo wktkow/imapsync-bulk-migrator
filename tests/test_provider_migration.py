@@ -190,6 +190,49 @@ def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> Non
             provider_import_account(config, account, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("artifact_name", "needle"),
+    [
+        ("manifest.jsonl", "manifest load failed|symlinked provider file"),
+        ("export-state.json", "export-state"),
+        ("import-target@icloud.com.journal.jsonl", "import journal load failed|symlinked provider file"),
+    ],
+)
+def test_provider_read_paths_reject_symlinked_control_artifacts(
+    tmp_path: Path,
+    artifact_name: str,
+    needle: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    artifact = account_dir / artifact_name
+    if artifact_name.startswith("import-"):
+        artifact.write_text(json.dumps(_journal_fixture(config, {
+            "canonical_id": "gmail-123",
+            "target_account": "target@icloud.com",
+            "target_mailbox": "Archive",
+            "status": "committed",
+        })) + "\n")
+    outside = tmp_path / f"outside-{artifact_name.replace('/', '_')}"
+    outside.write_text(artifact.read_text(encoding="utf-8"), encoding="utf-8")
+    artifact.unlink()
+    try:
+        artifact.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any(re.search(needle, issue) for issue in audit_issues)
+    assert any(re.search(needle, issue) for issue in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider file|export-state"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_prune_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
     account_dir = tmp_path / "source@example.com"
     outside = tmp_path / "outside-messages"

@@ -129,6 +129,12 @@ def _open_provider_private_file(path: Path, flags: int) -> int:
         raise
 
 
+def _read_provider_private_file(path: Path) -> str:
+    fd = _open_provider_private_file(path, os.O_RDONLY)
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 def provider_endpoint_state(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> Dict[str, Any]:
     provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
     host = provider_hosts.get(endpoint.provider, endpoint.host)
@@ -888,18 +894,18 @@ def account_export_dir(root: Path, account: MigrationAccount) -> Path:
 
 def load_manifest(account_dir: Path) -> List[Dict[str, Any]]:
     manifest = account_dir / "manifest.jsonl"
+    _raise_if_provider_path_symlink(manifest, "file")
     if not manifest.exists():
         raise RuntimeError(f"manifest not found: {manifest}")
     rows: List[Dict[str, Any]] = []
-    with manifest.open("r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                raise RuntimeError(f"invalid manifest row {line_no}: {manifest}")
-            rows.append(row)
+    for line_no, line in enumerate(_read_provider_private_file(manifest).splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise RuntimeError(f"invalid manifest row {line_no}: {manifest}")
+        rows.append(row)
     return rows
 
 
@@ -936,7 +942,7 @@ def provider_export_state_issues(
 ) -> List[str]:
     state_path = account_dir / "export-state.json"
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(_read_provider_private_file(state_path))
     except Exception as exc:
         return [f"export-state missing or invalid: {exc}"]
     issues: List[str] = []
@@ -1646,9 +1652,10 @@ def load_import_journal(
 ) -> List[Dict[str, Any]]:
     path = _journal_path(account_dir, account)
     rows: List[Dict[str, Any]] = []
+    _raise_if_provider_path_symlink(path, "file")
     if not path.exists():
         return rows
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = _read_provider_private_file(path).splitlines()
     needs_rewrite = False
     for line_no, line in enumerate(lines, 1):
         line = line.strip()
