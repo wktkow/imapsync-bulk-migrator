@@ -5163,6 +5163,30 @@ class TestRound2ConfirmedBugs:
         assert stats["errors"] >= 1
         assert "provider-wrong-dir: source_account source@example.com does not match provider account directory wrong@example.com" in output
 
+    def test_verify_export_rejects_empty_provider_state_account_directory_mismatch(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        account_dir.mkdir(parents=True)
+        (account_dir / "manifest.jsonl").write_text("")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "source_account": "other@example.com",
+            "complete": True,
+            "canonical_messages": 0,
+            "manifest_sha256": hashlib.sha256(b"").hexdigest(),
+        }))
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 1
+        assert "export-state source_account other@example.com does not match provider account directory source@example.com" in output
+
     def test_verify_export_accepts_sanitized_provider_account_directory(self, tmp_path: Path) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
         from components.provider_ops import provider_manifest_digest

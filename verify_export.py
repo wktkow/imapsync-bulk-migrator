@@ -437,8 +437,8 @@ def verify_provider_account(account_path):
         errors.append(f"manifest load failed: {exc}")
         rows = []
 
+    errors.extend(provider_account_directory_binding_issues(account_path, rows))
     if rows:
-        errors.extend(provider_account_directory_binding_issues(account_path, rows))
         errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
         errors.extend(manifest_schema_issues(rows))
         errors.extend(manifest_integrity_issues(rows))
