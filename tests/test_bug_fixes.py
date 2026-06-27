@@ -878,6 +878,52 @@ class TestLegacyImportJournal:
         with pytest.raises(RuntimeError, match="pending append"):
             import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
 
+    def test_import_retries_after_clean_append_no(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        class AppendNoThenOk:
+            def __init__(self) -> None:
+                self.append_count = 0
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+                self.append_count += 1
+                if self.append_count == 1:
+                    return "NO", [b"invalid flags"]
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = AppendNoThenOk()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[AppendNoThenOk]:
+            yield fake_imap
+
+        with pytest.raises(RuntimeError, match="append failed"):
+            import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+
+        statuses = [
+            json.loads(line)["status"]
+            for line in (account_dir / "import.journal.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert statuses == ["pending", "failed", "pending", "committed"]
+        assert fake_imap.append_count == 2
+
     def test_import_rejects_invalid_legacy_journal_status(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
         from components.models import Account, ServerConfig
