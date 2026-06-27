@@ -97,6 +97,8 @@ class DirectAdminClient:
                             dynamic_values.append(v)
                 if dynamic_values:
                     return [str(u) for u in dynamic_values]
+                if err in {"0", "false", "False"}:
+                    return []
             elif isinstance(json_obj, list):
                 # Some DA variants return a plain JSON array
                 return [str(u) for u in json_obj]
@@ -107,7 +109,7 @@ class DirectAdminClient:
                 raise RuntimeError(msg)
             items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
             if items is None:
-                raise RuntimeError("Unable to parse POP account list response from DirectAdmin API")
+                return []
             return [str(u) for u in items]
         raise RuntimeError("Unable to parse POP account list response from DirectAdmin API")
 

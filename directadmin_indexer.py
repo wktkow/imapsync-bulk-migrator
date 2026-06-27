@@ -142,6 +142,19 @@ class DirectAdminClient:
                     return [str(u) for u in json_obj["list"]]
                 if "users" in json_obj and isinstance(json_obj["users"], list):
                     return [str(u) for u in json_obj["users"]]
+                dynamic_values = []
+                for k, v in json_obj.items():
+                    if isinstance(k, str) and k.startswith("list"):
+                        if isinstance(v, list):
+                            dynamic_values.extend(v)
+                        else:
+                            dynamic_values.append(v)
+                if dynamic_values:
+                    return [str(u) for u in dynamic_values]
+                if str(json_obj.get("error", "0")) in {"0", "false", "False"}:
+                    return []
+            elif isinstance(json_obj, list):
+                return [str(u) for u in json_obj]
         if kv is not None:
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
@@ -149,7 +162,7 @@ class DirectAdminClient:
                 raise RuntimeError(msg)
             items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
             if items is None:
-                raise RuntimeError(f"Unable to parse POP account list response for {domain}")
+                return []
             return [str(u) for u in items]
         # Some installs place names under index keys like list0=user
         if json_obj and isinstance(json_obj, dict):
