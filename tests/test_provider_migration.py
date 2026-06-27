@@ -5117,6 +5117,15 @@ def test_target_probe_rejects_wrong_hash(tmp_path: Path) -> None:
     assert not target_has_message(fake, "Archive", row, create_if_missing=False)
 
 
+def test_target_probe_accepts_uppercase_content_hash(tmp_path: Path) -> None:
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["content_sha256"] = str(row["content_sha256"]).upper()
+    fake = FakeTargetImap(has_existing=True)
+
+    assert target_has_message(fake, "Archive", row, create_if_missing=False)
+
+
 def test_provider_import_empty_mode_resumes_with_journaled_target_messages(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

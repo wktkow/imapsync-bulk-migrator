@@ -2522,7 +2522,7 @@ def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row
     if status != "OK" or not data or not data[0]:
         return []
     expected_size = int(manifest_row.get("rfc822_size") or 0)
-    expected_hash = str(manifest_row.get("content_sha256") or "")
+    expected_hash = str(manifest_row.get("content_sha256") or "").lower()
     if expected_size <= 0 and not expected_hash and message_id:
         return list(data[0].split())
     matches: List[bytes] = []
