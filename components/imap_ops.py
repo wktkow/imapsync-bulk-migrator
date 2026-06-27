@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -34,9 +35,18 @@ def quote_mailbox_name(mailbox: str) -> str:
 
 
 def ensure_private_dir(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked directory: {path}")
     path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked directory: {path}")
     with contextlib.suppress(Exception):
         os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def _raise_if_symlink(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked {label}: {path}")
 
 
 def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -291,6 +301,7 @@ def _unresolved_legacy_pending_keys(rows: List[Dict[str, str]], target_id: str) 
 def _load_legacy_import_journal(account_dir: Path) -> List[Dict[str, str]]:
     path = _legacy_import_journal_path(account_dir)
     rows: List[Dict[str, str]] = []
+    _raise_if_symlink(path, "legacy import journal")
     if not path.exists():
         return rows
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -330,7 +341,16 @@ def _write_legacy_import_journal(account_dir: Path, rows: List[Dict[str, str]]) 
 def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> None:
     path = _legacy_import_journal_path(account_dir)
     ensure_private_dir(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    _raise_if_symlink(path, "legacy import journal")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
+            raise RuntimeError(f"refusing to use symlinked legacy import journal: {path}") from exc
+        raise
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
@@ -598,6 +618,7 @@ def import_account(
     lazy POP account creation is attempted before retrying login.
     """
     account_dir = in_root / sanitize_for_path(account.email)
+    _raise_if_symlink(account_dir, "legacy account directory")
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
     logging.info("[import] %s: starting", account.email)
@@ -656,7 +677,12 @@ def import_account(
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str], Optional[int], Optional[str]]]] = {}
     staged_marker_paths: set[str] = set()
     staged_markers: Dict[str, Dict[str, object]] = {}
-    for folder_dir in sorted([p for p in account_dir.iterdir() if p.is_dir()]):
+    folder_dirs: List[Path] = []
+    for child in sorted(account_dir.iterdir()):
+        _raise_if_symlink(child, "legacy mailbox path")
+        if child.is_dir():
+            folder_dirs.append(child)
+    for folder_dir in folder_dirs:
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
         marker = folder_dir / ".mailbox.json"

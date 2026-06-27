@@ -4691,6 +4691,78 @@ class TestRound6ConfirmedBugs:
         assert not ok
         assert any("u0000000001.eml: invalid uid metadata" in issue for issue in issues)
 
+
+class TestRound7ConfirmedBugs:
+    def test_legacy_export_rejects_symlinked_mailbox_directory(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        out_root = tmp_path / "exported"
+        account_dir = out_root / "user@example.com"
+        account_dir.mkdir(parents=True)
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "stale.eml").write_bytes(b"do not delete")
+        try:
+            (account_dir / "INBOX").symlink_to(victim, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        class EmptyInbox:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[EmptyInbox]:
+            yield EmptyInbox()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="symlinked directory"):
+                export_account(
+                    Account("user@example.com", "secret"),
+                    ServerConfig("imap.example.com"),
+                    out_root,
+                    ignore_errors=False,
+                )
+
+        assert (victim / "stale.eml").exists()
+        assert not (victim / ".mailbox.json").exists()
+
+    def test_legacy_import_rejects_symlinked_import_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        victim = tmp_path / "victim.journal.jsonl"
+        victim.write_text("")
+        try:
+            (tmp_path / "user@example.com" / "import.journal.jsonl").symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy import journal"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        assert victim.read_text() == ""
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
