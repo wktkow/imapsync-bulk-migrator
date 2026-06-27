@@ -50,6 +50,28 @@ def _has_later_rfc822_header_block(msg_text):
         idx = max(end + 1, idx + 1)
     return False
 
+
+def _starts_with_rfc822_header_block(msg_text):
+    lines = msg_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    idx = 0
+    while idx < len(lines) and lines[idx] == '':
+        idx += 1
+    header_names = set()
+    while idx < len(lines) and lines[idx] != '':
+        match = re.match(r'^([A-Za-z][A-Za-z0-9-]*):', lines[idx])
+        if match:
+            header_names.add(match.group(1).lower())
+        elif not lines[idx].startswith((' ', '\t')):
+            return False
+        idx += 1
+    return 'message-id' in header_names and (
+        'return-path' in header_names
+        or 'from' in header_names
+        or 'to' in header_names
+        or 'date' in header_names
+    )
+
+
 def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None):
     """Analyze a single exported message"""
     try:
@@ -71,6 +93,9 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
         msg = BytesParser(policy=default_policy).parsebytes(msg_bytes)
         parts = list(msg.walk()) if msg.is_multipart() else [msg]
         has_encapsulated_rfc822 = any(part.get_content_type() == 'message/rfc822' for part in parts)
+        later_rfc822_header_block = _has_later_rfc822_header_block(msg_text)
+        if has_encapsulated_rfc822:
+            later_rfc822_header_block = _starts_with_rfc822_header_block(msg.epilogue or '')
         
         # Read metadata
         if not json_path.exists():
@@ -130,7 +155,7 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
             'multiple_messages_detected': (
                 return_path_count > 1
                 or message_id_count > 1
-                or (not has_encapsulated_rfc822 and _has_later_rfc822_header_block(msg_text))
+                or later_rfc822_header_block
             ),
             'return_path_count': return_path_count,
             'message_id_count': message_id_count
