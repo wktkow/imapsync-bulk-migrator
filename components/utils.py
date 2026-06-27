@@ -97,13 +97,7 @@ def ensure_imapsync_available() -> None:
 def check_environment(min_free_gb: float = 1.0) -> None:
     if sys.version_info < (3, 9):
         raise RuntimeError("Python 3.9+ is required.")
-
-    total, used, free = shutil.disk_usage(Path.cwd())
-    free_gb = free / (1024 ** 3)
-    if free_gb < min_free_gb:
-        raise RuntimeError(
-            f"Insufficient free disk space: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
-        )
+    _ = min_free_gb
 
 
 def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:

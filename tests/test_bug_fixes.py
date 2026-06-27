@@ -1454,6 +1454,37 @@ class TestCliAndConfigHardening:
         ]) == 2
         assert main(["--mode", "test", *base, "--no-connectivity-test"]) == 2
 
+    def test_main_free_space_check_uses_requested_output_not_cwd(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        output_dir = tmp_path / "exported"
+        gib = 1024 ** 3
+
+        def fake_disk_usage(path):
+            if Path(path).resolve() == Path.cwd().resolve():
+                raise AssertionError("CWD free space should not gate requested output path")
+            return (100 * gib, 1 * gib, 99 * gib)
+
+        with mock.patch("components.utils.shutil.disk_usage", fake_disk_usage), \
+            mock.patch("components.main.export_account"):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(output_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "10",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--no-audit-after-export",
+            ])
+
+        assert rc == 0
+
     def test_setup_logging_creates_private_log_file(self, tmp_path: Path) -> None:
         from components.main import setup_logging
 
