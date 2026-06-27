@@ -383,20 +383,27 @@ def audit_account(
                 identity_candidates: List[Tuple[Path, str, str]] = []
                 for folder_dir in folder_dirs:
                     folder = folder_dir.name
+                    local_mailbox = _folder_mailbox_name(folder_dir)
                     local_count = len(list(folder_dir.glob("*.eml")))
                     remote_count = remote_counts.get(folder, -1)
+                    remote_mailbox = remote_mailbox_by_path.get(folder)
                     if remote_count < 0:
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
                     elif remote_count >= 0 and local_count != remote_count:
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
+                    elif remote_mailbox is not None and remote_mailbox != local_mailbox:
+                        count_mismatched.add(folder)
+                        issues.append(
+                            f"{account.email}:{folder}: remote mailbox name mismatch for sanitized path "
+                            f"(local={local_mailbox!r} remote={remote_mailbox!r})"
+                        )
                     elif local_count > 0:
-                        mailbox = remote_mailbox_by_path.get(folder, _folder_mailbox_name(folder_dir))
                         for eml_path in sorted(folder_dir.glob("*.eml")):
                             if eml_path.is_symlink():
                                 continue
-                            identity_candidates.append((eml_path, folder, mailbox))
+                            identity_candidates.append((eml_path, folder, local_mailbox))
                 for folder_name, rcount in remote_counts.items():
                     if rcount > 0 and not (account_dir / folder_name).exists():
                         count_mismatched.add(folder_name)

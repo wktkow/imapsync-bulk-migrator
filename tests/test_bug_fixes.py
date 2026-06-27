@@ -3869,6 +3869,60 @@ class TestRound1ConfirmedBugs:
 
         assert any("remote mailbox name collision" in issue for issue in issues)
 
+    def test_audit_rejects_remote_mailbox_alias_for_sanitized_path(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "A_B"
+        _write_legacy_message_fixture(
+            folder,
+            mailbox="A/B",
+            data=b"Message-ID: <alias@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "A/B", "message_count": 1}))
+
+        class AliasedRemoteImap:
+            selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "A|B"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                assert command == "search"
+                return "OK", [b"1"]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[AliasedRemoteImap]:
+            yield AliasedRemoteImap()
+
+        with mock.patch("components.audit.imap_connection", fake_connection), \
+            mock.patch("components.audit._remote_has_message") as remote_has_message:
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any(
+            "remote mailbox name mismatch for sanitized path" in issue
+            and "A/B" in issue
+            and "A|B" in issue
+            for issue in issues
+        )
+        remote_has_message.assert_not_called()
+
     def test_negative_panel_quotas_are_rejected(self, tmp_path: Path) -> None:
         from components.main import main
 
