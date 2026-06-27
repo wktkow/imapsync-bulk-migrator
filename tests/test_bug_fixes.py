@@ -4194,3 +4194,32 @@ class TestRound4ConfirmedBugs:
 
         assert analysis is None
         assert error == "empty file"
+
+    @pytest.mark.parametrize(
+        ("marker_text", "needle"),
+        [
+            ("{", "failed to parse mailbox marker"),
+            (json.dumps({"mailbox": "INBOX", "message_count": 1}), "mailbox marker count mismatch"),
+        ],
+    )
+    def test_verify_export_rejects_invalid_empty_mailbox_marker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        marker_text: str,
+        needle: str,
+    ) -> None:
+        from verify_export import analyze_mailbox_marker, main, verify_account
+
+        inbox = tmp_path / "exported" / "user@example.com" / "INBOX"
+        inbox.mkdir(parents=True)
+        marker_path = inbox / ".mailbox.json"
+        marker_path.write_text(marker_text)
+        monkeypatch.chdir(tmp_path)
+
+        marker_issues = analyze_mailbox_marker(marker_path, "INBOX", 0)
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert any(needle in issue for issue in marker_issues)
+        assert stats["errors"] == 1
+        assert main() == 1

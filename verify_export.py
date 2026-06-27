@@ -139,6 +139,27 @@ def analyze_message(eml_path, json_path, *, require_metadata=True):
     except Exception as e:
         return None, str(e)
 
+
+def analyze_mailbox_marker(marker_path, folder_name, eml_count):
+    try:
+        with open(marker_path, 'r') as f:
+            marker = json.load(f)
+    except Exception as e:
+        return [f"{folder_name}: failed to parse mailbox marker: {e}"]
+    if not isinstance(marker, dict):
+        return [f"{folder_name}: mailbox marker json is not an object"]
+    issues = []
+    mailbox = marker.get('mailbox')
+    if not isinstance(mailbox, str) or not mailbox:
+        issues.append(f"{folder_name}: mailbox marker missing mailbox")
+    message_count = marker.get('message_count')
+    if type(message_count) is not int or message_count < 0:
+        issues.append(f"{folder_name}: mailbox marker has invalid message_count")
+    elif message_count != eml_count:
+        issues.append(f"{folder_name}: mailbox marker count mismatch (marker={message_count} eml={eml_count})")
+    return issues
+
+
 def verify_account(account_path):
     """Verify all messages in an account"""
     account_name = account_path.name
@@ -186,7 +207,12 @@ def verify_account(account_path):
             # Check for multiple messages in single file
             if analysis['multiple_messages_detected']:
                 multiple_message_files.append(f"{folder_name}/{eml_file.name} (Return-Path: {analysis['return_path_count']}, Message-ID: {analysis['message_id_count']})")
-        if not eml_files and not (folder_path / ".mailbox.json").exists():
+        mailbox_marker = folder_path / ".mailbox.json"
+        if mailbox_marker.exists():
+            marker_errors = analyze_mailbox_marker(mailbox_marker, folder_name, len(eml_files))
+            errors.extend(marker_errors)
+            folder_errors += len(marker_errors)
+        if not eml_files and not mailbox_marker.exists():
             errors.append(f"{folder_name}: no .eml files found and no mailbox marker present")
             folder_errors += 1
         
