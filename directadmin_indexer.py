@@ -368,11 +368,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             users = client.list_pop_accounts(domain)
         except Exception as exc:
-            print(f"Warning: failed to list accounts for {domain}: {exc}")
-            users = []
+            print(f"Failed to list accounts for {domain}: {exc}", file=sys.stderr)
+            return 2
         emails = [f"{u}@{domain}" for u in users]
         print(f"{domain}: {len(emails)} accounts")
         all_emails.extend(emails)
+    if not all_emails:
+        print("No email accounts found for the selected domain(s).")
+        return 0
 
     # Build config
     server = ServerSettings(
