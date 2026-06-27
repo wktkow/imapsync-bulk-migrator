@@ -14,6 +14,7 @@ from email.policy import default as default_policy
 import re
 
 from components.content_binding import legacy_content_binding_issue
+from components.imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate
 from components.utils import sanitize_for_path
 
 
@@ -155,6 +156,31 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
         binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
         if binding_issue:
             integrity_errors.append(binding_issue)
+        if 'uid' in metadata:
+            uid = metadata.get('uid')
+            if type(uid) is not int:
+                integrity_errors.append('invalid uid metadata')
+            else:
+                stem = Path(eml_path).stem
+                if stem.startswith('u') and stem[1:].isdigit() and uid != int(stem[1:]):
+                    integrity_errors.append(f'uid mismatch (name={int(stem[1:])} meta={uid})')
+        if 'flags' in metadata:
+            flags = metadata.get('flags')
+            if not isinstance(flags, str):
+                integrity_errors.append('invalid flags metadata')
+            elif any(not _valid_legacy_flag_token(token) for token in flags.split()):
+                integrity_errors.append('invalid flags metadata')
+        if 'internaldate' in metadata:
+            internaldate = metadata.get('internaldate')
+            if not isinstance(internaldate, str):
+                integrity_errors.append('invalid internaldate metadata')
+            elif internaldate.strip():
+                stripped = internaldate.strip()
+                parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
+                if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
+                    integrity_errors.append('invalid internaldate metadata')
+                elif not _valid_legacy_internaldate(parse_value):
+                    integrity_errors.append('invalid internaldate metadata')
         if folder_name is not None and 'mailbox' in metadata:
             mailbox = metadata.get('mailbox')
             if not isinstance(mailbox, str) or not mailbox.strip():

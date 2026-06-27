@@ -5121,3 +5121,31 @@ class TestRound7ConfirmedBugs:
                 ignore_errors=False,
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
+
+    def test_verify_export_rejects_invalid_legacy_delivery_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from verify_export import main, verify_account
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        inbox = account_dir / "INBOX"
+        inbox.mkdir(parents=True)
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        (inbox / "u0000000001.eml").write_bytes(data)
+        (inbox / "u0000000001.json").write_text(json.dumps(_legacy_integrity_metadata(
+            data,
+            mailbox="INBOX",
+            uid=True,
+            flags=["\\Seen"],
+            internaldate={"bad": "date"},
+        )))
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 1
+        assert main() == 1
