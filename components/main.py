@@ -428,6 +428,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if reset_confirm not in {target_host, "YES"}:
             logging.error("--reset-confirm must match target IMAP host %r or be YES for non-dry-run --reset", target_host)
             return 2
+    if args.mode in {"import", "validate", "audit"} and not panel_dry_run_requested:
+        input_root = Path(args.input_dir)
+        if input_root.is_symlink():
+            logging.error("Input directory is a symlink: %s", input_root)
+            return 2
+        if not input_root.exists():
+            logging.error("Input directory does not exist: %s", input_root)
+            return 2
 
     try:
         if (

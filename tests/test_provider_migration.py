@@ -8686,6 +8686,36 @@ def test_main_routes_provider_modes_with_expected_connectivity_roles(
     assert roles_seen == [expected_roles]
 
 
+@pytest.mark.parametrize("mode", ["import", "validate"])
+def test_main_rejects_provider_symlinked_input_root_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    outside = tmp_path / "outside-input"
+    outside.mkdir()
+    in_root = tmp_path / "exported"
+    try:
+        in_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main([
+            "--mode", mode,
+            "--config", str(config_path),
+            "--input-dir", str(in_root),
+            "--log-dir", str(tmp_path / f"logs-{mode}"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 2
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 

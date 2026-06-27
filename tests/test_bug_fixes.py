@@ -6373,6 +6373,41 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    @pytest.mark.parametrize("mode", ["import", "validate"])
+    def test_main_rejects_legacy_symlinked_input_root_before_connectivity(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside-input"
+        _write_legacy_message_fixture(outside / "user@example.com" / "INBOX")
+        in_root = tmp_path / "exported"
+        try:
+            in_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available", side_effect=AssertionError("imapsync check should not run")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / f"logs-{mode}"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 2
+
     def test_legacy_export_rejects_symlinked_mailbox_directory(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
