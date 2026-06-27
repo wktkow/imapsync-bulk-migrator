@@ -602,12 +602,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if (not is_provider_config) and args.mode == "import" and bool(getattr(args, "reset", False)):
         assert isinstance(config, Config)
         reset_input_root = Path(args.input_dir)
-        for acc in config.accounts:
-            if acc.email in panel_reset_failed_accounts:
-                continue
-            archive_path = archive_legacy_import_journal_for_reset(reset_input_root / sanitize_for_path(acc.email))
-            if archive_path is not None:
-                logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
+        try:
+            for acc in config.accounts:
+                if acc.email in panel_reset_failed_accounts:
+                    continue
+                archive_path = archive_legacy_import_journal_for_reset(reset_input_root / sanitize_for_path(acc.email))
+                if archive_path is not None:
+                    logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
+        except Exception as exc:
+            logging.error("[panel] Failed to archive stale import journal after reset: %s", exc)
+            return 4
 
     if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
         try:

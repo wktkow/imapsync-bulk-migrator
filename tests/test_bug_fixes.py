@@ -1414,6 +1414,49 @@ class TestLegacyImportJournal:
         assert list(account_dir.glob("import.journal.reset-*.jsonl"))
         import_mock.assert_not_called()
 
+    def test_reset_archive_failure_returns_error_without_import(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
+            mock.patch("components.main.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 4
+        import_mock.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # BUG #8 — Context manager type hint
