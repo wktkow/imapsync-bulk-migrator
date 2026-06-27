@@ -1739,14 +1739,24 @@ def provider_export_account(
                 identity_hint = f"gmail-{pre_parsed.get('gmail_msgid')}" if pre_parsed.get("gmail_msgid") else ""
                 if identity_hint and identity_hint in messages:
                     try:
-                        _manifest_path(account_dir, messages[identity_hint], "eml_path")
+                        existing_eml_path = _manifest_path(account_dir, messages[identity_hint], "eml_path")
                     except Exception:
                         logging.warning("[provider-export] %s: existing manifest row for %s has invalid eml_path; refetching body", account.source_email, identity_hint)
                     else:
-                        if _manifest_path(account_dir, messages[identity_hint], "eml_path").exists():
-                            update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
-                            persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
-                            continue
+                        if existing_eml_path.exists():
+                            try:
+                                require_manifest_payload_matches(messages[identity_hint], existing_eml_path.read_bytes())
+                            except Exception as exc:
+                                logging.warning(
+                                    "[provider-export] %s: existing payload for %s is invalid; refetching body: %s",
+                                    account.source_email,
+                                    identity_hint,
+                                    exc,
+                                )
+                            else:
+                                update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
+                                persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+                                continue
                 limiter.wait_for(int(pre_parsed.get("rfc822_size") or 0))
                 status, data = imap.uid(
                     "fetch",
@@ -1808,16 +1818,29 @@ def provider_export_account(
                     meta_rel = str(record.get("metadata_path") or f"metadata/{safe_id}.json")
                     record["eml_path"] = eml_rel
                     record["metadata_path"] = meta_rel
-                    if not (account_dir / eml_rel).exists():
-                        _atomic_bytes(account_dir / eml_rel, msg_bytes)
+                    eml_path = _manifest_path(account_dir, record, "eml_path")
+                    write_payload = not eml_path.exists()
+                    if not write_payload:
+                        try:
+                            require_manifest_payload_matches(record, eml_path.read_bytes())
+                        except Exception as exc:
+                            logging.warning(
+                                "[provider-export] %s: replacing invalid existing payload for %s: %s",
+                                account.source_email,
+                                identity,
+                                exc,
+                            )
+                            write_payload = True
+                    if write_payload:
+                        _atomic_bytes(eml_path, msg_bytes)
                     record.setdefault("source_provider", config.source.provider)
                     record.setdefault("source_account", account.source_email)
                     record["target_account"] = account.target_email
                     record.setdefault("gmail_msgid", parsed.get("gmail_msgid") or "")
                     record.setdefault("gmail_thrid", parsed.get("gmail_thrid") or "")
-                    record.setdefault("message_id_header", message_id)
-                    record.setdefault("content_sha256", sha256)
-                    record.setdefault("rfc822_size", int(parsed.get("rfc822_size") or len(msg_bytes)))
+                    record["message_id_header"] = message_id
+                    record["content_sha256"] = sha256
+                    record["rfc822_size"] = int(parsed.get("rfc822_size") or len(msg_bytes))
                     record.setdefault("flags", parsed.get("flags") or "")
                     record.setdefault("internaldate", parsed.get("internaldate") or "")
                     record.setdefault("exported_at", _utc_now())

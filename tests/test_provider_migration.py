@@ -1829,6 +1829,39 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert fake.body_fetches == 1
 
 
+def test_provider_export_resume_rewrites_corrupt_existing_payload(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    first_fake = FakeSourceImap()
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield first_fake
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    eml_path = account_dir / row["eml_path"]
+    original_payload = eml_path.read_bytes()
+    eml_path.write_bytes(b"corrupt")
+    second_fake = FakeSourceImap()
+
+    @contextlib.contextmanager
+    def second_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield second_fake
+
+    with mock.patch("components.provider_ops.imap_connection", second_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    updated_row = json.loads((account_dir / "manifest.jsonl").read_text())
+    assert eml_path.read_bytes() == original_payload
+    assert second_fake.body_fetches == 1
+    assert updated_row["rfc822_size"] == len(original_payload)
+    assert updated_row["content_sha256"] == hashlib.sha256(original_payload).hexdigest()
+
+
 @pytest.mark.parametrize(
     ("fake_cls", "needle"),
     [
