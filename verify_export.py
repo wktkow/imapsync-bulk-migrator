@@ -21,6 +21,7 @@ from components.provider_ops import (
     load_manifest,
     manifest_integrity_issues,
     manifest_payload_issues,
+    manifest_schema_issues,
     metadata_manifest_issues,
     provider_delivery_metadata_issues,
     provider_export_state_issues,
@@ -439,6 +440,7 @@ def verify_provider_account(account_path):
     if rows:
         errors.extend(provider_account_directory_binding_issues(account_path, rows))
         errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
+        errors.extend(manifest_schema_issues(rows))
         errors.extend(manifest_integrity_issues(rows))
         errors.extend(provider_delivery_metadata_issues(rows))
         errors.extend(metadata_manifest_issues(account_path, rows))

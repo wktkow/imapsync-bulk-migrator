@@ -5289,6 +5289,53 @@ class TestRound2ConfirmedBugs:
         assert "provider-1: invalid flags metadata" in output
         assert "provider-1: invalid internaldate metadata" in output
 
+    def test_verify_export_rejects_invalid_provider_manifest_schema(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <provider-schema@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        eml_rel = "messages/provider-schema.eml"
+        meta_rel = "metadata/provider-schema.json"
+        (account_dir / eml_rel).write_bytes(body)
+        row = {
+            "canonical_id": "provider-schema",
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "target_account": "target@example.com",
+            "primary_mailbox": ["Archive"],
+            "message_id_header": "<provider-schema@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": eml_rel,
+            "metadata_path": meta_rel,
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / meta_rel).write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+        }))
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 1
+        assert "provider-schema: missing or invalid primary_mailbox" in output
+
     def test_verify_export_rejects_symlinked_legacy_message_and_sidecar(
         self,
         tmp_path: Path,
