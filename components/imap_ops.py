@@ -376,6 +376,15 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
     return msg_bytes, flags, internaldate
 
 
+def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> None:
+    for path in list(folder_dir.glob("*.eml")):
+        if path.stem not in expected_stems:
+            path.unlink()
+    for path in list(folder_dir.glob("*.json")):
+        if path.name != ".mailbox.json" and path.stem not in expected_stems:
+            path.unlink()
+
+
 def export_account(account: Account, server: ServerConfig, out_root: Path, ignore_errors: bool, *, stop_event: Optional[object] = None) -> None:
     """Export all messages for an account into `out_root/<email>/<folder>/`.
 
@@ -432,11 +441,13 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                     folder_dir = account_dir / sanitize_for_path(mailbox)
                     ensure_private_dir(folder_dir)
                     _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": 0})
+                    _remove_stale_export_files(folder_dir, set())
                     continue
 
                 folder_dir = account_dir / sanitize_for_path(mailbox)
                 ensure_private_dir(folder_dir)
                 _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": len(uids)})
+                expected_stems = {f"u{int(uid):010d}" for uid in uids}
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
@@ -466,6 +477,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "content_sha256": hashlib.sha256(msg_bytes).hexdigest(),
                         }
                         _secure_atomic_json(meta_path, meta)
+                _remove_stale_export_files(folder_dir, expected_stems)
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if _stop_requested(stop_event):
