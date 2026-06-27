@@ -580,6 +580,10 @@ def verify_account(account_path):
 def main():
     export_dir = Path("exported")
     
+    if export_dir.is_symlink():
+        print("❌ Export directory 'exported' is a symlink!")
+        return 1
+
     if not export_dir.exists():
         print("❌ Export directory 'exported' not found!")
         return 1
