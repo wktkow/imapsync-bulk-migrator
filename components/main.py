@@ -296,6 +296,22 @@ def _invalid_panel_account_emails(config: Config) -> List[str]:
     return invalid
 
 
+def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
+    issues: List[str] = []
+    for acc in config.accounts:
+        account_dir = in_root / sanitize_for_path(acc.email)
+        if account_dir.is_symlink():
+            issues.append(f"{acc.email}: account directory is a symlink: {account_dir}")
+            continue
+        if not account_dir.exists() or not account_dir.is_dir():
+            continue
+        for path in sorted(account_dir.rglob("*")):
+            if path.is_symlink():
+                rel_path = path.relative_to(account_dir).as_posix()
+                issues.append(f"{acc.email}: staged path is a symlink: {rel_path}")
+    return issues
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with legacy and provider-aware workflows.",
@@ -443,6 +459,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not input_root.exists():
             logging.error("Input directory does not exist: %s", input_root)
             return 2
+        if not is_provider_config and args.mode in {"import", "validate"}:
+            assert isinstance(config, Config)
+            symlink_issues = _legacy_staged_symlink_issues(input_root, config)
+            if symlink_issues:
+                logging.error("Input directory contains symlinked staged data:")
+                for issue in symlink_issues:
+                    logging.error("[staged-symlink] %s", issue)
+                return 2
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:
