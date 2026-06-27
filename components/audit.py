@@ -108,6 +108,7 @@ def _legacy_export_state_issues(
         return issues
     staged_by_path = {folder_dir.name: folder_dir for folder_dir in folder_dirs}
     state_paths: set[str] = set()
+    state_mailbox_by_path: Dict[str, str] = {}
     for idx, raw in enumerate(raw_mailboxes, 1):
         if not isinstance(raw, dict):
             issues.append(f"{account.email}: export-state mailbox entry {idx} is not an object")
@@ -125,6 +126,14 @@ def _legacy_export_state_issues(
         if not isinstance(message_count, int) or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
+        previous_mailbox = state_mailbox_by_path.get(path)
+        if previous_mailbox is not None:
+            issues.append(
+                f"{account.email}: export-state mailbox path collision after sanitizing: "
+                f"{previous_mailbox!r} and {mailbox!r} both map to {path!r}"
+            )
+            continue
+        state_mailbox_by_path[path] = mailbox
         state_paths.add(path)
         folder_dir = staged_by_path.get(path)
         if folder_dir is None:
