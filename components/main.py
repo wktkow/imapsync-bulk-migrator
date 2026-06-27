@@ -1083,6 +1083,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if unresolved_pending_keys:
                         with mismatches_lock:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
+                        return
 
                     def marker_mailbox(folder_dir: Path) -> str:
                         marker_path = folder_dir / ".mailbox.json"
@@ -1100,11 +1101,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         with mismatches_lock:
                             validation_errors.append((email, "no mailbox folders found"))
                         return
+                    local_mailboxes_by_key: Dict[str, str] = {}
                     for folder_dir in folder_dirs:
                         default_mailbox = marker_mailbox(folder_dir)
                         eml_paths = sorted(folder_dir.glob("*.eml"))
                         if not eml_paths:
-                            local_counts.setdefault(sanitize_for_path(default_mailbox), 0)
+                            key = sanitize_for_path(default_mailbox)
+                            local_mailboxes_by_key.setdefault(key, default_mailbox)
+                            local_counts.setdefault(key, 0)
                             local_messages.setdefault(default_mailbox, [])
                             continue
                         for eml_path in eml_paths:
@@ -1119,11 +1123,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if isinstance(metadata_mailbox, str) and metadata_mailbox:
                                     mailbox = metadata_mailbox
                             key = sanitize_for_path(mailbox)
+                            local_mailboxes_by_key.setdefault(key, mailbox)
                             local_counts[key] = local_counts.get(key, 0) + 1
                             local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
+                    remote_name_mismatch_keys: Set[str] = set()
                     with imap_connection(config.server, acc) as imap:
                         mailboxes = list_all_mailboxes(imap)
                         for mailbox in mailboxes:
@@ -1137,6 +1143,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 num = len((data[0] or b"").split()) if data else 0
                                 key = sanitize_for_path(mailbox)
                                 alias_key = sanitized_path_key(mailbox)
+                                expected_mailbox = local_mailboxes_by_key.get(key)
+                                if expected_mailbox is not None and mailbox != expected_mailbox:
+                                    remote_counts[key] = num
+                                    remote_mailboxes[key] = mailbox
+                                    remote_name_mismatch_keys.add(key)
+                                    with mismatches_lock:
+                                        validation_errors.append((
+                                            email,
+                                            f"{expected_mailbox}: remote mailbox name mismatch for staged path {key}: "
+                                            f"expected {expected_mailbox!r} got {mailbox!r}",
+                                        ))
+                                    continue
                                 previous = remote_mailboxes_by_alias_key.get(alias_key)
                                 if previous is not None and previous[0] != mailbox:
                                     previous_mailbox, previous_path = previous
@@ -1160,6 +1178,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 remote_mailboxes.setdefault(key, mailbox)
                         mismatched_folders = set()
                         for folder, local_count in local_counts.items():
+                            if folder in remote_name_mismatch_keys:
+                                mismatched_folders.add(folder)
+                                continue
                             remote = remote_counts.get(folder, -1)
                             if local_count != remote:
                                 mismatched_folders.add(folder)

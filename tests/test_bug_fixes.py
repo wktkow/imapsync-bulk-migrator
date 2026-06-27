@@ -2308,6 +2308,109 @@ class TestCliAndConfigHardening:
 
         assert rc == 0
 
+    def test_legacy_validate_rejects_sanitized_remote_mailbox_alias(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        data = (
+            b"From: sender@example.com\r\n"
+            b"To: recipient@example.com\r\n"
+            b"Message-ID: <alias-validate@example.com>\r\n"
+            b"\r\n"
+            b"body"
+        )
+        folder = input_dir / "a@example.com" / "A_B"
+        _write_legacy_message_fixture(folder, mailbox="A/B", data=data, source_server=server)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "A/B", "message_count": 1}))
+
+        class AliasRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "A_B"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, *_args, **_kwargs):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[AliasRemote]:
+            yield AliasRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-alias"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_validate_rejects_pending_journal_before_target_contact(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        mailbox_dir = account_dir / "INBOX"
+        data = b"Message-ID: <pending-validate@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(mailbox_dir, data=data, source_server=server)
+        key = _legacy_import_key(account_dir, eml, "INBOX", data)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": key,
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+        opened = False
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[object]:
+            nonlocal opened
+            opened = True
+            raise AssertionError("target should not be contacted")
+            yield object()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-pending"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        assert opened is False
+
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
