@@ -362,6 +362,7 @@ class ProviderMigrationConfig:
         allow_target_duplicates = self.migration.account_merge_mode == "many_to_one"
         unique_target_keys = {auth_username_identity(self.target, account.target_email) for account in self.accounts}
         shared_single_target = allow_target_duplicates and len(unique_target_keys) == 1
+        source_labels_by_username: Dict[str, Dict[str, int]] = {}
         target_usernames_by_target: Dict[str, Dict[str, int]] = {}
         target_labels_by_username: Dict[str, Dict[str, int]] = {}
         for idx, account in enumerate(self.accounts):
@@ -373,12 +374,27 @@ class ProviderMigrationConfig:
                 raise ValueError(f"accounts[{idx}].target_email duplicates accounts[{seen_targets[target_key]}].target_email")
             seen_sources[source_key] = idx
             seen_targets[target_key] = idx
+            source_username_key = auth_username_identity(
+                self.source,
+                _effective_auth_username(self.source, account, role="source"),
+            )
             target_username_key = auth_username_identity(
                 self.target,
                 _effective_auth_username(self.target, account, role="target"),
             )
+            source_labels_by_username.setdefault(source_username_key, {}).setdefault(source_key, idx)
             target_usernames_by_target.setdefault(target_key, {}).setdefault(target_username_key, idx)
             target_labels_by_username.setdefault(target_username_key, {}).setdefault(target_key, idx)
+        for username_key, source_indexes in sorted(source_labels_by_username.items()):
+            if len(source_indexes) > 1:
+                details = ", ".join(
+                    f"accounts[{idx}]={source!r}"
+                    for source, idx in sorted(source_indexes.items(), key=lambda item: item[1])
+                )
+                raise ValueError(
+                    f"effective source_auth.username {username_key!r} is reused by multiple source_email labels "
+                    f"({details})"
+                )
         for username_key, target_indexes in sorted(target_labels_by_username.items()):
             if len(target_indexes) > 1:
                 details = ", ".join(

@@ -922,6 +922,31 @@ def test_multi_account_provider_auth_requires_per_account_usernames(tmp_path: Pa
         load_config_file(path)
 
 
+def test_provider_config_rejects_duplicate_effective_source_usernames(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-source-login.json"
+    path.write_text(json.dumps({
+        "source": {"provider": "imap", "host": "mail.example.com", "auth": {"method": "password"}},
+        "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password"}},
+        "accounts": [
+            {
+                "source_email": "a@example.com",
+                "target_email": "a@target.example.com",
+                "source_auth": {"method": "password", "username": "shared-login", "password": "source-a"},
+                "target_auth": {"method": "password", "username": "a@target.example.com", "password": "target-a"},
+            },
+            {
+                "source_email": "b@example.com",
+                "target_email": "b@target.example.com",
+                "source_auth": {"method": "password", "username": "shared-login", "password": "source-b"},
+                "target_auth": {"method": "password", "username": "b@target.example.com", "password": "target-b"},
+            },
+        ],
+    }))
+
+    with pytest.raises(ValueError, match="effective source_auth.username"):
+        load_config_file(path)
+
+
 def test_provider_config_rejects_duplicate_target_email_without_merge_mode(tmp_path: Path) -> None:
     path = tmp_path / "duplicate-target.json"
     path.write_text(json.dumps({
