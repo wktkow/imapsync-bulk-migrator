@@ -4454,3 +4454,42 @@ class TestRound6ConfirmedBugs:
 
         assert not ok
         assert any("Projects: missing remotely or not selectable but local has 0 messages" in issue for issue in issues)
+
+    def test_verify_export_rejects_mailbox_marker_folder_mismatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "Archive"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Sent", "message_count": 0}))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert stats["errors"] == 1
+        assert main() == 1
+
+    def test_verify_export_rejects_message_sidecar_folder_mismatch(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "Archive"
+        eml = _write_legacy_message_fixture(
+            folder,
+            mailbox="Sent",
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Archive", "message_count": 1}))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+
+        assert eml.exists()
+        assert stats["errors"] == 1
+        assert main() == 1

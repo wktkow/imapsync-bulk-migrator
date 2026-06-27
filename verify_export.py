@@ -14,6 +14,7 @@ from email.policy import default as default_policy
 import re
 
 from components.content_binding import legacy_content_binding_issue
+from components.utils import sanitize_for_path
 
 
 def _has_later_rfc822_header_block(msg_text):
@@ -49,7 +50,7 @@ def _has_later_rfc822_header_block(msg_text):
         idx = max(end + 1, idx + 1)
     return False
 
-def analyze_message(eml_path, json_path, *, require_metadata=True):
+def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None):
     """Analyze a single exported message"""
     try:
         # Read the email
@@ -104,6 +105,12 @@ def analyze_message(eml_path, json_path, *, require_metadata=True):
         binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
         if binding_issue:
             integrity_errors.append(binding_issue)
+        if folder_name is not None and 'mailbox' in metadata:
+            mailbox = metadata.get('mailbox')
+            if not isinstance(mailbox, str) or not mailbox.strip():
+                integrity_errors.append('missing mailbox metadata')
+            elif sanitize_for_path(mailbox) != folder_name:
+                integrity_errors.append(f'mailbox metadata mismatch (folder={folder_name} meta={mailbox})')
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
@@ -161,8 +168,10 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
         return [f"{folder_name}: mailbox marker json is not an object"]
     issues = []
     mailbox = marker.get('mailbox')
-    if not isinstance(mailbox, str) or not mailbox:
+    if not isinstance(mailbox, str) or not mailbox.strip():
         issues.append(f"{folder_name}: mailbox marker missing mailbox")
+    elif sanitize_for_path(mailbox) != folder_name:
+        issues.append(f"{folder_name}: mailbox marker name mismatch (marker={mailbox})")
     message_count = marker.get('message_count')
     if type(message_count) is not int or message_count < 0:
         issues.append(f"{folder_name}: mailbox marker has invalid message_count")
@@ -207,7 +216,7 @@ def verify_account(account_path):
         for eml_file in eml_files:
             json_file = eml_file.with_suffix('.json')
             
-            analysis, error = analyze_message(eml_file, json_file)
+            analysis, error = analyze_message(eml_file, json_file, folder_name=folder_name)
             
             if error:
                 errors.append(f"{folder_name}/{eml_file.name}: {error}")
