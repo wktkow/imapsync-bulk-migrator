@@ -2918,12 +2918,10 @@ def target_message_count(imap: imaplib.IMAP4, mailbox: str) -> int:
 
 
 def gmail_system_view_mailboxes_for_row(row: Dict[str, Any], target_mailboxes: List[MailboxInfo]) -> List[str]:
-    flags = {token.lower() for token in str(row.get("flags") or "").split()}
-    labels = {str(label).lower() for label in (row.get("gmail_labels") or [])}
     wanted: set[str] = set()
-    if "\\flagged" in flags or "\\starred" in labels or "\\flagged" in labels:
+    if row_has_gmail_starred(row):
         wanted.update({"\\flagged", "\\starred", "starred", "[gmail]/starred", "[googlemail]/starred"})
-    if "\\important" in labels or "important" in labels or "\\important" in flags:
+    if row_has_gmail_important(row):
         wanted.update({"\\important", "important", "[gmail]/important", "[googlemail]/important"})
     result: List[str] = []
     for mailbox in target_mailboxes:

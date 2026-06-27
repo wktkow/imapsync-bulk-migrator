@@ -5665,6 +5665,22 @@ def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_pat
     assert fake.appended == []
 
 
+def test_gmail_system_views_include_plain_starred_label() -> None:
+    from components.provider_ops import gmail_system_view_mailboxes_for_row
+
+    mailboxes = [
+        MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="[Gmail]/Starred", delimiter="/", attributes=("\\HasNoChildren", "\\Flagged")),
+    ]
+    row = {
+        "canonical_id": "gmail-123",
+        "gmail_labels": ["Starred"],
+        "flags": "",
+    }
+
+    assert gmail_system_view_mailboxes_for_row(row, mailboxes) == ["[Gmail]/Starred"]
+
+
 def test_provider_import_empty_mode_permits_journaled_gmail_important_view_plain_label(tmp_path: Path) -> None:
     class ImportantGmailTarget(FakeGmailTargetImap):
         def __init__(self, **kwargs) -> None:
