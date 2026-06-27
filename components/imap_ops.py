@@ -7,6 +7,7 @@ import re
 import ssl
 import time
 from contextlib import AbstractContextManager
+from email.utils import parsedate_to_datetime
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
@@ -535,6 +536,50 @@ def _require_legacy_payload_integrity(eml_path: Path, data: bytes, expected_size
             raise RuntimeError(f"{eml_path}: content_sha256 mismatch")
 
 
+def _valid_legacy_flag_token(token: str) -> bool:
+    if not token:
+        return False
+    if token == "\\" or "\\" in token[1:]:
+        return False
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in token):
+        return False
+    return not any(ch in '(){}%*"][' for ch in token)
+
+
+def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -> Tuple[str, Optional[str]]:
+    errors: List[str] = []
+    flags_raw = meta.get("flags", "")
+    flags = ""
+    if "flags" in meta and not isinstance(flags_raw, str):
+        errors.append("invalid flags metadata")
+    elif isinstance(flags_raw, str):
+        flags = flags_raw
+        invalid_flags = [token for token in flags.split() if not _valid_legacy_flag_token(token)]
+        if invalid_flags:
+            errors.append("invalid flags metadata")
+
+    internaldate_raw = meta.get("internaldate")
+    internaldate: Optional[str] = None
+    if "internaldate" in meta:
+        if not isinstance(internaldate_raw, str):
+            errors.append("invalid internaldate metadata")
+        elif internaldate_raw.strip():
+            stripped = internaldate_raw.strip()
+            parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
+                errors.append("invalid internaldate metadata")
+            else:
+                try:
+                    parsedate_to_datetime(parse_value)
+                except Exception:
+                    errors.append("invalid internaldate metadata")
+                else:
+                    internaldate = stripped
+    if errors:
+        raise RuntimeError(f"{label}: " + "; ".join(errors))
+    return flags, internaldate
+
+
 def import_account(
     account: Account,
     server: ServerConfig,
@@ -639,8 +684,7 @@ def import_account(
                     if not isinstance(meta, dict):
                         raise RuntimeError(f"{meta_path}: message metadata is not an object")
                     expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
-                    flags = str(meta.get("flags", ""))
-                    internaldate = meta.get("internaldate") or None
+                    flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
                     mbox = meta.get("mailbox")
                     if isinstance(mbox, str) and mbox.strip():
                         mailbox_meta = mbox

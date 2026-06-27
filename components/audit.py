@@ -10,7 +10,14 @@ from typing import Dict, List, Optional, Tuple, Set
 
 from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
-from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
+from .imap_ops import (
+    _validate_legacy_delivery_metadata,
+    imap_connection,
+    legacy_server_endpoint,
+    legacy_server_endpoint_digest,
+    list_all_mailboxes,
+    quote_mailbox_name,
+)
 from .utils import quote_imap_search_value, sanitize_for_path
 
 
@@ -277,6 +284,10 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid uid metadata")
                 elif isinstance(uid_meta, int) and uid_meta != uid_in_name:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
+            try:
+                _validate_legacy_delivery_metadata(meta, f"{account.email}:{folder}:{eml_path.name}")
+            except RuntimeError as exc:
+                issues.append(str(exc))
             integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
             if require_integrity_metadata or integrity_keys_present:
                 expected_hash_raw = meta.get("content_sha256")
