@@ -483,6 +483,41 @@ def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
         load_config_file(invalid_target_override)
 
 
+@pytest.mark.parametrize(
+    "folder_map",
+    [
+        {"Projects": None},
+        {"Projects": 123},
+        {"Projects": ""},
+        {"": "Archive"},
+    ],
+)
+def test_provider_config_rejects_invalid_folder_map_entries(tmp_path: Path, folder_map: dict) -> None:
+    path = tmp_path / "invalid-folder-map.json"
+    path.write_text(json.dumps({
+        "source": {
+            "provider": "gmail",
+            "host": "imap.gmail.com",
+            "auth": {"method": "xoauth2", "username": "source@example.com", "password": "token"},
+        },
+        "target": {
+            "provider": "icloud",
+            "host": "imap.mail.me.com",
+            "auth": {"method": "app_password", "username": "target", "password": "secret"},
+        },
+        "accounts": [{"source_email": "source@example.com", "target_email": "target@icloud.com"}],
+        "migration": {"folder_map": folder_map},
+    }))
+
+    with pytest.raises(ValueError, match="migration\\.folder_map"):
+        load_config_file(path)
+
+
+def test_migration_settings_rejects_non_string_folder_map_keys() -> None:
+    with pytest.raises(ValueError, match="migration\\.folder_map keys"):
+        MigrationSettings.from_dict({"folder_map": {1: "Archive"}})
+
+
 def test_readme_minimal_provider_config_does_not_preverify_gmail_visibility() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     marker = "Minimal provider config:"

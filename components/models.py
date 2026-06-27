@@ -238,7 +238,13 @@ class MigrationSettings:
         folder_map_raw = raw.get("folder_map", {})
         if not isinstance(folder_map_raw, dict):
             raise ValueError("migration.folder_map must be an object")
-        folder_map = {str(k): str(v) for k, v in folder_map_raw.items()}
+        folder_map: Dict[str, str] = {}
+        for key, value in folder_map_raw.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("migration.folder_map keys must be non-empty strings")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("migration.folder_map values must be non-empty strings")
+            folder_map[key] = value
         validation = str(raw.get("validation", "manifest_exact"))
         if validation != "manifest_exact":
             raise ValueError("migration.validation must be 'manifest_exact'")
