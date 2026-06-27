@@ -202,7 +202,10 @@ def _provider_endpoint_state_digest_matches(
         return False
     digest = actual_digest.lower()
     if isinstance(actual_endpoint, dict):
-        return digest == _provider_endpoint_state_payload_digest(actual_endpoint)
+        canonical_digest = _provider_endpoint_state_payload_digest(
+            _canonical_provider_endpoint_state_dict(actual_endpoint)
+        )
+        return digest == canonical_digest == expected_digest.lower()
     return False
 
 

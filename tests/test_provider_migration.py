@@ -41,6 +41,7 @@ from components.provider_ops import (
     provider_import_account,
     provider_import_all,
     provider_manifest_digest,
+    provider_account_endpoint_state_digest,
     provider_endpoint_state,
     provider_endpoint_state_digest,
     provider_target_journal_binding,
@@ -5166,9 +5167,7 @@ def test_provider_audit_and_validation_accept_gmail_source_username_case_only_ch
     source_endpoint = dict(state["source_endpoint"])
     source_endpoint["username"] = "SOURCE@EXAMPLE.COM"
     state["source_endpoint"] = source_endpoint
-    state["source_endpoint_sha256"] = hashlib.sha256(
-        json.dumps(source_endpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    state["source_endpoint_sha256"] = provider_account_endpoint_state_digest(config.source, account, role="source")
     (account_dir / "export-state.json").write_text(json.dumps(state))
 
     _name, audit_issues = provider_audit_account(config, account, tmp_path)
@@ -6260,6 +6259,32 @@ def test_provider_import_audit_and_validation_reject_journal_target_endpoint_mis
     assert any("target_endpoint" in issue for issue in report["failed"])
 
 
+def test_provider_audit_and_validation_reject_self_consistent_journal_endpoint_digest(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })
+    target_endpoint = dict(row["target_endpoint"])
+    target_endpoint["host"] = "IMAP.MAIL.ME.COM."
+    target_endpoint["unexpected"] = "ignored-by-canonical-endpoint-match"
+    row["target_endpoint"] = target_endpoint
+    row["target_endpoint_sha256"] = hashlib.sha256(
+        json.dumps(target_endpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(row) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any("target_endpoint_sha256" in issue for issue in audit_issues)
+    assert any("target_endpoint_sha256" in issue for issue in report["failed"])
+
+
 def test_provider_audit_and_validation_reject_malformed_gmail_journal_target_endpoint_host(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -6348,9 +6373,7 @@ def test_provider_audit_and_validation_accept_gmail_target_username_case_only_ch
     target_endpoint = dict(row["target_endpoint"])
     target_endpoint["username"] = "Target@Gmail.com"
     row["target_endpoint"] = target_endpoint
-    row["target_endpoint_sha256"] = hashlib.sha256(
-        json.dumps(target_endpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    row["target_endpoint_sha256"] = provider_account_endpoint_state_digest(config.target, account, role="target")
     (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(row) + "\n")
 
     _name, audit_issues = provider_audit_account(config, account, tmp_path)
