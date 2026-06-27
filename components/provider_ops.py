@@ -4116,6 +4116,7 @@ def provider_validate_account(
     in_root: Path,
     *,
     check_target: bool = False,
+    write_report: bool = True,
 ) -> Tuple[str, Dict[str, Any]]:
     account_dir = account_export_dir(in_root, account)
     report: Dict[str, Any] = {
@@ -4484,7 +4485,8 @@ def provider_validate_account(
     report["ok"] = not report["missing"] and not report["duplicates"] and not report["failed"]
     if report["remote_missing"]:
         report["ok"] = False
-    _atomic_json(account_dir / f"validation-{sanitize_for_path(account.target_email)}.json", report)
+    if write_report:
+        _atomic_json(account_dir / f"validation-{sanitize_for_path(account.target_email)}.json", report)
     return account.email, report
 
 

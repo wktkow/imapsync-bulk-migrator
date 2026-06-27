@@ -8715,6 +8715,8 @@ def test_main_routes_provider_modes_with_expected_connectivity_roles(
     output_dir = tmp_path / "exported"
     input_dir = tmp_path / "exported"
     input_dir.mkdir()
+    if mode in {"import", "validate"}:
+        _write_manifest_fixture(input_dir)
     roles_seen: List[tuple[str, ...]] = []
 
     def record_test_accounts(*_args, **kwargs):
@@ -8925,6 +8927,35 @@ def test_main_rejects_provider_symlinked_manifest_before_connectivity(
         rc = main(args)
 
     assert rc == 2
+
+
+@pytest.mark.parametrize("mode", ["import", "validate"])
+def test_main_rejects_provider_corrupt_payload_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / f"provider-root-corrupt-{mode}"
+    account_dir = _write_manifest_fixture(root)
+    (account_dir / "messages" / "gmail-123.eml").write_bytes(b"corrupt payload")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")), \
+        mock.patch("components.main.provider_import_all", side_effect=AssertionError("import should not run")), \
+        mock.patch("components.main.provider_validate_all", side_effect=AssertionError("validate should not run")):
+        rc = main([
+            "--mode", mode,
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / f"logs-corrupt-{mode}"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 4
+    assert not (account_dir / "validation-target@icloud.com.json").exists()
 
 
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:

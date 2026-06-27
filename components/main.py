@@ -31,6 +31,7 @@ from .provider_ops import (
     provider_import_all,
     provider_preflight,
     provider_test_accounts,
+    provider_validate_account,
     provider_validate_all,
     _raise_if_provider_path_symlink,
 )
@@ -369,6 +370,25 @@ def _provider_cli_local_root_issues(
     return issues
 
 
+def _provider_cli_staged_validation_issues(
+    root: Path,
+    config: ProviderMigrationConfig,
+) -> List[str]:
+    issues: List[str] = []
+    for account in config.accounts:
+        _name, report = provider_validate_account(
+            config,
+            account,
+            root,
+            check_target=False,
+            write_report=False,
+        )
+        for key in ("duplicates", "failed"):
+            for item in report.get(key, []):
+                issues.append(f"{account.source_email}: {key}: {item}")
+    return issues
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with legacy and provider-aware workflows.",
@@ -527,6 +547,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for issue in provider_local_issues:
                     logging.error("[provider-local] %s", issue)
                 return 2
+            if args.mode in {"import", "validate"}:
+                provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config)
+                if provider_staged_issues:
+                    logging.error("Provider %s staged data failed local validation:", args.mode)
+                    for issue in provider_staged_issues:
+                        logging.error("[provider-staged] %s", issue)
+                    return 4
         elif _legacy_symlink_component(input_root) is not None:
             logging.error("Input directory is a symlink: %s", input_root)
             return 2
