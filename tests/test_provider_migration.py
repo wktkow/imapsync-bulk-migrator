@@ -8829,6 +8829,69 @@ def test_main_rejects_provider_symlinked_output_root_before_connectivity(tmp_pat
     assert rc == 2
 
 
+@pytest.mark.parametrize("mode", ["export", "import", "validate"])
+def test_main_rejects_provider_symlinked_account_dir_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / f"provider-root-{mode}"
+    root.mkdir()
+    outside = tmp_path / f"outside-account-{mode}"
+    outside.mkdir()
+    account_dir = root / "source@example.com"
+    try:
+        account_dir.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    args = [
+        "--mode", mode,
+        "--config", str(config_path),
+        "--output-dir", str(root if mode == "export" else tmp_path / f"unused-output-{mode}"),
+        "--input-dir", str(root if mode != "export" else tmp_path / f"unused-input-{mode}"),
+        "--log-dir", str(tmp_path / f"logs-account-{mode}"),
+        "--min-free-gb", "0",
+        "--max-workers", "1",
+        "--no-audit-after-export",
+    ]
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main(args)
+
+    assert rc == 2
+
+
+@pytest.mark.parametrize("mode", ["export", "import", "validate"])
+def test_main_rejects_provider_file_root_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / f"provider-root-{mode}"
+    root.write_text("not a directory\n", encoding="utf-8")
+
+    args = [
+        "--mode", mode,
+        "--config", str(config_path),
+        "--output-dir", str(root if mode == "export" else tmp_path / f"unused-output-file-{mode}"),
+        "--input-dir", str(root if mode != "export" else tmp_path / f"unused-input-file-{mode}"),
+        "--log-dir", str(tmp_path / f"logs-file-{mode}"),
+        "--min-free-gb", "0",
+        "--max-workers", "1",
+        "--no-audit-after-export",
+    ]
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main(args)
+
+    assert rc == 2
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 

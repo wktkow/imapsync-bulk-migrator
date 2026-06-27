@@ -312,6 +312,36 @@ def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
     return issues
 
 
+def _provider_cli_local_root_issues(
+    root: Path,
+    config: ProviderMigrationConfig,
+    *,
+    label: str,
+    require_exists: bool,
+) -> List[str]:
+    issues: List[str] = []
+    try:
+        _raise_if_provider_path_symlink(root, f"{label} root")
+    except RuntimeError as exc:
+        return [str(exc)]
+    if not root.exists():
+        if require_exists:
+            issues.append(f"{label.capitalize()} directory does not exist: {root}")
+        return issues
+    if not root.is_dir():
+        return [f"{label.capitalize()} directory is not a directory: {root}"]
+    for account in config.accounts:
+        account_dir = root / sanitize_for_path(account.source_email)
+        try:
+            _raise_if_provider_path_symlink(account_dir, "account directory")
+        except RuntimeError as exc:
+            issues.append(f"{account.source_email}: {exc}")
+            continue
+        if account_dir.exists() and not account_dir.is_dir():
+            issues.append(f"{account.source_email}: provider account path is not a directory: {account_dir}")
+    return issues
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Bulk export/import/validate IMAP mailboxes with legacy and provider-aware workflows.",
@@ -448,10 +478,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.mode in {"import", "validate", "audit"} and not panel_dry_run_requested:
         input_root = Path(args.input_dir)
         if is_provider_config:
-            try:
-                _raise_if_provider_path_symlink(input_root, f"{args.mode} root")
-            except RuntimeError as exc:
-                logging.error("%s", exc)
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_local_issues = _provider_cli_local_root_issues(
+                input_root,
+                config,
+                label=args.mode,
+                require_exists=True,
+            )
+            if provider_local_issues:
+                logging.error("Provider %s input failed local preflight:", args.mode)
+                for issue in provider_local_issues:
+                    logging.error("[provider-local] %s", issue)
                 return 2
         elif _legacy_symlink_component(input_root) is not None:
             logging.error("Input directory is a symlink: %s", input_root)
@@ -470,10 +507,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:
-            try:
-                _raise_if_provider_path_symlink(output_root, "export root")
-            except RuntimeError as exc:
-                logging.error("%s", exc)
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_local_issues = _provider_cli_local_root_issues(
+                output_root,
+                config,
+                label="export",
+                require_exists=False,
+            )
+            if provider_local_issues:
+                logging.error("Provider export output failed local preflight:")
+                for issue in provider_local_issues:
+                    logging.error("[provider-local] %s", issue)
                 return 2
         elif _legacy_symlink_component(output_root) is not None:
             logging.error("Output directory is a symlink: %s", output_root)
