@@ -4952,6 +4952,88 @@ class TestRound7ConfirmedBugs:
         assert victim.read_bytes() == b"original"
         assert not (inbox / "u0000000001.eml").exists()
 
+    def test_strict_audit_rejects_symlinked_mailbox_directory(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        outside_inbox = tmp_path / "outside-inbox"
+        outside_inbox.mkdir()
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        (outside_inbox / "u0000000001.eml").write_bytes(data)
+        (outside_inbox / "u0000000001.json").write_text(json.dumps(
+            _legacy_integrity_metadata(data, mailbox="INBOX", uid=1)
+        ))
+        (outside_inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}],
+        }))
+        try:
+            (account_dir / "INBOX").symlink_to(outside_inbox, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("INBOX: mailbox path is a symlink" in issue for issue in issues)
+
+    def test_panel_reset_rejects_symlinked_account_before_panel_calls(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_root = tmp_path / "exported"
+        input_root.mkdir()
+        outside_account = tmp_path / "outside-account"
+        _write_legacy_message_fixture(outside_account / "INBOX")
+        try:
+            (input_root / "a@example.com").symlink_to(outside_account, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.CPanelClient") as client_cls, \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel") as reset_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 4
+        client_cls.assert_not_called()
+        reset_mock.assert_not_called()
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256

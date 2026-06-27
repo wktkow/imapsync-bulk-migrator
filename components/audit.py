@@ -210,10 +210,19 @@ def audit_account(
     """Audit a single account directory and optionally compare to remote counts."""
     issues: List[str] = []
     account_dir = in_root / sanitize_for_path(account.email)
+    if account_dir.is_symlink():
+        issues.append(f"{account.email}: account directory is a symlink: {account_dir}")
+        return account.email, issues
     if not account_dir.exists():
         issues.append(f"account directory missing: {account_dir}")
         return account.email, issues
-    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+    folder_dirs: List[Path] = []
+    for child in account_dir.iterdir():
+        if child.is_symlink():
+            issues.append(f"{account.email}:{child.name}: mailbox path is a symlink")
+            continue
+        if child.is_dir():
+            folder_dirs.append(child)
     if not folder_dirs:
         issues.append(f"{account.email}: no mailbox folders found")
     issues.extend(
