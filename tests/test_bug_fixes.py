@@ -11,6 +11,7 @@ import json
 import queue
 import signal
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -3516,3 +3517,349 @@ class TestBug10MultiMessageDetection:
         assert analysis["multiple_messages_detected"] is False, (
             "LF-only email with forwarded headers should NOT be flagged"
         )
+
+    def test_verify_export_checks_metadata_hash_and_size(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "test.eml"
+        eml_path.write_bytes(b"Message-ID: <m@example.com>\r\n\r\ncorrupted")
+        json_path = tmp_path / "test.json"
+        json_path.write_text(json.dumps({
+            "content_sha256": hashlib.sha256(b"original").hexdigest(),
+            "rfc822_size": len(b"original"),
+        }))
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert analysis is None
+        assert error is not None
+        assert "content_sha256 mismatch" in error
+        assert "rfc822_size mismatch" in error
+
+    def test_concatenated_message_after_body_is_detected(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "test.eml"
+        eml_path.write_bytes(
+            b"Return-Path: <a@example.com>\r\n"
+            b"Message-ID: <one@example.com>\r\n"
+            b"From: a@example.com\r\n"
+            b"To: b@example.com\r\n"
+            b"\r\n"
+            b"body\r\n"
+            b"Return-Path: <c@example.com>\r\n"
+            b"Message-ID: <two@example.com>\r\n"
+            b"From: c@example.com\r\n"
+            b"To: d@example.com\r\n"
+            b"\r\n"
+            b"body2\r\n"
+        )
+        json_path = tmp_path / "test.json"
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert error is None
+        assert analysis is not None
+        assert analysis["multiple_messages_detected"] is True
+
+
+class TestRound1ConfirmedBugs:
+    def test_bad_log_dir_returns_cli_error(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        log_path = tmp_path / "logs-as-file"
+        log_path.write_text("not a directory")
+
+        assert main(["--mode", "audit", "--config", "missing.json", "--log-dir", str(log_path)]) == 2
+
+    def test_config_rejects_whitespace_only_host_and_email(self, tmp_path: Path) -> None:
+        from components.models import load_config_file
+
+        legacy_path = tmp_path / "legacy.json"
+        legacy_path.write_text(json.dumps({
+            "server": {"host": "   ", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "   ", "password": "secret"}],
+        }))
+        provider_path = tmp_path / "provider.json"
+        provider_path.write_text(json.dumps({
+            "source": {"provider": "imap", "host": "   ", "auth": {"method": "password", "password": "x"}},
+            "target": {"provider": "imap", "host": "target.example.com", "auth": {"method": "password", "password": "x"}},
+            "accounts": [{"source_email": "   ", "target_email": "target@example.com"}],
+        }))
+
+        with pytest.raises(ValueError, match="host"):
+            load_config_file(legacy_path)
+        with pytest.raises(ValueError, match="source.host"):
+            load_config_file(provider_path)
+
+    def test_sanitize_for_path_never_returns_unsafe_components(self) -> None:
+        from components.utils import sanitize_for_path
+
+        assert sanitize_for_path("") == "_"
+        assert sanitize_for_path("   ") == "_"
+        assert sanitize_for_path(".") == "_"
+        assert sanitize_for_path("..") == "_"
+
+    def test_export_mailbox_dotdot_stays_inside_account_dir(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        class DotDotMailboxImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" ".."']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        b"Message-ID: <m@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DotDotMailboxImap]:
+            yield DotDotMailboxImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+        assert not list(tmp_path.glob("*.eml"))
+        assert (tmp_path / "user@example.com" / "_" / "u0000000001.eml").exists()
+
+    def test_audit_reports_remote_sanitized_mailbox_collision(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com" / "A_B"
+        account_dir.mkdir(parents=True)
+        (account_dir / ".mailbox.json").write_text(json.dumps({"mailbox": "A_B", "message_count": 0}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "complete": True,
+            "mailboxes": [{"mailbox": "A_B", "path": "A_B", "message_count": 0}],
+        }))
+
+        class CollidingRemoteImap:
+            selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "A/B"', b'(\\HasNoChildren) "/" "A_B"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"0"]
+
+            def uid(self, command: str, arg: str):
+                assert command == "search"
+                return "OK", [b"1 2 3" if self.selected == "A/B" else b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CollidingRemoteImap]:
+            yield CollidingRemoteImap()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(
+                Account("user@example.com", "secret"),
+                tmp_path,
+                ServerConfig("imap.example.com"),
+                check_remote=True,
+            )
+
+        assert any("remote mailbox name collision" in issue for issue in issues)
+
+    def test_negative_panel_quotas_are_rejected(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"):
+            rc_da = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs-da"),
+                "--min-free-gb", "0",
+                "--auto-provision-da",
+                "--da-quota-mb", "-1",
+            ])
+            rc_cpanel = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs-cpanel"),
+                "--min-free-gb", "0",
+                "--auto-provision-cpanel",
+                "--cpanel-quota-mb", "-1",
+            ])
+
+        assert rc_da == 2
+        assert rc_cpanel == 2
+
+    def test_directadmin_indexer_fails_on_selected_domain_list_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import directadmin_indexer
+
+        class FailingListClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def list_domains(self) -> List[str]:
+                return ["example.com"]
+
+            def list_pop_accounts(self, domain: str) -> List[str]:
+                raise RuntimeError("API timeout")
+
+        out = tmp_path / "export.pass.config.json"
+        monkeypatch.setattr(directadmin_indexer, "DirectAdminClient", FailingListClient)
+        monkeypatch.setattr(directadmin_indexer, "prompt_select_from_list", lambda *_args, **_kwargs: [0])
+
+        rc = directadmin_indexer.main([
+            "--url", "https://panel.example.com:2222",
+            "--username", "u",
+            "--password", "p",
+            "--imap-host", "mail.example.com",
+            "--out", str(out),
+        ])
+
+        assert rc == 2
+        assert not out.exists()
+
+    def test_directadmin_list_pop_accounts_accepts_empty_success_shapes(self) -> None:
+        from components.da_client import DirectAdminClient
+        from directadmin_indexer import DirectAdminClient as IndexerDirectAdminClient
+
+        for client_cls in (DirectAdminClient, IndexerDirectAdminClient):
+            client = object.__new__(client_cls)
+            client._get = lambda *_args, **_kwargs: ({"error": "0"}, None)
+            assert client.list_pop_accounts("example.com") == []
+            client._get = lambda *_args, **_kwargs: (None, {"error": ["0"]})
+            assert client.list_pop_accounts("example.com") == []
+            client._get = lambda *_args, **_kwargs: ([], None)
+            assert client.list_pop_accounts("example.com") == []
+
+    def test_cpanel_indexer_import_survives_missing_requests(self) -> None:
+        code = r'''
+import builtins
+real_import = builtins.__import__
+def blocked_import(name, *args, **kwargs):
+    if name == "requests":
+        raise ImportError("blocked")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = blocked_import
+import cpanel_indexer
+print("ok")
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ok"
+
+    def test_reexport_removes_stale_message_files(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        class UidExportImap:
+            def __init__(self, uids: List[int]) -> None:
+                self.uids = uids
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [str(len(self.uids)).encode("ascii")]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [" ".join(str(uid) for uid in self.uids).encode("ascii")]
+                if command == "fetch":
+                    uid = int(args[0])
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        f"Message-ID: <{uid}@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody".encode("ascii"),
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection_factory(uids: List[int]) -> Iterator[UidExportImap]:
+            yield UidExportImap(uids)
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", lambda *_args: fake_connection_factory([1, 2])):
+            export_account(account, server, tmp_path, ignore_errors=False)
+        with mock.patch("components.imap_ops.imap_connection", lambda *_args: fake_connection_factory([1])):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        inbox = tmp_path / "user@example.com" / "INBOX"
+        assert sorted(path.name for path in inbox.glob("*.eml")) == ["u0000000001.eml"]
+        assert sorted(path.name for path in inbox.glob("*.json") if path.name != ".mailbox.json") == ["u0000000001.json"]
+
+    def test_plain_imapsync_probe_disables_ssl_and_tls(self) -> None:
+        from components.imapsync_cli import run_imapsync_justconnect
+
+        seen = {}
+
+        def fake_run(args, **_kwargs):
+            seen["args"] = args
+
+            class Result:
+                returncode = 0
+                stdout = "ok"
+
+            return Result()
+
+        with mock.patch("components.imapsync_cli.ensure_imapsync_available"), \
+            mock.patch("components.imapsync_cli.subprocess.run", fake_run):
+            ok, _out = run_imapsync_justconnect("imap.example.com", 143, False, False, "user", "secret")
+
+        assert ok
+        assert "--nossl1" in seen["args"]
+        assert "--notls1" in seen["args"]
+
+    def test_legacy_remote_message_search_quotes_special_message_id(self) -> None:
+        from components.imap_ops import _legacy_remote_has_message
+
+        message = b"Message-ID: <x@[127.0.0.1]>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SpecialMessageIdImap:
+            criteria = None
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                self.criteria = criteria
+                if criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"'):
+                    return "OK", [b"1"]
+                return "BAD", [b"bad search"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE 49 BODY[] {49}", message)]
+
+        fake = SpecialMessageIdImap()
+
+        assert _legacy_remote_has_message(fake, "INBOX", message, set())
+        assert fake.criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"')
