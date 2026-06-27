@@ -402,6 +402,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     is_provider_config = isinstance(config, ProviderMigrationConfig)
     use_da_panel = bool(getattr(args, "auto_provision_da", False))
     use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
+    if (
+        not is_provider_config
+        and args.mode != "import"
+        and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False)))
+    ):
+        logging.error("--auto-provision-da, --auto-provision-cpanel, and --reset are only valid with --mode import")
+        return 2
     panel_dry_run_requested = (
         args.mode == "import"
         and not is_provider_config

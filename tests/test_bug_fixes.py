@@ -1632,6 +1632,40 @@ class TestCliAndConfigHardening:
         ]) == 2
         assert main(["--mode", "test", *base, "--no-connectivity-test"]) == 2
 
+    @pytest.mark.parametrize(
+        ("mode", "extra_args"),
+        [
+            ("audit", ["--audit-offline", "--auto-provision-da"]),
+            ("validate", ["--auto-provision-cpanel"]),
+            ("export", ["--auto-provision-da", "--reset", "--reset-confirm", "imap.example.com"]),
+        ],
+    )
+    def test_main_rejects_legacy_panel_flags_outside_import(
+        self,
+        tmp_path: Path,
+        mode: str,
+        extra_args: List[str],
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.export_account", side_effect=AssertionError("mode should not run")):
+            rc = main([
+                "--mode", mode,
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / f"logs-{mode}"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+                *extra_args,
+            ])
+
+        assert rc == 2
+
     def test_main_free_space_check_uses_requested_output_not_cwd(self, tmp_path: Path) -> None:
         from components.main import main
 
