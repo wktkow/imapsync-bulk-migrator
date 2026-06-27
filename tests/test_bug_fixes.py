@@ -955,7 +955,14 @@ class TestLegacyImportJournal:
         account = Account(email="user@example.com", password="pass")
         server = ServerConfig(host="dummy", port=993, ssl=True)
 
-        with pytest.raises(RuntimeError, match="no staged \\.eml files|mailbox metadata mismatch"):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "no staged \\.eml files|mailbox metadata mismatch|"
+                "failed to parse mailbox marker|mailbox marker is not an object|"
+                "mailbox marker has invalid message_count"
+            ),
+        ):
             import_account(account, server, tmp_path, ignore_errors=False)
 
     @pytest.mark.parametrize(
@@ -1005,7 +1012,14 @@ class TestLegacyImportJournal:
         }))
         account = Account(email="user@example.com", password="pass")
 
-        with pytest.raises(RuntimeError, match="no staged \\.eml files|mailbox metadata mismatch"):
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "no staged \\.eml files|mailbox metadata mismatch|"
+                "failed to parse mailbox marker|mailbox marker is not an object|"
+                "mailbox marker has invalid message_count|mailbox marker count mismatch"
+            ),
+        ):
             import_account(account, server, tmp_path, ignore_errors=False)
 
     def test_import_rejects_pending_journal_entry(self, tmp_path: Path) -> None:
@@ -5507,6 +5521,47 @@ class TestRound7ConfirmedBugs:
             )
 
         assert ok, issues
+
+    def test_direct_import_rejects_orphan_legacy_sidecar_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <orphan-sidecar@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (folder / "u0000000002.json").write_text(json.dumps({"mailbox": "INBOX", "uid": 2}))
+
+        with pytest.raises(RuntimeError, match=r"metadata file\(s\) without \.eml counterpart"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_legacy_marker_count_mismatch_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <marker-count@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 2}))
+
+        with pytest.raises(RuntimeError, match=r"mailbox marker count mismatch \(marker=2 eml=1\)"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
 
     def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
         from components.audit import audit_export

@@ -729,21 +729,38 @@ def import_account(
         mailbox_meta = folder_dir.name
         marker = folder_dir / ".mailbox.json"
         _raise_if_symlink(marker, "legacy mailbox marker")
+        eml_paths = sorted(folder_dir.glob("*.eml"))
+        json_paths = sorted(path for path in folder_dir.glob("*.json") if path.name != ".mailbox.json")
+        eml_stems = {path.stem for path in eml_paths}
+        json_stems = {path.stem for path in json_paths}
+        orphan_sidecars = json_stems - eml_stems
+        if orphan_sidecars:
+            raise RuntimeError(f"{folder_dir}: {len(orphan_sidecars)} metadata file(s) without .eml counterpart")
         if marker.exists():
             staged_marker_paths.add(folder_dir.name)
-            marker_meta = None
-            with contextlib.suppress(Exception):
+            try:
                 marker_meta = json.loads(_read_file_no_symlink(marker, "legacy mailbox marker").decode("utf-8"))
+            except Exception as exc:
+                raise RuntimeError(f"{marker}: failed to parse mailbox marker: {exc}") from exc
             if isinstance(marker_meta, dict):
                 staged_markers[folder_dir.name] = marker_meta
+                expected_count = marker_meta.get("message_count")
+                if type(expected_count) is not int or expected_count < 0:
+                    raise RuntimeError(f"{marker}: mailbox marker has invalid message_count")
+                if expected_count != len(eml_paths):
+                    raise RuntimeError(
+                        f"{marker}: mailbox marker count mismatch (marker={expected_count} eml={len(eml_paths)})"
+                    )
                 marker_mailbox = marker_meta.get("mailbox")
                 if isinstance(marker_mailbox, str) and marker_mailbox.strip():
                     if sanitize_for_path(marker_mailbox) != folder_dir.name:
                         raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
                     mailbox_meta = marker_mailbox
+            else:
+                raise RuntimeError(f"{marker}: mailbox marker is not an object")
             per_folder.setdefault(mailbox_meta, [])
         default_mailbox = mailbox_meta
-        for eml_path in sorted(folder_dir.glob("*.eml")):
+        for eml_path in eml_paths:
             _raise_if_symlink(eml_path, "legacy message file")
             meta_path = eml_path.with_suffix(".json")
             flags = ""
