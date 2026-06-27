@@ -4046,3 +4046,119 @@ class TestRound2ConfirmedBugs:
 
         assert stats["errors"] == 1
         assert main() == 1
+
+
+class TestRound3ConfirmedBugs:
+    def test_strict_audit_rejects_duplicate_export_state_paths(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\nSubject: x\r\n\r\nbody"
+        folder = tmp_path / "user@example.com" / "Sent_Items"
+        folder.mkdir(parents=True)
+        (folder / "u0000000001.eml").write_bytes(data)
+        (folder / "u0000000001.json").write_text(json.dumps({
+            "mailbox": "Sent Items",
+            "uid": 1,
+            "rfc822_size": len(data),
+            "content_sha256": hashlib.sha256(data).hexdigest(),
+        }))
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Sent Items", "message_count": 1}))
+        (tmp_path / "user@example.com" / "export-state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "account": "user@example.com",
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "mailboxes": [
+                {"mailbox": "Sent Items", "path": "Sent_Items", "message_count": 1},
+                {"mailbox": "Sent/Items", "path": "Sent_Items", "message_count": 1},
+            ],
+        }))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("export-state mailbox path collision" in issue for issue in issues)
+
+    def test_direct_import_rejects_sidecar_integrity_mismatch(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\ncorrupted"
+        (folder / "u0000000001.eml").write_bytes(data)
+        (folder / "u0000000001.json").write_text(json.dumps({
+            "mailbox": "INBOX",
+            "uid": 1,
+            "rfc822_size": len(b"original"),
+            "content_sha256": hashlib.sha256(b"original").hexdigest(),
+        }))
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        class AppendTarget:
+            appended = 0
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.appended += 1
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        target = AppendTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[AppendTarget]:
+            yield target
+
+        with pytest.raises(RuntimeError, match="rfc822_size mismatch|content_sha256 mismatch"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+            )
+
+        assert target.appended == 0
+
+    def test_verify_export_fails_empty_root_and_unmarked_empty_mailbox(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from verify_export import main, verify_account
+
+        (tmp_path / "exported").mkdir()
+        monkeypatch.chdir(tmp_path)
+        assert main() == 1
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        mailbox_dir = account_dir / "INBOX"
+        mailbox_dir.mkdir(parents=True)
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 1
+        assert main() == 1
+
+    def test_invalid_only_indexer_selection_returns_no_selection(self) -> None:
+        from directadmin_indexer import prompt_select_from_list
+
+        for raw in ("999", "abc", "4-6"):
+            with mock.patch("builtins.input", return_value=raw):
+                assert prompt_select_from_list(["one", "two"], "Available") == []
+
+        with mock.patch("builtins.input", return_value="2,abc"):
+            assert prompt_select_from_list(["one", "two"], "Available") == [1]
