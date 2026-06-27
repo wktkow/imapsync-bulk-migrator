@@ -92,7 +92,10 @@ def _legacy_export_state_issues(
         return [f"{account.email}: export-state is not an object"]
     if state.get("complete") is not True:
         issues.append(f"{account.email}: export-state is not complete")
-    if state.get("account") not in {None, account.email}:
+    state_account = state.get("account")
+    if require_state and state_account != account.email:
+        issues.append(f"{account.email}: export-state account mismatch ({state_account})")
+    elif not require_state and state_account not in {None, account.email}:
         issues.append(f"{account.email}: export-state account mismatch ({state.get('account')})")
     source_server = state.get("source_server")
     source_server_sha256 = state.get("source_server_sha256")

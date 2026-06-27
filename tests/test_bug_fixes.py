@@ -5339,6 +5339,36 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_strict_audit_rejects_missing_export_state_account_binding(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <state-account@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        state = json.loads((folder.parent / "export-state.json").read_text())
+        del state["account"]
+        state["source_server"] = legacy_server_endpoint(server)
+        state["source_server_sha256"] = legacy_server_endpoint_digest(server)
+        (folder.parent / "export-state.json").write_text(json.dumps(state))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [Account("user@example.com", "secret")], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("export-state account mismatch (None)" in issue for issue in issues)
+
     def test_provider_export_rejects_symlinked_account_directory_before_source_contact(self, tmp_path: Path) -> None:
         from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
         from components.provider_ops import provider_export_account
