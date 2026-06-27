@@ -37,7 +37,7 @@ from .utils import check_free_space_for_path
 
 
 def _read_required_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").strip()
+    value = Path(path).read_text(encoding="utf-8").rstrip("\r\n")
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value
@@ -61,8 +61,8 @@ def _resolve_da_password(args: argparse.Namespace) -> str:
         return _read_required_secret_file(str(args.da_password_file), label="DirectAdmin password file")
     if getattr(args, "da_password_env", None):
         env_name = str(args.da_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"DirectAdmin password environment variable is unset or empty: {env_name}")
         return value
     logging.warning("--da-password exposes the DirectAdmin secret via shell history/process arguments; prefer --da-password-file or --da-password-env")
@@ -98,8 +98,8 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
         return _read_required_secret_file(str(args.cpanel_password_file), label="cPanel password file"), None
     if getattr(args, "cpanel_password_env", None):
         env_name = str(args.cpanel_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"cPanel password environment variable is unset or empty: {env_name}")
         return value, None
     if getattr(args, "cpanel_password", None):
@@ -109,8 +109,8 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
         return None, _read_required_secret_file(str(args.cpanel_token_file), label="cPanel API token file")
     if getattr(args, "cpanel_token_env", None):
         env_name = str(args.cpanel_token_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"cPanel API token environment variable is unset or empty: {env_name}")
         return None, value
     if getattr(args, "cpanel_token", None):

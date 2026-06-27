@@ -39,8 +39,8 @@ def _resolve_one_secret(args: argparse.Namespace, prefix: str, label: str) -> Op
         return read_secret_file(str(file_value), label=f"{label} file")
     if env_value:
         env_name = str(env_value)
-        secret = os.environ.get(env_name, "").strip()
-        if not secret:
+        secret = os.environ.get(env_name)
+        if secret is None or secret == "":
             raise ValueError(f"{label} environment variable is unset or empty: {env_name}")
         return secret
     if value:

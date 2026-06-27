@@ -275,7 +275,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
 
 
 def read_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").strip()
+    value = Path(path).read_text(encoding="utf-8").rstrip("\r\n")
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value
@@ -299,8 +299,8 @@ def resolve_password(args: argparse.Namespace) -> str:
         return read_secret_file(str(args.password_file), label="DirectAdmin password file")
     if getattr(args, "password_env", None):
         env_name = str(args.password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"DirectAdmin password environment variable is unset or empty: {env_name}")
         return value
     print("Warning: --password can expose the secret via shell history/process arguments; prefer --password-file or --password-env", file=sys.stderr)
@@ -323,8 +323,8 @@ def resolve_default_password(args: argparse.Namespace) -> str:
         return read_secret_file(str(args.default_password_file), label="Default mailbox password file")
     if getattr(args, "default_password_env", None):
         env_name = str(args.default_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"Default mailbox password environment variable is unset or empty: {env_name}")
         return value
     if getattr(args, "default_password", None):
