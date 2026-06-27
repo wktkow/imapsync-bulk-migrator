@@ -373,6 +373,8 @@ def _provider_cli_local_root_issues(
 def _provider_cli_staged_validation_issues(
     root: Path,
     config: ProviderMigrationConfig,
+    *,
+    mode: str,
 ) -> List[str]:
     issues: List[str] = []
     for account in config.accounts:
@@ -383,7 +385,8 @@ def _provider_cli_staged_validation_issues(
             check_target=False,
             write_report=False,
         )
-        for key in ("duplicates", "failed"):
+        keys = ("duplicates", "failed", "missing") if mode == "validate" else ("duplicates", "failed")
+        for key in keys:
             for item in report.get(key, []):
                 issues.append(f"{account.source_email}: {key}: {item}")
     return issues
@@ -555,7 +558,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.error("[provider-local] %s", issue)
                 return 2
             if args.mode in {"import", "validate"}:
-                provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config)
+                provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config, mode=args.mode)
                 if provider_staged_issues:
                     logging.error("Provider %s staged data failed local validation:", args.mode)
                     for issue in provider_staged_issues:

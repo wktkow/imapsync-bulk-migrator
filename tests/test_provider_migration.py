@@ -8716,7 +8716,16 @@ def test_main_routes_provider_modes_with_expected_connectivity_roles(
     input_dir = tmp_path / "exported"
     input_dir.mkdir()
     if mode in {"import", "validate"}:
-        _write_manifest_fixture(input_dir)
+        account_dir = _write_manifest_fixture(input_dir)
+        if mode == "validate":
+            config = load_config_file(config_path)
+            assert isinstance(config, ProviderMigrationConfig)
+            append_journal(account_dir, config.accounts[0], _journal_fixture(config, {
+                "canonical_id": "gmail-123",
+                "target_account": config.accounts[0].target_email,
+                "target_mailbox": "Archive",
+                "status": "committed",
+            }))
     roles_seen: List[tuple[str, ...]] = []
 
     def record_test_accounts(*_args, **kwargs):
@@ -8754,7 +8763,16 @@ def test_main_checks_provider_free_space_before_connectivity(
     output_dir = tmp_path / "provider-output"
     input_dir = tmp_path / "provider-input"
     if mode in {"import", "validate"}:
-        _write_manifest_fixture(input_dir)
+        account_dir = _write_manifest_fixture(input_dir)
+        if mode == "validate":
+            config = load_config_file(config_path)
+            assert isinstance(config, ProviderMigrationConfig)
+            append_journal(account_dir, config.accounts[0], _journal_fixture(config, {
+                "canonical_id": "gmail-123",
+                "target_account": config.accounts[0].target_email,
+                "target_mailbox": "Archive",
+                "status": "committed",
+            }))
     events: List[str] = []
 
     def fail_free_space(*_args, **_kwargs):
@@ -8989,6 +9007,29 @@ def test_main_rejects_provider_corrupt_payload_before_connectivity(
             "--config", str(config_path),
             "--input-dir", str(root),
             "--log-dir", str(tmp_path / f"logs-corrupt-{mode}"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 4
+    assert not (account_dir / "validation-target@icloud.com.json").exists()
+
+
+def test_main_rejects_provider_validate_missing_commit_before_connectivity(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    root = tmp_path / "provider-root-missing-commit"
+    account_dir = _write_manifest_fixture(root)
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")), \
+        mock.patch("components.main.provider_validate_all", side_effect=AssertionError("validate should not run")):
+        rc = main([
+            "--mode", "validate",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-missing-commit"),
             "--min-free-gb", "0",
             "--max-workers", "1",
         ])
