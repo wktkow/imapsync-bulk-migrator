@@ -8,6 +8,7 @@ import math
 import socket
 import os
 import signal
+import sys
 import threading
 from pathlib import Path
 from email.parser import BytesParser
@@ -311,11 +312,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    log_file = setup_logging(Path(args.log_dir))
+    try:
+        log_file = setup_logging(Path(args.log_dir))
+    except Exception as exc:
+        print(f"Failed to initialize logging: {exc}", file=sys.stderr)
+        return 2
     logging.info("Starting imapsync-bulk-migrator | mode=%s", args.mode)
 
     if int(args.max_workers) < 1:
         logging.error("--max-workers must be >= 1")
+        return 2
+    if int(args.da_quota_mb) < 0:
+        logging.error("--da-quota-mb must be >= 0")
+        return 2
+    if int(args.cpanel_quota_mb) < 0:
+        logging.error("--cpanel-quota-mb must be >= 0")
         return 2
     imap_timeout = float(args.imap_timeout)
     if not math.isfinite(imap_timeout) or imap_timeout <= 0:
