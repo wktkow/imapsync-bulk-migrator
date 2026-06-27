@@ -774,6 +774,63 @@ class TestLegacyImportJournal:
         assert fake_imap.append_count == 1
         assert fake_imap.stored == [imaplib.MapCRLF.sub(imaplib.CRLF, data)]
 
+    def test_import_rejects_empty_message_before_append(self, tmp_path: Path) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(folder, data=b"")
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["rfc822_size"] = 0
+        meta["content_sha256"] = hashlib.sha256(b"").hexdigest()
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        with pytest.raises(RuntimeError, match="invalid rfc822_size metadata"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_import_rejects_empty_message_without_integrity_metadata_before_append(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(folder, data=b"")
+        eml.with_suffix(".json").write_text(json.dumps({"mailbox": "INBOX", "uid": 1}))
+
+        class NoAppendImap:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def append(self, *_args, **_kwargs):
+                raise AssertionError("APPEND should not be reached")
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[NoAppendImap]:
+            yield NoAppendImap()
+
+        with pytest.raises(RuntimeError, match="empty message file"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+            )
+
     def test_import_recognizes_existing_raw_committed_key_for_lf_only_message(self, tmp_path: Path) -> None:
         import imaplib
 

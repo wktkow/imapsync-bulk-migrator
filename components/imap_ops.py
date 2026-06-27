@@ -568,7 +568,7 @@ def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object])
     expected_size_raw = meta.get("rfc822_size")
     expected_size: Optional[int] = None
     if expected_size_raw is not None:
-        if type(expected_size_raw) is not int or expected_size_raw < 0:
+        if type(expected_size_raw) is not int or expected_size_raw <= 0:
             raise RuntimeError(f"{meta_path}: invalid rfc822_size metadata")
         expected_size = expected_size_raw
     expected_hash_raw = meta.get("content_sha256")
@@ -584,6 +584,8 @@ def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object])
 
 
 def _require_legacy_payload_integrity(eml_path: Path, data: bytes, expected_size: Optional[int], expected_hash: Optional[str]) -> None:
+    if not data:
+        raise RuntimeError(f"{eml_path}: empty message file")
     if expected_size is not None and len(data) != expected_size:
         raise RuntimeError(f"{eml_path}: rfc822_size mismatch (metadata={expected_size} actual={len(data)})")
     if expected_hash is not None:
