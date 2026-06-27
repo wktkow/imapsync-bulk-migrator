@@ -227,7 +227,7 @@ def prompt_select_from_list(options: List[str], title: str) -> List[int]:
             seen.add(i)
             deduped.append(i)
     if not deduped:
-        return list(range(len(options)))
+        return []
     return deduped
 
 
@@ -378,6 +378,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     selected_idx = prompt_select_from_list(domains, title="Available Domains")
+    if not selected_idx:
+        print("No valid domain selection provided.", file=sys.stderr)
+        return 2
     selected_domains = [domains[i] for i in selected_idx]
 
     all_emails: List[str] = []

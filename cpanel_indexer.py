@@ -111,6 +111,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("No email accounts found for this cPanel account.")
         return 0
     selected_idx = prompt_select_from_list(domains, title="Available Email Domains")
+    if not selected_idx:
+        print("No valid domain selection provided.", file=sys.stderr)
+        return 2
     selected_domains = {domains[i] for i in selected_idx}
     selected_emails = sorted(email for email in all_emails if email.split("@", 1)[1].lower() in selected_domains)
 
