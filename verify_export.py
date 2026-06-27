@@ -13,8 +13,17 @@ from email.parser import BytesParser
 from email.policy import default as default_policy
 import re
 
-from components.content_binding import legacy_content_binding_issue
+from components.content_binding import legacy_content_binding_issue, provider_content_binding_issue
 from components.imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate
+from components.provider_ops import (
+    _manifest_path,
+    _provider_artifact_orphan_issues,
+    load_manifest,
+    manifest_integrity_issues,
+    manifest_payload_issues,
+    metadata_manifest_issues,
+    provider_export_state_issues,
+)
 from components.utils import sanitize_for_path
 
 
@@ -95,7 +104,7 @@ def _non_encapsulated_text_has_rfc822_header_block(part):
     return _has_later_rfc822_header_block('\n\n' + _decoded_text_payload(part))
 
 
-def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None):
+def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=None, content_binding="legacy"):
     """Analyze a single exported message"""
     try:
         # Read the email
@@ -153,7 +162,10 @@ def analyze_message(eml_path, json_path, *, require_metadata=True, folder_name=N
                 integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
         elif require_metadata:
             integrity_errors.append('missing rfc822_size metadata')
-        binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
+        if content_binding == "provider":
+            binding_issue = provider_content_binding_issue(metadata, required=require_metadata)
+        else:
+            binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
         if binding_issue:
             integrity_errors.append(binding_issue)
         if 'uid' in metadata:
@@ -316,8 +328,99 @@ def analyze_export_state(account_path, folder_counts):
     return issues
 
 
+def verify_provider_account(account_path):
+    """Verify a provider-layout account export."""
+    account_name = account_path.name
+    print(f"\n=== Verifying {account_name} (provider layout) ===")
+
+    errors = []
+    total_messages = 0
+    total_with_attachments = 0
+    total_attachments = 0
+    multiple_message_files = []
+    provider_mailboxes = set()
+
+    try:
+        rows = load_manifest(account_path)
+    except Exception as exc:
+        errors.append(f"manifest load failed: {exc}")
+        rows = []
+
+    if rows:
+        errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
+        errors.extend(manifest_integrity_issues(rows))
+        errors.extend(metadata_manifest_issues(account_path, rows))
+        errors.extend(manifest_payload_issues(account_path, rows))
+        errors.extend(_provider_artifact_orphan_issues(account_path, rows))
+    else:
+        errors.extend(provider_export_state_issues(account_path, manifest_rows=[]))
+        errors.extend(_provider_artifact_orphan_issues(account_path, []))
+
+    for row in rows:
+        identity = str(row.get("canonical_id") or "<missing>")
+        if row.get("primary_mailbox"):
+            provider_mailboxes.add(str(row.get("primary_mailbox")))
+        try:
+            eml_path = _manifest_path(account_path, row, "eml_path")
+            metadata_path = _manifest_path(account_path, row, "metadata_path")
+        except Exception as exc:
+            errors.append(f"{identity}: invalid provider paths: {exc}")
+            continue
+        if not eml_path.exists() or not metadata_path.exists():
+            continue
+
+        analysis, error = analyze_message(
+            eml_path,
+            metadata_path,
+            content_binding="provider",
+        )
+        if error:
+            errors.append(f"{identity}: {error}")
+            continue
+        total_messages += 1
+        if analysis["has_attachments"]:
+            total_with_attachments += 1
+            total_attachments += analysis["attachment_count"]
+        if analysis["multiple_messages_detected"]:
+            multiple_message_files.append(
+                f"{row.get('eml_path')} (Return-Path: {analysis['return_path_count']}, "
+                f"Message-ID: {analysis['message_id_count']})"
+            )
+
+    print(f"Total messages: {total_messages}")
+    print(f"Messages with attachments: {total_with_attachments}")
+    print(f"Total attachments: {total_attachments}")
+
+    if multiple_message_files:
+        print(f"\n🚨 CRITICAL: {len(multiple_message_files)} files contain multiple messages!")
+        for file_info in multiple_message_files[:10]:
+            print(f"  {file_info}")
+        if len(multiple_message_files) > 10:
+            print(f"  ... and {len(multiple_message_files) - 10} more files")
+
+    if errors:
+        print(f"\n⚠️  {len(errors)} errors found:")
+        for error in errors[:10]:
+            print(f"  {error}")
+        if len(errors) > 10:
+            print(f"  ... and {len(errors) - 10} more errors")
+
+    return {
+        'account': account_name,
+        'total_messages': total_messages,
+        'messages_with_attachments': total_with_attachments,
+        'total_attachments': total_attachments,
+        'folders': len(provider_mailboxes),
+        'errors': len(errors),
+        'multiple_message_files': len(multiple_message_files)
+    }
+
+
 def verify_account(account_path):
     """Verify all messages in an account"""
+    if (account_path / "manifest.jsonl").exists():
+        return verify_provider_account(account_path)
+
     account_name = account_path.name
     print(f"\n=== Verifying {account_name} ===")
     

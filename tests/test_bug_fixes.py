@@ -4166,6 +4166,49 @@ class TestRound2ConfirmedBugs:
         assert stats["errors"] == 1
         assert main() == 1
 
+    def test_verify_export_accepts_provider_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import main, verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        body = b"Message-ID: <provider@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        eml_rel = "messages/provider-1.eml"
+        meta_rel = "metadata/provider-1.json"
+        (account_dir / eml_rel).write_bytes(body)
+        row = {
+            "canonical_id": "provider-1",
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "target_account": "target@example.com",
+            "primary_mailbox": "Archive",
+            "message_id_header": "<provider@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "flags": "\\Seen",
+            "internaldate": "01-Jan-2024 00:00:00 +0000",
+            "eml_path": eml_rel,
+            "metadata_path": meta_rel,
+        }
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / meta_rel).write_text(json.dumps(row))
+        (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "complete": True,
+            "canonical_messages": 1,
+            "manifest_sha256": provider_manifest_digest([row]),
+        }))
+
+        stats = verify_account(account_dir)
+        monkeypatch.chdir(tmp_path)
+
+        assert stats["errors"] == 0
+        assert stats["total_messages"] == 1
+        assert main() == 0
+
 
 class TestRound3ConfirmedBugs:
     def test_strict_audit_rejects_duplicate_export_state_paths(self, tmp_path: Path) -> None:
