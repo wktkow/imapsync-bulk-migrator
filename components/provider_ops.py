@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from .content_binding import CONTENT_BINDING_FIELD, provider_content_binding_issue, provider_content_binding_sha256
 from .executor import parallel_process_accounts
+from .imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
 from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
 
@@ -1194,10 +1195,42 @@ def manifest_integrity_issues(rows: List[Dict[str, Any]]) -> List[str]:
     return issues
 
 
+def provider_delivery_metadata_issues(rows: List[Dict[str, Any]]) -> List[str]:
+    issues: List[str] = []
+    for idx, row in enumerate(rows, 1):
+        identity = str(row.get("canonical_id") or f"row {idx}")
+        flags_raw = row.get("flags", "")
+        if "flags" in row and not isinstance(flags_raw, str):
+            issues.append(f"{identity}: invalid flags metadata")
+        elif isinstance(flags_raw, str):
+            invalid_flags = [token for token in flags_raw.split() if not _valid_legacy_flag_token(token)]
+            if invalid_flags:
+                issues.append(f"{identity}: invalid flags metadata")
+
+        internaldate_raw = row.get("internaldate")
+        if "internaldate" in row:
+            if not isinstance(internaldate_raw, str):
+                issues.append(f"{identity}: invalid internaldate metadata")
+            elif internaldate_raw.strip():
+                stripped = internaldate_raw.strip()
+                parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
+                if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
+                    issues.append(f"{identity}: invalid internaldate metadata")
+                elif not _valid_legacy_internaldate(parse_value):
+                    issues.append(f"{identity}: invalid internaldate metadata")
+    return issues
+
+
 def require_manifest_integrity_metadata(rows: List[Dict[str, Any]]) -> None:
     issues = manifest_integrity_issues(rows)
     if issues:
         raise RuntimeError("invalid manifest integrity metadata: " + "; ".join(issues))
+
+
+def require_provider_delivery_metadata(rows: List[Dict[str, Any]]) -> None:
+    issues = provider_delivery_metadata_issues(rows)
+    if issues:
+        raise RuntimeError("invalid provider delivery metadata: " + "; ".join(issues))
 
 
 def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
@@ -2224,6 +2257,12 @@ def _provider_flag_tokens(
     if target_provider != "gmail":
         portable.add("\\DELETED")
     tokens = [tok for tok in flags.split() if tok.strip()]
+    invalid_tokens = [token for token in tokens if not _valid_legacy_flag_token(token)]
+    if invalid_tokens:
+        raise RuntimeError(
+            "invalid provider flags: "
+            + ", ".join(sorted(set(invalid_tokens), key=str.upper))
+        )
     filtered: List[str] = []
     unsupported: List[str] = []
     missing_permanent_flags = permanent_flags is None
@@ -2309,6 +2348,9 @@ def restore_imap_flags(
 def _internaldate_for_append(internaldate: str) -> str:
     if internaldate.strip():
         value = internaldate.strip()
+        parse_value = value[1:-1] if value.startswith('"') and value.endswith('"') else value
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value) or not _valid_legacy_internaldate(parse_value):
+            raise RuntimeError("invalid provider internaldate")
         return value if value.startswith('"') and value.endswith('"') else f'"{value}"'
     return imaplib.Time2Internaldate(time.time())
 
@@ -3063,6 +3105,7 @@ def _validated_group_stage(
     require_manifest_accounts(manifest_rows, account)
     require_manifest_source_provider(manifest_rows, config.source.provider)
     require_manifest_integrity_metadata(manifest_rows)
+    require_provider_delivery_metadata(manifest_rows)
     require_complete_export_state(
         account_dir,
         account=account,
@@ -3200,6 +3243,7 @@ def provider_import_account(
     require_manifest_accounts(manifest_rows, account)
     require_manifest_source_provider(manifest_rows, config.source.provider)
     require_manifest_integrity_metadata(manifest_rows)
+    require_provider_delivery_metadata(manifest_rows)
     require_complete_export_state(
         account_dir,
         account=account,
@@ -3622,6 +3666,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     issues.extend(manifest_account_issues(rows, account))
     issues.extend(manifest_source_provider_issues(rows, config.source.provider))
     issues.extend(manifest_integrity_issues(rows))
+    issues.extend(provider_delivery_metadata_issues(rows))
     issues.extend(metadata_manifest_issues(account_dir, rows, require_present=False))
     issues.extend(_provider_artifact_orphan_issues(account_dir, rows))
     issues.extend(gmail_target_decommission_issues(config.target, account))
@@ -3747,6 +3792,7 @@ def provider_validate_account(
         report["failed"].append(str(exc))
     report["failed"].extend(manifest_source_provider_issues(manifest_rows, config.source.provider))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
+    report["failed"].extend(provider_delivery_metadata_issues(manifest_rows))
     report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
     report["failed"].extend(manifest_payload_issues(account_dir, manifest_rows))
     report["failed"].extend(_provider_artifact_orphan_issues(account_dir, manifest_rows))

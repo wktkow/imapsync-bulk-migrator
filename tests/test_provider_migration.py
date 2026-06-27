@@ -5064,6 +5064,39 @@ def test_provider_import_rejects_corrupt_staged_payload_before_append(tmp_path: 
     assert not journal.exists()
 
 
+def test_provider_rejects_invalid_delivery_metadata_before_target_contact(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["flags"] = "BAD ))"
+    row["internaldate"] = "not a date"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir)
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any("gmail-123: invalid flags metadata" in issue for issue in audit_issues)
+    assert any("gmail-123: invalid internaldate metadata" in issue for issue in audit_issues)
+    assert any("gmail-123: invalid flags metadata" in issue for issue in report["failed"])
+    assert any("gmail-123: invalid internaldate metadata" in issue for issue in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="invalid provider delivery metadata.*invalid flags metadata.*invalid internaldate metadata"):
+            provider_import_account(config, account, tmp_path)
+
+
+def test_provider_append_metadata_formatters_reject_invalid_values() -> None:
+    from components.provider_ops import _flags_for_provider_append, _internaldate_for_append
+
+    with pytest.raises(RuntimeError, match="invalid provider flags"):
+        _flags_for_provider_append("BAD ))", target_provider="imap", permanent_flags=None)
+
+    with pytest.raises(RuntimeError, match="invalid provider internaldate"):
+        _internaldate_for_append("not a date")
+
+
 @pytest.mark.parametrize(
     ("payload_action", "needle"),
     [

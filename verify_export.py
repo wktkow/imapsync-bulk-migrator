@@ -22,6 +22,7 @@ from components.provider_ops import (
     manifest_integrity_issues,
     manifest_payload_issues,
     metadata_manifest_issues,
+    provider_delivery_metadata_issues,
     provider_export_state_issues,
 )
 from components.utils import sanitize_for_path, sanitized_path_key
@@ -351,6 +352,7 @@ def verify_provider_account(account_path):
     if rows:
         errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
         errors.extend(manifest_integrity_issues(rows))
+        errors.extend(provider_delivery_metadata_issues(rows))
         errors.extend(metadata_manifest_issues(account_path, rows))
         errors.extend(manifest_payload_issues(account_path, rows))
         errors.extend(_provider_artifact_orphan_issues(account_path, rows))
