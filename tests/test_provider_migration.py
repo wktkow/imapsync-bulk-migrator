@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Iterator, List, Optional
 from unittest import mock
@@ -4590,6 +4591,33 @@ def test_provider_import_rejects_corrupt_staged_payload_before_append(tmp_path: 
 
     journal = account_dir / "import-target@icloud.com.journal.jsonl"
     assert not journal.exists()
+
+
+@pytest.mark.parametrize(
+    ("payload_action", "needle"),
+    [
+        ("missing", "missing eml_path"),
+        ("corrupt", "content_sha256 mismatch|rfc822_size mismatch"),
+    ],
+)
+def test_provider_validation_rejects_missing_or_corrupt_staged_payload(
+    tmp_path: Path,
+    payload_action: str,
+    needle: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    payload_path = account_dir / "messages" / "gmail-123.eml"
+    if payload_action == "missing":
+        payload_path.unlink()
+    else:
+        payload_path.write_bytes(b"Message-ID: <m1@example.com>\r\n\r\ncorrupted")
+
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert not report["ok"]
+    assert any(re.search(needle, issue) for issue in report["failed"])
 
 
 def test_provider_import_rejects_corrupt_payload_before_merge_probe(tmp_path: Path) -> None:

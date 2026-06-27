@@ -1209,6 +1209,30 @@ def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, r
     return issues
 
 
+def manifest_payload_issues(account_dir: Path, rows: List[Dict[str, Any]]) -> List[str]:
+    issues: List[str] = []
+    for row in rows:
+        identity = str(row.get("canonical_id") or "<missing>")
+        try:
+            eml_path = _manifest_path(account_dir, row, "eml_path")
+        except Exception as exc:
+            issues.append(f"{identity}: invalid eml_path: {exc}")
+            continue
+        if not eml_path.exists():
+            issues.append(f"{identity}: missing eml_path")
+            continue
+        try:
+            data = eml_path.read_bytes()
+        except Exception as exc:
+            issues.append(f"{identity}: failed to read eml: {exc}")
+            continue
+        try:
+            require_manifest_payload_matches(row, data)
+        except Exception as exc:
+            issues.append(str(exc))
+    return issues
+
+
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
     issues: List[str] = []
     for idx, row in enumerate(rows, 1):
@@ -3564,6 +3588,7 @@ def provider_validate_account(
     report["failed"].extend(manifest_source_provider_issues(manifest_rows, config.source.provider))
     report["failed"].extend(manifest_integrity_issues(manifest_rows))
     report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
+    report["failed"].extend(manifest_payload_issues(account_dir, manifest_rows))
     report["failed"].extend(gmail_target_decommission_issues(config.target, account))
 
     journal_issues = journal_row_issues(journal_rows, account)
