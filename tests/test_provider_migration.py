@@ -1363,6 +1363,44 @@ def test_icloud_effective_auth_defaults_to_local_part_username() -> None:
     assert auth.password == "icloud-secret"
 
 
+def test_icloud_endpoint_state_treats_local_part_and_full_address_as_same_login() -> None:
+    from components.provider_ops import (
+        provider_account_endpoint_state,
+        provider_account_endpoint_state_digest,
+        provider_export_state_contract_issues,
+    )
+
+    account = MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")
+    local_part_endpoint = ProviderEndpoint(
+        provider="icloud",
+        host="imap.mail.me.com",
+        auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+    )
+    full_address_endpoint = ProviderEndpoint(
+        provider="icloud",
+        host="imap.mail.me.com",
+        auth=AuthConfig(method="app_password", username="target@icloud.com", password="icloud-secret"),
+    )
+
+    local_state = provider_account_endpoint_state(local_part_endpoint, account, role="target")
+    full_state = provider_account_endpoint_state(full_address_endpoint, account, role="target")
+    state = {
+        "source_account": "source@example.com",
+        "target_account": "target@icloud.com",
+        "target_provider": "icloud",
+        "target_endpoint": local_state,
+        "target_endpoint_sha256": provider_account_endpoint_state_digest(local_part_endpoint, account, role="target"),
+    }
+
+    assert local_state == full_state
+    assert provider_export_state_contract_issues(
+        state,
+        account=account,
+        target_provider="icloud",
+        target_endpoint=full_address_endpoint,
+    ) == []
+
+
 def test_provider_endpoint_state_canonicalizes_gmail_username_case() -> None:
     gmail = ProviderEndpoint(provider="gmail", host="imap.gmail.com")
     generic = ProviderEndpoint(provider="imap", host="mail.example.com")

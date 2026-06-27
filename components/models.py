@@ -309,6 +309,10 @@ def auth_username_identity(endpoint: ProviderEndpoint, username: str) -> str:
         if sep and domain in {"gmail.com", "googlemail.com"}:
             return f"{local.replace('.', '')}@gmail.com"
         return identity
+    if endpoint.provider == "icloud":
+        local, sep, domain = username.partition("@")
+        if sep and domain.lower() in {"icloud.com", "me.com", "mac.com"}:
+            return local
     return username
 
 
