@@ -5129,6 +5129,52 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("u0000000001.eml: message file is a symlink" in issue for issue in issues)
 
+    def test_remote_audit_skips_symlinked_message_identity_check(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(folder, data=data, source_server=server)
+        outside = tmp_path / "outside.eml"
+        outside.write_bytes(data)
+        eml.unlink()
+        try:
+            eml.symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        class FakeRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b"1"]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[FakeRemote]:
+            yield FakeRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection), \
+            mock.patch("components.audit._remote_has_message", side_effect=AssertionError("symlink should not be checked remotely")):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any("u0000000001.eml: message file is a symlink" in issue for issue in issues)
+
     def test_legacy_import_rejects_symlinked_message_file_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

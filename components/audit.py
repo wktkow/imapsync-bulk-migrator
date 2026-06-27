@@ -394,6 +394,8 @@ def audit_account(
                     elif local_count > 0:
                         mailbox = remote_mailbox_by_path.get(folder, _folder_mailbox_name(folder_dir))
                         for eml_path in sorted(folder_dir.glob("*.eml")):
+                            if eml_path.is_symlink():
+                                continue
                             identity_candidates.append((eml_path, folder, mailbox))
                 for folder_name, rcount in remote_counts.items():
                     if rcount > 0 and not (account_dir / folder_name).exists():
