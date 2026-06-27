@@ -4738,8 +4738,8 @@ class TestRound4ConfirmedBugs:
         inbox.mkdir(parents=True)
         payload = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
         (inbox / "u0000000001.eml").write_bytes(payload)
-        (inbox / "u0000000001.json").write_text(json.dumps(_legacy_integrity_metadata(payload)))
-        (inbox / "u0000000002.json").write_text(json.dumps(_legacy_integrity_metadata(b"missing")))
+        (inbox / "u0000000001.json").write_text(json.dumps(_legacy_integrity_metadata(payload, mailbox="INBOX")))
+        (inbox / "u0000000002.json").write_text(json.dumps(_legacy_integrity_metadata(b"missing", mailbox="INBOX")))
         _write_verify_export_state(inbox.parent, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}])
         monkeypatch.chdir(tmp_path)
 
@@ -5042,6 +5042,36 @@ class TestRound6ConfirmedBugs:
 
 
 class TestRound7ConfirmedBugs:
+    def test_verify_export_rejects_missing_legacy_mailbox_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from verify_export import main, verify_account
+
+        folder = tmp_path / "exported" / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            mailbox="INBOX",
+            data=b"Message-ID: <missing-mailbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        )
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        del meta["mailbox"]
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+        monkeypatch.chdir(tmp_path)
+
+        stats = verify_account(tmp_path / "exported" / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 1
+        assert "INBOX/u0000000001.eml: missing mailbox metadata" in output
+        assert main() == 1
+
     def test_strict_audit_rejects_missing_original_mailbox_marker(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig

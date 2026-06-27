@@ -209,16 +209,19 @@ def analyze_message(
                     integrity_errors.append('invalid internaldate metadata')
                 elif not _valid_legacy_internaldate(parse_value):
                     integrity_errors.append('invalid internaldate metadata')
-        if folder_name is not None and 'mailbox' in metadata:
-            mailbox = metadata.get('mailbox')
-            if not isinstance(mailbox, str) or not mailbox.strip():
+        if folder_name is not None:
+            if 'mailbox' not in metadata:
                 integrity_errors.append('missing mailbox metadata')
-            elif sanitize_for_path(mailbox) != folder_name:
-                integrity_errors.append(f'mailbox metadata mismatch (folder={folder_name} meta={mailbox})')
-            elif mailbox_marker_mailbox is not None and mailbox != mailbox_marker_mailbox:
-                integrity_errors.append(f'mailbox metadata mismatch (marker={mailbox_marker_mailbox} meta={mailbox})')
-            elif not mailbox_marker_present and mailbox != folder_name:
-                integrity_errors.append(f'missing mailbox marker for original mailbox {mailbox}')
+            else:
+                mailbox = metadata.get('mailbox')
+                if not isinstance(mailbox, str) or not mailbox.strip():
+                    integrity_errors.append('missing mailbox metadata')
+                elif sanitize_for_path(mailbox) != folder_name:
+                    integrity_errors.append(f'mailbox metadata mismatch (folder={folder_name} meta={mailbox})')
+                elif mailbox_marker_mailbox is not None and mailbox != mailbox_marker_mailbox:
+                    integrity_errors.append(f'mailbox metadata mismatch (marker={mailbox_marker_mailbox} meta={mailbox})')
+                elif not mailbox_marker_present and mailbox != folder_name:
+                    integrity_errors.append(f'missing mailbox marker for original mailbox {mailbox}')
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
