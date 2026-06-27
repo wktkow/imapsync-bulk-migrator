@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -34,6 +35,12 @@ from .provider_ops import (
 )
 from .utils import check_environment, quote_imap_search_value, sanitize_for_path
 from .utils import check_free_space_for_path
+
+
+def _utc_log_timestamp() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 def _read_required_secret_file(path: str, *, label: str) -> str:
@@ -175,14 +182,16 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optio
 
 def setup_logging(log_directory: Path) -> Path:
     """Initialize root logger with file + stdout handlers and return log path."""
+    if log_directory.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
     log_directory.mkdir(parents=True, exist_ok=True)
-    from datetime import datetime, timezone
+    if log_directory.is_symlink():
+        raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
     import logging
     import sys
     import time
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_file = log_directory / f"run-{timestamp}.log"
+    timestamp = _utc_log_timestamp()
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -195,7 +204,26 @@ def setup_logging(log_directory: Path) -> Path:
     )
     formatter.converter = time.gmtime
 
-    log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    log_file: Optional[Path] = None
+    log_fd: Optional[int] = None
+    for attempt in range(100):
+        suffix = "" if attempt == 0 else f"-{attempt}"
+        candidate = log_directory / f"run-{timestamp}{suffix}.log"
+        try:
+            log_fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EMLINK} or candidate.is_symlink():
+                raise RuntimeError(f"refusing to use symlinked log file: {candidate}") from exc
+            raise
+        log_file = candidate
+        break
+    if log_file is None or log_fd is None:
+        raise RuntimeError(f"could not create a unique log file in {log_directory}")
     os.fchmod(log_fd, 0o600)
     fh = logging.StreamHandler(os.fdopen(log_fd, "a", encoding="utf-8"))
     fh.setFormatter(formatter)

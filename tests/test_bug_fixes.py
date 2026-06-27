@@ -1568,6 +1568,32 @@ class TestCliAndConfigHardening:
 
         assert log_file.stat().st_mode & 0o777 == 0o600
 
+    def test_setup_logging_does_not_follow_symlinked_log_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components.main import setup_logging
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        victim = tmp_path / "victim.txt"
+        victim.write_text("outside\n", encoding="utf-8")
+        victim.chmod(0o644)
+        symlink = log_dir / "run-20240101-000000.log"
+        try:
+            symlink.symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        monkeypatch.setattr("components.main._utc_log_timestamp", lambda: "20240101-000000")
+
+        log_file = setup_logging(log_dir)
+
+        assert log_file.name == "run-20240101-000000-1.log"
+        assert not log_file.is_symlink()
+        assert victim.read_text(encoding="utf-8") == "outside\n"
+        assert victim.stat().st_mode & 0o777 == 0o644
+
     def test_setup_logging_uses_utc_timestamps_for_z_suffix(self, tmp_path: Path) -> None:
         import logging
         import time
