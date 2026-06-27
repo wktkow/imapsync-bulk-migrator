@@ -138,7 +138,7 @@ def test_provider_atomic_json_refuses_preexisting_temp_symlink(tmp_path: Path) -
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
 
 
-def test_provider_atomic_json_allows_symlinked_ancestor_with_real_account_dir(tmp_path: Path) -> None:
+def test_provider_atomic_json_rejects_symlinked_ancestor(tmp_path: Path) -> None:
     real_root = tmp_path / "real-root"
     real_root.mkdir()
     linked_root = tmp_path / "linked-root"
@@ -148,10 +148,10 @@ def test_provider_atomic_json_allows_symlinked_ancestor_with_real_account_dir(tm
         pytest.skip(f"symlink creation unavailable: {exc}")
     account_dir = linked_root / "source@example.com"
 
-    _atomic_json(account_dir / "export-state.json", {"complete": False})
+    with pytest.raises(RuntimeError, match="symlinked provider directory"):
+        _atomic_json(account_dir / "export-state.json", {"complete": False})
 
-    assert not account_dir.is_symlink()
-    assert (real_root / "source@example.com" / "export-state.json").exists()
+    assert not (real_root / "source@example.com" / "export-state.json").exists()
 
 
 def test_provider_append_journal_rejects_symlinked_journal(tmp_path: Path) -> None:
@@ -254,6 +254,34 @@ def test_provider_audit_and_validate_reject_symlinked_input_root(tmp_path: Path)
     assert any("symlinked provider validate root" in issue for issue in report["failed"])
     assert not validate_ok
     assert any("symlinked provider validate root" in issue for issue in validate_all_issues)
+
+
+def test_provider_rejects_symlinked_input_root_ancestor_before_target_contact(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    outside_root = tmp_path / "outside"
+    staged_root = outside_root / "staged"
+    _write_manifest_fixture(staged_root)
+    link_root = tmp_path / "link"
+    try:
+        link_root.symlink_to(outside_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    in_root = link_root / "staged"
+    assert not in_root.is_symlink()
+
+    audit_ok, audit_issues = provider_audit_all(config, in_root, max_workers=1)
+    _name, report = provider_validate_account(config, account, in_root, check_target=True)
+    validate_ok, validate_issues = provider_validate_all(config, in_root, max_workers=1)
+
+    assert not audit_ok
+    assert any("symlinked provider audit root" in issue for issue in audit_issues)
+    assert any("symlinked provider validate root" in issue for issue in report["failed"])
+    assert not validate_ok
+    assert any("symlinked provider validate root" in issue for issue in validate_issues)
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider import root"):
+            provider_import_account(config, account, in_root)
 
 
 @pytest.mark.parametrize(
@@ -8736,6 +8764,38 @@ def test_main_rejects_provider_symlinked_input_root_before_connectivity(
             "--config", str(config_path),
             "--input-dir", str(in_root),
             "--log-dir", str(tmp_path / f"logs-{mode}"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 2
+
+
+@pytest.mark.parametrize("mode", ["import", "validate"])
+def test_main_rejects_provider_symlinked_input_root_ancestor_before_connectivity(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    outside = tmp_path / "outside-input"
+    (outside / "staged").mkdir(parents=True)
+    link_root = tmp_path / "link"
+    try:
+        link_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    in_root = link_root / "staged"
+    assert not in_root.is_symlink()
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")):
+        rc = main([
+            "--mode", mode,
+            "--config", str(config_path),
+            "--input-dir", str(in_root),
+            "--log-dir", str(tmp_path / f"logs-ancestor-{mode}"),
             "--min-free-gb", "0",
             "--max-workers", "1",
         ])

@@ -32,6 +32,7 @@ from .provider_ops import (
     provider_preflight,
     provider_test_accounts,
     provider_validate_all,
+    _raise_if_provider_path_symlink,
 )
 from .utils import check_environment, quote_imap_search_value, sanitize_for_path, sanitized_path_key
 from .utils import check_free_space_for_path
@@ -430,7 +431,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
     if args.mode in {"import", "validate", "audit"} and not panel_dry_run_requested:
         input_root = Path(args.input_dir)
-        if input_root.is_symlink():
+        if is_provider_config:
+            try:
+                _raise_if_provider_path_symlink(input_root, f"{args.mode} root")
+            except RuntimeError as exc:
+                logging.error("%s", exc)
+                return 2
+        elif input_root.is_symlink():
             logging.error("Input directory is a symlink: %s", input_root)
             return 2
         if not input_root.exists():

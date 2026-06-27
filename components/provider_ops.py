@@ -112,8 +112,20 @@ def ensure_private_dir(path: Path) -> None:
 
 
 def _raise_if_provider_path_symlink(path: Path, label: str) -> None:
-    if path.is_symlink():
+    if _provider_symlink_component(path) is not None:
         raise RuntimeError(f"refusing to use symlinked provider {label}: {path}")
+
+
+def _provider_symlink_component(path: Path) -> Optional[Path]:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            return current
+        if not current.exists():
+            break
+    return None
 
 
 def _json_values_match(left: Any, right: Any) -> bool:
@@ -3946,11 +3958,15 @@ def _journal_row(
 
 def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAccount, in_root: Path) -> Tuple[str, List[str]]:
     issues: List[str] = []
-    if in_root.is_symlink():
-        return account.email, [f"refusing to use symlinked provider audit root: {in_root}"]
+    try:
+        _raise_if_provider_path_symlink(in_root, "audit root")
+    except RuntimeError as exc:
+        return account.email, [str(exc)]
     account_dir = account_export_dir(in_root, account)
-    if account_dir.is_symlink():
-        return account.email, [f"refusing to use symlinked provider account directory: {account_dir}"]
+    try:
+        _raise_if_provider_path_symlink(account_dir, "account directory")
+    except RuntimeError as exc:
+        return account.email, [str(exc)]
     if not account_dir.exists():
         return account.email, [f"account export directory missing: {account_dir}"]
     try:
@@ -4052,7 +4068,7 @@ def provider_merge_group_identity_collision_issues(config: ProviderMigrationConf
         target_label = group_accounts[0].target_email
         for account in group_accounts:
             account_dir = account_export_dir(in_root, account)
-            if account_dir.is_symlink() or not account_dir.exists():
+            if _provider_symlink_component(account_dir) is not None or not account_dir.exists():
                 continue
             try:
                 manifest_rows = load_manifest(account_dir)
@@ -4075,8 +4091,10 @@ def provider_merge_group_identity_collision_issues(config: ProviderMigrationConf
 
 def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
-    if in_root.is_symlink():
-        return False, [f"refusing to use symlinked provider audit root: {in_root}"]
+    try:
+        _raise_if_provider_path_symlink(in_root, "audit root")
+    except RuntimeError as exc:
+        return False, [str(exc)]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> List[str]:
@@ -4111,13 +4129,13 @@ def provider_validate_account(
         "exported": 0,
         "ok": False,
     }
-    if in_root.is_symlink():
-        report["failed"].append(f"refusing to use symlinked provider validate root: {in_root}")
+    try:
+        _raise_if_provider_path_symlink(in_root, "validate root")
+    except RuntimeError as exc:
+        report["failed"].append(str(exc))
         return account.email, report
     try:
-        if account_dir.is_symlink():
-            report["failed"].append(f"refusing to use symlinked provider account directory: {account_dir}")
-            return account.email, report
+        _raise_if_provider_path_symlink(account_dir, "account directory")
         journal_rows = load_import_journal(account_dir, account)
         manifest_rows = load_manifest(account_dir)
     except Exception as exc:
@@ -4472,8 +4490,10 @@ def provider_validate_account(
 
 def provider_validate_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
-    if in_root.is_symlink():
-        return False, [f"refusing to use symlinked provider validate root: {in_root}"]
+    try:
+        _raise_if_provider_path_symlink(in_root, "validate root")
+    except RuntimeError as exc:
+        return False, [str(exc)]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> Dict[str, Any]:
