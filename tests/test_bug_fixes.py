@@ -7384,6 +7384,39 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("u0000000001.eml: message file is a symlink" in issue for issue in issues)
 
+    def test_remote_audit_rejects_symlinked_mailbox_marker_without_following_or_connecting(self, tmp_path: Path) -> None:
+        from components.audit import _folder_mailbox_name, audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+            source_server=server,
+        )
+        outside_marker = tmp_path / "outside-marker.json"
+        outside_marker.write_text(json.dumps({"mailbox": "OUTSIDE_FROM_SYMLINK", "message_count": 1}))
+        try:
+            (folder / ".mailbox.json").symlink_to(outside_marker)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        assert _folder_mailbox_name(folder) == "INBOX"
+
+        with mock.patch("components.audit.imap_connection", side_effect=AssertionError("remote audit should not run")):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any("INBOX: mailbox marker is a symlink" in issue for issue in issues)
+        assert not any("OUTSIDE_FROM_SYMLINK" in issue for issue in issues)
+
     def test_legacy_import_rejects_symlinked_message_file_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

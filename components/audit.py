@@ -69,6 +69,8 @@ def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set
 
 def _folder_mailbox_name(folder_dir: Path) -> str:
     marker_path = folder_dir / ".mailbox.json"
+    if marker_path.is_symlink():
+        return folder_dir.name
     if not marker_path.exists():
         return folder_dir.name
     with contextlib.suppress(Exception):
@@ -228,6 +230,7 @@ def audit_account(
 ) -> Tuple[str, List[str]]:
     """Audit a single account directory and optionally compare to remote counts."""
     issues: List[str] = []
+    remote_safe = True
     account_dir = in_root / sanitize_for_path(account.email)
     if account_dir.is_symlink():
         issues.append(f"{account.email}: account directory is a symlink: {account_dir}")
@@ -239,6 +242,7 @@ def audit_account(
     for child in account_dir.iterdir():
         if child.is_symlink():
             issues.append(f"{account.email}:{child.name}: mailbox path is a symlink")
+            remote_safe = False
             continue
         if child.is_dir():
             folder_dirs.append(child)
@@ -264,6 +268,7 @@ def audit_account(
             issues.append(f"{account.email}:{folder}: no .eml files found")
         if mailbox_marker.is_symlink():
             issues.append(f"{account.email}:{folder}: mailbox marker is a symlink")
+            remote_safe = False
         elif mailbox_marker.exists():
             try:
                 marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
@@ -292,8 +297,11 @@ def audit_account(
         symlink_jsons = {p for p in jsons if p.is_symlink()}
         for json_path in sorted(symlink_jsons):
             issues.append(f"{account.email}:{folder}:{json_path.name}: message metadata is a symlink")
+            remote_safe = False
         for eml_path in emls:
             eml_is_symlink = eml_path.is_symlink()
+            if eml_is_symlink:
+                remote_safe = False
             issues.extend(_audit_eml_file(eml_path, folder))
             stem = eml_path.stem
             meta_path = eml_path.with_suffix(".json")
@@ -384,7 +392,7 @@ def audit_account(
                             )
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: failed integrity read: {exc}")
-    if check_remote and server is not None:
+    if check_remote and server is not None and remote_safe:
         try:
             with imap_connection(server, account) as imap:
                 remote_mailboxes = list_all_mailboxes(imap)
