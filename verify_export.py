@@ -24,7 +24,7 @@ from components.provider_ops import (
     metadata_manifest_issues,
     provider_export_state_issues,
 )
-from components.utils import sanitize_for_path
+from components.utils import sanitize_for_path, sanitized_path_key
 
 
 def _has_later_rfc822_header_block(msg_text):
@@ -291,7 +291,7 @@ def analyze_export_state(account_path, folder_counts):
         issues.append("export-state mailboxes is not a list")
         return issues
 
-    seen_paths = set()
+    seen_paths = {}
     state_paths = set()
     for idx, entry in enumerate(mailboxes, 1):
         if not isinstance(entry, dict):
@@ -306,10 +306,12 @@ def analyze_export_state(account_path, folder_counts):
         if not isinstance(path, str) or not path.strip():
             issues.append(f"export-state mailbox {label!r} missing path")
             continue
-        if path in seen_paths:
-            issues.append(f"export-state mailbox path collision: {path}")
+        path_key = sanitized_path_key(path)
+        previous_path = seen_paths.get(path_key)
+        if previous_path is not None:
+            issues.append(f"export-state mailbox path collision: {previous_path} and {path}")
             continue
-        seen_paths.add(path)
+        seen_paths[path_key] = path
         state_paths.add(path)
         if isinstance(mailbox, str) and mailbox.strip() and sanitize_for_path(mailbox) != path:
             issues.append(f"export-state mailbox {mailbox!r} path mismatch (path={path})")

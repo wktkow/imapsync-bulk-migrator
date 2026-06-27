@@ -4294,6 +4294,19 @@ class TestRound3ConfirmedBugs:
         assert not ok
         assert any("export-state mailbox path collision" in issue for issue in issues)
 
+    def test_verify_export_rejects_casefold_export_state_path_collision(self, tmp_path: Path) -> None:
+        from verify_export import analyze_export_state
+
+        account_dir = tmp_path / "user@example.com"
+        _write_verify_export_state(account_dir, [
+            {"mailbox": "Folder", "path": "Folder", "message_count": 0},
+            {"mailbox": "folder", "path": "folder", "message_count": 0},
+        ])
+
+        issues = analyze_export_state(account_dir, {"Folder": 0, "folder": 0})
+
+        assert any("export-state mailbox path collision: Folder and folder" in issue for issue in issues)
+
     def test_strict_audit_rejects_content_binding_mismatch(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account
