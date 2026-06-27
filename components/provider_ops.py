@@ -1606,6 +1606,11 @@ def _existing_record_for_rescan(row: Dict[str, Any]) -> Dict[str, Any]:
     return record
 
 
+def _refresh_export_delivery_metadata(record: Dict[str, Any], parsed: Dict[str, Any]) -> None:
+    record["flags"] = parsed.get("flags") or ""
+    record["internaldate"] = parsed.get("internaldate") or ""
+
+
 def provider_export_account(
     config: ProviderMigrationConfig,
     account: MigrationAccount,
@@ -1787,6 +1792,7 @@ def provider_export_account(
                                     exc,
                                 )
                             else:
+                                _refresh_export_delivery_metadata(messages[identity_hint], pre_parsed)
                                 update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
                                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
                                 continue
@@ -1874,8 +1880,7 @@ def provider_export_account(
                     record["message_id_header"] = message_id
                     record["content_sha256"] = sha256
                     record["rfc822_size"] = int(parsed.get("rfc822_size") or len(msg_bytes))
-                    record.setdefault("flags", parsed.get("flags") or "")
-                    record.setdefault("internaldate", parsed.get("internaldate") or "")
+                    _refresh_export_delivery_metadata(record, parsed)
                     record.setdefault("exported_at", _utc_now())
                 record = messages[identity]
                 update_membership(identity, mailbox, uid, uidvalidity, parsed)

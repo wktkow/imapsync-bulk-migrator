@@ -1962,6 +1962,54 @@ def test_provider_export_resume_rewrites_corrupt_existing_payload(tmp_path: Path
     assert updated_row["content_sha256"] == hashlib.sha256(original_payload).hexdigest()
 
 
+class FakeSourceChangedMetadataNoBody(FakeSourceImap):
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = args[-1]
+            labels = b"(\\Inbox \"Project A\")" if self.selected == "INBOX" else b"(\"Project A\")"
+            meta = (
+                b'1 (UID 1 RFC822.SIZE 36 FLAGS (\\Answered) INTERNALDATE "02-Jan-2024 03:04:05 +0000" '
+                b"X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS " + labels + b")"
+            )
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            raise AssertionError("resume with a valid payload should not fetch the body")
+        raise AssertionError(command)
+
+
+def test_provider_export_resume_refreshes_delivery_metadata_without_body_fetch(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    first_fake = FakeSourceImap()
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield first_fake
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    initial_row = json.loads((account_dir / "manifest.jsonl").read_text())
+    assert initial_row["flags"] == "\\Seen"
+    assert initial_row["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    second_fake = FakeSourceChangedMetadataNoBody()
+
+    @contextlib.contextmanager
+    def second_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield second_fake
+
+    with mock.patch("components.provider_ops.imap_connection", second_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    updated_row = json.loads((account_dir / "manifest.jsonl").read_text())
+    assert updated_row["flags"] == "\\Answered"
+    assert updated_row["internaldate"] == "02-Jan-2024 03:04:05 +0000"
+    assert updated_row[CONTENT_BINDING_FIELD] == provider_content_binding_sha256(updated_row)
+
+
 @pytest.mark.parametrize(
     ("fake_cls", "needle"),
     [
