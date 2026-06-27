@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from .content_binding import CONTENT_BINDING_FIELD, provider_content_binding_issue, provider_content_binding_sha256
 from .executor import parallel_process_accounts
-from .imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate
+from .imap_ops import _imap_append_wire_bytes, _valid_legacy_flag_token, _valid_legacy_internaldate
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
 from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
 
@@ -1289,6 +1289,37 @@ def require_manifest_payload_matches(row: Dict[str, Any], data: bytes) -> None:
         raise RuntimeError(f"{identity}: {binding_issue}")
 
 
+def provider_payload_content_identities(data: bytes) -> set[Tuple[int, str]]:
+    identities: set[Tuple[int, str]] = set()
+    for payload in (data, _imap_append_wire_bytes(data)):
+        identities.add((len(payload), hashlib.sha256(payload).hexdigest()))
+    return identities
+
+
+def manifest_payload_content_identities(account_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, set[Tuple[int, str]]]:
+    identities_by_id: Dict[str, set[Tuple[int, str]]] = {}
+    for row in rows:
+        identity = str(row.get("canonical_id") or "")
+        if not identity:
+            continue
+        try:
+            data = _manifest_path(account_dir, row, "eml_path").read_bytes()
+            require_manifest_payload_matches(row, data)
+        except Exception:
+            continue
+        identities_by_id[identity] = provider_payload_content_identities(data)
+    return identities_by_id
+
+
+def merge_group_payload_content_identities(
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+) -> Dict[str, set[Tuple[int, str]]]:
+    identities_by_id: Dict[str, set[Tuple[int, str]]] = {}
+    for _group_account, account_dir, manifest_rows, _journal_rows in stages:
+        identities_by_id.update(manifest_payload_content_identities(account_dir, manifest_rows))
+    return identities_by_id
+
+
 def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, require_present: bool = True) -> List[str]:
     issues: List[str] = []
     for row in rows:
@@ -1605,6 +1636,7 @@ def repair_missing_journal_target_gmail_msgids(
     manifest_rows: List[Dict[str, Any]],
     target_mailbox_by_identity: Dict[str, str],
     target_binding: Dict[str, Any],
+    expected_content_identities_by_id: Optional[Dict[str, set[Tuple[int, str]]]] = None,
 ) -> List[Dict[str, Any]]:
     manifest_by_id = {
         str(row.get("canonical_id") or ""): row
@@ -1625,7 +1657,17 @@ def repair_missing_journal_target_gmail_msgids(
             continue
         manifest_row = manifest_by_id[identity]
         matches: Dict[str, bytes] = {}
-        for num in target_matching_message_nums(imap, target_mailbox, manifest_row, create_if_missing=False):
+        for num in target_matching_message_nums(
+            imap,
+            target_mailbox,
+            manifest_row,
+            create_if_missing=False,
+            expected_content_identities=(
+                expected_content_identities_by_id.get(identity)
+                if expected_content_identities_by_id
+                else None
+            ),
+        ):
             gmail_msgid = _target_gmail_msgid(imap, num)
             if gmail_msgid:
                 matches.setdefault(gmail_msgid, num)
@@ -2703,7 +2745,39 @@ def restore_gmail_starred_flag(imap: imaplib.IMAP4, target_mailbox: str, row: Di
         raise RuntimeError(f"failed to restore Gmail starred flag for {row.get('canonical_id')}: {response}")
 
 
-def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> List[bytes]:
+def _expected_content_identities(
+    manifest_row: Dict[str, Any],
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+) -> set[Tuple[int, str]]:
+    identities: set[Tuple[int, str]] = set()
+    for size, digest in expected_content_identities or ():
+        try:
+            size_int = int(size)
+        except (TypeError, ValueError):
+            continue
+        digest_text = str(digest or "").lower()
+        if size_int >= 0 and re.fullmatch(r"[0-9a-f]{64}", digest_text):
+            identities.add((size_int, digest_text))
+    if identities:
+        return identities
+    try:
+        expected_size = int(manifest_row.get("rfc822_size") or 0)
+    except (TypeError, ValueError):
+        expected_size = 0
+    expected_hash = str(manifest_row.get("content_sha256") or "").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        identities.add((expected_size, expected_hash))
+    return identities
+
+
+def target_matching_message_nums(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    *,
+    create_if_missing: bool = True,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+) -> List[bytes]:
     message_id = str(manifest_row.get("message_id_header") or "").strip()
     if create_if_missing:
         ensure_mailbox(imap, mailbox)
@@ -2716,8 +2790,14 @@ def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row
         status, data = imap.search(None, "ALL")
     if status != "OK" or not data or not data[0]:
         return []
-    expected_size = int(manifest_row.get("rfc822_size") or 0)
+    try:
+        expected_size = int(manifest_row.get("rfc822_size") or 0)
+    except (TypeError, ValueError):
+        expected_size = 0
     expected_hash = str(manifest_row.get("content_sha256") or "").lower()
+    content_identities = _expected_content_identities(manifest_row, expected_content_identities)
+    if expected_hash and not content_identities:
+        return []
     if expected_size <= 0 and not expected_hash and message_id:
         return list(data[0].split())
     matches: List[bytes] = []
@@ -2730,10 +2810,24 @@ def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row
             if not isinstance(raw, (bytes, bytearray)):
                 continue
             match = re.search(rb"RFC822\.SIZE\s+(\d+)", bytes(raw), flags=re.IGNORECASE)
-            if expected_size > 0 and match and int(match.group(1)) != expected_size:
+            if content_identities:
+                if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
+                    body = bytes(part[1])
+                    if (len(body), hashlib.sha256(body).hexdigest()) in content_identities:
+                        matches.append(num)
+                        break
                 continue
+            if expected_size > 0:
+                body_size = (
+                    len(part[1])
+                    if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))
+                    else None
+                )
+                if body_size != expected_size and (not match or int(match.group(1)) != expected_size):
+                    continue
             if expected_hash and isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
-                if hashlib.sha256(bytes(part[1])).hexdigest() == expected_hash:
+                body = bytes(part[1])
+                if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
                     matches.append(num)
                     break
                 continue
@@ -2743,8 +2837,23 @@ def target_matching_message_nums(imap: imaplib.IMAP4, mailbox: str, manifest_row
     return matches
 
 
-def target_has_message(imap: imaplib.IMAP4, mailbox: str, manifest_row: Dict[str, Any], *, create_if_missing: bool = True) -> bool:
-    return bool(target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing))
+def target_has_message(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    manifest_row: Dict[str, Any],
+    *,
+    create_if_missing: bool = True,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+) -> bool:
+    return bool(
+        target_matching_message_nums(
+            imap,
+            mailbox,
+            manifest_row,
+            create_if_missing=create_if_missing,
+            expected_content_identities=expected_content_identities,
+        )
+    )
 
 
 def _target_gmail_msgid(imap: imaplib.IMAP4, num: bytes) -> str:
@@ -2766,10 +2875,17 @@ def consume_target_match_num(
     *,
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[bytes]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
-    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+    for num in target_matching_message_nums(
+        imap,
+        mailbox,
+        manifest_row,
+        create_if_missing=create_if_missing,
+        expected_content_identities=expected_content_identities,
+    ):
         if num not in used:
             if used_gmail_msgids is not None:
                 gmail_msgid = _target_gmail_msgid(imap, num)
@@ -2791,12 +2907,19 @@ def consume_target_gmail_msgid_match_num(
     *,
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[bytes]:
     if not target_gmail_msgid:
         return None
     mailbox_key = _target_mailbox_lookup_key(mailbox, "gmail")
     used = used_by_mailbox.setdefault(mailbox_key, set())
-    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+    for num in target_matching_message_nums(
+        imap,
+        mailbox,
+        manifest_row,
+        create_if_missing=create_if_missing,
+        expected_content_identities=expected_content_identities,
+    ):
         if num in used:
             continue
         gmail_msgid = _target_gmail_msgid(imap, num)
@@ -2819,11 +2942,18 @@ def consume_target_gmail_match_in_mailboxes(
     *,
     target_gmail_msgid: str = "",
     used_gmail_msgids: Optional[set[str]] = None,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[Tuple[str, bytes, str]]:
     for mailbox in mailboxes:
         mailbox_key = _target_mailbox_lookup_key(mailbox, "gmail")
         used = used_by_mailbox.setdefault(mailbox_key, set())
-        for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=False):
+        for num in target_matching_message_nums(
+            imap,
+            mailbox,
+            manifest_row,
+            create_if_missing=False,
+            expected_content_identities=expected_content_identities,
+        ):
             if num in used:
                 continue
             gmail_msgid = _target_gmail_msgid(imap, num)
@@ -2847,6 +2977,7 @@ def consume_target_match(
     *,
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> bool:
     return consume_target_match_num(
         imap,
@@ -2855,6 +2986,7 @@ def consume_target_match(
         used_by_mailbox,
         create_if_missing=create_if_missing,
         used_gmail_msgids=used_gmail_msgids,
+        expected_content_identities=expected_content_identities,
     ) is not None
 
 
@@ -2882,10 +3014,17 @@ def consume_target_match_with_gmail_state(
     *,
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[Tuple[set[str], set[str]]]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
-    for num in target_matching_message_nums(imap, mailbox, manifest_row, create_if_missing=create_if_missing):
+    for num in target_matching_message_nums(
+        imap,
+        mailbox,
+        manifest_row,
+        create_if_missing=create_if_missing,
+        expected_content_identities=expected_content_identities,
+    ):
         if num in used:
             continue
         if used_gmail_msgids is not None:
@@ -2933,11 +3072,19 @@ def matching_gmail_msgids_for_row(
     imap: imaplib.IMAP4,
     row: Dict[str, Any],
     mailboxes: List[str],
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> set[str]:
     gmail_msgids: set[str] = set()
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
-        for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
+        for num in target_matching_message_nums(
+            imap,
+            mailbox,
+            row,
+            create_if_missing=False,
+            expected_content_identities=expected_content_identities,
+        ):
             used = used_by_mailbox.setdefault(_target_mailbox_lookup_key(mailbox, "gmail"), set())
             if num in used:
                 continue
@@ -2953,8 +3100,16 @@ def target_gmail_labels_for_msgid(
     row: Dict[str, Any],
     mailboxes: List[str],
     target_gmail_msgid: str,
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[set[str]]:
-    result = target_gmail_labels_and_flags_for_msgid(imap, row, mailboxes, target_gmail_msgid)
+    result = target_gmail_labels_and_flags_for_msgid(
+        imap,
+        row,
+        mailboxes,
+        target_gmail_msgid,
+        expected_content_identities=expected_content_identities,
+    )
     if result is None:
         return None
     labels, _flags = result
@@ -2966,10 +3121,18 @@ def target_gmail_labels_and_flags_for_msgid(
     row: Dict[str, Any],
     mailboxes: List[str],
     target_gmail_msgid: str,
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[Tuple[set[str], set[str]]]:
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
-        for num in target_matching_message_nums(imap, mailbox, row, create_if_missing=False):
+        for num in target_matching_message_nums(
+            imap,
+            mailbox,
+            row,
+            create_if_missing=False,
+            expected_content_identities=expected_content_identities,
+        ):
             used = used_by_mailbox.setdefault(_target_mailbox_lookup_key(mailbox, "gmail"), set())
             if num in used:
                 continue
@@ -3026,6 +3189,7 @@ def enforce_empty_target(
     *,
     target_provider: str = "imap",
     gmail_journal_msgids: Optional[Dict[Tuple[str, str], str]] = None,
+    expected_content_identities_by_id: Optional[Dict[str, set[Tuple[int, str]]]] = None,
 ) -> None:
     target_provider = (target_provider or "imap").lower()
     permitted_by_mailbox: Dict[str, List[Tuple[Dict[str, Any], Tuple[str, str]]]] = {}
@@ -3077,6 +3241,12 @@ def enforce_empty_target(
         used: Dict[str, set[bytes]] = {}
         mailbox_key = _target_mailbox_lookup_key(mailbox.name, target_provider)
         for permitted_row, journal_key in permitted_by_mailbox.get(mailbox_key, []):
+            identity = str(permitted_row.get("canonical_id") or "")
+            expected_content_identities = (
+                expected_content_identities_by_id.get(identity)
+                if expected_content_identities_by_id and identity
+                else None
+            )
             target_gmail_msgid = gmail_journal_msgids.get(journal_key, "") if target_provider == "gmail" else ""
             if target_gmail_msgid:
                 matched = consume_target_gmail_msgid_match_num(
@@ -3086,11 +3256,19 @@ def enforce_empty_target(
                     target_gmail_msgid,
                     used,
                     create_if_missing=False,
+                    expected_content_identities=expected_content_identities,
                 )
                 if matched is not None:
                     verified += 1
                 continue
-            if consume_target_match(imap, mailbox.name, permitted_row, used, create_if_missing=False):
+            if consume_target_match(
+                imap,
+                mailbox.name,
+                permitted_row,
+                used,
+                create_if_missing=False,
+                expected_content_identities=expected_content_identities,
+            ):
                 verified += 1
         if count > verified:
             raise RuntimeError(
@@ -3329,6 +3507,7 @@ def provider_import_account(
     if metadata_issues:
         raise RuntimeError("metadata does not match manifest: " + "; ".join(metadata_issues))
     payloads_by_identity: Dict[str, bytes] = {}
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]] = {}
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
         eml_path = _manifest_path(account_dir, row, "eml_path")
@@ -3337,6 +3516,7 @@ def provider_import_account(
         data = eml_path.read_bytes()
         require_manifest_payload_matches(row, data)
         payloads_by_identity[identity] = data
+        expected_content_identities_by_id[identity] = provider_payload_content_identities(data)
     journal_rows = load_import_journal(account_dir, account, repair_trailing=True)
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
@@ -3390,6 +3570,9 @@ def provider_import_account(
                 target_mailboxes,
                 target_provider=config.target.provider,
             )
+        merge_group_expected_content_identities_by_id = expected_content_identities_by_id
+        if merge_group_stages is not None:
+            merge_group_expected_content_identities_by_id = merge_group_payload_content_identities(merge_group_stages)
         target_mailbox_by_identity = translated_target_mailboxes_for_rows(
             manifest_rows,
             target_mailboxes,
@@ -3416,6 +3599,7 @@ def provider_import_account(
                 manifest_rows,
                 target_mailbox_by_identity,
                 target_binding,
+                expected_content_identities_by_id,
             )
             repaired_journal_issues = []
             repaired_journal_issues.extend(
@@ -3455,6 +3639,7 @@ def provider_import_account(
                 empty_target_journaled,
                 target_provider=config.target.provider,
                 gmail_journal_msgids=empty_target_gmail_msgids,
+                expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
             )
         for row in sorted(manifest_rows, key=lambda item: str(item.get("canonical_id", ""))):
             _raise_if_stopped(stop_event, f"provider import {account.target_email}")
@@ -3470,6 +3655,7 @@ def provider_import_account(
                 target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = (identity, target_mailbox)
             data = payloads_by_identity[identity]
+            expected_content_identities = expected_content_identities_by_id.get(identity)
             if key in committed:
                 journal_target_gmail_msgid = str(latest_committed.get(key, {}).get("target_gmail_msgid") or "")
                 committed_mailbox = target_mailbox
@@ -3481,6 +3667,7 @@ def provider_import_account(
                         used_target_nums,
                         target_gmail_msgid=journal_target_gmail_msgid,
                         used_gmail_msgids=used_target_gmail_msgids,
+                        expected_content_identities=expected_content_identities,
                     )
                     if committed_match is None:
                         committed_num = None
@@ -3494,6 +3681,7 @@ def provider_import_account(
                         used_target_nums,
                         create_if_missing=False,
                         used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+                        expected_content_identities=expected_content_identities,
                     )
                 if committed_num is None and config.target.provider == "gmail" and journal_target_gmail_msgid:
                     raise RuntimeError(
@@ -3537,6 +3725,7 @@ def provider_import_account(
                         row,
                         used_target_nums,
                         used_gmail_msgids=used_target_gmail_msgids,
+                        expected_content_identities=expected_content_identities,
                     )
                     if matched is not None:
                         matched_mailbox, matched_num, matched_gmail_msgid = matched
@@ -3546,6 +3735,7 @@ def provider_import_account(
                         target_mailbox,
                         row,
                         used_target_nums,
+                        expected_content_identities=expected_content_identities,
                     )
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
@@ -3611,6 +3801,7 @@ def provider_import_account(
                 used_target_nums,
                 create_if_missing=False,
                 used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
+                expected_content_identities=expected_content_identities,
             )
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
@@ -3906,6 +4097,7 @@ def provider_validate_account(
 
     by_id = {str(row.get("canonical_id")): row for row in manifest_rows if row.get("canonical_id")}
     manifest_ids = set(by_id)
+    expected_content_identities_by_id = manifest_payload_content_identities(account_dir, manifest_rows)
     journal_gmail_msgid_missing = (
         missing_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids)
         if config.target.provider == "gmail"
@@ -3991,6 +4183,9 @@ def provider_validate_account(
                         target_mailboxes,
                         target_provider=config.target.provider,
                     )
+                merge_group_expected_content_identities_by_id = expected_content_identities_by_id
+                if merge_group_stages is not None:
+                    merge_group_expected_content_identities_by_id = merge_group_payload_content_identities(merge_group_stages)
                 target_mailbox_by_identity = translated_target_mailboxes_for_rows(
                     manifest_rows,
                     target_mailboxes,
@@ -4033,6 +4228,7 @@ def provider_validate_account(
                             empty_target_journaled,
                             target_provider=config.target.provider,
                             gmail_journal_msgids=empty_target_gmail_msgids,
+                            expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
                         )
                     except Exception as exc:
                         report["failed"].append(f"remote target validation failed: {exc}")
@@ -4054,6 +4250,7 @@ def provider_validate_account(
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
                             continue
+                        expected_content_identities = expected_content_identities_by_id.get(identity)
                         report["remote_checked"] += 1
                         if config.target.provider == "gmail":
                             expected_mailboxes = gmail_expected_target_mailboxes_for_row(
@@ -4061,7 +4258,12 @@ def provider_validate_account(
                                 target_mailbox,
                                 target_mailboxes,
                             )
-                            matching_gmail_msgids = matching_gmail_msgids_for_row(imap, row, expected_mailboxes)
+                            matching_gmail_msgids = matching_gmail_msgids_for_row(
+                                imap,
+                                row,
+                                expected_mailboxes,
+                                expected_content_identities=expected_content_identities,
+                            )
                             journal_target_gmail_msgid = target_gmail_msgid_by_id.get(identity, "")
                             primary_actual_labels: Optional[set[str]] = None
                             primary_actual_flags: Optional[set[str]] = None
@@ -4074,6 +4276,7 @@ def provider_validate_account(
                                     row,
                                     [target_mailbox],
                                     journal_target_gmail_msgid,
+                                    expected_content_identities=expected_content_identities,
                                 )
                                 if primary_actual_state is None:
                                     report["remote_missing"].append(identity)
@@ -4101,6 +4304,7 @@ def provider_validate_account(
                                     used_target_nums,
                                     create_if_missing=False,
                                     used_gmail_msgids=used_target_gmail_msgids,
+                                    expected_content_identities=expected_content_identities,
                                 )
                                 actual_labels = actual_state[0] if actual_state is not None else None
                                 actual_flags = actual_state[1] if actual_state is not None else None
@@ -4141,6 +4345,7 @@ def provider_validate_account(
                                 row,
                                 used_target_nums,
                                 create_if_missing=False,
+                                expected_content_identities=expected_content_identities,
                             )
                             if target_num is None:
                                 report["remote_missing"].append(identity)

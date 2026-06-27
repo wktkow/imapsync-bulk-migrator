@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import imaplib
 import json
 import os
 import re
@@ -2780,6 +2781,74 @@ def test_provider_migrates_zero_octet_message(tmp_path: Path) -> None:
     assert target.bodies_by_mailbox["INBOX"] == [b""]
 
 
+def test_provider_import_matches_imaplib_append_wire_bytes(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    body = b"Message-ID: <lf-provider@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody\n"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="lf-provider",
+        message_id="<lf-provider@example.com>",
+        body=body,
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    target = ImaplibNormalizingStoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[ImaplibNormalizingStoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    stored = imaplib.MapCRLF.sub(imaplib.CRLF, body)
+    journal = load_import_journal(account_dir, account)
+    assert target.bodies_by_mailbox["Archive"] == [stored]
+    assert journal[-1]["status"] == "committed"
+    assert journal[-1]["action"] == "appended"
+
+
+def test_provider_validate_matches_imaplib_append_wire_bytes(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    body = b"Message-ID: <lf-validated@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody\n"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="lf-validated",
+        message_id="<lf-validated@example.com>",
+        body=body,
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "lf-validated",
+        "target_account": account.target_email,
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "content_sha256": row["content_sha256"],
+        "rfc822_size": row["rfc822_size"],
+        CONTENT_BINDING_FIELD: row[CONTENT_BINDING_FIELD],
+    })) + "\n")
+    target = ImaplibNormalizingStoredMessageTarget({
+        "Archive": [imaplib.MapCRLF.sub(imaplib.CRLF, body)],
+    })
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[ImaplibNormalizingStoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert report["ok"], report
+
+
 def test_provider_export_fails_when_uidvalidity_changes(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -3070,6 +3139,11 @@ class StoredMessageTarget(FakeTargetImap):
             + f" (RFC822.SIZE {len(body)} FLAGS ({flags}) BODY[] {{{len(body)}}}".encode("ascii"),
             body,
         )]
+
+
+class ImaplibNormalizingStoredMessageTarget(StoredMessageTarget):
+    def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+        return super().append(mailbox, flags, date_time, imaplib.MapCRLF.sub(imaplib.CRLF, data))
 
 
 class GenericSpecialUseTarget(StoredMessageTarget):
