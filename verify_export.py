@@ -139,11 +139,13 @@ def verify_account(account_path):
     errors = []
     folder_stats = {}
     multiple_message_files = []
+    mailbox_folders_found = 0
     
     # Walk through all folders
     for folder_path in account_path.iterdir():
         if not folder_path.is_dir():
             continue
+        mailbox_folders_found += 1
             
         folder_name = folder_path.name
         folder_messages = 0
@@ -179,6 +181,9 @@ def verify_account(account_path):
                 'attachments': folder_attachments,
                 'errors': folder_errors
             }
+
+    if mailbox_folders_found == 0:
+        errors.append("no mailbox folders found")
     
     # Print summary
     print(f"Total messages: {total_messages}")
