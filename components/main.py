@@ -509,7 +509,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[da] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
+            if da_client is None or bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
                 return 3
     if (not is_provider_config) and args.mode == "import" and use_cpanel:
         missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
@@ -549,7 +549,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[cpanel] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
+            if cpanel_client is None or bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
     if args.mode == "import" and (
         (use_da_panel and bool(getattr(args, "da_dry_run", False)))
