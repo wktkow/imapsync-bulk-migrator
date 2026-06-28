@@ -8255,6 +8255,41 @@ class TestRound7ConfirmedBugs:
         assert any("INBOX: mailbox marker is a symlink" in issue for issue in issues)
         assert not any("OUTSIDE_FROM_SYMLINK" in issue for issue in issues)
 
+    def test_remote_audit_rejects_hard_linked_mailbox_marker_without_connecting(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / account.email / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <hardlink-marker-audit@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        marker = folder / ".mailbox.json"
+        marker.write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        victim = tmp_path / "outside-marker.json"
+        victim.write_bytes(marker.read_bytes())
+        marker.unlink()
+        try:
+            marker.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        with mock.patch("components.audit.imap_connection", side_effect=AssertionError("remote audit should not run")):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [account], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any("hard-linked legacy mailbox marker" in issue for issue in issues)
+        assert not any("remote check failed" in issue for issue in issues)
+
     def test_legacy_import_rejects_symlinked_message_file_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

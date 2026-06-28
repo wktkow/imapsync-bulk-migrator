@@ -291,6 +291,7 @@ def audit_account(
                     marker_mailbox = mailbox_name
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")
+                remote_safe = False
         eml_stems = {p.stem for p in emls}
         json_stems = {p.stem for p in jsons}
         missing_meta = eml_stems - json_stems
