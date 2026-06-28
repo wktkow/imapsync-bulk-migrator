@@ -9646,16 +9646,19 @@ class TestRound7ConfirmedBugs:
         assert not list(real_account_dir.glob("import.journal.reset-*.jsonl"))
 
     @pytest.mark.parametrize(
-        ("field", "needle"),
+        ("field", "value", "needle"),
         [
-            ("key", "invalid key"),
-            ("target", "invalid target"),
+            ("key", "not-a-sha256", "invalid key"),
+            ("target", "not-a-sha256", "invalid target"),
+            ("key", "A" * 64, "invalid key"),
+            ("target", "B" * 64, "invalid target"),
         ],
     )
     def test_legacy_load_import_journal_rejects_malformed_digest_ids(
         self,
         tmp_path: Path,
         field: str,
+        value: str,
         needle: str,
     ) -> None:
         from components.imap_ops import _load_legacy_import_journal
@@ -9669,23 +9672,26 @@ class TestRound7ConfirmedBugs:
             "path": "INBOX/u0000000001.eml",
             "status": "committed",
         }
-        row[field] = "not-a-sha256"
+        row[field] = value
         (account_dir / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
 
         with pytest.raises(RuntimeError, match=needle):
             _load_legacy_import_journal(account_dir)
 
     @pytest.mark.parametrize(
-        ("field", "needle"),
+        ("field", "value", "needle"),
         [
-            ("key", "invalid key"),
-            ("target", "invalid target"),
+            ("key", "not-a-sha256", "invalid key"),
+            ("target", "not-a-sha256", "invalid target"),
+            ("key", "A" * 64, "invalid key"),
+            ("target", "B" * 64, "invalid target"),
         ],
     )
     def test_legacy_import_rejects_malformed_journal_ids_before_target_contact(
         self,
         tmp_path: Path,
         field: str,
+        value: str,
         needle: str,
     ) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
@@ -9703,7 +9709,7 @@ class TestRound7ConfirmedBugs:
             "path": "INBOX/u0000000001.eml",
             "status": "committed",
         }
-        row[field] = "not-a-sha256"
+        row[field] = value
         (folder.parent / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
         opened = False
 

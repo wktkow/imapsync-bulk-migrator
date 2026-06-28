@@ -27,7 +27,7 @@ PRIVATE_FILE_MODE = 0o600
 LEGACY_ACCOUNT_RESERVED_PATHS = frozenset({"export-state.json", "import.journal.jsonl", "manifest.jsonl"})
 _LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGACY_ACCOUNT_RESERVED_PATHS)
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
-_SHA256_HEX_RE = re.compile(r"[0-9a-fA-F]{64}")
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _IMAP_INTERNALDATE_RE = re.compile(
     r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
