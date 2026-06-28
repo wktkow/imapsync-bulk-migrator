@@ -2920,6 +2920,53 @@ class FakeGenericAllAndFlaggedOnlySourceImap(FakeNonGmailDuplicateSourceImap):
         raise AssertionError(command)
 
 
+class FakeGenericInboxAndAllSourceImap:
+    def __init__(self) -> None:
+        self.selected = ""
+        self.selected_mailboxes: List[str] = []
+        self.fetch_queries_by_mailbox: dict[str, List[str]] = {}
+        self.inbox_body = b"Message-ID: <inbox@example.com>\r\n\r\ninbox"
+        self.archived_body = b"Message-ID: <archived@example.com>\r\n\r\narchived"
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "All Mail"',
+        ]
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r"\"", '"')
+        self.selected_mailboxes.append(self.selected)
+        count = b"1" if self.selected == "INBOX" else b"2"
+        return "OK", [count]
+
+    def response(self, name: str):
+        return "OK", [b"111" if self.selected == "INBOX" else b"222"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"] if self.selected == "INBOX" else [b"1 2"]
+        if command == "fetch":
+            query = str(args[-1])
+            self.fetch_queries_by_mailbox.setdefault(self.selected, []).append(query)
+            uid = str(args[0])
+            body = self.inbox_body if uid == "1" else self.archived_body
+            meta = (
+                f'{uid} (UID {uid} RFC822.SIZE {len(body)} FLAGS (\\Seen) '
+                'INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            ).encode("ascii")
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + f" BODY[] {{{len(body)}}}".encode("ascii"), body)]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
 @contextlib.contextmanager
 def _fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
     yield FakeSourceImap()
@@ -3546,6 +3593,40 @@ def test_provider_export_skips_generic_virtual_views_when_physical_mailbox_exist
         provider_import_account(config, account, tmp_path)
 
     assert target.appended == ["INBOX"]
+
+
+def test_provider_export_scans_generic_all_with_physical_mailbox_for_archived_only_messages(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    source = FakeGenericInboxAndAllSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericInboxAndAllSourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    rows_by_message_id = {row["message_id_header"]: row for row in manifest}
+    assert set(source.fetch_queries_by_mailbox) == {"INBOX", "All Mail"}
+    assert set(rows_by_message_id) == {"<inbox@example.com>", "<archived@example.com>"}
+    assert rows_by_message_id["<inbox@example.com>"]["source_mailboxes"] == ["INBOX"]
+    assert rows_by_message_id["<archived@example.com>"]["source_mailboxes"] == ["All Mail"]
 
 
 def test_provider_export_requests_special_use_attrs_before_filtering_generic_all_view(tmp_path: Path) -> None:
