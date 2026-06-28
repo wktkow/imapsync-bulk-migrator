@@ -390,11 +390,37 @@ def _is_legacy_special_use_source_view(attributes: Tuple[str, ...]) -> bool:
     return "\\all" in attr_lowers
 
 
+def _is_legacy_flagged_source_view(attributes: Tuple[str, ...]) -> bool:
+    attr_lowers = {attr.lower() for attr in attributes}
+    return "\\flagged" in attr_lowers
+
+
+def _covers_legacy_flagged_source_view(attributes: Tuple[str, ...]) -> bool:
+    attr_lowers = {attr.lower() for attr in attributes}
+    return "\\all" not in attr_lowers and "\\flagged" not in attr_lowers
+
+
+def _should_skip_legacy_source_view(
+    name: str,
+    attributes: Tuple[str, ...],
+    mailboxes: List[Tuple[str, Tuple[str, ...]]],
+) -> bool:
+    if _is_legacy_special_use_source_view(attributes):
+        return True
+    if _is_legacy_flagged_source_view(attributes):
+        return any(
+            candidate_name != name and _covers_legacy_flagged_source_view(candidate_attrs)
+            for candidate_name, candidate_attrs in mailboxes
+        )
+    return False
+
+
 def list_export_scope_mailboxes(imap: imaplib.IMAP4) -> List[str]:
+    mailboxes = _list_selectable_mailbox_entries(imap)
     return [
         name
-        for name, attrs in _list_selectable_mailbox_entries(imap)
-        if not _is_legacy_special_use_source_view(attrs)
+        for name, attrs in mailboxes
+        if not _should_skip_legacy_source_view(name, attrs, mailboxes)
     ]
 
 

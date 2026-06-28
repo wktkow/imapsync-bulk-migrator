@@ -985,12 +985,11 @@ class TestLegacyListParsing:
 
         assert list_all_mailboxes(fake_imap) == ["Föld & Team"]
 
-    def test_export_skips_generic_all_view_but_keeps_flagged_mailbox(self, tmp_path: Path) -> None:
+    def test_export_skips_generic_all_and_covered_flagged_views(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
 
         body = b"Message-ID: <legacy-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
-        flagged_body = b"Message-ID: <legacy-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
 
         class SpecialUseSource:
             def __init__(self) -> None:
@@ -1013,10 +1012,9 @@ class TestLegacyListParsing:
                 if command == "search":
                     return "OK", [b"1"]
                 if command == "fetch":
-                    payload = flagged_body if self.selected_mailbox == "Flagged" else body
                     return "OK", [(
                         b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
-                        payload,
+                        body,
                     )]
                 raise AssertionError(command)
 
@@ -1039,14 +1037,69 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX", "Flagged"]
+        assert source.selected == ["INBOX"]
         assert state["mailboxes"] == [
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
-            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
-        assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
         assert not (account_dir / "All_Mail").exists()
+        assert not (account_dir / "Flagged").exists()
+
+    def test_export_keeps_generic_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        flagged_body = b"Message-ID: <legacy-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
+
+        class FlaggedOnlySource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen \\Flagged) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        flagged_body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = FlaggedOnlySource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[FlaggedOnlySource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["Flagged"]
+        assert state["mailboxes"] == [
+            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
+        ]
+        assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
 
     def test_export_requests_special_use_attrs_before_filtering_all_view(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
