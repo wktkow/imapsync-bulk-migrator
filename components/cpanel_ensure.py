@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .cpanel_client import CPanelClient
 from .models import Account, Config
@@ -25,6 +25,11 @@ def _accounts_by_domain(config: Config) -> Dict[str, List[Account]]:
     return per_domain
 
 
+def _raise_if_stopped(stop_event: Optional[Any], label: str) -> None:
+    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+        raise RuntimeError(f"{label}: stop requested before completion")
+
+
 def ensure_accounts_exist_cpanel(
     config: Config,
     client: CPanelClient,
@@ -32,8 +37,10 @@ def ensure_accounts_exist_cpanel(
     dry_run: bool = False,
     ignore_errors: bool = False,
     quota_mb: int = 0,
+    stop_event: Optional[Any] = None,
 ) -> None:
     for domain, accounts in _accounts_by_domain(config).items():
+        _raise_if_stopped(stop_event, f"cpanel provisioning {domain}")
         try:
             existing_locals = set(client.list_pop_accounts(domain))
         except Exception as exc:
@@ -49,6 +56,7 @@ def ensure_accounts_exist_cpanel(
             if dry_run:
                 logging.info("[cpanel][dry-run] Would create mailbox: %s", acc.email)
                 continue
+            _raise_if_stopped(stop_event, f"cpanel provisioning {acc.email}")
             try:
                 client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb)
                 existing_locals.add(local)
@@ -66,9 +74,11 @@ def reset_accounts_cpanel(
     dry_run: bool = False,
     ignore_errors: bool = False,
     quota_mb: int = 0,
+    stop_event: Optional[Any] = None,
 ) -> Set[str]:
     failed: Set[str] = set()
     for domain, accounts in _accounts_by_domain(config).items():
+        _raise_if_stopped(stop_event, f"cpanel reset {domain}")
         if dry_run:
             try:
                 existing_locals = set(client.list_pop_accounts(domain))
@@ -81,6 +91,7 @@ def reset_accounts_cpanel(
             if dry_run:
                 logging.info("[cpanel][dry-run] Would reset mailbox: %s (delete+create)", acc.email)
                 continue
+            _raise_if_stopped(stop_event, f"cpanel reset {acc.email}")
             try:
                 client.delete_pop_account(domain, local)
                 client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb, allow_existing=False)

@@ -733,6 +733,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     cpanel_password: Optional[str] = None
     cpanel_token: Optional[str] = None
     panel_reset_failed_accounts: set[str] = set()
+    stop_event = threading.Event()
+
+    def handle_sig(signum, _frame):
+        logging.warning("Received signal %s, requesting stop...", signum)
+        stop_event.set()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, handle_sig)
+        signal.signal(signal.SIGTERM, handle_sig)
+
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
         invalid_panel_accounts = _invalid_panel_account_emails(config)
@@ -833,6 +843,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.da_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.da_quota_mb),
+                    stop_event=stop_event,
                 )
             else:
                 ensure_accounts_exist_directadmin(
@@ -841,6 +852,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.da_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.da_quota_mb),
+                    stop_event=stop_event,
                 )
             logging.info("[da] Auto-provisioning step completed")
         except Exception as exc:
@@ -869,6 +881,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.cpanel_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.cpanel_quota_mb),
+                    stop_event=stop_event,
                 )
             else:
                 ensure_accounts_exist_cpanel(
@@ -877,6 +890,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.cpanel_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.cpanel_quota_mb),
+                    stop_event=stop_event,
                 )
             logging.info("[cpanel] Auto-provisioning step completed")
         except Exception as exc:
@@ -885,6 +899,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
             if cpanel_client is None or bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
+    if stop_event.is_set():
+        logging.warning("Stop requested during panel setup; aborting before connectivity or import")
+        return 130
     if args.mode == "import" and (
         (use_da_panel and bool(getattr(args, "da_dry_run", False)))
         or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
@@ -936,16 +953,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
     elif args.mode in {"export", "import", "test", "validate"}:
         logging.info("Skipping connectivity tests due to --no-connectivity-test")
-
-    stop_event = threading.Event()
-
-    def handle_sig(signum, _frame):
-        logging.warning("Received signal %s, requesting stop...", signum)
-        stop_event.set()
-
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGINT, handle_sig)
-        signal.signal(signal.SIGTERM, handle_sig)
 
     try:
         if is_provider_config:

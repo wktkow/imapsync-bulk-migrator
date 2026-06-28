@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .da_client import DirectAdminClient
 from .models import Account, Config
@@ -23,9 +23,23 @@ def _accounts_by_domain(config: Config) -> Dict[str, List[Account]]:
     return per_domain
 
 
-def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> None:
+def _raise_if_stopped(stop_event: Optional[Any], label: str) -> None:
+    if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+        raise RuntimeError(f"{label}: stop requested before completion")
+
+
+def ensure_accounts_exist_directadmin(
+    config: "Config",
+    client: DirectAdminClient,
+    *,
+    dry_run: bool = False,
+    ignore_errors: bool = False,
+    quota_mb: int = 0,
+    stop_event: Optional[Any] = None,
+) -> None:
     per_domain = _accounts_by_domain(config)
     for domain, accounts in per_domain.items():
+        _raise_if_stopped(stop_event, f"directadmin provisioning {domain}")
         try:
             existing_locals = set(client.list_pop_accounts(domain))
         except Exception as exc:
@@ -41,6 +55,7 @@ def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClien
             if dry_run:
                 logging.info("[da][dry-run] Would create mailbox: %s", acc.email)
                 continue
+            _raise_if_stopped(stop_event, f"directadmin provisioning {acc.email}")
             try:
                 client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb)
                 existing_locals.add(local)
@@ -51,7 +66,15 @@ def ensure_accounts_exist_directadmin(config: "Config", client: DirectAdminClien
                     raise
 
 
-def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, dry_run: bool = False, ignore_errors: bool = False, quota_mb: int = 0) -> Set[str]:
+def reset_accounts_directadmin(
+    config: "Config",
+    client: DirectAdminClient,
+    *,
+    dry_run: bool = False,
+    ignore_errors: bool = False,
+    quota_mb: int = 0,
+    stop_event: Optional[Any] = None,
+) -> Set[str]:
     """Delete then recreate each account in the config via DirectAdmin.
 
     Intended for use prior to import when a clean mailbox is desired.
@@ -60,6 +83,7 @@ def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, d
     per_domain = _accounts_by_domain(config)
 
     for domain, accounts in per_domain.items():
+        _raise_if_stopped(stop_event, f"directadmin reset {domain}")
         if dry_run:
             try:
                 existing_locals = set(client.list_pop_accounts(domain))
@@ -72,6 +96,7 @@ def reset_accounts_directadmin(config: "Config", client: DirectAdminClient, *, d
             if dry_run:
                 logging.info("[da][dry-run] Would reset mailbox: %s (delete+create)", acc.email)
                 continue
+            _raise_if_stopped(stop_event, f"directadmin reset {acc.email}")
             try:
                 client.delete_pop_account(domain, local)
                 client.create_pop_account(domain, local, acc.password, quota_mb=quota_mb, allow_existing=False)

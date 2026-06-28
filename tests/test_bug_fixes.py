@@ -10912,6 +10912,108 @@ class TestRound7ConfirmedBugs:
         client_cls.assert_not_called()
         reset_mock.assert_not_called()
 
+    def test_cpanel_reset_stop_event_rejects_before_delete(self) -> None:
+        from components.cpanel_ensure import reset_accounts_cpanel
+        from components.models import Account, Config, ServerConfig
+
+        class Client:
+            def __init__(self) -> None:
+                self.deleted = False
+                self.created = False
+
+            def delete_pop_account(self, domain: str, local_part: str) -> None:
+                self.deleted = True
+
+            def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0, *, allow_existing: bool = True) -> None:
+                self.created = True
+
+        stop_event = threading.Event()
+        stop_event.set()
+        client = Client()
+        config = Config(ServerConfig("imap.example.com"), [Account("a@example.com", "secret")])
+
+        with pytest.raises(RuntimeError, match="stop requested"):
+            reset_accounts_cpanel(config, client, stop_event=stop_event)
+
+        assert not client.deleted
+        assert not client.created
+
+    def test_directadmin_reset_stop_event_rejects_before_delete(self) -> None:
+        from components.da_ensure import reset_accounts_directadmin
+        from components.models import Account, Config, ServerConfig
+
+        class Client:
+            def __init__(self) -> None:
+                self.deleted = False
+                self.created = False
+
+            def delete_pop_account(self, domain: str, local_part: str) -> None:
+                self.deleted = True
+
+            def create_pop_account(self, domain: str, local_part: str, password: str, quota_mb: int = 0, *, allow_existing: bool = True) -> None:
+                self.created = True
+
+        stop_event = threading.Event()
+        stop_event.set()
+        client = Client()
+        config = Config(ServerConfig("imap.example.com"), [Account("a@example.com", "secret")])
+
+        with pytest.raises(RuntimeError, match="stop requested"):
+            reset_accounts_directadmin(config, client, stop_event=stop_event)
+
+        assert not client.deleted
+        assert not client.created
+
+    def test_main_registers_signal_before_cpanel_reset_and_aborts_before_import(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_reset(*_args, **kwargs):
+            assert "stop_event" in kwargs
+            assert signal.SIGTERM in handlers
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return set()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel", fake_reset), \
+            mock.patch("components.main.import_account", side_effect=AssertionError("import should not run after stop")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 130
+
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
