@@ -744,6 +744,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         signal.signal(signal.SIGINT, handle_sig)
         signal.signal(signal.SIGTERM, handle_sig)
 
+    def stop_requested_result(label: str) -> Optional[int]:
+        if not stop_event.is_set():
+            return None
+        logging.warning("%s: stop requested before completion", label)
+        return 130
+
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
         invalid_panel_accounts = _invalid_panel_account_emails(config)
@@ -900,9 +906,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
             if cpanel_client is None or bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
-    if stop_event.is_set():
-        logging.warning("Stop requested during panel setup; aborting before connectivity or import")
-        return 130
+    stop_rc = stop_requested_result("panel setup")
+    if stop_rc is not None:
+        return stop_rc
     if args.mode == "import" and (
         (use_da_panel and bool(getattr(args, "da_dry_run", False)))
         or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
@@ -950,16 +956,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 test_accounts(connectivity_config, max_workers=int(args.max_workers), imap_timeout=imap_timeout)
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
+            if stop_event.is_set():
+                logging.warning("Connectivity tests stopped: %s", exc)
+                return 130
             logging.error("Connectivity tests failed: %s", exc)
             return 3
     elif args.mode in {"export", "import", "test", "validate"}:
         logging.info("Skipping connectivity tests due to --no-connectivity-test")
 
+    stop_rc = stop_requested_result("connectivity tests")
+    if stop_rc is not None:
+        return stop_rc
+
     try:
+        stop_rc = stop_requested_result(args.mode)
+        if stop_rc is not None:
+            return stop_rc
         if is_provider_config:
             assert isinstance(config, ProviderMigrationConfig)
             if args.mode == "preflight":
                 ok, issues = provider_preflight(config, max_workers=int(args.max_workers))
+                stop_rc = stop_requested_result("provider preflight")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider preflight passed")
                     return 0
@@ -979,9 +998,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ignore_errors=bool(args.ignore_errors),
                     stop_event=stop_event,
                 )
+                stop_rc = stop_requested_result("provider export")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider export finished. Data stored under: %s", out_root)
                 if not bool(getattr(args, "no_audit_after_export", False)):
                     ok, issues = provider_audit_all(config, out_root, max_workers=int(args.max_workers))
+                    stop_rc = stop_requested_result("provider audit")
+                    if stop_rc is not None:
+                        return stop_rc
                     if ok:
                         logging.info("Provider audit passed")
                     else:
@@ -1003,8 +1028,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ignore_errors=bool(args.ignore_errors),
                     stop_event=stop_event,
                 )
+                stop_rc = stop_requested_result("provider import")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider import finished into server %s", config.target.host)
             elif args.mode == "test":
+                stop_rc = stop_requested_result("provider test")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider test completed successfully.")
             elif args.mode == "validate":
                 if bool(getattr(args, "resync_missing", False)):
@@ -1014,6 +1045,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
                 ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers))
+                stop_rc = stop_requested_result("provider validate")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider validation successful.")
                 else:
@@ -1027,6 +1061,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
                 ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers))
+                stop_rc = stop_requested_result("provider audit")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider audit passed")
                     return 0
@@ -1078,6 +1115,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
             parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            stop_rc = stop_requested_result("legacy export")
+            if stop_rc is not None:
+                return stop_rc
             logging.info("Export finished. Data stored under: %s", out_root)
 
             if not bool(getattr(args, "no_audit_after_export", False)):
@@ -1095,6 +1135,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         check_remote=not bool(getattr(args, "audit_offline", False)),
                         require_integrity_metadata=True,
                     )
+                    stop_rc = stop_requested_result("legacy export audit")
+                    if stop_rc is not None:
+                        return stop_rc
                     if ok:
                         logging.info("Audit passed: exported data looks consistent for all accounts")
                     else:
@@ -1169,6 +1212,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             import_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
             parallel_process_accounts("import", do_import, import_accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            stop_rc = stop_requested_result("legacy import")
+            if stop_rc is not None:
+                return stop_rc
             if panel_reset_failed_accounts:
                 logging.error(
                     "[panel] Import skipped %d account(s) because control-panel reset failed: %s",
@@ -1178,6 +1224,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 3
             logging.info("Import finished into server %s", config.server.host)
         elif args.mode == "test":
+            stop_rc = stop_requested_result("legacy test")
+            if stop_rc is not None:
+                return stop_rc
             logging.info("Test completed successfully.")
         elif args.mode == "validate":
             assert isinstance(config, Config)
@@ -1402,6 +1451,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if account_dir_fd is not None:
                         os.close(account_dir_fd)
             parallel_process_accounts("validate", do_validate, config.accounts, int(args.max_workers), stop_on_error=False)
+            stop_rc = stop_requested_result("legacy validate")
+            if stop_rc is not None:
+                return stop_rc
             if validation_errors:
                 logging.warning("Validation account failures found:")
                 for email, reason in validation_errors:
@@ -1440,6 +1492,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     require_integrity_metadata=True,
                 )
                 journal_issues = _legacy_pending_import_journal_issues(in_root, config, repair_trailing=False)
+                stop_rc = stop_requested_result("legacy audit")
+                if stop_rc is not None:
+                    return stop_rc
                 if journal_issues:
                     audit_issues.extend(journal_issues)
                     ok = False
@@ -1451,14 +1506,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.error("[audit] %s", line)
                 return 4
             except Exception as exc:
+                if stop_event.is_set():
+                    logging.warning("Legacy audit stopped: %s", exc)
+                    return 130
                 logging.exception("Fatal audit error: %s", exc)
                 return 4
         else:
             logging.error("Unknown mode: %s", args.mode)
             return 2
     except Exception as exc:
+        if stop_event.is_set():
+            logging.warning("Stop requested; aborting after interruption: %s", exc)
+            return 130
         logging.exception("Fatal error: %s", exc)
         return 1
 
+    stop_rc = stop_requested_result(args.mode)
+    if stop_rc is not None:
+        return stop_rc
     logging.info("Done. Log file: %s", log_file)
     return 0

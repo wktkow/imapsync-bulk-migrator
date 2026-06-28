@@ -11384,6 +11384,111 @@ class TestRound7ConfirmedBugs:
 
         assert rc == 130
 
+    def test_main_returns_130_when_signal_arrives_during_legacy_test_connectivity(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "test.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_test_accounts(*_args, **_kwargs):
+            handlers[signal.SIGINT](signal.SIGINT, None)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.test_accounts", side_effect=fake_test_accounts):
+            rc = main([
+                "--mode", "test",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 130
+
+    def test_main_returns_130_when_signal_arrives_during_provider_preflight_success(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "provider.config.json"
+        config_path.write_text(json.dumps({
+            "source": {
+                "provider": "imap",
+                "host": "source.example.com",
+                "auth": {"method": "password", "username": "source@example.com", "password": "secret"},
+            },
+            "target": {
+                "provider": "imap",
+                "host": "target.example.com",
+                "auth": {"method": "password", "username": "target@example.com", "password": "secret"},
+            },
+            "accounts": [{"source_email": "source@example.com", "target_email": "target@example.com"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_preflight(*_args, **_kwargs):
+            handlers[signal.SIGINT](signal.SIGINT, None)
+            return True, []
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.provider_preflight", side_effect=fake_preflight):
+            rc = main([
+                "--mode", "preflight",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 130
+
+    def test_main_returns_130_for_stop_requested_worker_exception(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_export(*_args, **_kwargs):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            raise RuntimeError("legacy export a@example.com: stop requested before completion")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.export_account", side_effect=fake_export):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--no-audit-after-export",
+            ])
+
+        assert rc == 130
+
     def test_provider_private_read_rejects_ancestor_swap_during_final_open(self, tmp_path: Path) -> None:
         from components import provider_ops
 
