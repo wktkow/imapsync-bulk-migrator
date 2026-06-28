@@ -7876,6 +7876,42 @@ def test_provider_audit_and_offline_validate_reject_stale_journal_content(tmp_pa
     assert any("journal committed content_sha256 does not match manifest" in issue for issue in report["failed"])
 
 
+@pytest.mark.parametrize(
+    ("mutations", "needle"),
+    [
+        ({"canonical_id": 123}, "non-string canonical_id"),
+        ({"rfc822_size": True}, "journal committed rfc822_size does not match manifest"),
+        ({"target_mailbox": True}, "non-string target_mailbox"),
+    ],
+)
+def test_provider_audit_validation_and_import_reject_malformed_journal_field_types(
+    tmp_path: Path,
+    mutations: dict,
+    needle: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })
+    row.update(mutations)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(row) + "\n")
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any(needle in issue for issue in issues)
+    assert any(needle in issue for issue in report["failed"])
+    assert not report["ok"]
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=needle):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_import_audit_and_validation_reject_stale_journal_content_binding(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

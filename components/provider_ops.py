@@ -1286,15 +1286,24 @@ def journal_target_key(
     return identity, mailbox_key
 
 
+def _non_empty_json_string(row: Dict[str, Any], key: str) -> Optional[str]:
+    value = row.get(key)
+    if not isinstance(value, str) or value == "":
+        return None
+    return value
+
+
 def journal_row_target_key(
     row: Dict[str, Any],
     *,
     target_provider: str = "imap",
     target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> Tuple[str, str]:
+    identity = _non_empty_json_string(row, "canonical_id") or ""
+    target_mailbox = _non_empty_json_string(row, "target_mailbox") or ""
     return journal_target_key(
-        str(row.get("canonical_id") or ""),
-        str(row.get("target_mailbox") or ""),
+        identity,
+        target_mailbox,
         target_provider=target_provider,
         target_mailboxes=target_mailboxes,
     )
@@ -1308,8 +1317,8 @@ def latest_committed_journal_rows(
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
-        identity = str(row.get("canonical_id") or "")
-        target_mailbox = str(row.get("target_mailbox") or "")
+        identity = _non_empty_json_string(row, "canonical_id") or ""
+        target_mailbox = _non_empty_json_string(row, "target_mailbox") or ""
         if not identity or not target_mailbox:
             continue
         key = journal_target_key(
@@ -1907,18 +1916,33 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
         if not isinstance(row, dict):
             issues.append(f"journal row {idx} is not an object")
             continue
-        status = str(row.get("status") or "")
+        raw_status = row.get("status")
+        status = raw_status if isinstance(raw_status, str) else ""
         if status not in {"pending", "committed"}:
-            issues.append(f"journal row {idx} has invalid status: {status or '<missing>'}")
+            if raw_status in (None, ""):
+                shown_status = "<missing>"
+            elif isinstance(raw_status, str):
+                shown_status = raw_status
+            else:
+                shown_status = f"non-string {type(raw_status).__name__}"
+            issues.append(f"journal row {idx} has invalid status: {shown_status}")
             continue
-        identity = str(row.get("canonical_id") or "")
-        target_mailbox = str(row.get("target_mailbox") or "")
-        target_account = str(row.get("target_account") or "")
+        identity = _non_empty_json_string(row, "canonical_id") or ""
+        target_mailbox = _non_empty_json_string(row, "target_mailbox") or ""
+        target_account = _non_empty_json_string(row, "target_account") or ""
         label = identity or f"row {idx}"
         if not identity:
-            issues.append(f"journal row {idx} missing canonical_id")
+            if row.get("canonical_id") in (None, ""):
+                issues.append(f"journal row {idx} missing canonical_id")
+            else:
+                issues.append(f"journal row {idx} has non-string canonical_id")
         if not target_mailbox:
-            issues.append(f"journal {label} missing target_mailbox")
+            if row.get("target_mailbox") in (None, ""):
+                issues.append(f"journal {label} missing target_mailbox")
+            else:
+                issues.append(f"journal {label} has non-string target_mailbox")
+        if not target_account and row.get("target_account") not in (None, ""):
+            issues.append(f"journal {label} has non-string target_account")
         if target_account != account.target_email:
             issues.append(
                 f"journal {label} target_account does not match config target_email "
@@ -2147,11 +2171,14 @@ def committed_journal_manifest_content_issues(
         if manifest_row is None:
             issues.append(f"journal committed identity not in manifest: {identity}")
             continue
-        if journal_row.get("content_sha256") != manifest_row.get("content_sha256"):
+        journal_content_sha256 = journal_row.get("content_sha256")
+        journal_size = journal_row.get("rfc822_size")
+        journal_binding = journal_row.get(CONTENT_BINDING_FIELD)
+        if not isinstance(journal_content_sha256, str) or journal_content_sha256 != manifest_row.get("content_sha256"):
             issues.append(f"journal committed content_sha256 does not match manifest: {label}")
-        if journal_row.get("rfc822_size") != manifest_row.get("rfc822_size"):
+        if type(journal_size) is not int or journal_size != manifest_row.get("rfc822_size"):
             issues.append(f"journal committed rfc822_size does not match manifest: {label}")
-        if journal_row.get(CONTENT_BINDING_FIELD) != manifest_row.get(CONTENT_BINDING_FIELD):
+        if not isinstance(journal_binding, str) or journal_binding != manifest_row.get(CONTENT_BINDING_FIELD):
             issues.append(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest: {label}")
     return issues
 
