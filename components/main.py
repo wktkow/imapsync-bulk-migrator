@@ -617,7 +617,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     stop_event = threading.Event()
 
     def handle_sig(signum, _frame):
-        logging.warning("Received signal %s, requesting stop...", signum)
         stop_event.set()
 
     if threading.current_thread() is threading.main_thread():

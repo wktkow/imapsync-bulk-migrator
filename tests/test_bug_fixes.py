@@ -11467,6 +11467,40 @@ class TestRound7ConfirmedBugs:
 
         assert rc == 130
 
+    def test_main_signal_handler_sets_stop_without_logging_first(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "test.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_test_accounts(*_args, **kwargs):
+            stop_event = kwargs["stop_event"]
+            with mock.patch("components.main.logging.warning", side_effect=AssertionError("signal handler must not log")):
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+            assert stop_event.is_set()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.test_accounts", side_effect=fake_test_accounts):
+            rc = main([
+                "--mode", "test",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 130
+
     def test_main_returns_130_when_signal_arrives_during_panel_staged_audit(self, tmp_path: Path) -> None:
         from components.main import main
 
