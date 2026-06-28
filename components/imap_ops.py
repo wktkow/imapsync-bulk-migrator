@@ -495,10 +495,10 @@ def legacy_export_output_symlink_issues(out_root: Path, accounts: List[Account])
     issues: List[str] = []
     for account in accounts:
         account_dir = out_root / sanitize_for_path(account.email)
-        if not account_dir.exists():
-            continue
         if account_dir.is_symlink() or _legacy_symlink_component(account_dir) is not None:
             issues.append(f"{account.email}: account output path is a symlink: {account_dir}")
+            continue
+        if not account_dir.exists():
             continue
         if not account_dir.is_dir():
             issues.append(f"{account.email}: account output path is not a directory: {account_dir}")
