@@ -5170,6 +5170,32 @@ class TestCPanelProvisioning:
 class TestImapsyncPasswordHandling:
     """imapsync probe must not expose passwords in process arguments."""
 
+    def test_imapsync_availability_probe_uses_timeout(self) -> None:
+        from components import utils
+
+        captured_kwargs = {}
+
+        def fake_run(_args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return subprocess.CompletedProcess(_args, 0, "", "")
+
+        with mock.patch("components.utils.shutil.which", return_value="/usr/bin/imapsync"), \
+            mock.patch("components.utils.subprocess.run", side_effect=fake_run):
+            utils.ensure_imapsync_available()
+
+        assert captured_kwargs["timeout"] == utils.IMAPSYNC_VERSION_TIMEOUT_SEC
+
+    def test_imapsync_availability_probe_timeout_is_dependency_error(self) -> None:
+        from components import utils
+
+        with mock.patch("components.utils.shutil.which", return_value="/usr/bin/imapsync"), \
+            mock.patch(
+                "components.utils.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["/usr/bin/imapsync", "--version"], utils.IMAPSYNC_VERSION_TIMEOUT_SEC),
+            ):
+            with pytest.raises(RuntimeError, match="did not respond to --version"):
+                utils.ensure_imapsync_available()
+
     def test_justconnect_uses_passfile_not_password_arg(self) -> None:
         from components.imapsync_cli import run_imapsync_justconnect
 

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.@+-]+")
+IMAPSYNC_VERSION_TIMEOUT_SEC = 10
 
 
 def sanitize_for_path(name: str) -> str:
@@ -97,7 +98,18 @@ def ensure_imapsync_available() -> None:
         raise RuntimeError(
             "The 'imapsync' binary is required but was not found in PATH. Install it and try again."
         )
-    subprocess.run([path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    try:
+        subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=IMAPSYNC_VERSION_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"The 'imapsync' binary did not respond to --version within {IMAPSYNC_VERSION_TIMEOUT_SEC} seconds."
+        ) from exc
 
 
 def check_environment(min_free_gb: float = 1.0) -> None:
