@@ -1335,6 +1335,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     validation_errors.append((email, f"{remote_mailboxes.get(folder, folder)}: remote mailbox could not be counted"))
+                            elif folder not in local_counts and remote_count == 0:
+                                mismatched_folders.add(folder)
+                                with mismatches_lock:
+                                    validation_errors.append((email, f"{remote_mailboxes.get(folder, folder)}: missing locally but remote has 0 messages"))
                             elif folder not in local_counts and remote_count > 0:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:

@@ -3552,7 +3552,7 @@ class TestCliAndConfigHardening:
         assert rc == 2
         assert journal.read_text() == original
 
-    def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+    def test_legacy_validate_rejects_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
         from components.models import ServerConfig
@@ -3608,7 +3608,7 @@ class TestCliAndConfigHardening:
                 "--no-connectivity-test",
             ])
 
-        assert rc == 0
+        assert rc == 4
 
     def test_legacy_validate_rejects_case_only_remote_mailbox_collision(self, tmp_path: Path) -> None:
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
@@ -3708,7 +3708,7 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
-    def test_legacy_audit_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
+    def test_legacy_audit_rejects_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account, ServerConfig
 
@@ -3753,7 +3753,7 @@ class TestCliAndConfigHardening:
         with mock.patch("components.audit.imap_connection", fake_connection):
             _email, issues = audit_account(account, tmp_path, ServerConfig(host="imap.example.com"), check_remote=True)
 
-        assert issues == []
+        assert any("Projects: missing locally but remote has 0 messages" in issue for issue in issues)
 
     def test_legacy_resync_missing_does_not_replay_import(self, tmp_path: Path) -> None:
         from components.main import main
