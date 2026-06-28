@@ -2014,6 +2014,29 @@ def test_gmail_target_folder_resolution_uses_special_use_and_gmail_names() -> No
     assert resolve_target_mailbox("Starred", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Starred"
 
 
+def test_gmail_target_system_mailbox_issues_require_important_and_starred() -> None:
+    from components.provider_ops import gmail_target_system_mailbox_issues
+
+    rows = [
+        {"canonical_id": "important-message", "primary_mailbox": "Important"},
+        {"canonical_id": "starred-message", "primary_mailbox": "Starred"},
+    ]
+    base_mailboxes = [
+        MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="[Gmail]/All Mail", delimiter="/", attributes=("\\HasNoChildren", "\\All")),
+    ]
+
+    issues = gmail_target_system_mailbox_issues(rows, base_mailboxes)
+
+    assert any("required important system mailbox" in issue for issue in issues)
+    assert any("required starred system mailbox" in issue for issue in issues)
+    assert gmail_target_system_mailbox_issues(rows, [
+        *base_mailboxes,
+        MailboxInfo(name="[Gmail]/Important", delimiter="/", attributes=("\\HasNoChildren", "\\Important")),
+        MailboxInfo(name="[Gmail]/Starred", delimiter="/", attributes=("\\HasNoChildren", "\\Flagged")),
+    ]) == []
+
+
 def test_target_folder_resolution_is_target_provider_aware() -> None:
     mailboxes = [
         MailboxInfo(name="Archive", delimiter="/", attributes=("\\HasNoChildren", "\\Archive")),
@@ -4512,6 +4535,49 @@ def test_provider_import_to_gmail_requires_selectable_all_mail_before_append(tmp
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         with pytest.raises(RuntimeError, match="All Mail is not selectable"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert not (account_dir / "import-target@gmail.com.journal.jsonl").exists()
+
+
+@pytest.mark.parametrize(("primary_mailbox", "system_key"), [("Important", "important"), ("Starred", "starred")])
+def test_provider_import_to_gmail_requires_important_and_starred_system_mailboxes_before_append(
+    tmp_path: Path,
+    primary_mailbox: str,
+    system_key: str,
+) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_provider"] = "imap"
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = primary_mailbox
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match=f"missing required {system_key} system mailbox"):
             provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []

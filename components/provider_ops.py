@@ -2599,6 +2599,12 @@ _GMAIL_TARGET_NAME_SYSTEM_KEYS = {
     "[googlemail]/trash": "trash",
     "[gmail]/spam": "spam",
     "[googlemail]/spam": "spam",
+    "[gmail]/important": "important",
+    "[googlemail]/important": "important",
+    "important": "important",
+    "[gmail]/starred": "starred",
+    "[googlemail]/starred": "starred",
+    "starred": "starred",
 }
 
 _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS = {
@@ -2628,6 +2634,15 @@ _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS = {
     "[googlemail]/spam": "spam",
     "\\junk": "spam",
     "\\spam": "spam",
+    "important": "important",
+    "[gmail]/important": "important",
+    "[googlemail]/important": "important",
+    "\\important": "important",
+    "starred": "starred",
+    "[gmail]/starred": "starred",
+    "[googlemail]/starred": "starred",
+    "\\starred": "starred",
+    "\\flagged": "starred",
 }
 
 
@@ -2645,6 +2660,8 @@ def _gmail_system_key_for_mailbox(mailbox: MailboxInfo) -> str:
         "\\trash": "trash",
         "\\junk": "spam",
         "\\inbox": "inbox",
+        "\\important": "important",
+        "\\flagged": "starred",
     }
     for attr, key in attr_keys.items():
         if attr in attr_lowers:
