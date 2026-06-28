@@ -442,13 +442,20 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags, PRIVATE_FILE_MODE)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
             raise RuntimeError(f"refusing to use symlinked legacy import journal: {path}") from exc
+        if exc.errno == errno.ENXIO:
+            raise RuntimeError(f"refusing to use non-regular legacy import journal: {path}") from exc
         raise
     try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError(f"refusing to use non-regular legacy import journal: {path}")
         _raise_if_hard_linked_private_file_fd(fd, path, "legacy import journal")
     except Exception:
         os.close(fd)

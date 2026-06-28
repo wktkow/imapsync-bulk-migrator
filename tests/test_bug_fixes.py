@@ -9223,6 +9223,64 @@ class TestRound7ConfirmedBugs:
 
         assert victim.read_text() == ""
 
+    def test_legacy_append_import_journal_rejects_non_regular_journal_with_reader(self, tmp_path: Path) -> None:
+        from components.imap_ops import _append_legacy_import_journal
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        _mkfifo_or_skip(journal)
+        reader_fd = os.open(journal, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            with pytest.raises(RuntimeError, match="non-regular legacy import journal"):
+                _append_legacy_import_journal(account_dir, {
+                    "key": "k",
+                    "status": "pending",
+                    "target": "imap://target",
+                    "mailbox": "INBOX",
+                    "path": "INBOX/u0000000001.eml",
+                    "timestamp": "0",
+                })
+            assert os.read(reader_fd, 4096) == b""
+        finally:
+            os.close(reader_fd)
+
+    def test_legacy_append_import_journal_rejects_non_regular_journal_without_reader(self, tmp_path: Path) -> None:
+        from components.imap_ops import _append_legacy_import_journal
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        _mkfifo_or_skip(journal)
+        result: queue.Queue[tuple[str, str]] = queue.Queue()
+
+        def append_journal() -> None:
+            try:
+                _append_legacy_import_journal(account_dir, {
+                    "key": "k",
+                    "status": "pending",
+                    "target": "imap://target",
+                    "mailbox": "INBOX",
+                    "path": "INBOX/u0000000001.eml",
+                    "timestamp": "0",
+                })
+            except BaseException as exc:
+                result.put(("raised", str(exc)))
+            else:
+                result.put(("returned", ""))
+
+        thread = threading.Thread(target=append_journal, daemon=True)
+        thread.start()
+        thread.join(1)
+        if thread.is_alive():
+            reader_fd = os.open(journal, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            os.close(reader_fd)
+            thread.join(1)
+            pytest.fail("legacy import journal append blocked on FIFO")
+        status, message = result.get_nowait()
+        assert status == "raised"
+        assert "non-regular legacy import journal" in message
+
     def test_legacy_atomic_write_does_not_chmod_replaced_symlink_target(
         self,
         tmp_path: Path,
