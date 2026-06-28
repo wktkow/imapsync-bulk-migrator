@@ -2783,6 +2783,20 @@ class FakeGenericFlaggedOnlySourceImap(FakeNonGmailDuplicateSourceImap):
         return "OK", [b'(\\HasNoChildren \\Flagged) "/" "Flagged"']
 
 
+class FakeGenericAllOnlySourceImap(FakeNonGmailDuplicateSourceImap):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fetch_queries: List[str] = []
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\All) "/" "Archive"']
+
+    def uid(self, command: str, *args):
+        if command == "fetch":
+            self.fetch_queries.append(str(args[-1]))
+        return super().uid(command, *args)
+
+
 @contextlib.contextmanager
 def _fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
     yield FakeSourceImap()
@@ -3409,6 +3423,39 @@ def test_provider_export_requests_special_use_attrs_before_filtering_generic_all
     assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
     assert {tuple(row["source_mailboxes"]) for row in manifest} == {("INBOX",), ("Flagged",)}
     assert not any(row["primary_mailbox"] == "All Mail" for row in manifest)
+
+
+def test_provider_export_scans_generic_all_view_when_it_is_only_source_mailbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    source = FakeGenericAllOnlySourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericAllOnlySourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 1
+    assert manifest[0]["primary_mailbox"] == "Archive"
+    assert manifest[0]["source_mailboxes"] == ["Archive"]
+    assert source.fetch_queries
 
 
 def test_provider_export_keeps_generic_flagged_only_mailbox(tmp_path: Path) -> None:
@@ -9956,6 +10003,36 @@ def test_provider_preflight_counts_generic_flagged_only_mailbox(tmp_path: Path) 
 
     assert not ok
     assert any("estimated source bytes 43 exceed target.available_bytes 42" in issue for issue in issues)
+
+
+def test_provider_preflight_counts_generic_all_when_it_is_only_source_mailbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=42,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    source = FakeGenericAllOnlySourceImap()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield source if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("estimated source bytes 43 exceed target.available_bytes 42" in issue for issue in issues)
+    assert source.fetch_queries
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:

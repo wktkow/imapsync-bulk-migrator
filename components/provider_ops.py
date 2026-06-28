@@ -529,6 +529,28 @@ def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     return False
 
 
+def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: List[MailboxInfo]) -> bool:
+    provider_key = provider.lower()
+    if is_noselect(mailbox):
+        return True
+    if provider_key == "icloud" and mailbox.name.lower() == "vip":
+        return True
+    if provider_key == "gmail":
+        return False
+    attr_lowers = {attr.lower() for attr in mailbox.attributes}
+    if "\\all" not in attr_lowers:
+        return False
+    for candidate in mailboxes:
+        if candidate is mailbox or is_noselect(candidate):
+            continue
+        candidate_attrs = {attr.lower() for attr in candidate.attributes}
+        if "\\all" not in candidate_attrs and not (
+            provider_key == "icloud" and candidate.name.lower() == "vip"
+        ):
+            return True
+    return False
+
+
 def is_virtual_target_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     return provider.lower() == "icloud" and mailbox.name.lower() == "vip"
 
@@ -2494,7 +2516,7 @@ def provider_export_account(
             if is_noselect(mailbox):
                 logging.info("[provider-export] %s: skipping non-selectable mailbox %s", account.source_email, mailbox.name)
                 continue
-            if is_virtual_source_mailbox(config.source.provider, mailbox):
+            if should_skip_source_mailbox(config.source.provider, mailbox, mailboxes):
                 logging.info("[provider-export] %s: skipping virtual source mailbox %s", account.source_email, mailbox.name)
                 continue
             _raise_if_stopped(stop_event, f"provider export {account.source_email}")
@@ -5298,7 +5320,7 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                     account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
                     account_issues.extend(gmail_account_decommission_issues(config.source, acc))
                 for mailbox in source_mailboxes:
-                    if is_noselect(mailbox) or is_virtual_source_mailbox(config.source.provider, mailbox):
+                    if should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes):
                         continue
                     try:
                         uids, _uidvalidity = fetch_all_uids_and_uidvalidity(source_imap, mailbox.name)
