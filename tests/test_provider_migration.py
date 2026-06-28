@@ -25,6 +25,7 @@ from components.provider_ops import (
     MailboxInfo,
     _atomic_json,
     _prune_provider_artifact_orphans,
+    _safe_identity,
     build_xoauth2_payload,
     consume_target_match_num,
     effective_auth,
@@ -1899,6 +1900,16 @@ def test_list_and_gmail_fetch_parsers() -> None:
     assert parsed["flags"] == "\\Seen"
     assert parsed["rfc822_size"] == 42
 
+    too_large = str(1 << 64)
+    overlong_ids = parse_provider_fetch_response([
+        (
+            f"1 (RFC822.SIZE 10 X-GM-MSGID {too_large} X-GM-THRID {too_large})".encode("ascii"),
+            b"Message-ID: <too-large@example.com>\r\n\r\nbody",
+        )
+    ])
+    assert overlong_ids["gmail_msgid"] == ""
+    assert overlong_ids["gmail_thrid"] == ""
+
     with_parens = parse_provider_fetch_response([
         (
             b'1 (RFC822.SIZE 10 X-GM-LABELS ("Team (Old)" "Project B"))',
@@ -1941,6 +1952,16 @@ def test_list_and_gmail_fetch_parsers() -> None:
         b'))',
     ])
     assert multi_literal_labels["gmail_labels"] == ["Label", "Second"]
+
+
+def test_provider_safe_identity_hashes_truncated_names() -> None:
+    first = "gmail-" + ("1" * 174) + "2"
+    second = "gmail-" + ("1" * 174) + "3"
+
+    assert _safe_identity("gmail-123") == "gmail-123"
+    assert len(_safe_identity(first)) == 180
+    assert len(_safe_identity(second)) == 180
+    assert _safe_identity(first) != _safe_identity(second)
 
 
 def test_list_parser_accepts_literal_mailbox_names() -> None:

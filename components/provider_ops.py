@@ -666,6 +666,21 @@ def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
     return ""
 
 
+_MAX_GMAIL_UINT64 = (1 << 64) - 1
+
+
+def _valid_gmail_uint64(value: Optional[str]) -> str:
+    if not value or not value.isdecimal():
+        return ""
+    try:
+        number = int(value)
+    except ValueError:
+        return ""
+    if number > _MAX_GMAIL_UINT64:
+        return ""
+    return value
+
+
 def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, Any]:
     msg_bytes: Optional[bytes] = None
     meta_chunks: List[str] = []
@@ -710,13 +725,15 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
     for label in literal_labels:
         if label not in labels:
             labels.append(label)
+    gmail_msgid = _valid_gmail_uint64(group(r"X-GM-MSGID\s+(\d+)") or "")
+    gmail_thrid = _valid_gmail_uint64(group(r"X-GM-THRID\s+(\d+)") or "")
     return {
         "message_bytes": msg_bytes,
         "flags": group(r"FLAGS\s+\((.*?)\)") or "",
         "internaldate": group(r'INTERNALDATE\s+"([^"]+)"') or "",
         "rfc822_size": int(size_raw) if size_raw else (len(msg_bytes) if msg_bytes is not None else 0),
-        "gmail_msgid": group(r"X-GM-MSGID\s+(\d+)") or "",
-        "gmail_thrid": group(r"X-GM-THRID\s+(\d+)") or "",
+        "gmail_msgid": gmail_msgid,
+        "gmail_thrid": gmail_thrid,
         "gmail_labels": labels,
     }
 
@@ -905,7 +922,12 @@ def resolve_primary_mailbox(
 
 
 def _safe_identity(identity: str) -> str:
-    return sanitize_for_path(identity)[:180]
+    safe = sanitize_for_path(identity)
+    if len(safe) <= 180:
+        return safe
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    prefix_len = 180 - len(digest) - 1
+    return f"{safe[:prefix_len]}-{digest}"
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
