@@ -2647,7 +2647,7 @@ class TestCliAndConfigHardening:
         }))
         seen_calls: List[Tuple[int, float]] = []
 
-        def fake_test_accounts(_config, *, max_workers, imap_timeout):
+        def fake_test_accounts(_config, *, max_workers, imap_timeout, **_kwargs):
             seen_calls.append((max_workers, imap_timeout))
 
         with mock.patch("components.main.check_environment"), \
@@ -5680,6 +5680,51 @@ class TestImapsyncPasswordHandling:
         assert "--passfile1" in imapsync_args
         assert "--password1" not in imapsync_args
         assert "super-secret" not in imapsync_args
+
+    def test_justconnect_terminates_subprocess_when_stop_requested(self) -> None:
+        from components.imapsync_cli import run_imapsync_justconnect
+
+        stop_event = threading.Event()
+        stop_event.set()
+
+        class FakeProcess:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.returncode = None
+                self.communicate_calls = 0
+                self.terminated = False
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(["imapsync"], timeout)
+                self.returncode = -15 if self.terminated else 0
+                return "stopped", None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        fake_process = FakeProcess()
+
+        with mock.patch("components.imapsync_cli.ensure_imapsync_available"), \
+            mock.patch("components.imapsync_cli.subprocess.Popen", return_value=fake_process):
+            ok, out = run_imapsync_justconnect(
+                host="imap.example.com",
+                port=993,
+                ssl_enabled=True,
+                starttls=False,
+                user="user@example.com",
+                password="super-secret",
+                stop_event=stop_event,
+            )
+
+        assert not ok
+        assert "stop requested" in out
+        assert fake_process.terminated
+        assert not fake_process.killed
 
 
 # ---------------------------------------------------------------------------
@@ -11545,6 +11590,40 @@ class TestRound7ConfirmedBugs:
             ])
 
         assert rc == 130
+
+    def test_legacy_test_accounts_stop_event_prevents_later_account_probes(self) -> None:
+        from components.main import test_accounts
+        from components.models import Account, Config, ServerConfig
+
+        stop_event = threading.Event()
+        config = Config(
+            ServerConfig("imap.example.com"),
+            [
+                Account("a@example.com", "secret-a"),
+                Account("b@example.com", "secret-b"),
+            ],
+        )
+        imap_probes: List[str] = []
+        imapsync_probes: List[str] = []
+
+        @contextlib.contextmanager
+        def fake_connection(_server, account):
+            imap_probes.append(account.email)
+            if account.email == "a@example.com":
+                stop_event.set()
+            yield object()
+
+        def fake_justconnect(*_args, user, **_kwargs):
+            imapsync_probes.append(user)
+            return True, "ok"
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection), \
+            mock.patch("components.main.run_imapsync_justconnect", fake_justconnect):
+            with pytest.raises(RuntimeError, match="stop requested"):
+                test_accounts(config, max_workers=1, stop_event=stop_event)
+
+        assert imap_probes == ["a@example.com"]
+        assert imapsync_probes == []
 
     def test_main_returns_130_when_signal_arrives_during_provider_preflight_success(self, tmp_path: Path) -> None:
         from components.main import main

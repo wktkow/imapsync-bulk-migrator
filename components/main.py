@@ -265,7 +265,13 @@ def setup_logging(log_directory: Path) -> Path:
     return log_file
 
 
-def test_accounts(config: Config, max_workers: int, *, imap_timeout: float = 30.0) -> None:
+def test_accounts(
+    config: Config,
+    max_workers: int,
+    *,
+    imap_timeout: float = 30.0,
+    stop_event: Optional[object] = None,
+) -> None:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     import concurrent.futures
@@ -273,11 +279,20 @@ def test_accounts(config: Config, max_workers: int, *, imap_timeout: float = 30.
     errors: queue.Queue[str] = queue.Queue()
     from .imap_ops import imap_connection
 
+    def stop_requested() -> bool:
+        return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+    def raise_if_stopped(label: str) -> None:
+        if stop_requested():
+            raise RuntimeError(f"{label}: stop requested before completion")
+
     def worker(acc: Account) -> None:
         try:
+            raise_if_stopped(f"connectivity test {acc.email}")
             # Properly open and logout via the context manager
             with imap_connection(config.server, acc):
                 pass
+            raise_if_stopped(f"connectivity test {acc.email}")
             ok, out = run_imapsync_justconnect(
                 host=config.server.host,
                 port=config.server.port,
@@ -286,16 +301,62 @@ def test_accounts(config: Config, max_workers: int, *, imap_timeout: float = 30.
                 user=acc.email,
                 password=acc.password,
                 timeout_sec=imap_timeout,
+                stop_event=stop_event,
             )
+            raise_if_stopped(f"connectivity test {acc.email}")
             if not ok:
                 raise RuntimeError(f"imapsync justconnect failed for {acc.email}:\n{out}")
             logging.info("[test] %s: OK", acc.email)
         except Exception as exc:
             logging.error("[test] %s: FAILED: %s", acc.email, exc)
             errors.put(f"{acc.email}: {exc}")
+            if stop_requested():
+                raise
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="test") as ex:
-        list(ex.map(worker, config.accounts))
+    account_iter = iter(config.accounts)
+    futures: Dict[concurrent.futures.Future[None], Account] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="test")
+    wait_timeout = 0.2 if stop_event is not None else None
+
+    def submit_next() -> bool:
+        if stop_requested():
+            return False
+        try:
+            acc = next(account_iter)
+        except StopIteration:
+            return False
+        futures[executor.submit(worker, acc)] = acc
+        return True
+
+    try:
+        for _ in range(min(max_workers, len(config.accounts))):
+            if not submit_next():
+                break
+        while futures:
+            raise_if_stopped("connectivity tests")
+            done, _pending = concurrent.futures.wait(
+                futures,
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            completed_successfully = 0
+            for fut in done:
+                futures.pop(fut, None)
+                fut.result()
+                completed_successfully += 1
+                raise_if_stopped("connectivity tests")
+            for _ in range(completed_successfully):
+                submit_next()
+        raise_if_stopped("connectivity tests")
+    finally:
+        if stop_requested():
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     if not errors.empty():
         reason_lines: List[str] = []
@@ -970,7 +1031,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         skipped,
                     )
                     connectivity_config = Config(server=config.server, accounts=active_accounts, source_server=config.source_server)
-                test_accounts(connectivity_config, max_workers=int(args.max_workers), imap_timeout=imap_timeout)
+                test_accounts(connectivity_config, max_workers=int(args.max_workers), imap_timeout=imap_timeout, stop_event=stop_event)
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
             if stop_event.is_set():
