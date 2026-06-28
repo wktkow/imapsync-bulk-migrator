@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import time
 from contextlib import AbstractContextManager
@@ -493,6 +494,17 @@ def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> No
             path.unlink()
 
 
+def _remove_stale_mailbox_dirs(account_dir: Path, expected_paths: set[str]) -> None:
+    for child in sorted(account_dir.iterdir()):
+        if child.name in {"export-state.json", "import.journal.jsonl"}:
+            continue
+        if not child.is_dir() or child.is_symlink():
+            continue
+        rel = child.relative_to(account_dir).as_posix()
+        if rel not in expected_paths:
+            shutil.rmtree(child)
+
+
 def legacy_export_output_symlink_issues(out_root: Path, accounts: List[Account]) -> List[str]:
     issues: List[str] = []
     for account in accounts:
@@ -630,6 +642,10 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             f"legacy export {account.email} failed for {len(mailbox_errors)} mailbox(es): "
             + "; ".join(mailbox_errors)
         )
+    _remove_stale_mailbox_dirs(
+        account_dir,
+        {str(item.get("path") or "") for item in export_state_mailboxes},
+    )
     _secure_atomic_json(
         state_path,
         {

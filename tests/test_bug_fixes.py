@@ -5337,6 +5337,62 @@ print("ok")
         assert sorted(path.name for path in inbox.glob("*.eml")) == ["u0000000001.eml"]
         assert sorted(path.name for path in inbox.glob("*.json") if path.name != ".mailbox.json") == ["u0000000001.json"]
 
+    def test_reexport_removes_deleted_mailbox_directories(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.models import Account, Config, ServerConfig
+
+        class MailboxExportImap:
+            def __init__(self, mailboxes: List[str]) -> None:
+                self.mailboxes = mailboxes
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    f'(\\HasNoChildren) "/" "{mailbox}"'.encode("ascii")
+                    for mailbox in self.mailboxes
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    body = f"Message-ID: <{self.selected.lower()}@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody".encode("ascii")
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection_factory(mailboxes: List[str]) -> Iterator[MailboxExportImap]:
+            yield MailboxExportImap(mailboxes)
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", lambda *_args: fake_connection_factory(["INBOX", "Archive"])):
+            export_account(account, server, tmp_path, ignore_errors=False)
+        with mock.patch("components.imap_ops.imap_connection", lambda *_args: fake_connection_factory(["INBOX"])):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        assert not (tmp_path / "user@example.com" / "Archive").exists()
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server=server, accounts=[account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        assert ok
+        assert issues == []
+
     def test_legacy_export_rejects_existing_provider_layout_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
