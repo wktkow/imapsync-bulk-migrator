@@ -10762,6 +10762,42 @@ def test_provider_preflight_counts_generic_all_when_it_is_only_source_mailbox(tm
     assert source.fetch_queries
 
 
+def test_provider_preflight_dedupes_generic_all_overlap_for_capacity(tmp_path: Path) -> None:
+    source = FakeGenericInboxAndAllSourceImap()
+    unique_source_bytes = len(source.inbox_body) + len(source.archived_body)
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=unique_source_bytes,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield source if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert ok, issues
+    assert source.fetch_queries_by_mailbox["INBOX"]
+    assert source.fetch_queries_by_mailbox["All Mail"]
+    assert all(
+        "BODY.PEEK[]" in query
+        for queries in source.fetch_queries_by_mailbox.values()
+        for query in queries
+    )
+
+
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
     config = _many_to_one_config()
     config.target.available_bytes = 60

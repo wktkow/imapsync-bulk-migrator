@@ -5752,10 +5752,20 @@ def provider_preflight(
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
                     account_issues.extend(gmail_account_decommission_issues(config.source, acc))
-                for mailbox in source_mailboxes:
+                retained_source_mailboxes = [
+                    mailbox
+                    for mailbox in source_mailboxes
+                    if not should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes)
+                ]
+                provider_key = config.source.provider.lower()
+                fetch_body_for_identity = (
+                    provider_key != "gmail"
+                    and any(_is_non_gmail_all_mailbox(provider_key, mailbox) for mailbox in retained_source_mailboxes)
+                )
+                ordinary_content_identities: set[Tuple[int, str]] = set()
+                aggregate_all_content_identities: set[Tuple[int, str]] = set()
+                for mailbox in retained_source_mailboxes:
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
-                    if should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes):
-                        continue
                     try:
                         uids, _uidvalidity = fetch_all_uids_and_uidvalidity(source_imap, mailbox.name)
                     except Exception as exc:
@@ -5766,7 +5776,11 @@ def provider_preflight(
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     for uid in uids:
                         _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
-                        status, data = source_imap.uid("fetch", str(uid), fetch_items(include_body=False, gmail_extensions=gmail_extensions))
+                        status, data = source_imap.uid(
+                            "fetch",
+                            str(uid),
+                            fetch_items(include_body=fetch_body_for_identity, gmail_extensions=gmail_extensions),
+                        )
                         _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         if status != "OK":
                             account_issues.append(f"metadata fetch failed in {mailbox.name} for UID {uid}")
@@ -5783,6 +5797,39 @@ def provider_preflight(
                         parsed = parse_provider_fetch_response(data or [])
                         if gmail_extensions and not parsed.get("gmail_msgid"):
                             account_issues.append(f"metadata fetch missing X-GM-MSGID in {mailbox.name} for UID {uid}")
+                            continue
+                        if fetch_body_for_identity:
+                            msg_bytes = parsed.get("message_bytes")
+                            if not isinstance(msg_bytes, bytes):
+                                account_issues.append(f"body fetch missing message bytes in {mailbox.name} for UID {uid}")
+                                continue
+                            size = int(parsed.get("rfc822_size") or len(msg_bytes))
+                            content_identity = (size, hashlib.sha256(msg_bytes).hexdigest())
+                            non_gmail_all_source = _is_non_gmail_all_mailbox(provider_key, mailbox)
+                            non_gmail_flagged_source = _is_non_gmail_flagged_mailbox(provider_key, mailbox)
+                            if non_gmail_all_source:
+                                if (
+                                    content_identity in ordinary_content_identities
+                                    or content_identity in aggregate_all_content_identities
+                                ):
+                                    continue
+                                aggregate_all_content_identities.add(content_identity)
+                                source_total += size
+                                continue
+                            if not non_gmail_flagged_source:
+                                if (
+                                    content_identity in aggregate_all_content_identities
+                                    and content_identity not in ordinary_content_identities
+                                ):
+                                    ordinary_content_identities.add(content_identity)
+                                    continue
+                                ordinary_content_identities.add(content_identity)
+                            else:
+                                identity = f"{mailbox.name}:{uid}"
+                                if identity in seen_identity:
+                                    continue
+                                seen_identity.add(identity)
+                            source_total += size
                             continue
                         identity = (
                             str(parsed.get("gmail_msgid") or f"{mailbox.name}:{uid}")
