@@ -7586,6 +7586,58 @@ class TestRound7ConfirmedBugs:
 
         assert victim.read_text() == ""
 
+    def test_legacy_append_import_journal_rejects_hard_linked_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import _append_legacy_import_journal
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        victim = tmp_path / "victim-hardlink.jsonl"
+        victim.write_text("")
+        journal = account_dir / "import.journal.jsonl"
+        try:
+            journal.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="hard-linked legacy import journal"):
+            _append_legacy_import_journal(account_dir, {
+                "key": "k",
+                "status": "pending",
+                "target": "imap://target",
+                "mailbox": "INBOX",
+                "path": "INBOX/u0000000001.eml",
+                "timestamp": "0",
+            })
+
+        assert victim.read_text() == ""
+
+    def test_legacy_import_rejects_hard_linked_import_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+        )
+        victim = tmp_path / "victim-hardlink.jsonl"
+        victim.write_text("")
+        journal = tmp_path / "user@example.com" / "import.journal.jsonl"
+        try:
+            journal.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="hard-linked legacy import journal"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        assert victim.read_text() == ""
+
     def test_strict_audit_rejects_symlinked_message_file(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig

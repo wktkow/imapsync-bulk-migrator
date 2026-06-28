@@ -68,7 +68,7 @@ def _legacy_symlink_component(path: Path) -> Optional[Path]:
     return None
 
 
-def _read_file_no_symlink(path: Path, label: str) -> bytes:
+def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = False) -> bytes:
     _raise_if_symlink(path, label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -79,8 +79,20 @@ def _read_file_no_symlink(path: Path, label: str) -> bytes:
         if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
             raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
         raise
+    try:
+        if reject_hard_links:
+            _raise_if_hard_linked_private_file_fd(fd, path, label)
+    except Exception:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "rb") as f:
         return f.read()
+
+
+def _raise_if_hard_linked_private_file_fd(fd: int, path: Path, label: str) -> None:
+    stat_result = os.fstat(fd)
+    if getattr(stat_result, "st_nlink", 1) > 1:
+        raise RuntimeError(f"refusing to use hard-linked {label}: {path}")
 
 
 def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -351,7 +363,13 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
     _raise_if_symlink(path, "legacy import journal")
     if not path.exists():
         return rows
-    lines = path.read_text(encoding="utf-8").splitlines()
+    try:
+        raw = _read_file_no_symlink(path, "legacy import journal", reject_hard_links=True)
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+            return rows
+        raise
+    lines = raw.decode("utf-8").splitlines()
     needs_rewrite = False
     for line_no, line in enumerate(lines, 1):
         line = line.strip()
@@ -397,6 +415,11 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
             raise RuntimeError(f"refusing to use symlinked legacy import journal: {path}") from exc
+        raise
+    try:
+        _raise_if_hard_linked_private_file_fd(fd, path, "legacy import journal")
+    except Exception:
+        os.close(fd)
         raise
     with os.fdopen(fd, "a", encoding="utf-8") as f:
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
