@@ -1183,7 +1183,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_validate(acc: Account) -> None:
                 email = acc.email
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys, imap_connection, list_all_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_all_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
@@ -1217,7 +1217,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         if not marker_path.exists():
                             return folder_dir.name
                         try:
-                            raw = json.loads(marker_path.read_text(encoding="utf-8"))
+                            marker_bytes = _read_file_no_symlink(
+                                marker_path,
+                                "legacy mailbox marker",
+                                reject_hard_links=True,
+                            )
+                            raw = json.loads(marker_bytes.decode("utf-8"))
                         except Exception as exc:
                             raise RuntimeError(f"{marker_path}: failed to parse mailbox marker: {exc}") from exc
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
@@ -1243,7 +1248,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                             metadata_path = eml_path.with_suffix(".json")
                             if metadata_path.exists():
                                 try:
-                                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                                    metadata_bytes = _read_file_no_symlink(
+                                        metadata_path,
+                                        "legacy message metadata",
+                                        reject_hard_links=True,
+                                    )
+                                    metadata = json.loads(metadata_bytes.decode("utf-8"))
                                 except Exception as exc:
                                     raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
                                 metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
@@ -1252,7 +1262,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                             key = sanitize_for_path(mailbox)
                             local_mailboxes_by_key.setdefault(key, mailbox)
                             local_counts[key] = local_counts.get(key, 0) + 1
-                            local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
+                            message_bytes = _read_file_no_symlink(
+                                eml_path,
+                                "legacy message file",
+                                reject_hard_links=True,
+                            )
+                            local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}

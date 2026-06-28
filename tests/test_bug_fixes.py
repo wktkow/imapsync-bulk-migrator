@@ -9589,6 +9589,71 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("u0000000001.eml: message file is a symlink" in issue for issue in issues)
 
+    def test_validate_rejects_message_symlink_swapped_after_audit_before_remote_check(self, tmp_path: Path) -> None:
+        from components.audit import audit_export as real_audit_export
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        folder = input_root / "user@example.com" / "INBOX"
+        source_server = {
+            "host": "source.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        target_server = {
+            "host": "target.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        original = b"Message-ID: <original@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=original,
+            source_server=ServerConfig(**source_server),
+        )
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": source_server,
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside.eml"
+        outside.write_bytes(b"Message-ID: <outside@example.com>\r\nFrom: x\r\nTo: y\r\n\r\noutside")
+        calls = 0
+
+        def audit_then_swap(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = real_audit_export(*args, **kwargs)
+            if calls == 2:
+                eml.unlink()
+                try:
+                    eml.symlink_to(outside)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+            return result
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=audit_then_swap), \
+            mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("remote validate should not run")):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert calls == 2
+        assert eml.is_symlink()
+        assert rc == 4
+
     def test_remote_audit_rejects_symlinked_mailbox_marker_without_following_or_connecting(self, tmp_path: Path) -> None:
         from components.audit import _folder_mailbox_name, audit_export
         from components.models import Account, Config, ServerConfig
