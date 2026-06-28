@@ -6122,7 +6122,49 @@ class TestRound2ConfirmedBugs:
         monkeypatch.chdir(tmp_path)
 
         assert main() == 1
-        assert "is a symlink" in capsys.readouterr().out
+        assert "path contains a symlink" in capsys.readouterr().out
+
+    def test_verify_account_rejects_symlinked_export_root_ancestor(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import verify_account
+
+        real_exported = tmp_path / "real-exported"
+        _write_legacy_message_fixture(real_exported / "user@example.com" / "INBOX")
+        linked_exported = tmp_path / "linked-exported"
+        try:
+            linked_exported.symlink_to(real_exported, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        stats = verify_account(linked_exported / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 1
+        assert "account path contains a symlink" in output
+
+    def test_verify_export_main_rejects_symlinked_cwd_ancestor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import main
+
+        real_cwd = tmp_path / "real-cwd"
+        _write_legacy_message_fixture(real_cwd / "exported" / "user@example.com" / "INBOX")
+        linked_cwd = tmp_path / "linked-cwd"
+        try:
+            linked_cwd.symlink_to(real_cwd, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        monkeypatch.chdir(linked_cwd)
+        monkeypatch.setenv("PWD", str(linked_cwd))
+
+        assert main() == 1
+        assert "path contains a symlink" in capsys.readouterr().out
 
     def test_verify_export_main_rejects_file_export_root(
         self,

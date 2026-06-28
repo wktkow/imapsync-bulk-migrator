@@ -31,6 +31,42 @@ from components.provider_ops import (
 from components.utils import sanitize_for_path, sanitized_path_key
 
 
+def _symlink_component(path):
+    path = Path(path)
+    if not path.is_absolute():
+        cwd = Path.cwd()
+        pwd = Path(os.environ.get("PWD", ""))
+        if pwd.is_absolute():
+            try:
+                if pwd.resolve() == cwd.resolve():
+                    path = pwd / path
+                else:
+                    path = cwd / path
+            except OSError:
+                path = cwd / path
+        else:
+            path = cwd / path
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _empty_error_stats(account_name):
+    return {
+        'account': account_name,
+        'total_messages': 0,
+        'messages_with_attachments': 0,
+        'total_attachments': 0,
+        'folders': 0,
+        'errors': 1,
+        'multiple_message_files': 0,
+    }
+
+
 def _has_later_rfc822_header_block(msg_text):
     lines = msg_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
     try:
@@ -110,16 +146,18 @@ def _non_encapsulated_text_has_rfc822_header_block(part):
 
 def _read_artifact_no_links(path, label):
     path = Path(path)
-    if path.is_symlink():
-        raise RuntimeError(f"{label} is a symlink")
+    symlink_component = _symlink_component(path)
+    if symlink_component is not None:
+        raise RuntimeError(f"{label} path contains a symlink: {symlink_component}")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        if path.is_symlink():
-            raise RuntimeError(f"{label} is a symlink") from exc
+        symlink_component = _symlink_component(path)
+        if symlink_component is not None:
+            raise RuntimeError(f"{label} path contains a symlink: {symlink_component}") from exc
         raise
     try:
         stat_result = os.fstat(fd)
@@ -536,6 +574,14 @@ def provider_empty_state_binding_issues(account_path):
 
 def verify_provider_account(account_path):
     """Verify a provider-layout account export."""
+    symlink_component = _symlink_component(account_path)
+    if symlink_component is not None:
+        account_name = account_path.name
+        print(f"\n=== Verifying {account_name} (provider layout) ===")
+        print(f"\n⚠️  1 errors found:")
+        print(f"  account path contains a symlink: {symlink_component}")
+        return _empty_error_stats(account_name)
+
     account_name = account_path.name
     print(f"\n=== Verifying {account_name} (provider layout) ===")
 
@@ -632,20 +678,13 @@ def verify_provider_account(account_path):
 
 def verify_account(account_path):
     """Verify all messages in an account"""
-    if account_path.is_symlink():
+    symlink_component = _symlink_component(account_path)
+    if symlink_component is not None:
         account_name = account_path.name
         print(f"\n=== Verifying {account_name} ===")
         print(f"\n⚠️  1 errors found:")
-        print(f"  account path is a symlink: {account_path}")
-        return {
-            'account': account_name,
-            'total_messages': 0,
-            'messages_with_attachments': 0,
-            'total_attachments': 0,
-            'folders': 0,
-            'errors': 1,
-            'multiple_message_files': 0,
-        }
+        print(f"  account path contains a symlink: {symlink_component}")
+        return _empty_error_stats(account_name)
     if (account_path / "manifest.jsonl").exists():
         return verify_provider_account(account_path)
 
@@ -797,8 +836,9 @@ def verify_account(account_path):
 def main():
     export_dir = Path("exported")
     
-    if export_dir.is_symlink():
-        print("❌ Export directory 'exported' is a symlink!")
+    symlink_component = _symlink_component(export_dir)
+    if symlink_component is not None:
+        print(f"❌ Export directory 'exported' path contains a symlink: {symlink_component}")
         return 1
 
     if not export_dir.exists():
