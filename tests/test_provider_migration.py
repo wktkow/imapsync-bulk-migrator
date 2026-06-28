@@ -5656,6 +5656,46 @@ def test_provider_import_rejects_manifest_paths_outside_export_dir(tmp_path: Pat
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_rejects_manifest_artifacts_outside_canonical_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from verify_export import verify_account
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    old_eml = account_dir / row["eml_path"]
+    old_metadata = account_dir / row["metadata_path"]
+    (account_dir / "payload.bin").write_bytes(old_eml.read_bytes())
+    old_eml.unlink()
+    old_metadata.unlink()
+    row["eml_path"] = "payload.bin"
+    row["metadata_path"] = "sidecar.dat"
+    _refresh_provider_binding(row)
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "sidecar.dat").write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    stats = verify_account(account_dir)
+    output = capsys.readouterr().out
+
+    assert any("invalid eml_path layout" in issue for issue in audit_issues)
+    assert any("invalid metadata_path layout" in issue for issue in audit_issues)
+    assert any("invalid eml_path layout" in issue for issue in report["failed"])
+    assert any("invalid metadata_path layout" in issue for issue in report["failed"])
+    assert stats["errors"] >= 1
+    assert "invalid eml_path layout" in output
+    assert "invalid metadata_path layout" in output
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="invalid metadata_path layout|invalid eml_path layout"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_import_rejects_duplicate_manifest_identity(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

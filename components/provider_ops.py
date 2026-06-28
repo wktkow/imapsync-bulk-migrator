@@ -1966,6 +1966,24 @@ def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:
     rel_path = Path(value)
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise RuntimeError(f"manifest row {row.get('canonical_id') or '<unknown>'}: unsafe {key}: {value!r}")
+    if key == "eml_path" and (
+        len(rel_path.parts) < 2
+        or rel_path.parts[0] != "messages"
+        or rel_path.suffix != ".eml"
+    ):
+        raise RuntimeError(
+            f"manifest row {row.get('canonical_id') or '<unknown>'}: "
+            f"invalid eml_path layout, expected messages/*.eml: {value!r}"
+        )
+    if key == "metadata_path" and (
+        len(rel_path.parts) < 2
+        or rel_path.parts[0] != "metadata"
+        or rel_path.suffix != ".json"
+    ):
+        raise RuntimeError(
+            f"manifest row {row.get('canonical_id') or '<unknown>'}: "
+            f"invalid metadata_path layout, expected metadata/*.json: {value!r}"
+        )
     root = account_dir.resolve()
     candidate = account_dir / rel_path
     current = account_dir
