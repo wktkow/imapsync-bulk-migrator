@@ -910,7 +910,7 @@ def import_account(
         folder_dirs,
         require_state=True,
         expected_source_server=source_server,
-        require_source_server_binding=source_server is not None,
+        require_source_server_binding=True,
     )
     if export_state_issues:
         raise RuntimeError("invalid legacy export-state: " + "; ".join(export_state_issues))

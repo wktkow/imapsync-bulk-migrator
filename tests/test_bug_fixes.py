@@ -735,11 +735,17 @@ class TestLegacyListParsing:
 class TestLegacyImportJournal:
     """Legacy import should not blindly duplicate committed local messages on rerun."""
 
+    def _source_server(self):
+        from components.models import ServerConfig
+
+        return ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+
     def _make_export(self, tmp_path: Path) -> Path:
         account_dir = tmp_path / "user@example.com" / "INBOX"
         eml = _write_legacy_message_fixture(
             account_dir,
             data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+            source_server=self._source_server(),
         )
         return tmp_path
 
@@ -834,8 +840,22 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator:
             yield fake_imap
 
-        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
-        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
+        import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append_count == 1
 
@@ -883,8 +903,22 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[NormalizingAppendImap]:
             yield fake_imap
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append_count == 1
         assert fake_imap.stored == [imaplib.MapCRLF.sub(imaplib.CRLF, data)]
@@ -994,7 +1028,14 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[ExistingNormalizedMessageImap]:
             yield fake_imap
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append_count == 0
 
@@ -1049,7 +1090,7 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[EmptyTarget]:
             yield fake
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory, source_server=server)
 
         assert fake.selected == ["INBOX"]
         assert fake.appended == 0
@@ -1167,7 +1208,14 @@ class TestLegacyImportJournal:
             yield fake_imap
 
         with pytest.raises(RuntimeError, match="pending append"):
-            import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+            import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+            )
         assert entered_imap is False
 
     def test_import_retries_after_clean_append_no(self, tmp_path: Path) -> None:
@@ -1205,9 +1253,23 @@ class TestLegacyImportJournal:
             yield fake_imap
 
         with pytest.raises(RuntimeError, match="append failed"):
-            import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+            import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+            )
 
-        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         statuses = [
             json.loads(line)["status"]
@@ -1258,7 +1320,14 @@ class TestLegacyImportJournal:
             yield fake_imap
 
         with pytest.raises(RuntimeError, match="append outcome is uncertain"):
-            import_account(account, server, in_root, ignore_errors=True, imap_factory=fake_factory)
+            import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=True,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+            )
 
         statuses = [
             json.loads(line)["status"]
@@ -1328,10 +1397,11 @@ class TestLegacyImportJournal:
                 import_account(account, server, in_root, ignore_errors=False)
 
     def test_import_ignore_errors_continues_but_raises_aggregate(self, tmp_path: Path) -> None:
-        from components.imap_ops import import_account
+        from components.imap_ops import import_account, legacy_server_endpoint, legacy_server_endpoint_digest
         from components.models import Account, ServerConfig
 
         account_dir = tmp_path / "user@example.com"
+        server = ServerConfig(host="dummy", port=993, ssl=True)
         for mailbox in ("Bad", "Good"):
             folder = account_dir / mailbox
             folder.mkdir(parents=True)
@@ -1350,8 +1420,12 @@ class TestLegacyImportJournal:
             {"mailbox": "Bad", "path": "Bad", "message_count": 1},
             {"mailbox": "Good", "path": "Good", "message_count": 1},
         ])
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["source_server"] = legacy_server_endpoint(server)
+        state["source_server_sha256"] = legacy_server_endpoint_digest(server)
+        state_path.write_text(json.dumps(state))
 
-        server = ServerConfig(host="dummy", port=993, ssl=True)
         account = Account(email="user@example.com", password="pass")
 
         class PartialImportImap:
@@ -1382,7 +1456,14 @@ class TestLegacyImportJournal:
             yield fake
 
         with pytest.raises(RuntimeError, match="legacy import user@example.com failed"):
-            import_account(account, server, tmp_path, ignore_errors=True, imap_factory=fake_factory)
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=True,
+                imap_factory=fake_factory,
+                source_server=server,
+            )
 
         assert fake.appended == ["Good"]
 
@@ -1413,7 +1494,14 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator:
             yield fake_imap
 
-        import_account(account, new_server, in_root, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            new_server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append.call_count == 1
 
@@ -1464,7 +1552,14 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[ExistingMessageImap]:
             yield fake_imap
 
-        import_account(account, equivalent_spelling, in_root, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            equivalent_spelling,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append_count == 0
 
@@ -1517,7 +1612,14 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[EmptyThenAppendedImap]:
             yield fake_imap
 
-        import_account(account, server, in_root, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.append_count == 1
         journal = (account_dir / "import.journal.jsonl").read_text()
@@ -1570,7 +1672,14 @@ class TestLegacyImportJournal:
         def fake_factory(*_args, **_kwargs) -> Iterator[SubscribeImportImap]:
             yield fake_imap
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=fake_factory)
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
 
         assert fake_imap.created == ["Projects"]
         assert fake_imap.subscribed == ["Projects"]
@@ -1839,7 +1948,7 @@ class TestBug6CreateExceptionLogged:
     """Failed imap.create should be logged, not silently suppressed."""
 
     def test_create_failure_is_logged(self, tmp_path: Path) -> None:
-        from components.imap_ops import import_account
+        from components.imap_ops import import_account, legacy_server_endpoint, legacy_server_endpoint_digest
         from components.models import Account, ServerConfig
 
         server = ServerConfig(host="dummy", port=993, ssl=True)
@@ -1863,6 +1972,11 @@ class TestBug6CreateExceptionLogged:
         _write_verify_export_state(acc_dir.parent, [
             {"mailbox": "NonExistent", "path": "NonExistent", "message_count": 1},
         ])
+        state_path = acc_dir.parent / "export-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["source_server"] = legacy_server_endpoint(server)
+        state["source_server_sha256"] = legacy_server_endpoint_digest(server)
+        state_path.write_text(json.dumps(state))
 
         fake_imap = mock.MagicMock()
         # First select fails, create fails, second select fails → RuntimeError
@@ -1878,6 +1992,7 @@ class TestBug6CreateExceptionLogged:
                 import_account(
                     account, server, tmp_path, ignore_errors=False,
                     imap_factory=fake_factory,
+                    source_server=server,
                 )
 
             # The create failure should have been logged as a warning
@@ -6893,6 +7008,24 @@ class TestRound7ConfirmedBugs:
                 source_server=wrong_source,
             )
 
+    def test_direct_import_requires_source_server_binding_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        source_server = ServerConfig("source.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder, source_server=source_server)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with pytest.raises(RuntimeError, match="config source_server missing"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("target.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_direct_zero_message_import_rejects_wrong_source_export_state_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account, legacy_server_endpoint, legacy_server_endpoint_digest
         from components.models import Account, ServerConfig
@@ -9397,6 +9530,7 @@ class TestRound7ConfirmedBugs:
             tmp_path,
             ignore_errors=False,
             imap_factory=fake_factory,
+            source_server=ServerConfig("imap.example.com"),
         )
 
         assert target.appended_flags == ["(project[2024)"]
