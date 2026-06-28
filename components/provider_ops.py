@@ -2446,7 +2446,7 @@ def _provider_flag_tokens(
         upper = token.upper()
         if upper == "\\RECENT":
             continue
-        if target_provider == "gmail" and upper == "\\DELETED":
+        if target_provider == "gmail" and upper in {"\\DELETED", "\\IMPORTANT"}:
             continue
         if upper in portable:
             if permanent_flags is None or upper in permanent_flags:
