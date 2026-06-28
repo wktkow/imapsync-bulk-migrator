@@ -251,6 +251,10 @@ def test_provider_validation_reports_broken_orphan_symlink_artifacts(
     assert any(needle in issue for issue in report["failed"])
     assert stats["errors"] >= 1
 
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=needle):
+            provider_import_account(config, account, tmp_path)
+
 
 def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
     config = _provider_config()
@@ -3396,6 +3400,11 @@ def _write_manifest_fixture(root: Path) -> Path:
     return account_dir
 
 
+def _remove_default_manifest_fixture_artifacts(account_dir: Path) -> None:
+    (account_dir / "messages" / "gmail-123.eml").unlink(missing_ok=True)
+    (account_dir / "metadata" / "gmail-123.json").unlink(missing_ok=True)
+
+
 def _write_provider_account_fixture(
     root: Path,
     *,
@@ -4804,6 +4813,7 @@ def test_provider_import_rejects_ambiguous_translated_folder_collision(tmp_path:
     second["eml_path"] = "messages/second.eml"
     second["metadata_path"] = "metadata/second.json"
     body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    _remove_default_manifest_fixture_artifacts(account_dir)
     (account_dir / "messages" / "first.eml").write_bytes(body)
     (account_dir / "messages" / "second.eml").write_bytes(body)
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
@@ -4865,6 +4875,7 @@ def test_provider_import_rejects_gmail_collision_before_label_mutation(tmp_path:
     second["eml_path"] = "messages/second.eml"
     second["metadata_path"] = "metadata/second.json"
     body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    _remove_default_manifest_fixture_artifacts(account_dir)
     (account_dir / "messages" / "first.eml").write_bytes(body)
     (account_dir / "messages" / "second.eml").write_bytes(body)
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
@@ -4917,6 +4928,7 @@ def test_provider_import_allows_repeated_rows_from_same_translated_source_folder
     second["eml_path"] = "messages/second.eml"
     second["metadata_path"] = "metadata/second.json"
     body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    _remove_default_manifest_fixture_artifacts(account_dir)
     (account_dir / "messages" / "first.eml").write_bytes(body)
     (account_dir / "messages" / "second.eml").write_bytes(body)
     (account_dir / "metadata" / "first.json").write_text(json.dumps(first))
@@ -7432,6 +7444,7 @@ def test_provider_validation_and_import_reject_duplicate_journaled_gmail_target_
     account_dir = _write_manifest_fixture(tmp_path)
     base = json.loads((account_dir / "manifest.jsonl").read_text())
     body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    _remove_default_manifest_fixture_artifacts(account_dir)
     rows = []
     for canonical_id in ("gmail-111", "gmail-222"):
         row = dict(base)
@@ -8207,6 +8220,10 @@ def test_provider_audit_and_validation_reject_orphan_provider_artifacts(tmp_path
     assert any("unmanifested provider metadata artifact: metadata/stale.json" in issue for issue in issues)
     assert any("unmanifested provider message artifact: messages/stale.eml" in item for item in report["failed"])
     assert any("unmanifested provider metadata artifact: metadata/stale.json" in item for item in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="unmanifested provider message artifact"):
+            provider_import_account(config, account, tmp_path)
 
 
 @pytest.mark.parametrize(

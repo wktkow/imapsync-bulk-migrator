@@ -3605,6 +3605,9 @@ def provider_import_account(
         require_manifest_payload_matches(row, data)
         payloads_by_identity[identity] = data
         expected_content_identities_by_id[identity] = provider_payload_content_identities(data)
+    artifact_issues = _provider_artifact_orphan_issues(account_dir, manifest_rows)
+    if artifact_issues:
+        raise RuntimeError("invalid provider artifacts: " + "; ".join(artifact_issues))
     journal_rows = load_import_journal(account_dir, account, repair_trailing=True)
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
