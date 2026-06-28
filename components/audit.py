@@ -83,7 +83,42 @@ def _is_legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
     return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
 
 
-def _remote_mailbox_content_covered(imap, mailbox: str, local_identities: Set[Tuple[int, str]]) -> bool:
+def _identity_variant_slots_cover(
+    remote_slots: List[Set[Tuple[int, str]]],
+    local_slots: List[Set[Tuple[int, str]]],
+) -> bool:
+    if len(remote_slots) > len(local_slots):
+        return False
+    edges: List[List[int]] = []
+    for remote_identities in remote_slots:
+        matches = [
+            idx
+            for idx, local_identities in enumerate(local_slots)
+            if remote_identities & local_identities
+        ]
+        if not matches:
+            return False
+        edges.append(matches)
+    match_for_local: Dict[int, int] = {}
+
+    def assign(remote_idx: int, seen: Set[int]) -> bool:
+        for local_idx in edges[remote_idx]:
+            if local_idx in seen:
+                continue
+            seen.add(local_idx)
+            previous_remote = match_for_local.get(local_idx)
+            if previous_remote is None or assign(previous_remote, seen):
+                match_for_local[local_idx] = remote_idx
+                return True
+        return False
+
+    for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
+        if not assign(remote_idx, set()):
+            return False
+    return True
+
+
+def _remote_mailbox_content_covered(imap, mailbox: str, local_identity_slots: List[Set[Tuple[int, str]]]) -> bool:
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
@@ -91,20 +126,20 @@ def _remote_mailbox_content_covered(imap, mailbox: str, local_identities: Set[Tu
     if status != "OK":
         return False
     nums = search_data[0].split() if search_data and search_data[0] else []
+    remote_slots: List[Set[Tuple[int, str]]] = []
     for num in nums:
         status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
         if status != "OK":
             return False
-        matched = False
+        remote_identities: Set[Tuple[int, str]] = set()
         for part in fetched or []:
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
-            if _content_identity_variants(bytes(part[1])) & local_identities:
-                matched = True
-                break
-        if not matched:
+            remote_identities.update(_content_identity_variants(bytes(part[1])))
+        if not remote_identities:
             return False
-    return True
+        remote_slots.append(remote_identities)
+    return _identity_variant_slots_cover(remote_slots, local_identity_slots)
 
 
 def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
@@ -564,7 +599,7 @@ def audit_account(
                     remote_mailbox_by_key[key] = (mbox, path)
                     remote_mailbox_by_path[path] = mbox
                 identity_candidates: List[Tuple[Path, str, str, bytes]] = []
-                local_content_identities: Set[Tuple[int, str]] = set()
+                local_content_identity_slots: List[Set[Tuple[int, str]]] = []
                 local_folder_info: Dict[str, Tuple[str, int]] = {}
                 for folder_dir in folder_dirs:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
@@ -593,7 +628,7 @@ def audit_account(
                         except Exception as exc:
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
                             continue
-                        local_content_identities.update(_content_identity_variants(data))
+                        local_content_identity_slots.append(_content_identity_variants(data))
                         identity_candidates.append((eml_path, folder, local_mailbox, data))
                 for folder, (local_mailbox, local_count) in local_folder_info.items():
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
@@ -609,7 +644,7 @@ def audit_account(
                             and _remote_mailbox_content_covered(
                                 imap,
                                 remote_mailbox or local_mailbox,
-                                local_content_identities,
+                                local_content_identity_slots,
                             )
                         ):
                             continue
@@ -629,7 +664,7 @@ def audit_account(
                         if (
                             rcount >= 0
                             and _is_legacy_virtual_source_attrs(attrs)
-                            and _remote_mailbox_content_covered(imap, remote_mailbox, local_content_identities)
+                            and _remote_mailbox_content_covered(imap, remote_mailbox, local_content_identity_slots)
                         ):
                             continue
                         count_mismatched.add(folder_name)

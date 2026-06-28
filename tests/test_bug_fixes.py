@@ -1715,6 +1715,150 @@ class TestLegacyListParsing:
 
         assert rc == 0
 
+    def test_remote_audit_rejects_duplicate_virtual_messages_covered_by_one_local_copy(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.models import Account, Config, ServerConfig
+
+        body = b"Message-ID: <legacy-duplicate-virtual@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class DuplicateAllRemote:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        remote = DuplicateAllRemote()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DuplicateAllRemote]:
+            yield remote
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [account], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert not ok
+        assert any("All_Mail: missing locally but remote has 2 messages" in issue for issue in issues)
+
+    def test_validate_rejects_duplicate_virtual_messages_covered_by_one_local_copy(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-validate-duplicate-virtual@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class DuplicateAllRemote:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self, *args):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DuplicateAllRemote]:
+            yield DuplicateAllRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path / "exported", ignore_errors=False)
+
+        config_path = tmp_path / "config.json"
+        server_json = {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False}
+        config_path.write_text(json.dumps({
+            "server": server_json,
+            "source_server": server_json,
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
     def test_import_translates_legacy_source_hierarchy_delimiter(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account, import_account
         from components.models import Account, ServerConfig
