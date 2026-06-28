@@ -208,6 +208,43 @@ class TestBug7ImportConfigPlaceholder:
         assert result["accounts"][0]["email"] == "a@example.com"
         assert import_path.stat().st_mode & 0o777 == 0o600
 
+    def test_export_mode_post_audit_uses_export_server_as_source(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        server = ServerConfig("source.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "export.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        output_dir = tmp_path / "exported"
+
+        def fake_export(account, _server, out_root, **_kwargs):
+            folder = out_root / account.email / "INBOX"
+            _write_legacy_message_fixture(
+                folder,
+                data=b"Message-ID: <post-audit@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+                source_server=server,
+            )
+            (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.export_account", side_effect=fake_export):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(output_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--audit-offline",
+            ])
+
+        assert rc == 0
+
     def test_generated_config_has_placeholder_host_and_private_permissions(self, tmp_path: Path) -> None:
         config_data = {
             "server": {"host": "real-export-server.example.com", "port": 993, "ssl": True, "starttls": False},

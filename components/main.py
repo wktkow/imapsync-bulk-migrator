@@ -1038,9 +1038,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not bool(getattr(args, "no_audit_after_export", False)):
                 try:
                     logging.info("Running export audit (%s)...", "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
+                    export_audit_config = Config(
+                        server=config.server,
+                        accounts=config.accounts,
+                        source_server=config.server,
+                    )
                     ok, audit_issues = audit_export(
                         out_root,
-                        config,
+                        export_audit_config,
                         int(args.max_workers),
                         check_remote=not bool(getattr(args, "audit_offline", False)),
                         require_integrity_metadata=True,
