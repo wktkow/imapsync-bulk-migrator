@@ -799,6 +799,10 @@ def main():
     if not export_dir.exists():
         print("❌ Export directory 'exported' not found!")
         return 1
+
+    if not export_dir.is_dir():
+        print("❌ Export path 'exported' is not a directory!")
+        return 1
     
     print("🔍 Verifying exported email data...")
     print("Checking message integrity, attachments, and folder structure...")

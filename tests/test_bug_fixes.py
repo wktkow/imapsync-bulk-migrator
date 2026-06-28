@@ -5717,6 +5717,21 @@ class TestRound2ConfirmedBugs:
         assert main() == 1
         assert "is a symlink" in capsys.readouterr().out
 
+    def test_verify_export_main_rejects_file_export_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import main
+
+        (tmp_path / "exported").write_text("not a directory\n")
+        monkeypatch.chdir(tmp_path)
+
+        assert main() == 1
+        output = capsys.readouterr().out
+        assert "not a directory" in output
+
     def test_verify_export_main_rejects_broken_account_symlink(
         self,
         tmp_path: Path,
