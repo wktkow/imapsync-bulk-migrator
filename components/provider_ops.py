@@ -2738,6 +2738,87 @@ def provider_export_account(
             if identity in messages
         }
 
+    def persist_fetched_message(
+        identity: str,
+        sha256: str,
+        message_id: str,
+        parsed: Dict[str, Any],
+        msg_bytes: bytes,
+        mailbox: MailboxInfo,
+        uid: int,
+        uidvalidity: str,
+    ) -> None:
+        safe_id = _safe_identity(identity)
+        if identity not in messages:
+            eml_rel = f"messages/{safe_id}.eml"
+            meta_rel = f"metadata/{safe_id}.json"
+            _atomic_bytes(account_dir / eml_rel, msg_bytes)
+            messages[identity] = {
+                "canonical_id": identity,
+                "source_provider": config.source.provider,
+                "source_account": account.source_email,
+                "target_account": account.target_email,
+                "source_mailboxes": [],
+                "source_mailbox_attributes": {},
+                "primary_mailbox": "",
+                "gmail_msgid": (parsed.get("gmail_msgid") or "") if use_gmail_metadata else "",
+                "gmail_thrid": (parsed.get("gmail_thrid") or "") if use_gmail_metadata else "",
+                "gmail_labels": [],
+                "message_id_header": message_id,
+                "content_sha256": sha256,
+                "rfc822_size": int(parsed.get("rfc822_size") or len(msg_bytes)),
+                "uid_by_mailbox": {},
+                "uidvalidity_by_mailbox": {},
+                "flags": parsed.get("flags") or "",
+                "internaldate": parsed.get("internaldate") or "",
+                "exported_at": _utc_now(),
+                "eml_path": eml_rel,
+                "metadata_path": meta_rel,
+            }
+        else:
+            record = messages[identity]
+            eml_rel = str(record.get("eml_path") or f"messages/{safe_id}.eml")
+            meta_rel = str(record.get("metadata_path") or f"metadata/{safe_id}.json")
+            record["eml_path"] = eml_rel
+            record["metadata_path"] = meta_rel
+            eml_path = _manifest_path(account_dir, record, "eml_path")
+            write_payload = not eml_path.exists()
+            if not write_payload:
+                try:
+                    existing_payload = _read_provider_artifact_bytes(eml_path, "provider message artifact")
+                    require_manifest_payload_matches(
+                        previous_rows_by_identity.get(identity, record),
+                        existing_payload,
+                    )
+                except Exception as exc:
+                    if _is_provider_artifact_safety_error(exc):
+                        raise
+                    logging.warning(
+                        "[provider-export] %s: replacing invalid existing payload for %s: %s",
+                        account.source_email,
+                        identity,
+                        exc,
+                    )
+                    write_payload = True
+                else:
+                    write_payload = existing_payload != msg_bytes
+            if write_payload:
+                _atomic_bytes(eml_path, msg_bytes)
+            record.setdefault("source_provider", config.source.provider)
+            record.setdefault("source_account", account.source_email)
+            record["target_account"] = account.target_email
+            record.setdefault("gmail_msgid", parsed.get("gmail_msgid") or "")
+            record.setdefault("gmail_thrid", parsed.get("gmail_thrid") or "")
+            record["message_id_header"] = message_id
+            record["content_sha256"] = sha256
+            record["rfc822_size"] = int(parsed.get("rfc822_size") or len(msg_bytes))
+            _refresh_export_delivery_metadata(record, parsed)
+            record.setdefault("exported_at", _utc_now())
+        trusted_payload_identities.add(identity)
+        update_membership(identity, mailbox, uid, uidvalidity, parsed)
+        persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+        previous_rows_by_identity[identity] = dict(messages[identity])
+
     with imap_connection(config.source, account, role="source") as imap:
         capabilities = get_capabilities(imap)
         use_gmail_metadata = config.source.provider == "gmail"
@@ -2781,6 +2862,10 @@ def provider_export_account(
                     "start a new export directory to avoid duplicate physical identities"
                 )
             logging.info("[provider-export] %s: %s -> %d messages", account.source_email, mailbox.name, len(uids))
+            pending_all_messages_by_content: Dict[
+                Tuple[int, str],
+                List[Tuple[str, str, str, Dict[str, Any], bytes, MailboxInfo, int, str]],
+            ] = {}
             for uid in uids:
                 _raise_if_stopped(stop_event, f"provider export {account.source_email}")
                 status, meta_data = imap.uid(
@@ -2865,82 +2950,39 @@ def provider_export_account(
                 if non_gmail_all_source:
                     remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                     if remaining_ordinary > 0:
-                        ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - 1
+                        pending_all_messages_by_content.setdefault(content_identity, []).append(
+                            (identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
+                        )
                         continue
-                safe_id = _safe_identity(identity)
-                if identity not in messages:
-                    eml_rel = f"messages/{safe_id}.eml"
-                    meta_rel = f"metadata/{safe_id}.json"
-                    _atomic_bytes(account_dir / eml_rel, msg_bytes)
-                    messages[identity] = {
-                        "canonical_id": identity,
-                        "source_provider": config.source.provider,
-                        "source_account": account.source_email,
-                        "target_account": account.target_email,
-                        "source_mailboxes": [],
-                        "source_mailbox_attributes": {},
-                        "primary_mailbox": "",
-                        "gmail_msgid": (parsed.get("gmail_msgid") or "") if use_gmail_metadata else "",
-                        "gmail_thrid": (parsed.get("gmail_thrid") or "") if use_gmail_metadata else "",
-                        "gmail_labels": [],
-                        "message_id_header": message_id,
-                        "content_sha256": sha256,
-                        "rfc822_size": int(parsed.get("rfc822_size") or len(msg_bytes)),
-                        "uid_by_mailbox": {},
-                        "uidvalidity_by_mailbox": {},
-                        "flags": parsed.get("flags") or "",
-                        "internaldate": parsed.get("internaldate") or "",
-                        "exported_at": _utc_now(),
-                        "eml_path": eml_rel,
-                        "metadata_path": meta_rel,
-                    }
-                else:
-                    record = messages[identity]
-                    eml_rel = str(record.get("eml_path") or f"messages/{safe_id}.eml")
-                    meta_rel = str(record.get("metadata_path") or f"metadata/{safe_id}.json")
-                    record["eml_path"] = eml_rel
-                    record["metadata_path"] = meta_rel
-                    eml_path = _manifest_path(account_dir, record, "eml_path")
-                    write_payload = not eml_path.exists()
-                    if not write_payload:
-                        try:
-                            existing_payload = _read_provider_artifact_bytes(eml_path, "provider message artifact")
-                            require_manifest_payload_matches(
-                                previous_rows_by_identity.get(identity, record),
-                                existing_payload,
-                            )
-                        except Exception as exc:
-                            if _is_provider_artifact_safety_error(exc):
-                                raise
-                            logging.warning(
-                                "[provider-export] %s: replacing invalid existing payload for %s: %s",
-                                account.source_email,
-                                identity,
-                                exc,
-                            )
-                            write_payload = True
-                        else:
-                            write_payload = existing_payload != msg_bytes
-                    if write_payload:
-                        _atomic_bytes(eml_path, msg_bytes)
-                    record.setdefault("source_provider", config.source.provider)
-                    record.setdefault("source_account", account.source_email)
-                    record["target_account"] = account.target_email
-                    record.setdefault("gmail_msgid", parsed.get("gmail_msgid") or "")
-                    record.setdefault("gmail_thrid", parsed.get("gmail_thrid") or "")
-                    record["message_id_header"] = message_id
-                    record["content_sha256"] = sha256
-                    record["rfc822_size"] = int(parsed.get("rfc822_size") or len(msg_bytes))
-                    _refresh_export_delivery_metadata(record, parsed)
-                    record.setdefault("exported_at", _utc_now())
-                trusted_payload_identities.add(identity)
-                record = messages[identity]
-                update_membership(identity, mailbox, uid, uidvalidity, parsed)
-                persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
-                previous_rows_by_identity[identity] = dict(record)
+                persist_fetched_message(identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
                 if provider_key != "gmail" and not non_gmail_all_source and not non_gmail_flagged_source:
                     ordinary_content_remaining_for_all[content_identity] = (
                         ordinary_content_remaining_for_all.get(content_identity, 0) + 1
+                    )
+            for content_identity, pending_messages in pending_all_messages_by_content.items():
+                remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
+                if len(pending_messages) <= remaining_ordinary:
+                    ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - len(pending_messages)
+                    continue
+                for (
+                    identity,
+                    sha256,
+                    message_id,
+                    parsed,
+                    msg_bytes,
+                    pending_mailbox,
+                    pending_uid,
+                    pending_uidvalidity,
+                ) in pending_messages:
+                    persist_fetched_message(
+                        identity,
+                        sha256,
+                        message_id,
+                        parsed,
+                        msg_bytes,
+                        pending_mailbox,
+                        pending_uid,
+                        pending_uidvalidity,
                     )
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
@@ -5755,6 +5797,7 @@ def provider_preflight(
                         account_issues.append(f"source mailbox {mailbox.name} scan failed: {exc}")
                         continue
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
+                    pending_all_sizes_by_content: Dict[Tuple[int, str], List[int]] = {}
                     for uid in uids:
                         _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         status, data = source_imap.uid(
@@ -5791,7 +5834,7 @@ def provider_preflight(
                             if non_gmail_all_source:
                                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                                 if remaining_ordinary > 0:
-                                    ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - 1
+                                    pending_all_sizes_by_content.setdefault(content_identity, []).append(size)
                                     continue
                                 source_total += size
                                 continue
@@ -5815,6 +5858,12 @@ def provider_preflight(
                             continue
                         seen_identity.add(identity)
                         source_total += int(parsed.get("rfc822_size") or 0)
+                    for content_identity, pending_sizes in pending_all_sizes_by_content.items():
+                        remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
+                        if len(pending_sizes) <= remaining_ordinary:
+                            ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - len(pending_sizes)
+                            continue
+                        source_total += sum(pending_sizes)
         except Exception as exc:
             if _stop_requested(stop_event):
                 raise
