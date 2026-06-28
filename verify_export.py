@@ -7,6 +7,7 @@ including attachments, message integrity, and folder structure.
 import json
 import hashlib
 import os
+import stat
 import sys
 from pathlib import Path
 from email.parser import BytesParser
@@ -152,6 +153,8 @@ def _read_artifact_no_links(path, label):
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -161,6 +164,8 @@ def _read_artifact_no_links(path, label):
         raise
     try:
         stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError(f"{label} is not a regular file")
         if getattr(stat_result, "st_nlink", 1) > 1:
             raise RuntimeError(f"{label} is hard-linked")
     except Exception:

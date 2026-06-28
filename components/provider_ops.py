@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import ssl
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -150,14 +151,20 @@ def _open_provider_private_file(path: Path, flags: int) -> int:
         raise RuntimeError(f"refusing to use symlinked provider file: {path}")
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags, PRIVATE_FILE_MODE)
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
             raise RuntimeError(f"refusing to use symlinked provider file: {path}") from exc
+        if exc.errno == errno.ENXIO:
+            raise RuntimeError(f"refusing to use non-regular provider file: {path}") from exc
         raise
     try:
         stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError(f"refusing to use non-regular provider file: {path}")
         if getattr(stat_result, "st_nlink", 1) > 1:
             raise RuntimeError(f"refusing to use hard-linked provider file: {path}")
         return fd
@@ -180,7 +187,11 @@ def _read_provider_artifact_bytes(path: Path, label: str) -> bytes:
 
 def _is_provider_artifact_safety_error(exc: BaseException) -> bool:
     message = str(exc)
-    return "symlinked provider file" in message or "hard-linked provider file" in message
+    return (
+        "symlinked provider file" in message
+        or "hard-linked provider file" in message
+        or "non-regular provider file" in message
+    )
 
 
 def _read_provider_artifact_text(path: Path, label: str) -> str:

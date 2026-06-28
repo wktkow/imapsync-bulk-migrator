@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import queue
 import signal
 import subprocess
@@ -42,6 +43,15 @@ def _write_verify_export_state(account_dir: Path, mailboxes: list[dict]) -> None
         "completed_at": 0,
         "mailboxes": mailboxes,
     }))
+
+
+def _mkfifo_or_skip(path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    try:
+        os.mkfifo(path)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
 
 
 def _write_legacy_message_fixture(
@@ -9506,6 +9516,166 @@ class TestRound7ConfirmedBugs:
                 tmp_path,
                 ignore_errors=False,
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    @pytest.mark.parametrize(
+        ("artifact", "needle", "verify_needle"),
+        [
+            ("message", "non-regular legacy message file", "message file is not a regular file"),
+            ("metadata", "non-regular legacy message metadata", "metadata sidecar is not a regular file"),
+        ],
+    )
+    def test_legacy_validation_rejects_non_regular_message_artifacts(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        artifact: str,
+        needle: str,
+        verify_needle: str,
+    ) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import import_account
+        from components.models import Account, Config, ServerConfig
+        from verify_export import verify_account
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <fifo-artifact@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        target = eml if artifact == "message" else eml.with_suffix(".json")
+        target.unlink()
+        _mkfifo_or_skip(target)
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        stats = verify_account(tmp_path / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert not ok
+        assert any(needle in issue for issue in issues)
+        assert stats["errors"] >= 1
+        assert verify_needle in output
+
+        with pytest.raises(RuntimeError, match=needle):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+    def test_direct_import_rejects_append_time_hard_link_swap(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        body = b"Message-ID: <append-race@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        folder = tmp_path / account.email / "INBOX"
+        eml = _write_legacy_message_fixture(folder, data=body, source_server=server)
+        victim = tmp_path / "outside-message.eml"
+        victim.write_bytes(body)
+
+        class AppendTarget:
+            appended = False
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def append(self, *_args, **_kwargs):
+                self.appended = True
+                return "OK", [b""]
+
+        target = AppendTarget()
+        calls = 0
+
+        def fake_factory(*_args, **_kwargs):
+            @contextlib.contextmanager
+            def manager():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    eml.unlink()
+                    try:
+                        os.link(victim, eml)
+                    except (OSError, NotImplementedError) as exc:
+                        pytest.skip(f"hard link creation unavailable: {exc}")
+                yield target
+
+            return manager()
+
+        with pytest.raises(RuntimeError, match="hard-linked legacy message file"):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=server,
+            )
+
+        assert calls == 2
+        assert target.appended is False
+
+    def test_direct_import_rejects_zero_message_export_state_symlink_swap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import audit as audit_module
+        from components.imap_ops import import_account, legacy_server_endpoint, legacy_server_endpoint_digest
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        account_dir = tmp_path / account.email
+        folder = account_dir / "INBOX"
+        folder.mkdir(parents=True)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        state = {
+            "schema_version": 1,
+            "account": account.email,
+            "source_server": legacy_server_endpoint(server),
+            "source_server_sha256": legacy_server_endpoint_digest(server),
+            "complete": True,
+            "completed_at": 0,
+            "mailboxes": [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}],
+        }
+        state_path = account_dir / "export-state.json"
+        state_path.write_text(json.dumps(state))
+        outside_state = tmp_path / "outside-export-state.json"
+        outside_state.write_text(json.dumps(state))
+        real_export_state_issues = audit_module._legacy_export_state_issues
+
+        def racing_export_state_issues(*args, **kwargs):
+            issues = real_export_state_issues(*args, **kwargs)
+            state_path.unlink()
+            try:
+                state_path.symlink_to(outside_state)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlink creation unavailable: {exc}")
+            return issues
+
+        monkeypatch.setattr(audit_module, "_legacy_export_state_issues", racing_export_state_issues)
+
+        with pytest.raises(RuntimeError, match=r"no staged \.eml files"):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+                source_server=server,
             )
 
     @pytest.mark.parametrize(

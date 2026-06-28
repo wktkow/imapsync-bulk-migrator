@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import ssl
+import stat
 import time
 from contextlib import AbstractContextManager
 from email.parser import BytesParser
@@ -88,6 +89,8 @@ def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = F
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -95,6 +98,9 @@ def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = F
             raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
         raise
     try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError(f"refusing to use non-regular {label}: {path}")
         if reject_hard_links:
             _raise_if_hard_linked_private_file_fd(fd, path, label)
     except Exception:
@@ -799,7 +805,13 @@ def import_account(
         if not state_path.exists():
             return False
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(
+                _read_file_no_symlink(
+                    state_path,
+                    "legacy export-state",
+                    reject_hard_links=True,
+                ).decode("utf-8")
+            )
         except Exception:
             return False
         if state.get("complete") is not True:
@@ -1021,7 +1033,7 @@ def import_account(
                 logging.info("[import] %s: %s <- %d messages", account.email, mailbox, len(entries))
                 for eml_path, flags, internaldate, expected_size, expected_hash in entries:
                     _raise_if_stopped(stop_event, f"legacy import {account.email}")
-                    data = _read_file_no_symlink(eml_path, "legacy message file")
+                    data = _read_file_no_symlink(eml_path, "legacy message file", reject_hard_links=True)
                     _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
                     append_data = _imap_append_wire_bytes(data)
                     flags_str = ""

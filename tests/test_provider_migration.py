@@ -193,6 +193,36 @@ def test_provider_append_journal_rejects_hard_linked_journal(tmp_path: Path) -> 
     assert os.stat(victim).st_ino == os.stat(journal).st_ino
 
 
+def test_provider_append_journal_rejects_non_regular_journal(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    journal = account_dir / "import-target@example.com.journal.jsonl"
+    try:
+        os.mkfifo(journal)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="non-regular provider file"):
+        append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+
+def test_provider_load_manifest_rejects_non_regular_manifest(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    try:
+        os.mkfifo(account_dir / "manifest.jsonl")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="non-regular provider file"):
+        load_manifest(account_dir)
+
+
 @pytest.mark.parametrize("writer_name", ["json", "jsonl"])
 def test_provider_atomic_writers_do_not_chmod_replaced_symlink_target(
     tmp_path: Path,
@@ -298,6 +328,35 @@ def test_provider_validation_rejects_hard_linked_message_artifacts(tmp_path: Pat
 
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match="hard-linked provider file"):
+            provider_import_account(config, account, tmp_path)
+
+
+@pytest.mark.parametrize("rel_path", ["messages/gmail-123.eml", "metadata/gmail-123.json"])
+def test_provider_validation_rejects_non_regular_message_artifacts(tmp_path: Path, rel_path: str) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    from verify_export import verify_account
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    artifact = account_dir / rel_path
+    artifact.unlink()
+    try:
+        os.mkfifo(artifact)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    stats = verify_account(account_dir)
+
+    assert any("non-regular provider file" in issue for issue in audit_issues)
+    assert any("non-regular provider file" in issue for issue in report["failed"])
+    assert stats["errors"] >= 1
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="non-regular provider file"):
             provider_import_account(config, account, tmp_path)
 
 
