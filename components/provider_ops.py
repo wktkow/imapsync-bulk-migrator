@@ -172,6 +172,16 @@ def _read_provider_private_file(path: Path) -> str:
         return f.read()
 
 
+def _read_provider_artifact_bytes(path: Path, label: str) -> bytes:
+    fd = _open_provider_private_file(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _read_provider_artifact_text(path: Path, label: str) -> str:
+    return _read_provider_artifact_bytes(path, label).decode("utf-8")
+
+
 def provider_endpoint_state(endpoint: ProviderEndpoint, *, username: Optional[str] = None) -> Dict[str, Any]:
     provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
     host = provider_hosts.get(endpoint.provider, endpoint.host)
@@ -1326,7 +1336,7 @@ def manifest_payload_content_identities(account_dir: Path, rows: List[Dict[str, 
         if not identity:
             continue
         try:
-            data = _manifest_path(account_dir, row, "eml_path").read_bytes()
+            data = _read_provider_artifact_bytes(_manifest_path(account_dir, row, "eml_path"), "provider message artifact")
             require_manifest_payload_matches(row, data)
         except Exception:
             continue
@@ -1358,7 +1368,7 @@ def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, r
                 issues.append(f"{identity}: missing metadata_path")
             continue
         try:
-            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            metadata = json.loads(_read_provider_artifact_text(meta_path, "provider metadata artifact"))
         except Exception as exc:
             issues.append(f"{identity}: failed to read metadata json: {exc}")
             continue
@@ -1389,7 +1399,7 @@ def manifest_payload_issues(account_dir: Path, rows: List[Dict[str, Any]]) -> Li
             issues.append(f"{identity}: missing eml_path")
             continue
         try:
-            data = eml_path.read_bytes()
+            data = _read_provider_artifact_bytes(eml_path, "provider message artifact")
         except Exception as exc:
             issues.append(f"{identity}: failed to read eml: {exc}")
             continue
@@ -3567,7 +3577,7 @@ def provider_import_account(
         eml_path = _manifest_path(account_dir, row, "eml_path")
         if not eml_path.exists():
             raise RuntimeError(f"message file missing for {identity}: {eml_path}")
-        data = eml_path.read_bytes()
+        data = _read_provider_artifact_bytes(eml_path, "provider message artifact")
         require_manifest_payload_matches(row, data)
         payloads_by_identity[identity] = data
         expected_content_identities_by_id[identity] = provider_payload_content_identities(data)
@@ -4051,7 +4061,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
             eml_path = _manifest_path(account_dir, row, "eml_path")
         if eml_rel and eml_path is not None and eml_path.exists():
             try:
-                data = eml_path.read_bytes()
+                data = _read_provider_artifact_bytes(eml_path, "provider message artifact")
                 try:
                     require_manifest_payload_matches(row, data)
                 except Exception as exc:

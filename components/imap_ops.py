@@ -850,7 +850,13 @@ def import_account(
             _raise_if_symlink(meta_path, "legacy message metadata")
             if not meta_path.exists():
                 raise RuntimeError(f"{eml_path}: missing message metadata")
-            meta = json.loads(_read_file_no_symlink(meta_path, "legacy message metadata").decode("utf-8"))
+            meta = json.loads(
+                _read_file_no_symlink(
+                    meta_path,
+                    "legacy message metadata",
+                    reject_hard_links=True,
+                ).decode("utf-8")
+            )
             if not isinstance(meta, dict):
                 raise RuntimeError(f"{meta_path}: message metadata is not an object")
             _validate_legacy_uid_metadata(meta_path, eml_path, meta)
@@ -871,7 +877,7 @@ def import_account(
                     raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
             elif mbox != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
-            data = _read_file_no_symlink(eml_path, "legacy message file")
+            data = _read_file_no_symlink(eml_path, "legacy message file", reject_hard_links=True)
             _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
             mailbox_meta = mbox
             per_folder.setdefault(mailbox_meta, []).append((eml_path, flags, internaldate, expected_size, expected_hash))

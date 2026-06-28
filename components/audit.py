@@ -13,6 +13,7 @@ from .models import Account, Config, ServerConfig
 from .imap_ops import (
     _imap_append_wire_bytes,
     _legacy_symlink_component,
+    _read_file_no_symlink,
     _validate_legacy_delivery_metadata,
     imap_connection,
     legacy_server_endpoint,
@@ -28,6 +29,10 @@ def _message_id_header(data: bytes) -> str:
         msg = BytesParser(policy=default_policy).parsebytes(data)
         return str(msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
     return ""
+
+
+def _read_staged_artifact(path: Path, label: str) -> bytes:
+    return _read_file_no_symlink(path, label, reject_hard_links=True)
 
 
 def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
@@ -184,7 +189,7 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     if eml_path.is_symlink():
         return [f"{eml_path}: message file is a symlink"]
     try:
-        data = eml_path.read_bytes()
+        data = _read_staged_artifact(eml_path, "legacy message file")
     except Exception as exc:
         return [f"{eml_path}: failed to read: {exc}"]
     if not data:
@@ -312,7 +317,7 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}:{meta_path.name}: message metadata is a symlink")
                 continue
             try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta = json.loads(_read_staged_artifact(meta_path, "legacy message metadata").decode("utf-8"))
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: failed to parse message metadata: {exc}")
                 continue
@@ -382,7 +387,7 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: {binding_issue}")
                 if not eml_is_symlink and (expected_hash is not None or expected_size is not None):
                     try:
-                        data = eml_path.read_bytes()
+                        data = _read_staged_artifact(eml_path, "legacy message file")
                         if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: content_sha256 mismatch")
                         if expected_size is not None and len(data) != expected_size:
@@ -459,7 +464,7 @@ def audit_account(
                     if folder in count_mismatched:
                         continue
                     try:
-                        data = eml_path.read_bytes()
+                        data = _read_staged_artifact(eml_path, "legacy message file")
                         used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
                         if not _remote_has_message(imap, mailbox, data, used_remote_nums):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")

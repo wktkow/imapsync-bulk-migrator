@@ -7916,6 +7916,66 @@ class TestRound7ConfirmedBugs:
 
         assert victim.read_text() == ""
 
+    @pytest.mark.parametrize(
+        ("artifact", "needle"),
+        [
+            ("message", "hard-linked legacy message file"),
+            ("metadata", "hard-linked legacy message metadata"),
+        ],
+    )
+    def test_legacy_validation_rejects_hard_linked_message_artifacts(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        artifact: str,
+        needle: str,
+    ) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import import_account
+        from components.models import Account, Config, ServerConfig
+        from verify_export import verify_account
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <hardlink-artifact@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        target = eml if artifact == "message" else eml.with_suffix(".json")
+        victim = tmp_path / f"outside-{artifact}"
+        victim.write_bytes(target.read_bytes())
+        target.unlink()
+        try:
+            target.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        stats = verify_account(tmp_path / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert not ok
+        assert any(needle in issue for issue in issues)
+        assert stats["errors"] >= 1
+        assert "hard-linked" in output
+
+        with pytest.raises(RuntimeError, match=needle):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_strict_audit_rejects_symlinked_message_file(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig

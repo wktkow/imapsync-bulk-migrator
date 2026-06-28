@@ -191,6 +191,35 @@ def test_provider_append_journal_rejects_hard_linked_journal(tmp_path: Path) -> 
     assert os.stat(victim).st_ino == os.stat(journal).st_ino
 
 
+@pytest.mark.parametrize("rel_path", ["messages/gmail-123.eml", "metadata/gmail-123.json"])
+def test_provider_validation_rejects_hard_linked_message_artifacts(tmp_path: Path, rel_path: str) -> None:
+    from verify_export import verify_account
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    artifact = account_dir / rel_path
+    victim = tmp_path / f"victim-{artifact.name}"
+    victim.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    try:
+        os.link(victim, artifact)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"hard link creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    stats = verify_account(account_dir)
+
+    assert any("hard-linked provider file" in issue for issue in audit_issues)
+    assert any("hard-linked provider file" in issue for issue in report["failed"])
+    assert stats["errors"] >= 1
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="hard-linked provider file"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

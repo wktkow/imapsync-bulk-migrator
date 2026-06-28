@@ -106,6 +106,30 @@ def _non_encapsulated_text_has_rfc822_header_block(part):
     return _has_later_rfc822_header_block('\n\n' + _decoded_text_payload(part))
 
 
+def _read_artifact_no_links(path, label):
+    path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError(f"{label} is a symlink")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if path.is_symlink():
+            raise RuntimeError(f"{label} is a symlink") from exc
+        raise
+    try:
+        stat_result = os.fstat(fd)
+        if getattr(stat_result, "st_nlink", 1) > 1:
+            raise RuntimeError(f"{label} is hard-linked")
+    except Exception:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
 def analyze_message(
     eml_path,
     json_path,
@@ -124,8 +148,7 @@ def analyze_message(
         if eml_path.is_symlink():
             return None, 'message file is a symlink'
         # Read the email
-        with open(eml_path, 'rb') as f:
-            msg_bytes = f.read()
+        msg_bytes = _read_artifact_no_links(eml_path, "message file")
         if not msg_bytes and content_binding != "provider":
             return None, 'empty file'
         
@@ -156,8 +179,7 @@ def analyze_message(
         elif json_path.is_symlink():
             return None, 'metadata sidecar is a symlink'
         else:
-            with open(json_path, 'r') as f:
-                metadata = json.load(f)
+            metadata = json.loads(_read_artifact_no_links(json_path, "metadata sidecar").decode("utf-8"))
             if not isinstance(metadata, dict):
                 return None, 'metadata json is not an object'
         
