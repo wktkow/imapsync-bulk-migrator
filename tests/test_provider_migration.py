@@ -193,6 +193,85 @@ def test_provider_append_journal_rejects_hard_linked_journal(tmp_path: Path) -> 
     assert os.stat(victim).st_ino == os.stat(journal).st_ino
 
 
+@pytest.mark.parametrize("writer_name", ["json", "jsonl"])
+def test_provider_atomic_writers_do_not_chmod_replaced_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "source@example.com" / (
+        "export-state.json" if writer_name == "json" else "manifest.jsonl"
+    )
+    victim = tmp_path / "victim.json"
+    victim.write_text("outside\n", encoding="utf-8")
+    victim.chmod(0o644)
+    original_mode = victim.stat().st_mode & 0o777
+    real_replace = Path.replace
+
+    def racing_replace(self: Path, target_path: Path) -> Path:
+        result = real_replace(self, target_path)
+        Path(target_path).unlink()
+        try:
+            Path(target_path).symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        return result
+
+    monkeypatch.setattr(Path, "replace", racing_replace)
+
+    if writer_name == "json":
+        _atomic_json(target, {"complete": False})
+    else:
+        provider_ops._write_jsonl(target, [{"canonical_id": "id"}])
+
+    assert target.is_symlink()
+    assert victim.stat().st_mode & 0o777 == original_mode
+
+
+def test_provider_append_journal_does_not_chmod_replaced_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    journal = account_dir / "import-target@example.com.journal.jsonl"
+    victim = tmp_path / "victim.journal.jsonl"
+    victim.write_text("outside\n", encoding="utf-8")
+    victim.chmod(0o644)
+    original_mode = victim.stat().st_mode & 0o777
+    real_fdopen = provider_ops.os.fdopen
+
+    def racing_fdopen(*args, **kwargs):
+        file_cm = real_fdopen(*args, **kwargs)
+
+        class RacingFile:
+            def __enter__(self):
+                return file_cm.__enter__()
+
+            def __exit__(self, exc_type, exc, tb):
+                result = file_cm.__exit__(exc_type, exc, tb)
+                journal.unlink()
+                try:
+                    journal.symlink_to(victim)
+                except (OSError, NotImplementedError) as symlink_exc:
+                    pytest.skip(f"symlink creation unavailable: {symlink_exc}")
+                return result
+
+        return RacingFile()
+
+    monkeypatch.setattr(provider_ops.os, "fdopen", racing_fdopen)
+
+    provider_ops.append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+    assert journal.is_symlink()
+    assert victim.stat().st_mode & 0o777 == original_mode
+
+
 @pytest.mark.parametrize("rel_path", ["messages/gmail-123.eml", "metadata/gmail-123.json"])
 def test_provider_validation_rejects_hard_linked_message_artifacts(tmp_path: Path, rel_path: str) -> None:
     from verify_export import verify_account

@@ -124,12 +124,11 @@ def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
         raise
     try:
         with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
         tmp.replace(path)
-        with contextlib.suppress(Exception):
-            os.chmod(path, PRIVATE_FILE_MODE)
     except Exception:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
@@ -449,12 +448,11 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
         os.close(fd)
         raise
     with os.fdopen(fd, "a", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
         json.dump(row, f, ensure_ascii=False, sort_keys=True)
         f.write("\n")
         f.flush()
         os.fsync(f.fileno())
-    with contextlib.suppress(Exception):
-        os.chmod(path, PRIVATE_FILE_MODE)
 
 
 def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:

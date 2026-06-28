@@ -3932,6 +3932,52 @@ class TestDirectAdminIndexerHardening:
         assert out.stat().st_mode & 0o777 == 0o600
         assert json.loads(out.read_text())["accounts"][0]["password"] == "secret"
 
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_json_does_not_chmod_replaced_symlink_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        overwrite: bool,
+    ) -> None:
+        import directadmin_indexer
+
+        out = tmp_path / "export.pass.config.json"
+        victim = tmp_path / "victim.json"
+        victim.write_text("outside\n")
+        victim.chmod(0o644)
+        original_mode = victim.stat().st_mode & 0o777
+
+        if overwrite:
+            out.write_text("{}")
+            real_replace = directadmin_indexer.os.replace
+
+            def racing_replace(src: str, dst: str) -> None:
+                real_replace(src, dst)
+                Path(dst).unlink()
+                try:
+                    Path(dst).symlink_to(victim)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+
+            monkeypatch.setattr(directadmin_indexer.os, "replace", racing_replace)
+        else:
+            real_link = directadmin_indexer.os.link
+
+            def racing_link(src: str, dst: str) -> None:
+                real_link(src, dst)
+                Path(dst).unlink()
+                try:
+                    Path(dst).symlink_to(victim)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+
+            monkeypatch.setattr(directadmin_indexer.os, "link", racing_link)
+
+        directadmin_indexer.write_json({"accounts": []}, str(out), overwrite=overwrite)
+
+        assert out.is_symlink()
+        assert victim.stat().st_mode & 0o777 == original_mode
+
     def test_indexer_list_pop_accounts_raises_on_api_error(self) -> None:
         from directadmin_indexer import DirectAdminClient
 
@@ -9122,6 +9168,84 @@ class TestRound7ConfirmedBugs:
             })
 
         assert victim.read_text() == ""
+
+    def test_legacy_atomic_write_does_not_chmod_replaced_symlink_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target = tmp_path / "user@example.com" / "export-state.json"
+        victim = tmp_path / "victim.json"
+        victim.write_text("outside\n")
+        victim.chmod(0o644)
+        original_mode = victim.stat().st_mode & 0o777
+        real_replace = Path.replace
+
+        def racing_replace(self: Path, target_path: Path) -> Path:
+            result = real_replace(self, target_path)
+            Path(target_path).unlink()
+            try:
+                Path(target_path).symlink_to(victim)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlink creation unavailable: {exc}")
+            return result
+
+        monkeypatch.setattr(Path, "replace", racing_replace)
+
+        imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
+
+        assert target.is_symlink()
+        assert victim.stat().st_mode & 0o777 == original_mode
+
+    def test_legacy_append_journal_does_not_chmod_replaced_symlink_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        victim = tmp_path / "victim.journal.jsonl"
+        victim.write_text("outside\n")
+        victim.chmod(0o644)
+        original_mode = victim.stat().st_mode & 0o777
+        real_fdopen = imap_ops.os.fdopen
+
+        def racing_fdopen(*args, **kwargs):
+            file_cm = real_fdopen(*args, **kwargs)
+
+            class RacingFile:
+                def __enter__(self):
+                    return file_cm.__enter__()
+
+                def __exit__(self, exc_type, exc, tb):
+                    result = file_cm.__exit__(exc_type, exc, tb)
+                    journal.unlink()
+                    try:
+                        journal.symlink_to(victim)
+                    except (OSError, NotImplementedError) as symlink_exc:
+                        pytest.skip(f"symlink creation unavailable: {symlink_exc}")
+                    return result
+
+            return RacingFile()
+
+        monkeypatch.setattr(imap_ops.os, "fdopen", racing_fdopen)
+
+        imap_ops._append_legacy_import_journal(account_dir, {
+            "key": "k",
+            "status": "pending",
+            "target": "imap://target",
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "timestamp": "0",
+        })
+
+        assert journal.is_symlink()
+        assert victim.stat().st_mode & 0o777 == original_mode
 
     def test_legacy_import_rejects_hard_linked_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account

@@ -273,7 +273,6 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
             except FileExistsError as exc:
                 raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
             tmp.unlink()
-        os.chmod(out, 0o600)
     except Exception:
         try:
             os.close(fd)
