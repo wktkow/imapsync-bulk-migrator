@@ -899,6 +899,70 @@ class TestLegacyListParsing:
         assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
         assert not (account_dir / "All_Mail").exists()
 
+    def test_export_requests_special_use_attrs_before_filtering_all_view(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-special-use-return@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SpecialUseReturnSource:
+            def __init__(self) -> None:
+                self.list_calls: List[tuple] = []
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self, *args):
+                self.list_calls.append(args)
+                all_attrs = b'(\\HasNoChildren \\All) "/" "All Mail"'
+                if args == ('""', '"*" RETURN (SPECIAL-USE)'):
+                    return "OK", [
+                        b'(\\HasNoChildren) "/" "INBOX"',
+                        all_attrs,
+                    ]
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = SpecialUseReturnSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SpecialUseReturnSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
+        assert source.selected == ["INBOX"]
+        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}]
+        assert not (account_dir / "All_Mail").exists()
+
     def test_remote_audit_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import export_account
