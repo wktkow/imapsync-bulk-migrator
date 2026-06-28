@@ -419,6 +419,73 @@ def provider_account_directory_binding_issues(account_path, rows):
     return issues
 
 
+def provider_state_manifest_binding_issues(account_path, rows):
+    state_path = account_path / "export-state.json"
+    if not rows or not state_path.exists() or state_path.is_symlink():
+        return []
+    try:
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(state, dict):
+        return []
+
+    issues = []
+
+    def expected_manifest_value(field, *, lower=False, required=True):
+        values = {}
+        for idx, row in enumerate(rows, 1):
+            identity = str(row.get("canonical_id") or f"row {idx}")
+            value = row.get(field)
+            if not isinstance(value, str) or not value.strip():
+                if required:
+                    issues.append(f"{identity}: missing or invalid {field}")
+                continue
+            normalized = value.strip().lower() if lower else value
+            values.setdefault(normalized, value)
+        if len(values) > 1:
+            issues.append(f"manifest {field} has multiple values: {', '.join(sorted(values))}")
+            return None
+        if len(values) == 1:
+            return next(iter(values))
+        return None
+
+    expected_source_provider = expected_manifest_value("source_provider", lower=True)
+    if expected_source_provider is not None:
+        state_source_provider = state.get("source_provider")
+        if not isinstance(state_source_provider, str) or state_source_provider.strip().lower() != expected_source_provider:
+            label = state_source_provider if isinstance(state_source_provider, str) and state_source_provider else "<missing>"
+            issues.append(
+                f"export-state source_provider {label} does not match manifest source_provider {expected_source_provider}"
+            )
+
+    expected_target_account = expected_manifest_value("target_account")
+    if expected_target_account is not None:
+        state_target_account = state.get("target_account")
+        if state_target_account != expected_target_account:
+            label = state_target_account if isinstance(state_target_account, str) and state_target_account else "<missing>"
+            issues.append(
+                f"export-state target_account {label} does not match manifest target_account {expected_target_account}"
+            )
+
+    state_target_provider = state.get("target_provider")
+    if not isinstance(state_target_provider, str) or not state_target_provider.strip():
+        issues.append("export-state target_provider is missing or invalid")
+    else:
+        normalized_target_provider = state_target_provider.strip().lower()
+        if normalized_target_provider not in {"gmail", "icloud", "imap"}:
+            issues.append(f"export-state target_provider is invalid: {state_target_provider}")
+        expected_target_provider = expected_manifest_value("target_provider", lower=True, required=False)
+        if expected_target_provider is not None and normalized_target_provider != expected_target_provider:
+            issues.append(
+                f"export-state target_provider {normalized_target_provider} "
+                f"does not match manifest target_provider {expected_target_provider}"
+            )
+
+    return issues
+
+
 def verify_provider_account(account_path):
     """Verify a provider-layout account export."""
     account_name = account_path.name
@@ -439,6 +506,7 @@ def verify_provider_account(account_path):
 
     errors.extend(provider_account_directory_binding_issues(account_path, rows))
     if rows:
+        errors.extend(provider_state_manifest_binding_issues(account_path, rows))
         errors.extend(provider_export_state_issues(account_path, manifest_rows=rows))
         errors.extend(manifest_schema_issues(rows))
         errors.extend(manifest_integrity_issues(rows))
