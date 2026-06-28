@@ -836,15 +836,17 @@ class TestLegacyListParsing:
 
         assert list_all_mailboxes(fake_imap) == ["Föld & Team"]
 
-    def test_export_skips_generic_special_use_source_views(self, tmp_path: Path) -> None:
+    def test_export_skips_generic_all_view_but_keeps_flagged_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
 
         body = b"Message-ID: <legacy-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        flagged_body = b"Message-ID: <legacy-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
 
         class SpecialUseSource:
             def __init__(self) -> None:
                 self.selected: List[str] = []
+                self.selected_mailbox = ""
 
             def list(self):
                 return "OK", [
@@ -854,16 +856,18 @@ class TestLegacyListParsing:
                 ]
 
             def select(self, mailbox: str, readonly: bool = False):
-                self.selected.append(mailbox.strip('"').replace(r"\"", '"'))
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
                 return "OK", [b"1"]
 
             def uid(self, command: str, *args):
                 if command == "search":
                     return "OK", [b"1"]
                 if command == "fetch":
+                    payload = flagged_body if self.selected_mailbox == "Flagged" else body
                     return "OK", [(
                         b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
-                        body,
+                        payload,
                     )]
                 raise AssertionError(command)
 
@@ -886,11 +890,160 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX"]
-        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}]
+        assert source.selected == ["INBOX", "Flagged"]
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
+        ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
+        assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
         assert not (account_dir / "All_Mail").exists()
-        assert not (account_dir / "Flagged").exists()
+
+    def test_remote_audit_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.models import Account, Config, ServerConfig
+
+        body = b"Message-ID: <legacy-audit-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SpecialUseRemote:
+            def __init__(self) -> None:
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<legacy-audit-special-use@example.com>":
+                        return "OK", [b"1"]
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE 73 BODY[] {73}", body)]
+
+            def logout(self):
+                return "OK", []
+
+        remote = SpecialUseRemote()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SpecialUseRemote]:
+            yield remote
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [account], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert ok, issues
+
+    def test_validate_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-validate-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SpecialUseRemote:
+            def __init__(self) -> None:
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<legacy-validate-special-use@example.com>":
+                        return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE 76 BODY[] {76}", body)]
+
+            def logout(self):
+                return "OK", []
+
+        remote = SpecialUseRemote()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SpecialUseRemote]:
+            yield remote
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path / "exported", ignore_errors=False)
+
+        config_path = tmp_path / "config.json"
+        server_json = {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False}
+        config_path.write_text(json.dumps({
+            "server": server_json,
+            "source_server": server_json,
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
 
 
 class TestLegacyImportJournal:

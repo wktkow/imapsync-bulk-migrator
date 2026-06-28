@@ -427,7 +427,7 @@ def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
         return True
     if provider_key != "gmail":
         attr_lowers = {attr.lower() for attr in mailbox.attributes}
-        if attr_lowers & {"\\all", "\\flagged"}:
+        if "\\all" in attr_lowers:
             return True
     return False
 

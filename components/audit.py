@@ -19,7 +19,7 @@ from .imap_ops import (
     legacy_reserved_mailbox_path_issue,
     legacy_server_endpoint,
     legacy_server_endpoint_digest,
-    list_all_mailboxes,
+    list_export_scope_mailboxes,
     quote_mailbox_name,
 )
 from .utils import quote_imap_search_value, sanitize_for_path, sanitized_path_key
@@ -416,7 +416,7 @@ def audit_account(
     if check_remote and server is not None and remote_safe:
         try:
             with imap_connection(server, account) as imap:
-                remote_mailboxes = list_all_mailboxes(imap)
+                remote_mailboxes = list_export_scope_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
                 remote_mailbox_by_key: Dict[str, Tuple[str, str]] = {}
                 remote_mailbox_by_path: Dict[str, str] = {}

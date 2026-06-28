@@ -249,7 +249,15 @@ def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tup
 
 def _is_legacy_special_use_source_view(attributes: Tuple[str, ...]) -> bool:
     attr_lowers = {attr.lower() for attr in attributes}
-    return bool(attr_lowers & {"\\all", "\\flagged"})
+    return "\\all" in attr_lowers
+
+
+def list_export_scope_mailboxes(imap: imaplib.IMAP4) -> List[str]:
+    return [
+        name
+        for name, attrs in _list_selectable_mailbox_entries(imap)
+        if not _is_legacy_special_use_source_view(attrs)
+    ]
 
 
 def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
@@ -597,12 +605,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     with imap_connection(server, account) as imap:
-        mailbox_entries = [
-            (mailbox, attrs)
-            for mailbox, attrs in _list_selectable_mailbox_entries(imap)
-            if not _is_legacy_special_use_source_view(attrs)
-        ]
-        mailboxes = [mailbox for mailbox, _attrs in mailbox_entries]
+        mailboxes = list_export_scope_mailboxes(imap)
 
         # Detect sanitize_for_path collisions before writing any data.
         # Two distinct mailbox names that map to the same directory would

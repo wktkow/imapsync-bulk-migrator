@@ -1185,7 +1185,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             def do_validate(acc: Account) -> None:
                 email = acc.email
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_all_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
@@ -1275,7 +1275,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
                     remote_name_mismatch_keys: Set[str] = set()
                     with imap_connection(config.server, acc) as imap:
-                        mailboxes = list_all_mailboxes(imap)
+                        mailboxes = list_export_scope_mailboxes(imap)
                         for mailbox in mailboxes:
                             try:
                                 status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)

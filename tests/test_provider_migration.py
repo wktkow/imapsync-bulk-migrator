@@ -2595,6 +2595,11 @@ class FakeGenericVirtualViewsSourceImap(FakeNonGmailDuplicateSourceImap):
         return super().uid(command, *args)
 
 
+class FakeGenericFlaggedOnlySourceImap(FakeNonGmailDuplicateSourceImap):
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\Flagged) "/" "Flagged"']
+
+
 @contextlib.contextmanager
 def _fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
     yield FakeSourceImap()
@@ -3147,7 +3152,7 @@ def test_provider_export_binds_non_gmail_physical_identity_to_source_account(tmp
     assert ids_by_source["a@example.com"] != ids_by_source["b@example.com"]
 
 
-def test_provider_export_skips_generic_special_use_source_views(tmp_path: Path) -> None:
+def test_provider_export_skips_generic_all_view_but_keeps_flagged_mailbox(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
             provider="imap",
@@ -3173,9 +3178,9 @@ def test_provider_export_skips_generic_special_use_source_views(tmp_path: Path) 
 
     account_dir = tmp_path / "source@example.com"
     manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
-    assert len(manifest) == 1
-    assert manifest[0]["source_mailboxes"] == ["INBOX"]
-    assert manifest[0]["primary_mailbox"] == "INBOX"
+    assert len(manifest) == 2
+    assert {tuple(row["source_mailboxes"]) for row in manifest} == {("INBOX",), ("Flagged",)}
+    assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Flagged"}
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
 
     target = StoredMessageTarget()
@@ -3187,7 +3192,39 @@ def test_provider_export_skips_generic_special_use_source_views(tmp_path: Path) 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, account, tmp_path)
 
-    assert target.appended == ["INBOX"]
+    assert set(target.appended) == {"Flagged", "INBOX"}
+    assert len(target.appended) == 2
+
+
+def test_provider_export_keeps_generic_flagged_only_mailbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericFlaggedOnlySourceImap]:
+        yield FakeGenericFlaggedOnlySourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 1
+    assert manifest[0]["source_mailboxes"] == ["Flagged"]
+    assert manifest[0]["primary_mailbox"] == "Flagged"
 
 
 def test_provider_uid_search_uses_rfc_valid_signature() -> None:
@@ -9464,6 +9501,34 @@ def test_provider_preflight_ignores_gmail_identity_metadata_for_generic_imap(tmp
     assert not ok
     assert any("estimated source bytes 86 exceed target.available_bytes 43" in issue for issue in issues)
     assert all("X-GM-" not in query for query in source.fetch_queries)
+
+
+def test_provider_preflight_counts_generic_flagged_only_mailbox(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=42,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakeGenericFlaggedOnlySourceImap() if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("estimated source bytes 43 exceed target.available_bytes 42" in issue for issue in issues)
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
