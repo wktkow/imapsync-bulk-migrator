@@ -385,6 +385,10 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
             raise RuntimeError(f"import journal row {line_no} is malformed: {path}") from None
         if not isinstance(row, dict):
             raise RuntimeError(f"import journal row {line_no} is not an object: {path}")
+        for required in ("key", "target"):
+            value = row.get(required)
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeError(f"import journal row {line_no} is missing {required}: {path}")
         coerced = {str(k): str(v) for k, v in row.items()}
         status = coerced.get("status", "")
         if status not in _LEGACY_IMPORT_JOURNAL_STATUSES:

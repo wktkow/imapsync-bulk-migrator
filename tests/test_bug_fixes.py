@@ -1162,6 +1162,30 @@ class TestLegacyImportJournal:
             with pytest.raises(RuntimeError, match="invalid status"):
                 import_account(account, server, in_root, ignore_errors=False)
 
+    def test_import_rejects_pending_journal_entry_missing_key(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "status": "pending",
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }) + "\n")
+
+        with pytest.raises(RuntimeError, match="import journal row 1 is missing key"):
+            import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_import_rejects_non_object_legacy_journal_row(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
@@ -2525,6 +2549,52 @@ class TestCliAndConfigHardening:
                 "--config", str(config_path),
                 "--input-dir", str(input_dir),
                 "--log-dir", str(tmp_path / "logs-pending"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        assert opened is False
+
+    def test_legacy_validate_rejects_keyless_pending_journal_before_target_contact(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        mailbox_dir = account_dir / "INBOX"
+        data = b"Message-ID: <keyless-pending-validate@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(mailbox_dir, data=data, source_server=server)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+        opened = False
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[object]:
+            nonlocal opened
+            opened = True
+            raise AssertionError("target should not be contacted")
+            yield object()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-keyless-pending"),
                 "--min-free-gb", "0",
                 "--no-connectivity-test",
             ])
