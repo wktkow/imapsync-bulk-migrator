@@ -5075,6 +5075,27 @@ class TestRound2ConfirmedBugs:
         assert stats["errors"] == 1
         assert main() == 1
 
+    def test_verify_export_counts_empty_legacy_mailbox_folder(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        inbox = account_dir / "INBOX"
+        inbox.mkdir(parents=True)
+        (inbox / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 0}))
+        _write_verify_export_state(account_dir, [{"mailbox": "INBOX", "path": "INBOX", "message_count": 0}])
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] == 0
+        assert stats["total_messages"] == 0
+        assert stats["folders"] == 1
+        assert "INBOX: 0 messages" in output
+
     def test_verify_export_accepts_provider_layout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
         from components.provider_ops import provider_manifest_digest

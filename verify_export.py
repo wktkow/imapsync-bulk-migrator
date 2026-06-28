@@ -626,12 +626,11 @@ def verify_account(account_path):
             errors.append(f"{folder_name}: no .eml files found and no mailbox marker present")
             folder_errors += 1
         
-        if folder_messages > 0:
-            folder_stats[folder_name] = {
-                'messages': folder_messages,
-                'attachments': folder_attachments,
-                'errors': folder_errors
-            }
+        folder_stats[folder_name] = {
+            'messages': folder_messages,
+            'attachments': folder_attachments,
+            'errors': folder_errors
+        }
 
     if mailbox_folders_found == 0:
         errors.append("no mailbox folders found")
