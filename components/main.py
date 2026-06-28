@@ -827,8 +827,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 require_integrity_metadata=True,
             )
         except Exception as exc:
+            if stop_event.is_set():
+                logging.warning("[panel] Staged export audit stopped: %s", exc)
+                return 130
             logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
             return 4
+        stop_rc = stop_requested_result("panel staged audit")
+        if stop_rc is not None:
+            return stop_rc
         if not ok:
             logging.error(
                 "[panel] Refusing %s because staged export audit found %d issue(s)",
@@ -873,6 +879,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[da] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
+            if stop_event.is_set():
+                return 130
             if da_client is None or bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
                 return 3
     if (not is_provider_config) and args.mode == "import" and use_cpanel:
@@ -911,6 +919,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("[cpanel] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
+            if stop_event.is_set():
+                return 130
             if cpanel_client is None or bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
     stop_rc = stop_requested_result("panel setup")
