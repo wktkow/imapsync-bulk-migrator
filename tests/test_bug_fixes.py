@@ -578,6 +578,71 @@ class TestBug1ExecutorErrorDraining:
 
 
 # ---------------------------------------------------------------------------
+# Executor stop_event must stop queued account work and drain running work
+# ---------------------------------------------------------------------------
+
+
+class TestExecutorStopEventPolling:
+    """Thread-pool account phases must honor cooperative stop requests."""
+
+    def test_stop_event_stops_queued_accounts_and_drains_running_workers(self) -> None:
+        from components.executor import parallel_process_accounts
+        from components.models import Account
+
+        accounts = [Account(email=f"user{i}@test.com", password="") for i in range(3)]
+        stop_event = threading.Event()
+        started: List[str] = []
+        finished: List[str] = []
+        lock = threading.Lock()
+
+        def worker(acc: Account) -> None:
+            with lock:
+                started.append(acc.email)
+            if acc.email == "user0@test.com":
+                stop_event.set()
+            time.sleep(0.05)
+            with lock:
+                finished.append(acc.email)
+
+        with pytest.raises(RuntimeError, match="stop requested before completion"):
+            parallel_process_accounts(
+                "test",
+                worker,
+                accounts,
+                max_workers=2,
+                stop_on_error=True,
+                stop_event=stop_event,
+            )
+
+        assert "user2@test.com" not in started
+        assert sorted(finished) == sorted(started)
+
+    def test_stop_event_stops_submission_when_error_continuation_is_enabled(self) -> None:
+        from components.executor import parallel_process_accounts
+        from components.models import Account
+
+        accounts = [Account(email=f"user{i}@test.com", password="") for i in range(2)]
+        stop_event = threading.Event()
+        started: List[str] = []
+
+        def worker(acc: Account) -> None:
+            started.append(acc.email)
+            stop_event.set()
+
+        with pytest.raises(RuntimeError, match="stop requested before completion"):
+            parallel_process_accounts(
+                "test",
+                worker,
+                accounts,
+                max_workers=1,
+                stop_on_error=False,
+                stop_event=stop_event,
+            )
+
+        assert started == ["user0@test.com"]
+
+
+# ---------------------------------------------------------------------------
 # BUG #12 — signal.signal guard for non-main thread
 # ---------------------------------------------------------------------------
 

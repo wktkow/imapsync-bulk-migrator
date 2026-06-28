@@ -1191,7 +1191,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raise RuntimeError(f"legacy export {acc.email}: stop requested before completion")
                 export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
-            parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            parallel_process_accounts(
+                "export",
+                do_export,
+                config.accounts,
+                int(args.max_workers),
+                stop_on_error=not args.ignore_errors,
+                stop_event=stop_event,
+            )
             stop_rc = stop_requested_result("legacy export")
             if stop_rc is not None:
                 return stop_rc
@@ -1288,7 +1295,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
 
             import_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
-            parallel_process_accounts("import", do_import, import_accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            parallel_process_accounts(
+                "import",
+                do_import,
+                import_accounts,
+                int(args.max_workers),
+                stop_on_error=not args.ignore_errors,
+                stop_event=stop_event,
+            )
             stop_rc = stop_requested_result("legacy import")
             if stop_rc is not None:
                 return stop_rc
@@ -1527,7 +1541,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 finally:
                     if account_dir_fd is not None:
                         os.close(account_dir_fd)
-            parallel_process_accounts("validate", do_validate, config.accounts, int(args.max_workers), stop_on_error=False)
+            parallel_process_accounts(
+                "validate",
+                do_validate,
+                config.accounts,
+                int(args.max_workers),
+                stop_on_error=False,
+                stop_event=stop_event,
+            )
             stop_rc = stop_requested_result("legacy validate")
             if stop_rc is not None:
                 return stop_rc

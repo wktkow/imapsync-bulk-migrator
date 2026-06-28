@@ -2934,7 +2934,14 @@ def provider_export_all(
             stop_event=stop_event,
         )
 
-    parallel_process_accounts("provider-export", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
+    parallel_process_accounts(
+        "provider-export",
+        worker,
+        config.accounts,
+        max_workers,
+        stop_on_error=not ignore_errors,
+        stop_event=stop_event,
+    )
 
 
 def _target_mailbox_lookup_key(name: str, target_provider: str = "imap") -> str:
@@ -4822,7 +4829,14 @@ def provider_import_all(
             raise RuntimeError(f"provider-import failed for {len(errors)} account(s): " + "; ".join(errors))
         return
 
-    parallel_process_accounts("provider-import", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
+    parallel_process_accounts(
+        "provider-import",
+        worker,
+        config.accounts,
+        max_workers,
+        stop_on_error=not ignore_errors,
+        stop_event=stop_event,
+    )
 
 
 def _journal_row(
