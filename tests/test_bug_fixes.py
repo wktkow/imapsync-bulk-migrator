@@ -9730,6 +9730,53 @@ class TestRound7ConfirmedBugs:
         assert (real_account_dir / "import.journal.jsonl").exists()
         assert not list(real_account_dir.glob("import.journal.reset-*.jsonl"))
 
+    def test_reset_journal_archive_rejects_account_dir_swap_after_validation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        row = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        (account_dir / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
+        outside = tmp_path / "outside-account"
+        outside.mkdir()
+        (outside / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
+        checked_account_dir = tmp_path / "checked-account"
+        real_load = imap_ops._load_legacy_import_journal
+        swapped = False
+
+        def racing_load(path: Path, *args, **kwargs):
+            nonlocal swapped
+            result = real_load(path, *args, **kwargs)
+            if path == account_dir and not swapped:
+                account_dir.rename(checked_account_dir)
+                try:
+                    account_dir.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return result
+
+        monkeypatch.setattr(imap_ops, "_load_legacy_import_journal", racing_load)
+
+        with pytest.raises(RuntimeError, match="replaced legacy import journal directory"):
+            imap_ops.archive_legacy_import_journal_for_reset(account_dir)
+
+        assert swapped
+        assert account_dir.is_symlink()
+        assert (outside / "import.journal.jsonl").exists()
+        assert not list(outside.glob("import.journal.reset-*.jsonl"))
+        assert (checked_account_dir / "import.journal.jsonl").exists()
+
     @pytest.mark.parametrize(
         ("field", "value", "needle"),
         [

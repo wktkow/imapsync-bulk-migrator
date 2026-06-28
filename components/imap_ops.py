@@ -434,17 +434,29 @@ def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]
     _raise_if_symlink(account_dir, "legacy account directory")
     path = _legacy_import_journal_path(account_dir)
     _raise_if_symlink(path, "legacy import journal")
-    if not path.exists():
-        return None
-    _load_legacy_import_journal(account_dir, repair_trailing=False)
-    stamp = int(time.time())
-    for idx in range(1000):
-        suffix = f"reset-{stamp}" if idx == 0 else f"reset-{stamp}-{idx}"
-        archive_path = account_dir / f"import.journal.{suffix}.jsonl"
-        if not archive_path.exists() and not archive_path.is_symlink():
-            path.replace(archive_path)
-            return archive_path
-    raise RuntimeError(f"unable to archive import journal for reset: {path}")
+    parent_fd, name, parent_path = _open_legacy_parent_dir(path, "legacy import journal")
+    try:
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+            return None
+        _load_legacy_import_journal(account_dir, repair_trailing=False)
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+        stamp = int(time.time())
+        for idx in range(1000):
+            suffix = f"reset-{stamp}" if idx == 0 else f"reset-{stamp}-{idx}"
+            archive_name = f"import.journal.{suffix}.jsonl"
+            try:
+                os.stat(archive_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+                os.rename(name, archive_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+                return account_dir / archive_name
+        raise RuntimeError(f"unable to archive import journal for reset: {path}")
+    finally:
+        os.close(parent_fd)
 
 
 def _legacy_import_target_id(server: ServerConfig, account: Account) -> str:
