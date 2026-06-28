@@ -1954,6 +1954,13 @@ def test_list_and_gmail_fetch_parsers() -> None:
     ])
     assert multi_literal_labels["gmail_labels"] == ["Label", "Second"]
 
+    with pytest.raises(RuntimeError, match="multiple message bodies"):
+        parse_provider_fetch_response([
+            (b"1 (RFC822.SIZE 10 BODY[] {5}", b"hello"),
+            (b" BODY[] {5}", b"world"),
+            b")",
+        ])
+
 
 def test_provider_safe_identity_hashes_truncated_names() -> None:
     first = "gmail-" + ("1" * 174) + "2"

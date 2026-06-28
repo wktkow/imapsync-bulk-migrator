@@ -703,7 +703,9 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, An
                 isinstance(body, (bytes, bytearray))
                 and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
             ):
-                msg_bytes = bytes(body) if msg_bytes is None else msg_bytes + bytes(body)
+                if msg_bytes is not None:
+                    raise RuntimeError("fetch returned multiple message bodies for one UID")
+                msg_bytes = bytes(body)
             elif isinstance(body, (bytes, bytearray)) and body and is_label_literal:
                 label = decode_imap_utf7(bytes(body).decode("ascii", errors="ignore").strip())
                 if label:
