@@ -1059,14 +1059,53 @@ def provider_manifest_digest(rows: List[Dict[str, Any]]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def latest_committed_journal_rows(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+def journal_target_key(
+    identity: str,
+    target_mailbox: str,
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> Tuple[str, str]:
+    mailbox_key = target_mailbox
+    if (target_provider or "imap").lower() == "gmail":
+        system_key = _gmail_target_system_key(target_mailbox, target_mailboxes)
+        if system_key:
+            mailbox_key = f"gmail-system:{system_key}"
+    return identity, mailbox_key
+
+
+def journal_row_target_key(
+    row: Dict[str, Any],
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> Tuple[str, str]:
+    return journal_target_key(
+        str(row.get("canonical_id") or ""),
+        str(row.get("target_mailbox") or ""),
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    )
+
+
+def latest_committed_journal_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         target_mailbox = str(row.get("target_mailbox") or "")
         if not identity or not target_mailbox:
             continue
-        key = (identity, target_mailbox)
+        key = journal_target_key(
+            identity,
+            target_mailbox,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
         if row.get("status") == "committed":
             latest[key] = row
         else:
@@ -3567,7 +3606,12 @@ def enforce_empty_target(
             target_provider=target_provider,
         )
         target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
-        key = (identity, target_mailbox)
+        key = journal_target_key(
+            identity,
+            target_mailbox,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
         if key in journaled:
             permitted_names = [target_mailbox]
             if target_provider == "gmail":
@@ -3851,13 +3895,24 @@ def require_merge_group_journals_remote_complete(
     expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
 ) -> None:
     for group_account, _account_dir, manifest_rows, journal_rows in stages:
-        committed_keys = set(latest_committed_journal_rows(journal_rows))
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        committed_keys = set(latest_committed)
         for row in journal_rows:
             if row.get("status") != "pending":
                 continue
             identity = str(row.get("canonical_id") or "<missing>")
             target_mailbox = str(row.get("target_mailbox") or "<missing>")
-            if (identity, target_mailbox) in committed_keys:
+            key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=target_provider,
+                target_mailboxes=target_mailboxes,
+            )
+            if key in committed_keys:
                 continue
             raise RuntimeError(
                 f"merge group source {group_account.source_email} has unresolved pending import journal row: "
@@ -3868,7 +3923,8 @@ def require_merge_group_journals_remote_complete(
             for row in manifest_rows
             if row.get("canonical_id")
         }
-        for (identity, target_mailbox), journal_row in latest_committed_journal_rows(journal_rows).items():
+        for (identity, _target_mailbox_key), journal_row in latest_committed.items():
+            target_mailbox = str(journal_row.get("target_mailbox") or "")
             manifest_row = row_by_id.get(identity)
             if manifest_row is None:
                 continue
@@ -3925,7 +3981,11 @@ def merge_group_empty_target_context(
     permitted_keys: set[Tuple[str, str]] = set()
     gmail_journal_msgids: Dict[Tuple[str, str], str] = {}
     for _group_account, _account_dir, manifest_rows, journal_rows in stages:
-        latest_committed = latest_committed_journal_rows(journal_rows)
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
+        )
         journaled = set(latest_committed)
         if config.target.provider == "gmail":
             for key, journal_row in latest_committed.items():
@@ -3933,7 +3993,11 @@ def merge_group_empty_target_context(
                 if target_gmail_msgid:
                     gmail_journal_msgids[key] = target_gmail_msgid
         journaled.update(
-            (str(row.get("canonical_id")), str(row.get("target_mailbox")))
+            journal_row_target_key(
+                row,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
             for row in journal_rows
             if row.get("status") == "pending"
         )
@@ -3957,7 +4021,12 @@ def merge_group_empty_target_context(
                     target_provider=config.target.provider,
                 )
                 target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
-            key = (identity, target_mailbox)
+            key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
             if key not in journaled:
                 continue
             permitted_rows.append(row)
@@ -4035,7 +4104,7 @@ def provider_import_account(
         if duplicate_gmail_msgid_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(duplicate_gmail_msgid_issues))
     pending = {
-        (str(row.get("canonical_id")), str(row.get("target_mailbox")))
+        journal_row_target_key(row, target_provider=config.target.provider)
         for row in journal_rows
         if row.get("status") == "pending"
     }
@@ -4124,7 +4193,11 @@ def provider_import_account(
             )
             if repaired_journal_issues:
                 raise RuntimeError("invalid import journal: " + "; ".join(repaired_journal_issues))
-        latest_committed = latest_committed_journal_rows(journal_rows)
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
+        )
         committed = set(latest_committed)
         if config.migration.target_mode == "empty":
             empty_target_rows = manifest_rows
@@ -4168,7 +4241,12 @@ def provider_import_account(
                     target_provider=config.target.provider,
                 )
                 target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
-            key = (identity, target_mailbox)
+            key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
             data = payloads_by_identity[identity]
             expected_content_identities = expected_content_identities_by_id.get(identity)
             if key in committed:
@@ -4660,14 +4738,19 @@ def provider_validate_account(
                 target_provider=config.target.provider,
             )
         )
-    committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
+    committed_journal_keys = set(
+        latest_committed_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+        )
+    )
     if not allow_unresolved_pending:
         for row in journal_rows:
             if row.get("status") != "pending":
                 continue
             identity = str(row.get("canonical_id") or "")
             target_mailbox = str(row.get("target_mailbox") or "")
-            if (identity, target_mailbox) not in committed_journal_keys:
+            if journal_row_target_key(row, target_provider=config.target.provider) not in committed_journal_keys:
                 report["failed"].append(
                     f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
                 )
@@ -4718,11 +4801,18 @@ def provider_validate_account(
     )
     report["exported"] = len(manifest_ids)
 
-    def evaluate_journal(expected_target_by_id: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, int], Dict[str, str], List[str]]:
+    def evaluate_journal(
+        expected_target_by_id: Optional[Dict[str, str]] = None,
+        target_mailboxes: Optional[List[MailboxInfo]] = None,
+    ) -> Tuple[Dict[str, int], Dict[str, str], List[str]]:
         committed_by_id: Dict[str, int] = {}
         target_by_id: Dict[str, str] = {}
         failures: List[str] = []
-        effective_committed = latest_committed_journal_rows(journal_rows)
+        effective_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
+        )
         for row in effective_committed.values():
             identity = str(row.get("canonical_id") or "")
             if not identity:
@@ -4745,7 +4835,7 @@ def provider_validate_account(
                 continue
             committed_by_id[identity] = committed_by_id.get(identity, 0) + 1
             if target_mailbox:
-                target_by_id[identity] = target_mailbox
+                target_by_id[identity] = expected_target or target_mailbox
         return committed_by_id, target_by_id, failures
 
     def apply_counts(committed_by_id: Dict[str, int]) -> None:
@@ -4796,7 +4886,10 @@ def provider_validate_account(
                     identity: target_mailbox_by_identity[identity]
                     for identity, row in by_id.items()
                 }
-                committed_by_id, target_by_id, failures = evaluate_journal(expected_target_by_id)
+                committed_by_id, target_by_id, failures = evaluate_journal(
+                    expected_target_by_id,
+                    target_mailboxes=target_mailboxes,
+                )
                 report["failed"].extend(failures)
                 apply_counts(committed_by_id)
                 if config.target.provider == "gmail":
@@ -4806,7 +4899,11 @@ def provider_validate_account(
                         raise RuntimeError("; ".join(target_readiness_issues))
                 if config.migration.target_mode == "empty":
                     empty_target_rows = manifest_rows
-                    effective_committed_rows = latest_committed_journal_rows(journal_rows)
+                    effective_committed_rows = latest_committed_journal_rows(
+                        journal_rows,
+                        target_provider=config.target.provider,
+                        target_mailboxes=target_mailboxes,
+                    )
                     empty_target_journaled = set(effective_committed_rows)
                     empty_target_gmail_msgids = {
                         key: str(row.get("target_gmail_msgid") or "")
@@ -4841,7 +4938,11 @@ def provider_validate_account(
                 if not report["missing"]:
                     used_target_nums: Dict[str, set[bytes]] = {}
                     used_target_gmail_msgids: set[str] = set()
-                    effective_committed_rows = latest_committed_journal_rows(journal_rows)
+                    effective_committed_rows = latest_committed_journal_rows(
+                        journal_rows,
+                        target_provider=config.target.provider,
+                        target_mailboxes=target_mailboxes,
+                    )
                     target_gmail_msgid_by_id = {
                         str(row.get("canonical_id") or ""): str(row.get("target_gmail_msgid") or "")
                         for row in effective_committed_rows.values()

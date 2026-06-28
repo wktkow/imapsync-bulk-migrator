@@ -6964,6 +6964,58 @@ def test_provider_import_empty_mode_permits_journaled_gmail_all_mail_message(tmp
     assert fake.appended == []
 
 
+def test_provider_import_and_validation_match_googlemail_all_mail_journal_alias(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _mark_manifest_source_provider(row, "imap")
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Archive"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[GoogleMail]/All Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })) + "\n")
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="[Gmail]/All Mail",
+        messages_by_mailbox={"[Gmail]/All Mail": 1},
+        gmail_msgid="9001",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert fake.appended == []
+    assert report["ok"], report
+    assert report["remote_missing"] == []
+    assert report["failed"] == []
+
+
 def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_path: Path) -> None:
     class StarredGmailTarget(FakeGmailTargetImap):
         def __init__(self, **kwargs) -> None:
