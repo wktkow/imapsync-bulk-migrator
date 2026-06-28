@@ -1835,12 +1835,19 @@ def _generic_imap_offline_target_requires_live_special_use(target_mailbox: str, 
     )
 
 
+def _gmail_offline_target_requires_live_special_use(target_mailbox: str, expected_target: str) -> bool:
+    expected_key = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
+    target_key = _gmail_target_system_key(target_mailbox)
+    return bool(target_mailbox and target_mailbox != expected_target and expected_key and not target_key)
+
+
 def committed_journal_target_mailbox_issues(
     rows: List[Dict[str, Any]],
     expected_target_by_id: Dict[str, str],
     *,
     target_provider: str = "imap",
     defer_generic_special_use: bool = False,
+    defer_gmail_special_use: bool = False,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -1863,6 +1870,12 @@ def committed_journal_target_mailbox_issues(
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
+            if (
+                defer_gmail_special_use
+                and provider == "gmail"
+                and _gmail_offline_target_requires_live_special_use(target_mailbox, expected_target)
+            ):
+                continue
             issues.append(
                 f"journal committed identity in wrong target mailbox: {identity} "
                 f"expected {expected_target!r} got {target_mailbox!r}"
@@ -1876,6 +1889,7 @@ def pending_journal_target_mailbox_issues(
     *,
     target_provider: str = "imap",
     defer_generic_special_use: bool = False,
+    defer_gmail_special_use: bool = False,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -1898,6 +1912,12 @@ def pending_journal_target_mailbox_issues(
                 defer_generic_special_use
                 and provider == "imap"
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
+            ):
+                continue
+            if (
+                defer_gmail_special_use
+                and provider == "gmail"
+                and _gmail_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
             issues.append(
@@ -1953,6 +1973,7 @@ def offline_journal_target_mailbox_issues(
         expected,
         target_provider=target_provider,
         defer_generic_special_use=True,
+        defer_gmail_special_use=True,
     )
     issues.extend(
         pending_journal_target_mailbox_issues(
@@ -1960,6 +1981,7 @@ def offline_journal_target_mailbox_issues(
             expected,
             target_provider=target_provider,
             defer_generic_special_use=True,
+            defer_gmail_special_use=True,
         )
     )
     return issues
@@ -4248,11 +4270,6 @@ def provider_import_account(
         )
         if duplicate_gmail_msgid_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(duplicate_gmail_msgid_issues))
-    pending = {
-        journal_row_target_key(row, target_provider=config.target.provider)
-        for row in journal_rows
-        if row.get("status") == "pending"
-    }
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
     used_target_nums: Dict[str, set[bytes]] = {}
     used_target_gmail_msgids: set[str] = set()
@@ -4278,6 +4295,15 @@ def provider_import_account(
                     "IMAP server did not advertise X-GM-EXT-1"
                 )
         target_mailboxes = list_mailboxes(imap)
+        pending = {
+            journal_row_target_key(
+                row,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
+            for row in journal_rows
+            if row.get("status") == "pending"
+        }
         if merge_group_stages is not None:
             require_merge_group_target_translation_safe(
                 merge_group_stages,
