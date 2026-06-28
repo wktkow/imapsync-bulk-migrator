@@ -1,4 +1,5 @@
 import contextlib
+import concurrent.futures
 import hashlib
 import json
 import re
@@ -23,6 +24,15 @@ from .imap_ops import (
     quote_mailbox_name,
 )
 from .utils import quote_imap_search_value, sanitize_for_path, sanitized_path_key
+
+
+def _stop_requested(stop_event: Optional[object]) -> bool:
+    return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+
+def _raise_if_stopped(stop_event: Optional[object], label: str) -> None:
+    if _stop_requested(stop_event):
+        raise RuntimeError(f"{label}: stop requested before completion")
 
 
 def _message_id_header(data: bytes) -> str:
@@ -236,8 +246,10 @@ def audit_account(
     *,
     require_integrity_metadata: bool = False,
     expected_source_server: Optional[ServerConfig] = None,
+    stop_event: Optional[object] = None,
 ) -> Tuple[str, List[str]]:
     """Audit a single account directory and optionally compare to remote counts."""
+    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
     issues: List[str] = []
     remote_safe = True
     account_dir = in_root / sanitize_for_path(account.email)
@@ -256,6 +268,7 @@ def audit_account(
         remote_safe = False
     folder_dirs: List[Path] = []
     for child in account_dir.iterdir():
+        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
         if child.is_symlink():
             issues.append(f"{account.email}:{child.name}: mailbox path is a symlink")
             remote_safe = False
@@ -278,6 +291,7 @@ def audit_account(
         )
     )
     for folder_dir in folder_dirs:
+        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
         jsons = [p for p in folder_dir.glob("*.json") if p.name != ".mailbox.json"]
@@ -317,9 +331,11 @@ def audit_account(
             issues.append(f"{account.email}:{folder}: {len(missing_eml)} metadata file(s) without .eml counterpart")
         symlink_jsons = {p for p in jsons if p.is_symlink()}
         for json_path in sorted(symlink_jsons):
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
             issues.append(f"{account.email}:{folder}:{json_path.name}: message metadata is a symlink")
             remote_safe = False
         for eml_path in emls:
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
             eml_is_symlink = eml_path.is_symlink()
             if eml_is_symlink:
                 remote_safe = False
@@ -415,6 +431,7 @@ def audit_account(
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: failed integrity read: {exc}")
     if check_remote and server is not None and remote_safe:
         try:
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
             with imap_connection(server, account) as imap:
                 remote_mailboxes = list_export_scope_mailboxes(imap)
                 remote_counts: Dict[str, int] = {}
@@ -422,6 +439,7 @@ def audit_account(
                 remote_mailbox_by_path: Dict[str, str] = {}
                 count_mismatched = set()
                 for mbox in remote_mailboxes:
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
                     path = sanitize_for_path(mbox)
                     key = sanitized_path_key(mbox)
@@ -449,6 +467,7 @@ def audit_account(
                     remote_mailbox_by_path[path] = mbox
                 identity_candidates: List[Tuple[Path, str, str]] = []
                 for folder_dir in folder_dirs:
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     folder = folder_dir.name
                     if folder_dir.is_symlink():
                         count_mismatched.add(folder)
@@ -476,15 +495,18 @@ def audit_account(
                         )
                     elif local_count > 0:
                         for eml_path in sorted(folder_dir.glob("*.eml")):
+                            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                             if eml_path.is_symlink():
                                 continue
                             identity_candidates.append((eml_path, folder, local_mailbox))
                 for folder_name, rcount in remote_counts.items():
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if not (account_dir / folder_name).exists():
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
                 used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}
                 for eml_path, folder, mailbox in identity_candidates:
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if folder in count_mismatched:
                         continue
                     try:
@@ -495,6 +517,8 @@ def audit_account(
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
         except Exception as exc:
+            if _stop_requested(stop_event):
+                raise
             issues.append(f"remote check failed: {exc}")
     return account.email, issues
 
@@ -506,6 +530,7 @@ def audit_export(
     check_remote: bool = True,
     *,
     require_integrity_metadata: bool = False,
+    stop_event: Optional[object] = None,
 ) -> Tuple[bool, List[str]]:
     """Audit all accounts concurrently and aggregate issues.
 
@@ -513,6 +538,7 @@ def audit_export(
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+    _raise_if_stopped(stop_event, "legacy audit")
     if _legacy_symlink_component(in_root) is not None:
         return False, [f"audit root is a symlink: {in_root}"]
     issues_accum: List[str] = []
@@ -522,6 +548,7 @@ def audit_export(
     remote_server = config.source_server or config.server
 
     def worker(acc: Account) -> List[str]:
+        _raise_if_stopped(stop_event, f"legacy audit {acc.email}")
         _email, issues = audit_account(
             acc,
             in_root,
@@ -529,14 +556,69 @@ def audit_export(
             check_remote=check_remote,
             require_integrity_metadata=require_integrity_metadata,
             expected_source_server=expected_source_server,
+            stop_event=stop_event,
         )
+        _raise_if_stopped(stop_event, f"legacy audit {acc.email}")
         if not issues:
             return []
         return [f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues]
 
-    import concurrent.futures
+    results: List[List[str]] = []
+    account_iter = iter(config.accounts)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="audit") as ex:
-        results = list(ex.map(worker, config.accounts))
+        futures: Dict[concurrent.futures.Future[List[str]], Account] = {}
+
+        def submit_next() -> bool:
+            if _stop_requested(stop_event):
+                return False
+            try:
+                acc = next(account_iter)
+            except StopIteration:
+                return False
+            futures[ex.submit(worker, acc)] = acc
+            return True
+
+        def cancel_and_drain_pending() -> None:
+            for pending in futures:
+                pending.cancel()
+            for fut in concurrent.futures.as_completed(list(futures)):
+                try:
+                    fut.result()
+                except concurrent.futures.CancelledError:
+                    pass
+            futures.clear()
+
+        for _ in range(min(max_workers, len(config.accounts))):
+            submit_next()
+
+        wait_timeout = 0.2 if stop_event is not None else None
+        while futures:
+            if _stop_requested(stop_event):
+                cancel_and_drain_pending()
+                _raise_if_stopped(stop_event, "legacy audit")
+            done, _pending = concurrent.futures.wait(
+                futures,
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            completed_successfully = 0
+            for fut in done:
+                futures.pop(fut, None)
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    cancel_and_drain_pending()
+                    raise
+                else:
+                    completed_successfully += 1
+            if _stop_requested(stop_event):
+                cancel_and_drain_pending()
+                _raise_if_stopped(stop_event, "legacy audit")
+            for _ in range(completed_successfully):
+                submit_next()
+    _raise_if_stopped(stop_event, "legacy audit")
     for lst in results:
         if lst:
             issues_accum.extend(lst)

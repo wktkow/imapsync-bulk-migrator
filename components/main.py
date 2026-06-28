@@ -766,6 +766,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         int(args.max_workers),
                         check_remote=False,
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
                 except Exception as exc:
                     if stop_event.is_set():
@@ -885,6 +886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 int(args.max_workers),
                 check_remote=False,
                 require_integrity_metadata=True,
+                stop_event=stop_event,
             )
         except Exception as exc:
             if stop_event.is_set():
@@ -1218,6 +1220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         int(args.max_workers),
                         check_remote=not bool(getattr(args, "audit_offline", False)),
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
                     stop_rc = stop_requested_result("legacy export audit")
                     if stop_rc is not None:
@@ -1256,6 +1259,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         int(args.max_workers),
                         check_remote=False,
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
                 except Exception as exc:
                     if stop_event.is_set():
@@ -1361,6 +1365,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         1,
                         check_remote=False,
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
                     guard_account_dir()
                     if not ok:
@@ -1594,6 +1599,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     int(args.max_workers),
                     check_remote=not bool(getattr(args, "audit_offline", False)),
                     require_integrity_metadata=True,
+                    stop_event=stop_event,
                 )
                 journal_issues = _legacy_pending_import_journal_issues(in_root, config, repair_trailing=False)
                 stop_rc = stop_requested_result("legacy audit")

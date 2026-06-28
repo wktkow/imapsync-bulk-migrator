@@ -11647,6 +11647,39 @@ class TestRound7ConfirmedBugs:
         assert audit_calls == 2
         assert rc == 130
 
+    def test_legacy_audit_export_stop_event_stops_queued_accounts_and_drains_running_worker(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        stop_event = threading.Event()
+        accounts = [
+            Account("a@example.com", "secret-a"),
+            Account("b@example.com", "secret-b"),
+        ]
+        config = Config(ServerConfig("imap.example.com"), accounts)
+        started: List[str] = []
+        finished: List[str] = []
+
+        def fake_audit_account(account: Account, *_args, **_kwargs):
+            started.append(account.email)
+            stop_event.set()
+            time.sleep(0.05)
+            finished.append(account.email)
+            return account.email, []
+
+        with mock.patch("components.audit.audit_account", side_effect=fake_audit_account):
+            with pytest.raises(RuntimeError, match="stop requested before completion"):
+                audit_export(
+                    tmp_path,
+                    config,
+                    max_workers=1,
+                    check_remote=False,
+                    stop_event=stop_event,
+                )
+
+        assert started == ["a@example.com"]
+        assert finished == ["a@example.com"]
+
     def test_main_signal_handler_sets_stop_without_logging_first(self, tmp_path: Path) -> None:
         from components.main import main
 
