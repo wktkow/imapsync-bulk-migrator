@@ -793,9 +793,10 @@ def canonical_identity(
     uidvalidity: str = "",
     uid: Optional[int] = None,
     collapse_fallback: bool = False,
+    use_gmail_msgid: bool = True,
 ) -> Tuple[str, str, str]:
     sha256 = hashlib.sha256(msg_bytes).hexdigest()
-    gmail_msgid = str(parsed.get("gmail_msgid") or "")
+    gmail_msgid = str(parsed.get("gmail_msgid") or "") if use_gmail_msgid else ""
     if gmail_msgid:
         return f"gmail-{gmail_msgid}", sha256, _message_id_header(msg_bytes)
     size = int(parsed.get("rfc822_size") or len(msg_bytes))
@@ -2200,8 +2201,9 @@ def provider_export_account(
         record["source_mailbox_attributes"][mailbox.name] = list(mailbox.attributes)
         record["source_mailbox_delimiters"][mailbox.name] = mailbox.delimiter
         record["source_mailbox_paths"][mailbox.name] = mailbox_path_segments(mailbox.name, mailbox.delimiter)
-        for label in parsed.get("gmail_labels") or []:
-            _append_unique(record["gmail_labels"], str(label))
+        if use_gmail_metadata:
+            for label in parsed.get("gmail_labels") or []:
+                _append_unique(record["gmail_labels"], str(label))
         record["uid_by_mailbox"][mailbox.name] = int(uid)
         record["uidvalidity_by_mailbox"][mailbox.name] = uidvalidity
         active_identities.add(identity)
@@ -2215,7 +2217,8 @@ def provider_export_account(
 
     with imap_connection(config.source, account, role="source") as imap:
         capabilities = get_capabilities(imap)
-        gmail_extensions = "X-GM-EXT-1" in capabilities
+        use_gmail_metadata = config.source.provider == "gmail"
+        gmail_extensions = use_gmail_metadata and "X-GM-EXT-1" in capabilities
         mailboxes = list_mailboxes(imap)
         _atomic_json(
             account_dir / "source-summary.json",
@@ -2262,7 +2265,11 @@ def provider_export_account(
                 if status != "OK":
                     raise RuntimeError(f"metadata fetch failed in {mailbox.name} for UID {uid}: {meta_data}")
                 pre_parsed = parse_provider_fetch_response(meta_data or [])
-                identity_hint = f"gmail-{pre_parsed.get('gmail_msgid')}" if pre_parsed.get("gmail_msgid") else ""
+                identity_hint = (
+                    f"gmail-{pre_parsed.get('gmail_msgid')}"
+                    if use_gmail_metadata and pre_parsed.get("gmail_msgid")
+                    else ""
+                )
                 if identity_hint and identity_hint in messages and identity_hint in trusted_payload_identities:
                     try:
                         existing_eml_path = _manifest_path(account_dir, messages[identity_hint], "eml_path")
@@ -2317,6 +2324,7 @@ def provider_export_account(
                     uidvalidity=uidvalidity,
                     uid=uid,
                     collapse_fallback=config.source.provider == "gmail",
+                    use_gmail_msgid=use_gmail_metadata,
                 )
                 safe_id = _safe_identity(identity)
                 if identity not in messages:
@@ -2331,8 +2339,8 @@ def provider_export_account(
                         "source_mailboxes": [],
                         "source_mailbox_attributes": {},
                         "primary_mailbox": "",
-                        "gmail_msgid": parsed.get("gmail_msgid") or "",
-                        "gmail_thrid": parsed.get("gmail_thrid") or "",
+                        "gmail_msgid": (parsed.get("gmail_msgid") or "") if use_gmail_metadata else "",
+                        "gmail_thrid": (parsed.get("gmail_thrid") or "") if use_gmail_metadata else "",
                         "gmail_labels": [],
                         "message_id_header": message_id,
                         "content_sha256": sha256,
@@ -4965,7 +4973,8 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
         try:
             with imap_connection(config.source, acc, role="source") as source_imap:
                 capabilities = get_capabilities(source_imap)
-                gmail_extensions = "X-GM-EXT-1" in capabilities
+                use_gmail_metadata = config.source.provider == "gmail"
+                gmail_extensions = use_gmail_metadata and "X-GM-EXT-1" in capabilities
                 source_mailboxes = list_mailboxes(source_imap)
                 if config.source.provider == "gmail":
                     account_issues.extend(gmail_source_readiness_issues(capabilities, source_mailboxes))
@@ -4994,7 +5003,11 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                             account_issues.append(f"metadata fetch missing RFC822.SIZE in {mailbox.name} for UID {uid}")
                             continue
                         parsed = parse_provider_fetch_response(data or [])
-                        identity = str(parsed.get("gmail_msgid") or f"{mailbox.name}:{uid}")
+                        identity = (
+                            str(parsed.get("gmail_msgid") or f"{mailbox.name}:{uid}")
+                            if use_gmail_metadata
+                            else f"{mailbox.name}:{uid}"
+                        )
                         if identity in seen_identity:
                             continue
                         seen_identity.add(identity)

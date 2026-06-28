@@ -2500,6 +2500,30 @@ class FakeNonGmailDuplicateSourceImap:
         return "OK", []
 
 
+class FakeNonGmailGmailMetadataDuplicateSourceImap(FakeNonGmailDuplicateSourceImap):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fetch_queries: List[str] = []
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = str(args[-1])
+            self.fetch_queries.append(query)
+            meta = (
+                b'1 (UID 1 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                b'X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS ("\\Inbox" "Project A"))'
+            )
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + b" BODY[] {42}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
+        raise AssertionError(command)
+
+
 class FakeGenericVirtualViewsSourceImap(FakeNonGmailDuplicateSourceImap):
     def list(self):
         return "OK", [
@@ -2990,6 +3014,42 @@ def test_provider_export_preserves_non_gmail_physical_copies(tmp_path: Path) -> 
     assert len(manifest) == 2
     assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Projects"}
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
+
+
+def test_provider_export_ignores_gmail_identity_metadata_for_generic_imap(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    fake = FakeNonGmailGmailMetadataDuplicateSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeNonGmailGmailMetadataDuplicateSourceImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 2
+    assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Projects"}
+    assert all(row["canonical_id"].startswith("physical-") for row in manifest)
+    assert all(row["gmail_msgid"] == "" for row in manifest)
+    assert all(row["gmail_thrid"] == "" for row in manifest)
+    assert all(row["gmail_labels"] == [] for row in manifest)
+    assert all("X-GM-" not in query for query in fake.fetch_queries)
 
 
 def test_provider_export_binds_non_gmail_physical_identity_to_source_account(tmp_path: Path) -> None:
@@ -9304,6 +9364,36 @@ def test_provider_preflight_reports_missing_metadata_size(tmp_path: Path) -> Non
 
     assert not ok
     assert any("metadata fetch missing RFC822.SIZE" in issue for issue in issues)
+
+
+def test_provider_preflight_ignores_gmail_identity_metadata_for_generic_imap(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=43,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    source = FakeNonGmailGmailMetadataDuplicateSourceImap()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield source if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("estimated source bytes 84 exceed target.available_bytes 43" in issue for issue in issues)
+    assert all("X-GM-" not in query for query in source.fetch_queries)
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
