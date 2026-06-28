@@ -541,25 +541,58 @@ def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     return False
 
 
+def _mailbox_attrs(mailbox: MailboxInfo) -> set[str]:
+    return {attr.lower() for attr in mailbox.attributes}
+
+
+def _is_non_gmail_all_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
+    return provider_key != "gmail" and "\\all" in _mailbox_attrs(mailbox)
+
+
+def _is_non_gmail_flagged_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
+    return provider_key != "gmail" and "\\flagged" in _mailbox_attrs(mailbox)
+
+
+def _is_icloud_vip_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
+    return provider_key == "icloud" and mailbox.name.lower() == "vip"
+
+
+def _covers_non_gmail_all_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
+    if is_noselect(mailbox) or _is_icloud_vip_mailbox(provider_key, mailbox):
+        return False
+    if _is_non_gmail_all_mailbox(provider_key, mailbox):
+        return False
+    if _is_non_gmail_flagged_mailbox(provider_key, mailbox):
+        return False
+    return True
+
+
+def _covers_non_gmail_flagged_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
+    if is_noselect(mailbox) or _is_icloud_vip_mailbox(provider_key, mailbox):
+        return False
+    if _is_non_gmail_flagged_mailbox(provider_key, mailbox):
+        return False
+    return True
+
+
 def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: List[MailboxInfo]) -> bool:
     provider_key = provider.lower()
     if is_noselect(mailbox):
         return True
-    if provider_key == "icloud" and mailbox.name.lower() == "vip":
+    if _is_icloud_vip_mailbox(provider_key, mailbox):
         return True
     if provider_key == "gmail":
         return False
-    attr_lowers = {attr.lower() for attr in mailbox.attributes}
-    if "\\all" not in attr_lowers:
+    if _is_non_gmail_flagged_mailbox(provider_key, mailbox):
+        for candidate in mailboxes:
+            if candidate is not mailbox and _covers_non_gmail_flagged_mailbox(provider_key, candidate):
+                return True
         return False
-    for candidate in mailboxes:
-        if candidate is mailbox or is_noselect(candidate):
-            continue
-        candidate_attrs = {attr.lower() for attr in candidate.attributes}
-        if "\\all" not in candidate_attrs and not (
-            provider_key == "icloud" and candidate.name.lower() == "vip"
-        ):
-            return True
+    if _is_non_gmail_all_mailbox(provider_key, mailbox):
+        for candidate in mailboxes:
+            if candidate is not mailbox and _covers_non_gmail_all_mailbox(provider_key, candidate):
+                return True
+        return False
     return False
 
 
