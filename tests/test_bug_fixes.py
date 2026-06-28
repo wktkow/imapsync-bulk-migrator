@@ -8002,6 +8002,58 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    @pytest.mark.parametrize(
+        ("artifact", "needle"),
+        [
+            ("mailbox-marker", "hard-linked legacy mailbox marker"),
+            ("export-state", "hard-linked legacy export-state"),
+        ],
+    )
+    def test_legacy_validation_rejects_hard_linked_control_metadata(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        artifact: str,
+        needle: str,
+    ) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+        from verify_export import verify_account
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <hardlink-control@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        marker = folder / ".mailbox.json"
+        marker.write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        target = marker if artifact == "mailbox-marker" else folder.parent / "export-state.json"
+        victim = tmp_path / f"outside-{artifact}.json"
+        victim.write_bytes(target.read_bytes())
+        target.unlink()
+        try:
+            target.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        stats = verify_account(tmp_path / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert not ok
+        assert any(needle in issue for issue in issues)
+        assert stats["errors"] >= 1
+        assert "hard-linked" in output
+
     def test_strict_audit_rejects_symlinked_message_file(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.models import Account, Config, ServerConfig

@@ -79,7 +79,7 @@ def _folder_mailbox_name(folder_dir: Path) -> str:
     if not marker_path.exists():
         return folder_dir.name
     with contextlib.suppress(Exception):
-        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        raw = json.loads(_read_staged_artifact(marker_path, "legacy mailbox marker").decode("utf-8"))
         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
         if isinstance(mailbox, str) and mailbox.strip():
             return mailbox
@@ -104,7 +104,7 @@ def _legacy_export_state_issues(
             issues.append(f"{account.email}: export-state missing; rerun legacy export before destructive reset")
         return issues
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(_read_staged_artifact(state_path, "legacy export-state").decode("utf-8"))
     except Exception as exc:
         return [f"{account.email}: export-state missing or invalid: {exc}"]
     if not isinstance(state, dict):
@@ -276,7 +276,7 @@ def audit_account(
             remote_safe = False
         elif mailbox_marker.exists():
             try:
-                marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
+                marker = json.loads(_read_staged_artifact(mailbox_marker, "legacy mailbox marker").decode("utf-8"))
                 expected_count = marker.get("message_count") if isinstance(marker, dict) else None
                 if type(expected_count) is not int or expected_count < 0:
                     issues.append(f"{account.email}:{folder}: mailbox marker has invalid message_count")

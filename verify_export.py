@@ -304,8 +304,9 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
     if Path(marker_path).is_symlink():
         return [f"{folder_name}: mailbox marker is a symlink"]
     try:
-        with open(marker_path, 'r') as f:
-            marker = json.load(f)
+        marker = json.loads(_read_artifact_no_links(marker_path, "mailbox marker").decode("utf-8"))
+    except RuntimeError as e:
+        return [f"{folder_name}: {e}"]
     except Exception as e:
         return [f"{folder_name}: failed to parse mailbox marker: {e}"]
     if not isinstance(marker, dict):
@@ -331,8 +332,9 @@ def analyze_export_state(account_path, folder_counts):
     if not state_path.exists():
         return ["export-state missing"]
     try:
-        with open(state_path, 'r') as f:
-            state = json.load(f)
+        state = json.loads(_read_artifact_no_links(state_path, "export-state").decode("utf-8"))
+    except RuntimeError as e:
+        return [str(e)]
     except Exception as e:
         return [f"export-state failed to parse: {e}"]
     if not isinstance(state, dict):
@@ -393,8 +395,7 @@ def expected_legacy_account_for_sidecars(account_path):
     if state_path.is_symlink() or not state_path.exists():
         return account_path.name
     try:
-        with open(state_path, 'r') as f:
-            state = json.load(f)
+        state = json.loads(_read_artifact_no_links(state_path, "export-state").decode("utf-8"))
     except Exception:
         return account_path.name
     if not isinstance(state, dict):
@@ -428,8 +429,7 @@ def provider_account_directory_binding_issues(account_path, rows):
     state_path = account_path / "export-state.json"
     if state_path.exists() and not state_path.is_symlink():
         try:
-            with open(state_path, 'r') as f:
-                state = json.load(f)
+            state = json.loads(_read_artifact_no_links(state_path, "export-state").decode("utf-8"))
         except Exception:
             state = None
         if isinstance(state, dict) and not matches_directory(state.get("source_account")):
@@ -446,8 +446,7 @@ def provider_state_manifest_binding_issues(account_path, rows):
     if not rows or not state_path.exists() or state_path.is_symlink():
         return []
     try:
-        with open(state_path, 'r') as f:
-            state = json.load(f)
+        state = json.loads(_read_artifact_no_links(state_path, "export-state").decode("utf-8"))
     except Exception:
         return []
     if not isinstance(state, dict):
@@ -513,8 +512,7 @@ def provider_empty_state_binding_issues(account_path):
     if not state_path.exists() or state_path.is_symlink():
         return []
     try:
-        with open(state_path, 'r') as f:
-            state = json.load(f)
+        state = json.loads(_read_artifact_no_links(state_path, "export-state").decode("utf-8"))
     except Exception:
         return []
     if not isinstance(state, dict):
@@ -677,7 +675,7 @@ def verify_account(account_path):
         mailbox_marker_mailbox = None
         if mailbox_marker.exists() and not mailbox_marker.is_symlink():
             try:
-                marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
+                marker = json.loads(_read_artifact_no_links(mailbox_marker, "mailbox marker").decode("utf-8"))
                 mailbox = marker.get("mailbox") if isinstance(marker, dict) else None
                 if isinstance(mailbox, str) and mailbox.strip() and sanitize_for_path(mailbox) == folder_name:
                     mailbox_marker_mailbox = mailbox
