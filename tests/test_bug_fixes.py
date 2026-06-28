@@ -5483,6 +5483,48 @@ class TestRound2ConfirmedBugs:
         assert "export-state target_provider is missing or invalid" in output
 
     @pytest.mark.parametrize(
+        ("root_name", "needle"),
+        [
+            ("messages", "symlinked provider message artifact directory: messages"),
+            ("metadata", "symlinked provider metadata artifact directory: metadata"),
+        ],
+    )
+    def test_verify_export_rejects_empty_provider_symlinked_artifact_root(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        root_name: str,
+        needle: str,
+    ) -> None:
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        account_dir.mkdir(parents=True)
+        (account_dir / "manifest.jsonl").write_text("")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_provider": "imap",
+            "source_account": "source@example.com",
+            "target_account": "target@example.com",
+            "target_provider": "imap",
+            "complete": True,
+            "canonical_messages": 0,
+            "manifest_sha256": provider_manifest_digest([]),
+        }))
+        outside = tmp_path / f"outside-{root_name}"
+        outside.mkdir()
+        try:
+            (account_dir / root_name).symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 1
+        assert needle in output
+
+    @pytest.mark.parametrize(
         ("row_updates", "state_updates", "expected"),
         [
             (
