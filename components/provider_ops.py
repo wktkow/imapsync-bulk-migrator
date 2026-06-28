@@ -1461,6 +1461,20 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
     return issues
 
 
+def provider_mixed_legacy_layout_issues(account_dir: Path) -> List[str]:
+    issues: List[str] = []
+    provider_dirs = {"messages", "metadata"}
+    for path in sorted(account_dir.iterdir()):
+        if path.name in provider_dirs or not path.is_dir():
+            continue
+        marker = path / ".mailbox.json"
+        has_marker = marker.exists() or marker.is_symlink()
+        has_messages = any(candidate.is_file() for candidate in path.glob("*.eml"))
+        if has_marker or has_messages:
+            issues.append(f"legacy mailbox directory present in provider account layout: {path.name}")
+    return issues
+
+
 def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any]]) -> None:
     _raise_if_provider_path_symlink(account_dir, "account directory")
     expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
@@ -3545,6 +3559,12 @@ def _validated_group_stage(
             f"metadata does not match manifest for merge source {account.source_email}: "
             + "; ".join(metadata_issues)
         )
+    mixed_layout_issues = provider_mixed_legacy_layout_issues(account_dir)
+    if mixed_layout_issues:
+        raise RuntimeError(
+            f"invalid provider account layout for merge source {account.source_email}: "
+            + "; ".join(mixed_layout_issues)
+        )
     journal_rows = load_import_journal(account_dir, account)
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
@@ -3732,6 +3752,9 @@ def provider_import_account(
     artifact_issues = _provider_artifact_orphan_issues(account_dir, manifest_rows)
     if artifact_issues:
         raise RuntimeError("invalid provider artifacts: " + "; ".join(artifact_issues))
+    mixed_layout_issues = provider_mixed_legacy_layout_issues(account_dir)
+    if mixed_layout_issues:
+        raise RuntimeError("invalid provider account layout: " + "; ".join(mixed_layout_issues))
     journal_rows = load_import_journal(account_dir, account, repair_trailing=True)
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
@@ -4172,6 +4195,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     issues.extend(provider_delivery_metadata_issues(rows))
     issues.extend(metadata_manifest_issues(account_dir, rows, require_present=False))
     issues.extend(_provider_artifact_orphan_issues(account_dir, rows))
+    issues.extend(provider_mixed_legacy_layout_issues(account_dir))
     issues.extend(gmail_target_decommission_issues(config.target, account))
     manifest_ids = {str(row.get("canonical_id") or "") for row in rows if row.get("canonical_id")}
     try:
@@ -4354,6 +4378,7 @@ def provider_validate_account(
     report["failed"].extend(metadata_manifest_issues(account_dir, manifest_rows))
     report["failed"].extend(manifest_payload_issues(account_dir, manifest_rows))
     report["failed"].extend(_provider_artifact_orphan_issues(account_dir, manifest_rows))
+    report["failed"].extend(provider_mixed_legacy_layout_issues(account_dir))
     report["failed"].extend(gmail_target_decommission_issues(config.target, account))
 
     journal_issues = journal_row_issues(journal_rows, account)

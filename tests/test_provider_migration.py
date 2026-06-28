@@ -6842,6 +6842,27 @@ def test_provider_import_rejects_metadata_mismatch_before_target_connect(tmp_pat
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_audit_and_validation_reject_mixed_legacy_layout(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    legacy_mailbox = account_dir / "INBOX"
+    legacy_mailbox.mkdir()
+    (legacy_mailbox / ".mailbox.json").write_text("{}")
+    (legacy_mailbox / "u00000001.eml").write_bytes(b"Message-ID: <legacy@example.com>\r\n\r\nlegacy")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="legacy mailbox directory present in provider account layout"):
+            provider_import_account(config, account, tmp_path)
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any("legacy mailbox directory present in provider account layout: INBOX" in item for item in audit_issues)
+    assert not report["ok"]
+    assert any("legacy mailbox directory present in provider account layout: INBOX" in item for item in report["failed"])
+
+
 def test_provider_import_and_validation_reject_journal_target_account_mismatch(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

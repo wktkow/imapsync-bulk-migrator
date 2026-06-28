@@ -26,6 +26,7 @@ from components.provider_ops import (
     metadata_manifest_issues,
     provider_delivery_metadata_issues,
     provider_export_state_issues,
+    provider_mixed_legacy_layout_issues,
 )
 from components.utils import sanitize_for_path, sanitized_path_key
 
@@ -627,21 +628,6 @@ def verify_provider_account(account_path):
         'errors': len(errors),
         'multiple_message_files': len(multiple_message_files)
     }
-
-
-def provider_mixed_legacy_layout_issues(account_path):
-    """Return provider-layout issues caused by adjacent legacy mailbox folders."""
-    issues = []
-    provider_dirs = {"messages", "metadata"}
-    for path in sorted(account_path.iterdir()):
-        if path.name in provider_dirs or not path.is_dir():
-            continue
-        marker = path / ".mailbox.json"
-        has_marker = marker.exists() or marker.is_symlink()
-        has_messages = any(candidate.is_file() for candidate in path.glob("*.eml"))
-        if has_marker or has_messages:
-            issues.append(f"legacy mailbox directory present in provider account layout: {path.name}")
-    return issues
 
 
 def verify_account(account_path):
