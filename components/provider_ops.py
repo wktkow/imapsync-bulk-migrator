@@ -602,8 +602,30 @@ def append_message(imap: imaplib.IMAP4, mailbox: str, flags: str, date_time: str
     return imap.append(quote_mailbox_name(mailbox), flags, date_time, data)
 
 
+def _list_mailboxes_with_special_use(imap: imaplib.IMAP4) -> Tuple[str, object]:
+    def _normal_status(value: object) -> str:
+        return value.decode("ascii", errors="ignore") if isinstance(value, bytes) else str(value)
+
+    def _plain_list() -> Tuple[str, object]:
+        status, data = imap.list()
+        return _normal_status(status), data
+
+    try:
+        status, data = imap.list('""', '"*" RETURN (SPECIAL-USE)')
+    except TypeError:
+        return _plain_list()
+    except imaplib.IMAP4.abort:
+        raise
+    except imaplib.IMAP4.error:
+        return _plain_list()
+    status_text = _normal_status(status)
+    if status_text.upper() == "OK":
+        return status_text, data
+    return _plain_list()
+
+
 def list_mailboxes(imap: imaplib.IMAP4) -> List[MailboxInfo]:
-    status, data = imap.list()
+    status, data = _list_mailboxes_with_special_use(imap)
     if status != "OK":
         raise RuntimeError("failed to list mailboxes")
     mailboxes: List[MailboxInfo] = []
@@ -4585,13 +4607,14 @@ def provider_validate_account(
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
     report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
-    report["failed"].extend(
-        offline_journal_target_mailbox_issues(
-            journal_rows,
-            manifest_rows,
-            target_provider=config.target.provider,
+    if not check_target:
+        report["failed"].extend(
+            offline_journal_target_mailbox_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=config.target.provider,
+            )
         )
-    )
     committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
     if not allow_unresolved_pending:
         for row in journal_rows:

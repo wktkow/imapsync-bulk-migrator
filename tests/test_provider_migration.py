@@ -2139,6 +2139,34 @@ def test_list_parser_accepts_literal_mailbox_names() -> None:
     assert mailboxes[0].name == "Föld & Team"
 
 
+def test_list_mailboxes_requests_special_use_attrs() -> None:
+    class SpecialUseReturnImap:
+        def __init__(self) -> None:
+            self.calls: List[tuple] = []
+
+        def list(self, *args):
+            self.calls.append(args)
+            if args == ('""', '"*" RETURN (SPECIAL-USE)'):
+                return "OK", [
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                    b'(\\HasNoChildren \\Trash) "/" "Papierkorb"',
+                ]
+            return "OK", [
+                b'(\\HasNoChildren) "/" "All Mail"',
+                b'(\\HasNoChildren) "/" "Papierkorb"',
+            ]
+
+    imap = SpecialUseReturnImap()
+    mailboxes = list_mailboxes(imap)
+
+    assert imap.calls == [('""', '"*" RETURN (SPECIAL-USE)')]
+    assert {mailbox.name: mailbox.attributes for mailbox in mailboxes} == {
+        "All Mail": ("\\HasNoChildren", "\\All"),
+        "Papierkorb": ("\\HasNoChildren", "\\Trash"),
+    }
+    assert resolve_target_mailbox("Deleted Messages", mailboxes, target_provider="imap") == "Papierkorb"
+
+
 def test_primary_folder_resolution_is_deterministic() -> None:
     assert resolve_primary_mailbox(["[Gmail]/Sent Mail", "[Gmail]/All Mail"], [], {}) == "Sent"
     assert resolve_primary_mailbox(["[Gmail]/Trash"], [], {}) == "Deleted Messages"
@@ -2636,6 +2664,26 @@ class FakeGenericVirtualViewsSourceImap(FakeNonGmailDuplicateSourceImap):
 
     def uid(self, command: str, *args):
         return super().uid(command, *args)
+
+
+class FakeGenericVirtualViewsSpecialUseReturnSourceImap(FakeGenericVirtualViewsSourceImap):
+    def __init__(self) -> None:
+        super().__init__()
+        self.list_calls: List[tuple] = []
+
+    def list(self, *args):
+        self.list_calls.append(args)
+        if args == ('""', '"*" RETURN (SPECIAL-USE)'):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "All Mail"',
+                b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+            ]
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren) "/" "All Mail"',
+            b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+        ]
 
 
 class FakeGenericFlaggedOnlySourceImap(FakeNonGmailDuplicateSourceImap):
@@ -3237,6 +3285,38 @@ def test_provider_export_skips_generic_all_view_but_keeps_flagged_mailbox(tmp_pa
 
     assert set(target.appended) == {"Flagged", "INBOX"}
     assert len(target.appended) == 2
+
+
+def test_provider_export_requests_special_use_attrs_before_filtering_generic_all_view(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    source = FakeGenericVirtualViewsSpecialUseReturnSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericVirtualViewsSpecialUseReturnSourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
+    assert {tuple(row["source_mailboxes"]) for row in manifest} == {("INBOX",), ("Flagged",)}
+    assert not any(row["primary_mailbox"] == "All Mail" for row in manifest)
 
 
 def test_provider_export_keeps_generic_flagged_only_mailbox(tmp_path: Path) -> None:
@@ -7111,6 +7191,46 @@ def test_provider_import_merge_mode_rejects_generic_special_use_alias_journal_be
 
     assert fake.appended == []
     assert fake.bodies_by_mailbox == {"Trash": [body]}
+
+
+def test_provider_online_validation_uses_live_special_use_target_mailbox(tmp_path: Path) -> None:
+    config = _generic_target_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Deleted Messages"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target=account.target_email)
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Trash",
+        "status": "committed",
+    })) + "\n")
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+
+    class TrashTarget(StoredMessageTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Trash) "/" "Trash"',
+            ]
+
+    fake = TrashTarget({"Trash": [body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[TrashTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert report["ok"], report
+    assert report["failed"] == []
+    assert report["missing"] == []
+    assert report["remote_missing"] == []
+    assert report["remote_checked"] == 1
 
 
 def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
