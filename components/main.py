@@ -1230,6 +1230,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             logging.error("[audit] %s", line)
                         return 4
                 except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Legacy export audit stopped: %s", exc)
+                        return 130
                     logging.error("Audit failed to complete: %s", exc)
                     return 4
         elif args.mode == "import":
@@ -1255,6 +1258,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         require_integrity_metadata=True,
                     )
                 except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Staged export audit stopped before import: %s", exc)
+                        return 130
                     logging.error("Staged export audit failed before import: %s", exc)
                     return 4
                 if not ok:

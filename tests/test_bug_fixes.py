@@ -11558,6 +11558,95 @@ class TestRound7ConfirmedBugs:
 
         assert rc == 130
 
+    def test_main_returns_130_when_post_export_audit_raises_after_stop(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "export.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_audit(*_args, **_kwargs):
+            assert signal.SIGTERM in handlers
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            raise RuntimeError("audit interrupted")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.export_account"), \
+            mock.patch("components.main.audit_export", side_effect=fake_audit):
+            rc = main([
+                "--mode", "export",
+                "--config", str(config_path),
+                "--output-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 130
+
+    def test_main_returns_130_when_second_staged_import_audit_raises_after_stop(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+        audit_calls = 0
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_audit(*_args, **_kwargs):
+            nonlocal audit_calls
+            audit_calls += 1
+            if audit_calls == 1:
+                return True, []
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            raise RuntimeError("staged audit interrupted")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main._ensure_cpanel_client_dependency"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.main.ensure_accounts_exist_cpanel"), \
+            mock.patch("components.main.audit_export", side_effect=fake_audit), \
+            mock.patch("components.main.import_account", side_effect=AssertionError("import should not start after stop")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert audit_calls == 2
+        assert rc == 130
+
     def test_main_signal_handler_sets_stop_without_logging_first(self, tmp_path: Path) -> None:
         from components.main import main
 
