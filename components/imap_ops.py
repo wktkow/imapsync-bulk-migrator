@@ -260,14 +260,17 @@ def _raise_if_stopped(stop_event: Optional[object], label: str) -> None:
 
 
 def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]:
+    _raise_if_symlink(account_dir, "legacy account directory")
     path = _legacy_import_journal_path(account_dir)
+    _raise_if_symlink(path, "legacy import journal")
     if not path.exists():
         return None
+    _load_legacy_import_journal(account_dir, repair_trailing=False)
     stamp = int(time.time())
     for idx in range(1000):
         suffix = f"reset-{stamp}" if idx == 0 else f"reset-{stamp}-{idx}"
         archive_path = account_dir / f"import.journal.{suffix}.jsonl"
-        if not archive_path.exists():
+        if not archive_path.exists() and not archive_path.is_symlink():
             path.replace(archive_path)
             return archive_path
     raise RuntimeError(f"unable to archive import journal for reset: {path}")

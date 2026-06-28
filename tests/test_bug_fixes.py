@@ -7957,6 +7957,56 @@ class TestRound7ConfirmedBugs:
 
         assert victim.read_text() == ""
 
+    def test_reset_journal_archive_rejects_hard_linked_import_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import archive_legacy_import_journal_for_reset
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        victim = tmp_path / "outside-journal.jsonl"
+        victim.write_text(json.dumps({
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }) + "\n")
+        journal = account_dir / "import.journal.jsonl"
+        try:
+            journal.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="hard-linked legacy import journal"):
+            archive_legacy_import_journal_for_reset(account_dir)
+
+        assert journal.exists()
+        assert victim.exists()
+        assert journal.stat().st_ino == victim.stat().st_ino
+
+    def test_reset_journal_archive_rejects_symlinked_account_path(self, tmp_path: Path) -> None:
+        from components.imap_ops import archive_legacy_import_journal_for_reset
+
+        real_account_dir = tmp_path / "real-account"
+        real_account_dir.mkdir()
+        (real_account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }) + "\n")
+        account_dir = tmp_path / "user@example.com"
+        try:
+            account_dir.symlink_to(real_account_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy account directory"):
+            archive_legacy_import_journal_for_reset(account_dir)
+
+        assert (real_account_dir / "import.journal.jsonl").exists()
+        assert not list(real_account_dir.glob("import.journal.reset-*.jsonl"))
+
     @pytest.mark.parametrize(
         ("field", "needle"),
         [
