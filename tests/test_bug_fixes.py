@@ -9587,18 +9587,18 @@ class TestRound7ConfirmedBugs:
         victim.write_text("outside\n")
         victim.chmod(0o644)
         original_mode = victim.stat().st_mode & 0o777
-        real_replace = Path.replace
+        real_rename = imap_ops.os.rename
 
-        def racing_replace(self: Path, target_path: Path) -> Path:
-            result = real_replace(self, target_path)
-            Path(target_path).unlink()
+        def racing_rename(src, dst, *args, **kwargs):
+            result = real_rename(src, dst, *args, **kwargs)
+            target.unlink()
             try:
-                Path(target_path).symlink_to(victim)
+                target.symlink_to(victim)
             except (OSError, NotImplementedError) as exc:
                 pytest.skip(f"symlink creation unavailable: {exc}")
             return result
 
-        monkeypatch.setattr(Path, "replace", racing_replace)
+        monkeypatch.setattr(imap_ops.os, "rename", racing_rename)
 
         imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
 
@@ -11013,6 +11013,115 @@ class TestRound7ConfirmedBugs:
             ])
 
         assert rc == 130
+
+    def test_provider_private_read_rejects_ancestor_swap_during_final_open(self, tmp_path: Path) -> None:
+        from components import provider_ops
+
+        account_dir = tmp_path / "source@example.com"
+        account_dir.mkdir()
+        (account_dir / "manifest.jsonl").write_text("original\n")
+        outside = tmp_path / "outside-provider"
+        outside.mkdir()
+        (outside / "manifest.jsonl").write_text("evil\n")
+        backup = tmp_path / "checked-provider"
+        real_open = provider_ops.os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == "manifest.jsonl" and dir_fd is not None and not swapped:
+                account_dir.rename(backup)
+                account_dir.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch("components.provider_ops.os.open", racing_open):
+            with pytest.raises(RuntimeError, match="replaced provider file directory"):
+                provider_ops._read_provider_private_file(account_dir / "manifest.jsonl")
+
+        assert swapped
+        assert account_dir.is_symlink()
+
+    def test_provider_atomic_write_rejects_ancestor_swap_after_directory_check(self, tmp_path: Path) -> None:
+        from components import provider_ops
+
+        account_dir = tmp_path / "source@example.com"
+        outside = tmp_path / "outside-provider-write"
+        backup = tmp_path / "checked-provider-write"
+        real_ensure = provider_ops.ensure_private_dir
+        swapped = False
+
+        def racing_ensure(path: Path) -> None:
+            nonlocal swapped
+            real_ensure(path)
+            if path == account_dir and not swapped:
+                account_dir.rename(backup)
+                outside.mkdir()
+                account_dir.symlink_to(outside, target_is_directory=True)
+                swapped = True
+
+        with mock.patch("components.provider_ops.ensure_private_dir", racing_ensure):
+            with pytest.raises(RuntimeError, match="symlinked provider file|replaced provider file directory"):
+                provider_ops._atomic_json(account_dir / "export-state.json", {"where": "payload"})
+
+        assert swapped
+        assert account_dir.is_symlink()
+        assert not (outside / "export-state.json").exists()
+
+    def test_legacy_private_read_rejects_ancestor_swap_during_final_open(self, tmp_path: Path) -> None:
+        from components import imap_ops
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        message = folder / "u0000000001.eml"
+        message.write_bytes(b"original")
+        outside = tmp_path / "outside-legacy"
+        outside.mkdir()
+        (outside / "u0000000001.eml").write_bytes(b"evil")
+        backup = tmp_path / "checked-legacy"
+        real_open = imap_ops.os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == "u0000000001.eml" and dir_fd is not None and not swapped:
+                folder.rename(backup)
+                folder.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch("components.imap_ops.os.open", racing_open):
+            with pytest.raises(RuntimeError, match="replaced legacy message file directory"):
+                imap_ops._read_file_no_symlink(message, "legacy message file", reject_hard_links=True)
+
+        assert swapped
+        assert folder.is_symlink()
+
+    def test_legacy_atomic_write_rejects_ancestor_swap_after_directory_check(self, tmp_path: Path) -> None:
+        from components import imap_ops
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        outside = tmp_path / "outside-legacy-write"
+        backup = tmp_path / "checked-legacy-write"
+        real_ensure = imap_ops.ensure_private_dir
+        swapped = False
+
+        def racing_ensure(path: Path) -> None:
+            nonlocal swapped
+            real_ensure(path)
+            if path == folder and not swapped:
+                folder.rename(backup)
+                outside.mkdir()
+                folder.symlink_to(outside, target_is_directory=True)
+                swapped = True
+
+        with mock.patch("components.imap_ops.ensure_private_dir", racing_ensure):
+            with pytest.raises(RuntimeError, match="symlinked legacy file|replaced legacy file directory"):
+                imap_ops._secure_atomic_write_bytes(folder / "u0000000001.eml", b"payload")
+
+        assert swapped
+        assert folder.is_symlink()
+        assert not (outside / "u0000000001.eml").exists()
 
     def test_strict_audit_rejects_invalid_legacy_delivery_metadata(self, tmp_path: Path) -> None:
         from components.audit import audit_export

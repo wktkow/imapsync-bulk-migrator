@@ -28,6 +28,7 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+_HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,91 @@ def _provider_symlink_component(path: Path) -> Optional[Path]:
     return None
 
 
+def _provider_normalized_absolute_path(path: Path) -> Path:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    parts: List[str] = []
+    for part in absolute.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return Path(absolute.anchor).joinpath(*parts)
+
+
+def _provider_parent_matches_fd(parent_path: Path, parent_fd: int) -> bool:
+    try:
+        current = os.stat(parent_path, follow_symlinks=False)
+    except OSError:
+        return False
+    pinned = os.fstat(parent_fd)
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and current.st_dev == pinned.st_dev
+        and current.st_ino == pinned.st_ino
+    )
+
+
+def _raise_if_provider_parent_replaced(parent_path: Path, parent_fd: int, label: str) -> None:
+    if not _provider_parent_matches_fd(parent_path, parent_fd):
+        raise RuntimeError(f"refusing to use replaced provider {label} directory: {parent_path}")
+
+
+def _provider_dir_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_provider_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
+    if not _HAS_DESCRIPTOR_RELATIVE_OPEN:
+        raise RuntimeError("platform does not support descriptor-relative provider file access")
+    absolute = _provider_normalized_absolute_path(path)
+    name = absolute.name
+    if not name or name in {".", ".."}:
+        raise RuntimeError(f"refusing to use invalid provider {label} path: {path}")
+    parent_path = absolute.parent
+    flags = _provider_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:-1]:
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked provider {label}: {path}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    with contextlib.suppress(OSError):
+                        component_stat = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISLNK(component_stat.st_mode):
+                            raise RuntimeError(f"refusing to use symlinked provider {label}: {path}") from exc
+                    raise RuntimeError(f"provider {label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"provider {label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+            current = current / part
+        _raise_if_provider_parent_replaced(parent_path, fd, label)
+        return fd, name, parent_path
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _json_values_match(left: Any, right: Any) -> bool:
     if type(left) is not type(right):
         return False
@@ -147,16 +233,16 @@ def _json_values_match(left: Any, right: Any) -> bool:
 
 
 def _open_provider_private_file(path: Path, flags: int) -> int:
-    if path.is_symlink():
-        raise RuntimeError(f"refusing to use symlinked provider file: {path}")
+    parent_fd, name, parent_path = _open_provider_parent_dir(path, "file")
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     try:
-        fd = os.open(path, flags, PRIVATE_FILE_MODE)
+        fd = os.open(name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
     except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EMLINK} or path.is_symlink():
+        os.close(parent_fd)
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
             raise RuntimeError(f"refusing to use symlinked provider file: {path}") from exc
         if exc.errno == errno.ENXIO:
             raise RuntimeError(f"refusing to use non-regular provider file: {path}") from exc
@@ -167,10 +253,13 @@ def _open_provider_private_file(path: Path, flags: int) -> int:
             raise RuntimeError(f"refusing to use non-regular provider file: {path}")
         if getattr(stat_result, "st_nlink", 1) > 1:
             raise RuntimeError(f"refusing to use hard-linked provider file: {path}")
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
         return fd
     except Exception:
         os.close(fd)
         raise
+    finally:
+        os.close(parent_fd)
 
 
 def _read_provider_private_file(path: Path) -> str:
@@ -984,52 +1073,86 @@ def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
     ensure_private_dir(path.parent)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    parent_fd, name, parent_path = _open_provider_parent_dir(path, "file")
+    tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     try:
-        fd = _open_provider_private_file(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    except RuntimeError:
-        raise
-    except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            raise RuntimeError(f"refusing to use unsafe provider temporary file: {tmp}") from exc
-        raise
-    try:
-        with os.fdopen(fd, "wb") as f:
-            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            fd = os.open(tmp_name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise RuntimeError(f"refusing to use unsafe provider temporary file: {path.with_name(tmp_name)}") from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked provider temporary file: {path.with_name(tmp_name)}") from exc
+            if exc.errno == errno.ENXIO:
+                raise RuntimeError(f"refusing to use non-regular provider temporary file: {path.with_name(tmp_name)}") from exc
+            raise
+        try:
+            with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=parent_fd)
+                raise
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            raise
+    finally:
+        os.close(parent_fd)
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     ensure_private_dir(path.parent)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    parent_fd, name, parent_path = _open_provider_parent_dir(path, "file")
+    tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     try:
-        fd = _open_provider_private_file(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    except RuntimeError:
-        raise
-    except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            raise RuntimeError(f"refusing to use unsafe provider temporary file: {tmp}") from exc
-        raise
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
-            for row in rows:
-                json.dump(row, f, ensure_ascii=False, sort_keys=True)
-                f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            fd = os.open(tmp_name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise RuntimeError(f"refusing to use unsafe provider temporary file: {path.with_name(tmp_name)}") from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked provider temporary file: {path.with_name(tmp_name)}") from exc
+            if exc.errno == errno.ENXIO:
+                raise RuntimeError(f"refusing to use non-regular provider temporary file: {path.with_name(tmp_name)}") from exc
+            raise
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+                for row in rows:
+                    json.dump(row, f, ensure_ascii=False, sort_keys=True)
+                    f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=parent_fd)
+                raise
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            raise
+    finally:
+        os.close(parent_fd)
 
 
 def account_export_dir(root: Path, account: MigrationAccount) -> Path:

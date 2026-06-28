@@ -238,18 +238,18 @@ def test_provider_atomic_writers_do_not_chmod_replaced_symlink_target(
     victim.write_text("outside\n", encoding="utf-8")
     victim.chmod(0o644)
     original_mode = victim.stat().st_mode & 0o777
-    real_replace = Path.replace
+    real_rename = provider_ops.os.rename
 
-    def racing_replace(self: Path, target_path: Path) -> Path:
-        result = real_replace(self, target_path)
-        Path(target_path).unlink()
+    def racing_rename(src, dst, *args, **kwargs):
+        result = real_rename(src, dst, *args, **kwargs)
+        target.unlink()
         try:
-            Path(target_path).symlink_to(victim)
+            target.symlink_to(victim)
         except (OSError, NotImplementedError) as exc:
             pytest.skip(f"symlink creation unavailable: {exc}")
         return result
 
-    monkeypatch.setattr(Path, "replace", racing_replace)
+    monkeypatch.setattr(provider_ops.os, "rename", racing_rename)
 
     if writer_name == "json":
         _atomic_json(target, {"complete": False})
