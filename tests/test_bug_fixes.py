@@ -836,6 +836,62 @@ class TestLegacyListParsing:
 
         assert list_all_mailboxes(fake_imap) == ["Föld & Team"]
 
+    def test_export_skips_generic_special_use_source_views(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SpecialUseSource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected.append(mailbox.strip('"').replace(r"\"", '"'))
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = SpecialUseSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SpecialUseSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["INBOX"]
+        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}]
+        assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
+        assert not (account_dir / "All_Mail").exists()
+        assert not (account_dir / "Flagged").exists()
+
 
 class TestLegacyImportJournal:
     """Legacy import should not blindly duplicate committed local messages on rerun."""

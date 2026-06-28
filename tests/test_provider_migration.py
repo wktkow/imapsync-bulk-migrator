@@ -2549,10 +2549,10 @@ class FakeNonGmailDuplicateSourceImap:
             return "OK", [b"1"]
         if command == "fetch":
             query = args[-1]
-            meta = b'1 (UID 1 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            meta = b'1 (UID 1 RFC822.SIZE 43 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
             if "BODY.PEEK[]" not in query:
                 return "OK", [meta]
-            return "OK", [(meta + b" BODY[] {42}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
+            return "OK", [(meta + b" BODY[] {43}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
         raise AssertionError(command)
 
     def logout(self):
@@ -2574,12 +2574,12 @@ class FakeNonGmailGmailMetadataDuplicateSourceImap(FakeNonGmailDuplicateSourceIm
             query = str(args[-1])
             self.fetch_queries.append(query)
             meta = (
-                b'1 (UID 1 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                b'1 (UID 1 RFC822.SIZE 43 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
                 b'X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS ("\\Inbox" "Project A"))'
             )
             if "BODY.PEEK[]" not in query:
                 return "OK", [meta]
-            return "OK", [(meta + b" BODY[] {42}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
+            return "OK", [(meta + b" BODY[] {43}", b"Message-ID: <copy@example.com>\r\n\r\nsame body")]
         raise AssertionError(command)
 
 
@@ -3147,7 +3147,7 @@ def test_provider_export_binds_non_gmail_physical_identity_to_source_account(tmp
     assert ids_by_source["a@example.com"] != ids_by_source["b@example.com"]
 
 
-def test_provider_export_includes_generic_special_use_mailboxes(tmp_path: Path) -> None:
+def test_provider_export_skips_generic_special_use_source_views(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
             provider="imap",
@@ -3173,10 +3173,21 @@ def test_provider_export_includes_generic_special_use_mailboxes(tmp_path: Path) 
 
     account_dir = tmp_path / "source@example.com"
     manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
-    assert len(manifest) == 3
-    assert {tuple(row["source_mailboxes"]) for row in manifest} == {("INBOX",), ("All Mail",), ("Flagged",)}
-    assert {row["primary_mailbox"] for row in manifest} == {"INBOX", "Archive", "Flagged"}
+    assert len(manifest) == 1
+    assert manifest[0]["source_mailboxes"] == ["INBOX"]
+    assert manifest[0]["primary_mailbox"] == "INBOX"
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
+
+    target = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert target.appended == ["INBOX"]
 
 
 def test_provider_uid_search_uses_rfc_valid_signature() -> None:
@@ -9451,7 +9462,7 @@ def test_provider_preflight_ignores_gmail_identity_metadata_for_generic_imap(tmp
         ok, issues = provider_preflight(config, max_workers=1)
 
     assert not ok
-    assert any("estimated source bytes 84 exceed target.available_bytes 43" in issue for issue in issues)
+    assert any("estimated source bytes 86 exceed target.available_bytes 43" in issue for issue in issues)
     assert all("X-GM-" not in query for query in source.fetch_queries)
 
 

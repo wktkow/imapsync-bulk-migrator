@@ -425,11 +425,15 @@ def is_virtual_source_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     provider_key = provider.lower()
     if provider_key == "icloud" and mailbox.name.lower() == "vip":
         return True
+    if provider_key != "gmail":
+        attr_lowers = {attr.lower() for attr in mailbox.attributes}
+        if attr_lowers & {"\\all", "\\flagged"}:
+            return True
     return False
 
 
 def is_virtual_target_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
-    return is_virtual_source_mailbox(provider, mailbox)
+    return provider.lower() == "icloud" and mailbox.name.lower() == "vip"
 
 
 def mailbox_path_segments(mailbox_name: str, delimiter: str) -> List[str]:

@@ -199,50 +199,66 @@ def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.
             imap.logout()
 
 
+def _mailbox_sort_key(mailbox: str) -> Tuple[int, str]:
+    return (0 if mailbox.upper() == "INBOX" else 1, mailbox.lower())
+
+
+def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tuple[str, ...]]]:
+    status, data = imap.list()
+    if status != "OK":
+        raise RuntimeError("Failed to list mailboxes")
+    mailboxes: List[Tuple[str, Tuple[str, ...]]] = []
+    for raw in data or []:
+        if raw is None:
+            continue
+        info = None
+        with contextlib.suppress(Exception):
+            from .provider_ops import parse_list_entry
+
+            info = parse_list_entry(raw)
+        if info is not None:
+            attr_lowers = {attr.lower() for attr in info.attributes}
+            if not attr_lowers & {"\\noselect", "\\nonexistent"}:
+                mailboxes.append((info.name, tuple(info.attributes)))
+            continue
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
+        line = raw.decode(errors="ignore").strip()
+        attrs_raw = line[1 : line.find(")")] if line.startswith("(") and ")" in line else ""
+        attrs = tuple(attr for attr in attrs_raw.split() if attr)
+        if any(attr.lower() in {"\\noselect", "\\nonexistent"} for attr in attrs):
+            continue
+        m = re.findall(r'"([^"]+)"\s*$', line)
+        if m:
+            mailboxes.append((decode_imap_utf7(m[0].replace(r"\"", '"').replace(r"\\", "\\")), attrs))
+        else:
+            parts = line.rsplit(" ", 1)
+            if parts:
+                candidate = parts[-1].strip().strip('"')
+                if candidate:
+                    mailboxes.append((decode_imap_utf7(candidate), attrs))
+    unique: List[Tuple[str, Tuple[str, ...]]] = []
+    seen = set()
+    for mb, attrs in mailboxes:
+        if mb not in seen:
+            seen.add(mb)
+            unique.append((mb, attrs))
+    unique.sort(key=lambda item: _mailbox_sort_key(item[0]))
+    return unique
+
+
+def _is_legacy_special_use_source_view(attributes: Tuple[str, ...]) -> bool:
+    attr_lowers = {attr.lower() for attr in attributes}
+    return bool(attr_lowers & {"\\all", "\\flagged"})
+
+
 def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
     """Return a stable, de-duplicated, sorted list of mailbox names.
 
     Prefers a quoted name at the end of LIST lines; falls back to the last atom.
     INBOX is sorted first.
     """
-    status, data = imap.list()
-    if status != "OK":
-        raise RuntimeError("Failed to list mailboxes")
-    mailboxes: List[str] = []
-    for raw in data or []:
-        if raw is None:
-            continue
-        with contextlib.suppress(Exception):
-            from .provider_ops import is_noselect, parse_list_entry
-
-            info = parse_list_entry(raw)
-            if info is not None:
-                if not is_noselect(info):
-                    mailboxes.append(info.name)
-                continue
-        if not isinstance(raw, (bytes, bytearray)):
-            continue
-        line = raw.decode(errors="ignore").strip()
-        attrs_raw = line[1 : line.find(")")] if line.startswith("(") and ")" in line else ""
-        if any(attr.lower() in {"\\noselect", "\\nonexistent"} for attr in attrs_raw.split()):
-            continue
-        m = re.findall(r'"([^"]+)"\s*$', line)
-        if m:
-            mailboxes.append(decode_imap_utf7(m[0].replace(r"\"", '"').replace(r"\\", "\\")))
-        else:
-            parts = line.rsplit(" ", 1)
-            if parts:
-                candidate = parts[-1].strip().strip('"')
-                if candidate:
-                    mailboxes.append(decode_imap_utf7(candidate))
-    unique = []
-    seen = set()
-    for mb in mailboxes:
-        if mb not in seen:
-            seen.add(mb)
-            unique.append(mb)
-    unique.sort(key=lambda x: (0 if x.upper() == "INBOX" else 1, x.lower()))
-    return unique
+    return [name for name, _attrs in _list_selectable_mailbox_entries(imap)]
 
 
 def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
@@ -581,7 +597,12 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     with imap_connection(server, account) as imap:
-        mailboxes = list_all_mailboxes(imap)
+        mailbox_entries = [
+            (mailbox, attrs)
+            for mailbox, attrs in _list_selectable_mailbox_entries(imap)
+            if not _is_legacy_special_use_source_view(attrs)
+        ]
+        mailboxes = [mailbox for mailbox, _attrs in mailbox_entries]
 
         # Detect sanitize_for_path collisions before writing any data.
         # Two distinct mailbox names that map to the same directory would
