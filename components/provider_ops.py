@@ -4845,6 +4845,30 @@ def provider_validate_account(
                                     + ", ".join(missing_flags)
                                 )
                         else:
+                            matching_nums = target_matching_message_nums(
+                                imap,
+                                target_mailbox,
+                                row,
+                                create_if_missing=False,
+                                expected_content_identities=expected_content_identities,
+                            )
+                            current_content_identities = _expected_content_identities(row, expected_content_identities)
+                            expected_occurrences = sum(
+                                1
+                                for other_identity, other_row in by_id.items()
+                                if target_by_id.get(other_identity) == target_mailbox
+                                and _expected_content_identities(
+                                    other_row,
+                                    expected_content_identities_by_id.get(other_identity),
+                                )
+                                == current_content_identities
+                            )
+                            if len(matching_nums) > max(expected_occurrences, 1):
+                                report["duplicates"].append({
+                                    "canonical_id": identity,
+                                    "count": len(matching_nums),
+                                    "source": "target",
+                                })
                             target_num = consume_target_match_num(
                                 imap,
                                 target_mailbox,

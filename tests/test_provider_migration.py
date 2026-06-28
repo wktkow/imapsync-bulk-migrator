@@ -7631,6 +7631,44 @@ def test_provider_validation_checks_target_occurrences_not_only_boolean_match(tm
     assert report["remote_missing"] == ["physical-duplicate"]
 
 
+def test_provider_validation_rejects_extra_matching_generic_target_copy_in_merge_mode(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _write_provider_export_state(account_dir)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+
+    class DuplicateGenericTarget(FakeTargetImap):
+        def search(self, charset: Optional[str], *criteria):
+            self.search_queries.append(criteria)
+            if criteria == ("HEADER", "Message-ID", row["message_id_header"]):
+                return "OK", [b"1 2"]
+            if criteria == ("ALL",):
+                return "OK", [b"1 2"]
+            return "OK", [b""]
+
+        def fetch(self, num: bytes, query: str):
+            return "OK", [(num + b" (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
+
+    fake = DuplicateGenericTarget(messages_by_mailbox={"Archive": 2})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[DuplicateGenericTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert report["duplicates"] == [{"canonical_id": "gmail-123", "count": 2, "source": "target"}]
+
+
 def test_provider_validation_rejects_single_gmail_message_for_two_physical_source_rows(tmp_path: Path) -> None:
     class OneGmailMessageInTwoLabels(FakeGmailTargetImap):
         def __init__(self, body: bytes) -> None:
