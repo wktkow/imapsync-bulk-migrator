@@ -410,7 +410,7 @@ def provider_account_directory_binding_issues(account_path, rows):
                 state = json.load(f)
         except Exception:
             state = None
-        if isinstance(state, dict) and "source_account" in state and not matches_directory(state.get("source_account")):
+        if isinstance(state, dict) and not matches_directory(state.get("source_account")):
             label = state.get("source_account")
             label = label if isinstance(label, str) and label else "<missing>"
             issues.append(
