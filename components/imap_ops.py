@@ -395,33 +395,14 @@ def _is_legacy_flagged_source_view(attributes: Tuple[str, ...]) -> bool:
     return "\\flagged" in attr_lowers
 
 
-def _covers_legacy_flagged_source_view(attributes: Tuple[str, ...]) -> bool:
-    attr_lowers = {attr.lower() for attr in attributes}
-    return "\\all" not in attr_lowers and "\\flagged" not in attr_lowers
-
-
-def _covers_legacy_all_source_view(attributes: Tuple[str, ...]) -> bool:
-    attr_lowers = {attr.lower() for attr in attributes}
-    return "\\all" not in attr_lowers and "\\flagged" not in attr_lowers
-
-
 def _should_skip_legacy_source_view(
     name: str,
     attributes: Tuple[str, ...],
     mailboxes: List[Tuple[str, Tuple[str, ...]]],
 ) -> bool:
-    if _is_legacy_all_source_view(attributes):
-        return any(
-            candidate_name != name and _covers_legacy_all_source_view(candidate_attrs)
-            for candidate_name, candidate_attrs in mailboxes
-        )
     if _is_legacy_flagged_source_view(attributes):
         return any(
-            candidate_name != name
-            and (
-                _is_legacy_all_source_view(candidate_attrs)
-                or _covers_legacy_flagged_source_view(candidate_attrs)
-            )
+            candidate_name != name and _is_legacy_all_source_view(candidate_attrs)
             for candidate_name, candidate_attrs in mailboxes
         )
     return False
@@ -870,8 +851,27 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     )
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
+    exported_regular_content: set[Tuple[int, str]] = set()
+    exported_virtual_content: set[Tuple[int, str]] = set()
     with imap_connection(server, account) as imap:
-        mailboxes = list_export_scope_mailboxes(imap)
+        mailbox_entries = _list_selectable_mailbox_entries(imap)
+        mailbox_attrs_by_name = {name: attrs for name, attrs in mailbox_entries}
+        mailboxes = [
+            name
+            for name, attrs in mailbox_entries
+            if not _should_skip_legacy_source_view(name, attrs, mailbox_entries)
+        ]
+        mailboxes.sort(
+            key=lambda name: (
+                1
+                if (
+                    _is_legacy_all_source_view(mailbox_attrs_by_name.get(name, ()))
+                    or _is_legacy_flagged_source_view(mailbox_attrs_by_name.get(name, ()))
+                )
+                else 0,
+                _mailbox_sort_key(name),
+            )
+        )
 
         # Detect sanitize_for_path collisions before writing any data.
         # Two distinct mailbox names that map to the same directory would
@@ -896,24 +896,26 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         for mailbox in mailboxes:
             _raise_if_stopped(stop_event, f"legacy export {account.email}")
             try:
+                attrs = mailbox_attrs_by_name.get(mailbox, ())
+                virtual_source = _is_legacy_all_source_view(attrs) or _is_legacy_flagged_source_view(attrs)
+                folder_dir = account_dir / sanitize_for_path(mailbox)
                 uids = fetch_all_uids(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
-                export_state_mailboxes.append({
-                    "mailbox": mailbox,
-                    "path": sanitize_for_path(mailbox),
-                    "message_count": len(uids),
-                })
                 if not uids:
-                    folder_dir = account_dir / sanitize_for_path(mailbox)
+                    if virtual_source:
+                        continue
                     ensure_private_dir(folder_dir)
                     _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": 0})
                     _remove_stale_export_files(folder_dir, set())
+                    export_state_mailboxes.append({
+                        "mailbox": mailbox,
+                        "path": sanitize_for_path(mailbox),
+                        "message_count": 0,
+                    })
                     continue
 
-                folder_dir = account_dir / sanitize_for_path(mailbox)
                 ensure_private_dir(folder_dir)
-                _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": len(uids)})
-                expected_stems = {f"u{int(uid):010d}" for uid in uids}
+                written_stems: set[str] = set()
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
@@ -929,6 +931,14 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             raise RuntimeError(f"fetch returned no message bytes in {mailbox} for UID {uid}")
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
+                        digest = hashlib.sha256(msg_bytes).hexdigest()
+                        content_identity = (len(msg_bytes), digest)
+                        if virtual_source:
+                            if content_identity in exported_regular_content or content_identity in exported_virtual_content:
+                                continue
+                            exported_virtual_content.add(content_identity)
+                        else:
+                            exported_regular_content.add(content_identity)
                         # Zero-pad UID so lexicographic order matches numeric order
                         base = f"u{int(uid):010d}"
                         eml_path = folder_dir / f"{base}.eml"
@@ -941,11 +951,19 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "flags": flags or "",
                             "internaldate": internaldate or "",
                             "rfc822_size": len(msg_bytes),
-                            "content_sha256": hashlib.sha256(msg_bytes).hexdigest(),
+                            "content_sha256": digest,
                         }
                         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
                         _secure_atomic_json(meta_path, meta)
-                _remove_stale_export_files(folder_dir, expected_stems)
+                        written_stems.add(base)
+                _remove_stale_export_files(folder_dir, written_stems)
+                if written_stems or not virtual_source:
+                    _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": len(written_stems)})
+                    export_state_mailboxes.append({
+                        "mailbox": mailbox,
+                        "path": sanitize_for_path(mailbox),
+                        "message_count": len(written_stems),
+                    })
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if _stop_requested(stop_event):

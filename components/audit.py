@@ -13,16 +13,19 @@ from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
 from .imap_ops import (
     _imap_append_wire_bytes,
+    _is_legacy_all_source_view,
+    _is_legacy_flagged_source_view,
     _legacy_symlink_component,
+    _list_selectable_mailbox_entries,
     _read_file_no_symlink,
     _require_legacy_payload_integrity,
+    _should_skip_legacy_source_view,
     _validate_legacy_delivery_metadata,
     _validate_legacy_sidecar_integrity,
     imap_connection,
     legacy_reserved_mailbox_path_issue,
     legacy_server_endpoint,
     legacy_server_endpoint_digest,
-    list_export_scope_mailboxes,
     quote_mailbox_name,
 )
 from .utils import quote_imap_search_value, sanitize_for_path, sanitized_path_key
@@ -66,6 +69,41 @@ def _read_bound_legacy_message(eml_path: Path, *, require_integrity_metadata: bo
     data = _read_staged_artifact(eml_path, "legacy message file")
     _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
     return data
+
+
+def _content_identity_variants(data: bytes) -> Set[Tuple[int, str]]:
+    variants = {data}
+    append_data = _imap_append_wire_bytes(data)
+    variants.add(append_data)
+    return {(len(candidate), hashlib.sha256(candidate).hexdigest()) for candidate in variants}
+
+
+def _is_legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
+    return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
+
+
+def _remote_mailbox_content_covered(imap, mailbox: str, local_identities: Set[Tuple[int, str]]) -> bool:
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    status, search_data = imap.search(None, "ALL")
+    if status != "OK":
+        return False
+    nums = search_data[0].split() if search_data and search_data[0] else []
+    for num in nums:
+        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            return False
+        matched = False
+        for part in fetched or []:
+            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            if _content_identity_variants(bytes(part[1])) & local_identities:
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
 
 
 def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
@@ -455,10 +493,19 @@ def audit_account(
         try:
             _raise_if_stopped(stop_event, f"legacy audit {account.email}")
             with imap_connection(server, account) as imap:
-                remote_mailboxes = list_export_scope_mailboxes(imap)
+                remote_entries = _list_selectable_mailbox_entries(imap)
+                remote_mailboxes = [
+                    name
+                    for name, attrs in remote_entries
+                    if not _should_skip_legacy_source_view(name, attrs, remote_entries)
+                ]
                 remote_counts: Dict[str, int] = {}
                 remote_mailbox_by_key: Dict[str, Tuple[str, str]] = {}
                 remote_mailbox_by_path: Dict[str, str] = {}
+                remote_attrs_by_path: Dict[str, Tuple[str, ...]] = {
+                    sanitize_for_path(name): attrs
+                    for name, attrs in remote_entries
+                }
                 count_mismatched = set()
                 for mbox in remote_mailboxes:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
@@ -487,7 +534,9 @@ def audit_account(
                     remote_counts[path] = num
                     remote_mailbox_by_key[key] = (mbox, path)
                     remote_mailbox_by_path[path] = mbox
-                identity_candidates: List[Tuple[Path, str, str]] = []
+                identity_candidates: List[Tuple[Path, str, str, bytes]] = []
+                local_content_identities: Set[Tuple[int, str]] = set()
+                local_folder_info: Dict[str, Tuple[str, int]] = {}
                 for folder_dir in folder_dirs:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     folder = folder_dir.name
@@ -500,13 +549,41 @@ def audit_account(
                         issues.append(f"{account.email}:{folder}: mailbox path is not a directory")
                         continue
                     local_mailbox = _folder_mailbox_name(folder_dir)
-                    local_count = len(list(folder_dir.glob("*.eml")))
+                    eml_paths = sorted(folder_dir.glob("*.eml"))
+                    local_count = len(eml_paths)
+                    local_folder_info[folder] = (local_mailbox, local_count)
+                    for eml_path in eml_paths:
+                        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+                        if eml_path.is_symlink():
+                            continue
+                        try:
+                            data = _read_bound_legacy_message(
+                                eml_path,
+                                require_integrity_metadata=require_integrity_metadata,
+                            )
+                        except Exception as exc:
+                            issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
+                            continue
+                        local_content_identities.update(_content_identity_variants(data))
+                        identity_candidates.append((eml_path, folder, local_mailbox, data))
+                for folder, (local_mailbox, local_count) in local_folder_info.items():
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     remote_count = remote_counts.get(folder, -1)
                     remote_mailbox = remote_mailbox_by_path.get(folder)
                     if remote_count < 0:
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
                     elif remote_count >= 0 and local_count != remote_count:
+                        remote_attrs = remote_attrs_by_path.get(folder, ())
+                        if (
+                            _is_legacy_virtual_source_attrs(remote_attrs)
+                            and _remote_mailbox_content_covered(
+                                imap,
+                                remote_mailbox or local_mailbox,
+                                local_content_identities,
+                            )
+                        ):
+                            continue
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
                     elif remote_mailbox is not None and remote_mailbox != local_mailbox:
@@ -515,27 +592,25 @@ def audit_account(
                             f"{account.email}:{folder}: remote mailbox name mismatch for sanitized path "
                             f"(local={local_mailbox!r} remote={remote_mailbox!r})"
                         )
-                    elif local_count > 0:
-                        for eml_path in sorted(folder_dir.glob("*.eml")):
-                            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
-                            if eml_path.is_symlink():
-                                continue
-                            identity_candidates.append((eml_path, folder, local_mailbox))
                 for folder_name, rcount in remote_counts.items():
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if not (account_dir / folder_name).exists():
+                        attrs = remote_attrs_by_path.get(folder_name, ())
+                        remote_mailbox = remote_mailbox_by_path.get(folder_name, folder_name)
+                        if (
+                            rcount >= 0
+                            and _is_legacy_virtual_source_attrs(attrs)
+                            and _remote_mailbox_content_covered(imap, remote_mailbox, local_content_identities)
+                        ):
+                            continue
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
                 used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}
-                for eml_path, folder, mailbox in identity_candidates:
+                for eml_path, folder, mailbox, data in identity_candidates:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if folder in count_mismatched:
                         continue
                     try:
-                        data = _read_bound_legacy_message(
-                            eml_path,
-                            require_integrity_metadata=require_integrity_metadata,
-                        )
                         used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
                         if not _remote_has_message(imap, mailbox, data, used_remote_nums):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")

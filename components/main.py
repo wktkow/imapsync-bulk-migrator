@@ -208,6 +208,45 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optio
     return False
 
 
+def _legacy_content_identity_variants(data: bytes) -> Set[Tuple[int, str]]:
+    from .imap_ops import _imap_append_wire_bytes
+
+    variants = {data, _imap_append_wire_bytes(data)}
+    return {(len(candidate), hashlib.sha256(candidate).hexdigest()) for candidate in variants}
+
+
+def _legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
+    from .imap_ops import _is_legacy_all_source_view, _is_legacy_flagged_source_view
+
+    return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
+
+
+def _legacy_remote_mailbox_content_covered(imap, mailbox: str, local_identities: Set[Tuple[int, str]]) -> bool:
+    from .imap_ops import quote_mailbox_name
+
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    status, search_data = imap.search(None, "ALL")
+    if status != "OK":
+        return False
+    nums = search_data[0].split() if search_data and search_data[0] else []
+    for num in nums:
+        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            return False
+        matched = False
+        for part in fetched or []:
+            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            if _legacy_content_identity_variants(bytes(part[1])) & local_identities:
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
 def setup_logging(log_directory: Path) -> Path:
     """Initialize root logger with file + stdout handlers and return log path."""
     if _legacy_symlink_component(log_directory) is not None:
@@ -1344,10 +1383,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                 email = acc.email
                 account_dir_fd: Optional[int] = None
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _open_legacy_dir, _raise_if_legacy_parent_replaced, _read_file_no_symlink, _require_legacy_payload_integrity, _unresolved_legacy_pending_keys, _validate_legacy_sidecar_integrity, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
+                    from .imap_ops import (
+                        _legacy_import_target_id,
+                        _list_selectable_mailbox_entries,
+                        _load_legacy_import_journal,
+                        _open_legacy_dir,
+                        _raise_if_legacy_parent_replaced,
+                        _read_file_no_symlink,
+                        _require_legacy_payload_integrity,
+                        _should_skip_legacy_source_view,
+                        _unresolved_legacy_pending_keys,
+                        _validate_legacy_sidecar_integrity,
+                        imap_connection,
+                        quote_mailbox_name,
+                    )
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
+                    local_content_identities: Set[Tuple[int, str]] = set()
                     if not account_dir.exists():
                         with mismatches_lock:
                             validation_errors.append((email, f"account directory missing: {account_dir}"))
@@ -1460,14 +1513,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                             guard_account_dir()
                             _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
+                            local_content_identities.update(_legacy_content_identity_variants(message_bytes))
                             local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
+                    remote_attrs_by_key: Dict[str, Tuple[str, ...]] = {}
                     remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
                     remote_name_mismatch_keys: Set[str] = set()
                     guard_account_dir()
                     with imap_connection(config.server, acc) as imap:
-                        mailboxes = list_export_scope_mailboxes(imap)
+                        mailbox_entries = _list_selectable_mailbox_entries(imap)
+                        mailboxes = [
+                            name
+                            for name, attrs in mailbox_entries
+                            if not _should_skip_legacy_source_view(name, attrs, mailbox_entries)
+                        ]
+                        remote_attrs_by_key = {
+                            sanitize_for_path(name): attrs
+                            for name, attrs in mailbox_entries
+                        }
                         for mailbox in mailboxes:
                             try:
                                 status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
@@ -1519,10 +1583,38 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 continue
                             remote = remote_counts.get(folder, -1)
                             if local_count != remote:
+                                remote_mailbox = remote_mailboxes.get(
+                                    folder,
+                                    local_mailboxes_by_key.get(folder, folder),
+                                )
+                                remote_attrs = remote_attrs_by_key.get(folder, ())
+                                if (
+                                    remote >= 0
+                                    and _legacy_virtual_source_attrs(remote_attrs)
+                                    and _legacy_remote_mailbox_content_covered(
+                                        imap,
+                                        remote_mailbox,
+                                        local_content_identities,
+                                    )
+                                ):
+                                    continue
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     mismatches.append((email, folder, local_count, remote))
                         for folder, remote_count in remote_counts.items():
+                            if folder not in local_counts:
+                                remote_mailbox = remote_mailboxes.get(folder, folder)
+                                remote_attrs = remote_attrs_by_key.get(folder, ())
+                                if (
+                                    remote_count >= 0
+                                    and _legacy_virtual_source_attrs(remote_attrs)
+                                    and _legacy_remote_mailbox_content_covered(
+                                        imap,
+                                        remote_mailbox,
+                                        local_content_identities,
+                                    )
+                                ):
+                                    continue
                             if folder not in local_counts and remote_count < 0:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:

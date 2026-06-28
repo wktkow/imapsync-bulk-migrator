@@ -1037,13 +1037,194 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX"]
+        assert source.selected == ["INBOX", "All Mail"]
         assert state["mailboxes"] == [
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
         assert not (account_dir / "All_Mail").exists()
         assert not (account_dir / "Flagged").exists()
+
+    def test_export_keeps_generic_all_archived_only_messages_with_inbox(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        inbox_body = b"Message-ID: <legacy-inbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ninbox"
+        archived_body = b"Message-ID: <legacy-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
+
+        class InboxAndAllSource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1" if self.selected_mailbox == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected_mailbox == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    body = inbox_body if uid == "1" else archived_body
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = InboxAndAllSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[InboxAndAllSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["INBOX", "All Mail"]
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+        ]
+        assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == inbox_body
+        assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == archived_body
+
+    def test_export_keeps_generic_flagged_archived_only_messages_with_inbox(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        inbox_body = b"Message-ID: <legacy-inbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ninbox"
+        flagged_body = b"Message-ID: <legacy-flagged-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
+
+        class InboxAndFlaggedSource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    body = flagged_body if self.selected_mailbox == "Flagged" else inbox_body
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen \\Flagged) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = InboxAndFlaggedSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[InboxAndFlaggedSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["INBOX", "Flagged"]
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
+        ]
+        assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == inbox_body
+        assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
+
+    def test_export_dedupes_generic_all_after_later_sorting_physical_mailbox(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-project@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class ProjectAndAllSource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                    b'(\\HasNoChildren) "/" "Projects"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = ProjectAndAllSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[ProjectAndAllSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["Projects", "All Mail"]
+        assert state["mailboxes"] == [
+            {"mailbox": "Projects", "path": "Projects", "message_count": 1},
+        ]
+        assert (account_dir / "Projects" / "u0000000001.eml").read_bytes() == body
+        assert not (account_dir / "All_Mail").exists()
 
     def test_export_keeps_generic_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -1281,7 +1462,7 @@ class TestLegacyListParsing:
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
         assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
-        assert source.selected == ["INBOX"]
+        assert source.selected == ["INBOX", "All Mail"]
         assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}]
         assert not (account_dir / "All_Mail").exists()
 
@@ -1423,6 +1604,109 @@ class TestLegacyListParsing:
                 "--mode", "validate",
                 "--config", str(config_path),
                 "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+
+    def test_audit_and_validate_accept_deduped_all_with_archived_only_message(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.main import main
+        from components.models import Account, Config, ServerConfig
+
+        inbox_body = b"Message-ID: <legacy-audit-inbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ninbox"
+        archived_body = b"Message-ID: <legacy-audit-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
+
+        class InboxAndAllRemote:
+            def __init__(self) -> None:
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected_mailbox == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected_mailbox == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    body = inbox_body if uid == "1" else archived_body
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1" if self.selected_mailbox == "INBOX" else b"1 2"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<legacy-audit-inbox@example.com>":
+                        return "OK", [b"1"]
+                    if wanted == "<legacy-audit-archived@example.com>" and self.selected_mailbox == "All Mail":
+                        return "OK", [b"2"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                body = inbox_body if int(num) == 1 else archived_body
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        remote = InboxAndAllRemote()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[InboxAndAllRemote]:
+            yield remote
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        export_root = tmp_path / "exported"
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, export_root, ignore_errors=False)
+
+        account_dir = export_root / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+        ]
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                export_root,
+                Config(server, [account], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+        assert ok, issues
+
+        config_path = tmp_path / "config.json"
+        server_json = {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False}
+        config_path.write_text(json.dumps({
+            "server": server_json,
+            "source_server": server_json,
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(export_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--max-workers", "1",
                 "--min-free-gb", "0",
