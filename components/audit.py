@@ -243,6 +243,9 @@ def audit_account(
     if not account_dir.exists():
         issues.append(f"account directory missing: {account_dir}")
         return account.email, issues
+    if not account_dir.is_dir():
+        issues.append(f"{account.email}: account path is not a directory: {account_dir}")
+        return account.email, issues
     folder_dirs: List[Path] = []
     for child in account_dir.iterdir():
         if child.is_symlink():

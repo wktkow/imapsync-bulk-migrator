@@ -8290,6 +8290,25 @@ class TestRound7ConfirmedBugs:
         assert any("hard-linked legacy mailbox marker" in issue for issue in issues)
         assert not any("remote check failed" in issue for issue in issues)
 
+    def test_audit_account_reports_file_account_path(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        account = Account("user@example.com", "secret")
+        (tmp_path / account.email).write_text("not a directory\n")
+
+        name, issues = audit_account(
+            account,
+            tmp_path,
+            ServerConfig("imap.example.com"),
+            check_remote=True,
+            require_integrity_metadata=True,
+            expected_source_server=ServerConfig("imap.example.com"),
+        )
+
+        assert name == account.email
+        assert any("account path is not a directory" in issue for issue in issues)
+
     def test_legacy_import_rejects_symlinked_message_file_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
