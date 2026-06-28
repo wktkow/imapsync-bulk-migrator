@@ -9128,6 +9128,15 @@ class FakePreflightSourceFailure:
         raise AssertionError(command)
 
 
+class FakePreflightSourceMissingSize(FakePreflightSourceFailure):
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            return "OK", [b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
+        raise AssertionError(command)
+
+
 class FakePreflightTarget:
     def capability(self):
         return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
@@ -9190,6 +9199,21 @@ def test_provider_preflight_reports_metadata_fetch_failures(tmp_path: Path) -> N
 
     assert not ok
     assert any("metadata fetch failed" in issue for issue in issues)
+
+
+def test_provider_preflight_reports_missing_metadata_size(tmp_path: Path) -> None:
+    config = _provider_config()
+    config.target.available_bytes = 1
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakePreflightSourceMissingSize() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("metadata fetch missing RFC822.SIZE" in issue for issue in issues)
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:

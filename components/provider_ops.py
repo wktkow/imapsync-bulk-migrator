@@ -4985,6 +4985,15 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                         if status != "OK":
                             account_issues.append(f"metadata fetch failed in {mailbox.name} for UID {uid}")
                             continue
+                        raw_fetch_parts: List[str] = []
+                        for item in data or []:
+                            raw = item[0] if isinstance(item, tuple) and item else item
+                            if isinstance(raw, (bytes, bytearray)):
+                                raw_fetch_parts.append(bytes(raw).decode(errors="ignore"))
+                        raw_fetch_text = " ".join(raw_fetch_parts)
+                        if not re.search(r"\bRFC822\.SIZE\s+\d+\b", raw_fetch_text, flags=re.IGNORECASE):
+                            account_issues.append(f"metadata fetch missing RFC822.SIZE in {mailbox.name} for UID {uid}")
+                            continue
                         parsed = parse_provider_fetch_response(data or [])
                         identity = str(parsed.get("gmail_msgid") or f"{mailbox.name}:{uid}")
                         if identity in seen_identity:
