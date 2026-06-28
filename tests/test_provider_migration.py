@@ -6235,6 +6235,29 @@ def test_provider_import_empty_mode_rejects_stale_pending_unmatched_target(tmp_p
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_import_rejects_pending_journal_wrong_target_mailbox_before_append(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "INBOX",
+        "status": "pending",
+    })) + "\n")
+    fake = FakeTargetImap(has_existing=False)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="pending identity in wrong target mailbox"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+
+
 def test_provider_import_rejects_committed_journal_missing_target_message(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
