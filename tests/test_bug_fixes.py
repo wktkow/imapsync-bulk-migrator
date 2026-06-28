@@ -4503,6 +4503,49 @@ class TestCPanelProvisioning:
         assert rc == 2
         client_cls.assert_not_called()
 
+    def test_reset_confirm_accepts_dns_equivalent_target_host(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        source_server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "IMAP.EXAMPLE.COM.", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "IMAP.EXAMPLE.COM.", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX", source_server=source_server)
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.CPanelClient", side_effect=DummyCPanelClient) as client_cls, \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"a@example.com"}) as reset_mock, \
+            mock.patch("components.main.import_account", side_effect=AssertionError("reset-failed account should be skipped")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--ignore-errors",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 3
+        client_cls.assert_called_once()
+        reset_mock.assert_called_once()
+
     def test_wrong_panel_dry_run_flag_does_not_bypass_directadmin_reset_confirmation(self, tmp_path: Path) -> None:
         from components.main import main
 

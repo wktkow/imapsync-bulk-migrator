@@ -58,6 +58,10 @@ def _read_required_secret_file(path: str, *, label: str) -> str:
     return value
 
 
+def _canonical_reset_confirm_host(value: str) -> str:
+    return value.strip().lower().rstrip(".")
+
+
 def _resolve_da_password(args: argparse.Namespace) -> str:
     sources = [
         name
@@ -572,7 +576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         target_host = config.target.host if isinstance(config, ProviderMigrationConfig) else config.server.host
         reset_confirm = str(getattr(args, "reset_confirm", "") or "")
-        if reset_confirm not in {target_host, "YES"}:
+        if reset_confirm != "YES" and _canonical_reset_confirm_host(reset_confirm) != _canonical_reset_confirm_host(target_host):
             logging.error("--reset-confirm must match target IMAP host %r or be YES for non-dry-run --reset", target_host)
             return 2
     if args.mode in {"import", "validate", "audit"}:
