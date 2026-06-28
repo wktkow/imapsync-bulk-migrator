@@ -1437,8 +1437,17 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
         root = account_dir / root_name
         if not root.exists():
             continue
+        reported_symlinks: set[str] = set()
+        for path in sorted(root.rglob("*")):
+            if not path.is_symlink() or not path.is_dir():
+                continue
+            rel_path = path.relative_to(account_dir).as_posix()
+            reported_symlinks.add(rel_path)
+            issues.append(f"symlinked provider {label} artifact directory: {rel_path}")
         for path in sorted(root.rglob(suffix)):
             rel_path = path.relative_to(account_dir).as_posix()
+            if rel_path in reported_symlinks:
+                continue
             if path.is_symlink():
                 issues.append(f"symlinked provider {label} artifact: {rel_path}")
                 continue
