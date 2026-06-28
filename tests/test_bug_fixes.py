@@ -5337,6 +5337,29 @@ print("ok")
         assert sorted(path.name for path in inbox.glob("*.eml")) == ["u0000000001.eml"]
         assert sorted(path.name for path in inbox.glob("*.json") if path.name != ".mailbox.json") == ["u0000000001.json"]
 
+    def test_legacy_export_rejects_existing_provider_layout_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        account_dir = tmp_path / "user@example.com"
+        (account_dir / "messages").mkdir(parents=True)
+        (account_dir / "metadata").mkdir()
+        (account_dir / "manifest.jsonl").write_text("{}\n")
+        provider_state = '{"provider": true}\n'
+        (account_dir / "export-state.json").write_text(provider_state)
+
+        with mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+            with pytest.raises(RuntimeError, match="provider manifest present in legacy output directory"):
+                export_account(
+                    Account("user@example.com", "secret"),
+                    ServerConfig("imap.example.com"),
+                    tmp_path,
+                    ignore_errors=False,
+                )
+
+        assert (account_dir / "export-state.json").read_text() == provider_state
+        assert not (account_dir / "INBOX").exists()
+
     def test_plain_imapsync_probe_disables_ssl_and_tls(self) -> None:
         from components.imapsync_cli import run_imapsync_justconnect
 

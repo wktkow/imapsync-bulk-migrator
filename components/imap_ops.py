@@ -505,6 +505,10 @@ def legacy_export_output_symlink_issues(out_root: Path, accounts: List[Account])
         if not account_dir.is_dir():
             issues.append(f"{account.email}: account output path is not a directory: {account_dir}")
             continue
+        provider_manifest = account_dir / "manifest.jsonl"
+        if provider_manifest.exists() or provider_manifest.is_symlink():
+            issues.append(f"{account.email}: provider manifest present in legacy output directory: {provider_manifest}")
+            continue
         for path in sorted(account_dir.rglob("*")):
             if path.is_symlink():
                 rel = path.relative_to(account_dir).as_posix()
