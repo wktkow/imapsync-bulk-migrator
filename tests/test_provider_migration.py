@@ -2861,6 +2861,42 @@ def test_provider_export_preserves_non_gmail_physical_copies(tmp_path: Path) -> 
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
 
 
+def test_provider_export_binds_non_gmail_physical_identity_to_source_account(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[
+            MigrationAccount(source_email="a@example.com", target_email="merged@icloud.com"),
+            MigrationAccount(source_email="b@example.com", target_email="merged@icloud.com"),
+        ],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+
+    ids_by_source = {}
+    for account in config.accounts:
+        @contextlib.contextmanager
+        def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeIcloudInboxSourceImap]:
+            yield FakeIcloudInboxSourceImap()
+
+        with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+            provider_export_account(config, account, tmp_path)
+
+        account_dir = tmp_path / account.source_email
+        row = json.loads((account_dir / "manifest.jsonl").read_text())
+        assert row["canonical_id"].startswith("physical-")
+        ids_by_source[account.source_email] = row["canonical_id"]
+
+    assert ids_by_source["a@example.com"] != ids_by_source["b@example.com"]
+
+
 def test_provider_export_includes_generic_special_use_mailboxes(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(

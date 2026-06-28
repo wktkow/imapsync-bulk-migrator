@@ -769,6 +769,7 @@ def canonical_identity(
     parsed: Dict[str, Any],
     msg_bytes: bytes,
     *,
+    source_account: str = "",
     mailbox: str = "",
     uidvalidity: str = "",
     uid: Optional[int] = None,
@@ -781,9 +782,29 @@ def canonical_identity(
     size = int(parsed.get("rfc822_size") or len(msg_bytes))
     message_id = _message_id_header(msg_bytes)
     if collapse_fallback or not mailbox or uid is None:
-        seed = f"{message_id}|{sha256}|{size}"
+        seed = json.dumps(
+            {
+                "message_id": message_id,
+                "sha256": sha256,
+                "size": size,
+                "source_account": source_account,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return f"fallback-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}", sha256, message_id
-    seed = f"{mailbox}|{uidvalidity}|{uid}|{sha256}|{size}"
+    seed = json.dumps(
+        {
+            "mailbox": mailbox,
+            "sha256": sha256,
+            "size": size,
+            "source_account": source_account,
+            "uid": uid,
+            "uidvalidity": uidvalidity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return f"physical-{hashlib.sha256(seed.encode('utf-8')).hexdigest()}", sha256, message_id
 
 
@@ -2259,6 +2280,7 @@ def provider_export_account(
                 identity, sha256, message_id = canonical_identity(
                     parsed,
                     msg_bytes,
+                    source_account=account.source_email,
                     mailbox=mailbox.name,
                     uidvalidity=uidvalidity,
                     uid=uid,
