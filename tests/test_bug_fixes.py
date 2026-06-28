@@ -2247,6 +2247,58 @@ class TestCliAndConfigHardening:
         ]) == 2
         assert main(["--mode", "test", *base, "--no-connectivity-test"]) == 2
 
+    def test_test_accounts_passes_imap_timeout_to_imapsync_probe(self) -> None:
+        from components.main import test_accounts
+        from components.models import Account, Config, ServerConfig
+
+        config = Config(
+            server=ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False),
+            accounts=[Account(email="a@example.com", password="secret")],
+        )
+        seen_timeouts: List[float] = []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[object]:
+            yield object()
+
+        def fake_justconnect(*_args, timeout_sec, **_kwargs):
+            seen_timeouts.append(timeout_sec)
+            return True, "ok"
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection), \
+            mock.patch("components.main.run_imapsync_justconnect", fake_justconnect):
+            test_accounts(config, max_workers=1, imap_timeout=123.0)
+
+        assert seen_timeouts == [123.0]
+
+    def test_main_passes_imap_timeout_to_legacy_test_mode(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "test.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        seen_calls: List[Tuple[int, float]] = []
+
+        def fake_test_accounts(_config, *, max_workers, imap_timeout):
+            seen_calls.append((max_workers, imap_timeout))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.test_accounts", fake_test_accounts):
+            rc = main([
+                "--mode", "test",
+                "--config", str(config_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--imap-timeout", "123",
+            ])
+
+        assert rc == 0
+        assert seen_calls == [(1, 123.0)]
+
     @pytest.mark.parametrize(
         ("mode", "extra_args"),
         [

@@ -246,7 +246,7 @@ def setup_logging(log_directory: Path) -> Path:
     return log_file
 
 
-def test_accounts(config: Config, max_workers: int) -> None:
+def test_accounts(config: Config, max_workers: int, *, imap_timeout: float = 30.0) -> None:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     import concurrent.futures
@@ -266,7 +266,7 @@ def test_accounts(config: Config, max_workers: int) -> None:
                 starttls=config.server.starttls,
                 user=acc.email,
                 password=acc.password,
-                timeout_sec=30,
+                timeout_sec=imap_timeout,
             )
             if not ok:
                 raise RuntimeError(f"imapsync justconnect failed for {acc.email}:\n{out}")
@@ -893,7 +893,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         skipped,
                     )
                     connectivity_config = Config(server=config.server, accounts=active_accounts, source_server=config.source_server)
-                test_accounts(connectivity_config, max_workers=int(args.max_workers))
+                test_accounts(connectivity_config, max_workers=int(args.max_workers), imap_timeout=imap_timeout)
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
             logging.error("Connectivity tests failed: %s", exc)
