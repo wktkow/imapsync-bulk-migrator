@@ -5377,6 +5377,32 @@ class TestRound2ConfirmedBugs:
         assert stats["errors"] >= 1
         assert "export-state source_account <missing> does not match provider account directory source@example.com" in output
 
+    def test_verify_export_rejects_empty_provider_state_missing_provider_bindings(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        account_dir.mkdir(parents=True)
+        (account_dir / "manifest.jsonl").write_text("")
+        (account_dir / "export-state.json").write_text(json.dumps({
+            "source_account": "source@example.com",
+            "complete": True,
+            "canonical_messages": 0,
+            "manifest_sha256": provider_manifest_digest([]),
+        }))
+
+        stats = verify_account(account_dir)
+        output = capsys.readouterr().out
+
+        assert stats["errors"] >= 3
+        assert "export-state source_provider is missing or invalid" in output
+        assert "export-state target_account is missing or invalid" in output
+        assert "export-state target_provider is missing or invalid" in output
+
     @pytest.mark.parametrize(
         ("row_updates", "state_updates", "expected"),
         [

@@ -508,6 +508,32 @@ def provider_state_manifest_binding_issues(account_path, rows):
     return issues
 
 
+def provider_empty_state_binding_issues(account_path):
+    state_path = account_path / "export-state.json"
+    if not state_path.exists() or state_path.is_symlink():
+        return []
+    try:
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(state, dict):
+        return []
+
+    issues = []
+    for field in ("source_provider", "target_provider"):
+        value = state.get(field)
+        if not isinstance(value, str) or not value.strip():
+            issues.append(f"export-state {field} is missing or invalid")
+            continue
+        if value.strip().lower() not in {"gmail", "icloud", "imap"}:
+            issues.append(f"export-state {field} is invalid: {value}")
+    target_account = state.get("target_account")
+    if not isinstance(target_account, str) or not target_account.strip():
+        issues.append("export-state target_account is missing or invalid")
+    return issues
+
+
 def verify_provider_account(account_path):
     """Verify a provider-layout account export."""
     account_name = account_path.name
@@ -537,6 +563,7 @@ def verify_provider_account(account_path):
         errors.extend(manifest_payload_issues(account_path, rows))
         errors.extend(_provider_artifact_orphan_issues(account_path, rows))
     else:
+        errors.extend(provider_empty_state_binding_issues(account_path))
         errors.extend(provider_export_state_issues(account_path, manifest_rows=[]))
         errors.extend(_provider_artifact_orphan_issues(account_path, []))
 
