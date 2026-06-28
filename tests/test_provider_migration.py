@@ -7105,6 +7105,25 @@ def test_provider_validation_rejects_wrong_target_mailbox_commit(tmp_path: Path)
     assert any("wrong target mailbox" in item for item in report["failed"])
 
 
+def test_provider_audit_and_offline_validation_reject_wrong_target_mailbox_commit(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+    })) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any("journal committed identity in wrong target mailbox" in issue for issue in audit_issues)
+    assert not report["ok"]
+    assert any("journal committed identity in wrong target mailbox" in item for item in report["failed"])
+
+
 def test_provider_validation_rejects_translated_folder_collision(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(

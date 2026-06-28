@@ -1508,9 +1508,27 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
     return issues
 
 
+def _target_mailbox_matches_expected(
+    target_mailbox: str,
+    expected_target: str,
+    *,
+    target_provider: str,
+) -> bool:
+    if target_mailbox == expected_target:
+        return True
+    if (target_provider or "").lower() == "gmail":
+        expected_key = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
+        target_key = _gmail_target_system_key(target_mailbox)
+        if expected_key and target_key:
+            return expected_key == target_key
+    return False
+
+
 def committed_journal_target_mailbox_issues(
     rows: List[Dict[str, Any]],
     expected_target_by_id: Dict[str, str],
+    *,
+    target_provider: str = "imap",
 ) -> List[str]:
     issues: List[str] = []
     for row in latest_committed_journal_rows(rows).values():
@@ -1521,7 +1539,11 @@ def committed_journal_target_mailbox_issues(
         if not expected_target:
             continue
         target_mailbox = str(row.get("target_mailbox") or "")
-        if target_mailbox != expected_target:
+        if not _target_mailbox_matches_expected(
+            target_mailbox,
+            expected_target,
+            target_provider=target_provider,
+        ):
             issues.append(
                 f"journal committed identity in wrong target mailbox: {identity} "
                 f"expected {expected_target!r} got {target_mailbox!r}"
@@ -1532,6 +1554,8 @@ def committed_journal_target_mailbox_issues(
 def pending_journal_target_mailbox_issues(
     rows: List[Dict[str, Any]],
     expected_target_by_id: Dict[str, str],
+    *,
+    target_provider: str = "imap",
 ) -> List[str]:
     issues: List[str] = []
     for row in rows:
@@ -1544,11 +1568,57 @@ def pending_journal_target_mailbox_issues(
         if not expected_target:
             continue
         target_mailbox = str(row.get("target_mailbox") or "")
-        if target_mailbox != expected_target:
+        if not _target_mailbox_matches_expected(
+            target_mailbox,
+            expected_target,
+            target_provider=target_provider,
+        ):
             issues.append(
                 f"journal pending identity in wrong target mailbox: {identity} "
                 f"expected {expected_target!r} got {target_mailbox!r}"
             )
+    return issues
+
+
+def offline_target_mailboxes_for_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    target_provider: str,
+) -> Dict[str, str]:
+    expected: Dict[str, str] = {}
+    for row in rows:
+        identity = str(row.get("canonical_id") or "")
+        if not identity:
+            continue
+        desired = str(row.get("primary_mailbox") or "Archive")
+        expected[identity] = translate_source_mailbox_for_target(
+            row,
+            desired,
+            [],
+            target_provider=target_provider,
+        )
+    return expected
+
+
+def offline_journal_target_mailbox_issues(
+    journal_rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+    *,
+    target_provider: str,
+) -> List[str]:
+    expected = offline_target_mailboxes_for_rows(manifest_rows, target_provider=target_provider)
+    issues = committed_journal_target_mailbox_issues(
+        journal_rows,
+        expected,
+        target_provider=target_provider,
+    )
+    issues.extend(
+        pending_journal_target_mailbox_issues(
+            journal_rows,
+            expected,
+            target_provider=target_provider,
+        )
+    )
     return issues
 
 
@@ -3489,6 +3559,16 @@ def _validated_group_stage(
             f"invalid import journal for merge source {account.source_email}: "
             + "; ".join(journal_content_issues)
         )
+    journal_mailbox_issues = offline_journal_target_mailbox_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider=config.target.provider,
+    )
+    if journal_mailbox_issues:
+        raise RuntimeError(
+            f"invalid import journal for merge source {account.source_email}: "
+            + "; ".join(journal_mailbox_issues)
+        )
     if config.target.provider == "gmail":
         manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
         gmail_journal_issues: List[str] = []
@@ -3721,12 +3801,14 @@ def provider_import_account(
         committed_target_issues = committed_journal_target_mailbox_issues(
             journal_rows,
             target_mailbox_by_identity,
+            target_provider=config.target.provider,
         )
         if committed_target_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(committed_target_issues))
         pending_target_issues = pending_journal_target_mailbox_issues(
             journal_rows,
             target_mailbox_by_identity,
+            target_provider=config.target.provider,
         )
         if pending_target_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(pending_target_issues))
@@ -4101,6 +4183,13 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         issues.extend(journal_row_issues(journal_rows, account))
         issues.extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
         issues.extend(committed_journal_manifest_content_issues(journal_rows, rows))
+        issues.extend(
+            offline_journal_target_mailbox_issues(
+                journal_rows,
+                rows,
+                target_provider=config.target.provider,
+            )
+        )
         if config.target.provider == "gmail":
             issues.extend(invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
     if config.target.provider == "gmail":
@@ -4271,6 +4360,13 @@ def provider_validate_account(
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
     report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
+    report["failed"].extend(
+        offline_journal_target_mailbox_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+        )
+    )
     committed_journal_keys = set(latest_committed_journal_rows(journal_rows))
     if not allow_unresolved_pending:
         for row in journal_rows:
@@ -4344,7 +4440,11 @@ def provider_validate_account(
                 continue
             target_mailbox = str(row.get("target_mailbox") or "")
             expected_target = expected_target_by_id.get(identity) if expected_target_by_id else None
-            if expected_target and target_mailbox != expected_target:
+            if expected_target and not _target_mailbox_matches_expected(
+                target_mailbox,
+                expected_target,
+                target_provider=config.target.provider,
+            ):
                 failures.append(
                     f"journal committed identity in wrong target mailbox: {identity} "
                     f"expected {expected_target!r} got {target_mailbox!r}"
