@@ -1514,6 +1514,10 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
                 issues.append(f"symlinked provider {label} artifact: {rel_path}")
                 continue
             if not path.is_file():
+                if rel_path not in expected:
+                    issues.append(f"unmanifested non-regular provider {label} artifact: {rel_path}")
+                else:
+                    issues.append(f"non-regular provider {label} artifact: {rel_path}")
                 continue
             if rel_path not in expected:
                 issues.append(f"unmanifested provider {label} artifact: {rel_path}")
@@ -1549,9 +1553,12 @@ def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any
         for path in sorted(root.rglob(suffix)):
             if path.is_symlink():
                 raise RuntimeError(f"refusing to prune symlinked provider artifact: {path}")
+            rel_path = path.relative_to(account_dir).as_posix()
             if not path.is_file():
+                if rel_path not in expected:
+                    raise RuntimeError(f"refusing to prune non-regular provider artifact: {path}")
                 continue
-            if path.relative_to(account_dir).as_posix() not in expected:
+            if rel_path not in expected:
                 path.unlink()
 
 

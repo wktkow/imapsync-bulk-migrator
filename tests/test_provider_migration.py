@@ -569,6 +569,24 @@ def test_provider_prune_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
     assert stale.exists()
 
 
+def test_provider_prune_rejects_non_regular_orphan_artifact(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    account_dir = tmp_path / "source@example.com"
+    messages = account_dir / "messages"
+    messages.mkdir(parents=True)
+    stale = messages / "stale.eml"
+    try:
+        os.mkfifo(stale)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="non-regular provider artifact"):
+        _prune_provider_artifact_orphans(account_dir, [])
+
+    assert stale.exists()
+
+
 def _many_to_one_config(*, target_mode: str = "empty") -> ProviderMigrationConfig:
     return ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -9128,6 +9146,33 @@ def test_provider_audit_and_validation_reject_orphan_provider_artifacts(tmp_path
 
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match="unmanifested provider message artifact"):
+            provider_import_account(config, account, tmp_path)
+
+
+def test_provider_audit_and_validation_reject_non_regular_orphan_provider_artifacts(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    message_orphan = account_dir / "messages" / "stale.eml"
+    metadata_orphan = account_dir / "metadata" / "stale.json"
+    try:
+        os.mkfifo(message_orphan)
+        os.mkfifo(metadata_orphan)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"FIFO creation unavailable: {exc}")
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any("unmanifested non-regular provider message artifact: messages/stale.eml" in issue for issue in issues)
+    assert any("unmanifested non-regular provider metadata artifact: metadata/stale.json" in issue for issue in issues)
+    assert any("unmanifested non-regular provider message artifact: messages/stale.eml" in item for item in report["failed"])
+    assert any("unmanifested non-regular provider metadata artifact: metadata/stale.json" in item for item in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="unmanifested non-regular provider message artifact"):
             provider_import_account(config, account, tmp_path)
 
 
