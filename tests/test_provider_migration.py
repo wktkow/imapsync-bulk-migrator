@@ -5282,6 +5282,7 @@ def test_provider_import_and_validation_many_to_one_reject_cross_source_folder_c
         primary_mailbox="Projects/Foo",
     )
     first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    first_row["source_mailboxes"] = ["Projects/Foo"]
     first_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects", "Foo"]}
     _write_single_manifest_row(first_dir, first_row)
     _write_provider_export_state(
@@ -5291,6 +5292,7 @@ def test_provider_import_and_validation_many_to_one_reject_cross_source_folder_c
         source_endpoint=ProviderEndpoint(provider="imap", host="mail.source.example.com"),
     )
     second_row = json.loads((second_dir / "manifest.jsonl").read_text())
+    second_row["source_mailboxes"] = ["Projects/Foo"]
     second_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects/Foo"]}
     _write_single_manifest_row(second_dir, second_row)
     _write_provider_export_state(
@@ -8146,6 +8148,25 @@ def test_provider_import_audit_and_validation_reject_content_binding_mismatch(tm
         provider_import_account(config, account, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_mailbox_paths", "Archive"),
+        ("source_mailbox_paths", {"Archive": "Archive"}),
+        ("source_mailbox_paths", {1: ["Archive"]}),
+        ("source_mailbox_attributes", "Archive"),
+        ("source_mailbox_attributes", {"Archive": "\\Archive"}),
+        ("source_mailbox_attributes", {1: ["\\Archive"]}),
+    ],
+)
+def test_provider_content_binding_rejects_malformed_route_map_shapes(field: str, value: object) -> None:
+    row = _default_manifest_fixture_row()
+    row[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        provider_content_binding_sha256(row)
+
+
 def test_provider_import_audit_and_validation_reject_boolean_manifest_size(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -8182,6 +8203,45 @@ def test_provider_manifest_rejects_malformed_structured_fields_before_import(
     account = config.accounts[0]
     account_dir = _write_manifest_fixture(tmp_path)
     row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row[field] = value
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir)
+
+    _name, issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path)
+
+    assert any(f"invalid {field}" in issue for issue in issues)
+    assert any(f"invalid {field}" in issue for issue in report["failed"])
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=f"invalid {field}"):
+            provider_import_account(config, account, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_mailbox_paths", "Archive"),
+        ("source_mailbox_paths", {"Archive": "Archive"}),
+        ("source_mailbox_paths", {"Other": ["Other"]}),
+        ("source_mailbox_paths", {"Archive": []}),
+        ("source_mailbox_paths", {"Archive": [""]}),
+        ("source_mailbox_attributes", "Archive"),
+        ("source_mailbox_attributes", {"Archive": "\\Archive"}),
+        ("source_mailbox_attributes", {"Other": []}),
+        ("source_mailbox_attributes", {1: []}),
+        ("source_mailbox_attributes", {"Archive": [42]}),
+    ],
+)
+def test_provider_manifest_rejects_malformed_route_maps_before_import(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_mailboxes"] = ["Archive"]
     row[field] = value
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir)

@@ -47,15 +47,17 @@ def _add_optional_text_list(fields: Dict[str, Any], record: Mapping[str, Any], k
 
 
 def _add_optional_text_list_map(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
+    if key not in record or record.get(key) is None:
+        return
     value = record.get(key)
     if not isinstance(value, Mapping):
-        return
+        raise ValueError(f"invalid {key}")
     normalized: Dict[str, Any] = {}
     for raw_key, raw_value in value.items():
         if not isinstance(raw_key, str):
-            return
+            raise ValueError(f"invalid {key}")
         if not isinstance(raw_value, list) or any(not isinstance(item, str) for item in raw_value):
-            return
+            raise ValueError(f"invalid {key}")
         normalized[raw_key] = list(raw_value)
     fields[key] = normalized
 

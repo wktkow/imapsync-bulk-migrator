@@ -1537,6 +1537,47 @@ def manifest_schema_issues(rows: List[Dict[str, Any]]) -> List[str]:
                 continue
             if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
                 issues.append(f"{identity}: invalid {field}")
+        source_mailboxes = row.get("source_mailboxes")
+        source_mailbox_names = (
+            set(source_mailboxes)
+            if isinstance(source_mailboxes, list) and all(isinstance(item, str) and item for item in source_mailboxes)
+            else None
+        )
+        for field in ("source_mailbox_paths", "source_mailbox_attributes"):
+            value = row.get(field)
+            if value is None:
+                continue
+            if source_mailbox_names is None:
+                issues.append(f"{identity}: invalid {field}: missing source_mailboxes")
+                continue
+            if not isinstance(value, dict):
+                issues.append(f"{identity}: invalid {field}")
+                continue
+            for map_key, map_value in value.items():
+                if (
+                    not isinstance(map_key, str)
+                    or not map_key
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in map_key)
+                ):
+                    issues.append(f"{identity}: invalid {field}")
+                    break
+                if map_key not in source_mailbox_names:
+                    issues.append(f"{identity}: invalid {field}: unknown source mailbox {map_key!r}")
+                    break
+                if not isinstance(map_value, list):
+                    issues.append(f"{identity}: invalid {field}")
+                    break
+                if field == "source_mailbox_paths" and not map_value:
+                    issues.append(f"{identity}: invalid {field}")
+                    break
+                if any(
+                    not isinstance(item, str)
+                    or (field == "source_mailbox_paths" and not item)
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in item)
+                    for item in map_value
+                ):
+                    issues.append(f"{identity}: invalid {field}")
+                    break
     return issues
 
 
