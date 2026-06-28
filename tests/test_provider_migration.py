@@ -9492,7 +9492,7 @@ def test_main_routes_provider_modes_with_expected_connectivity_roles(
     assert roles_seen == [expected_roles]
 
 
-@pytest.mark.parametrize("mode", ["export", "import", "validate"])
+@pytest.mark.parametrize("mode", ["export", "import", "validate", "audit"])
 def test_main_checks_provider_free_space_before_connectivity(
     tmp_path: Path,
     mode: str,
@@ -9502,7 +9502,7 @@ def test_main_checks_provider_free_space_before_connectivity(
     config_path = _write_provider_config_file(tmp_path)
     output_dir = tmp_path / "provider-output"
     input_dir = tmp_path / "provider-input"
-    if mode in {"import", "validate"}:
+    if mode in {"import", "validate", "audit"}:
         account_dir = _write_manifest_fixture(input_dir)
         if mode == "validate":
             config = load_config_file(config_path)
@@ -9524,7 +9524,8 @@ def test_main_checks_provider_free_space_before_connectivity(
         mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")), \
         mock.patch("components.main.provider_export_all", side_effect=AssertionError("export should not run")), \
         mock.patch("components.main.provider_import_all", side_effect=AssertionError("import should not run")), \
-        mock.patch("components.main.provider_validate_all", side_effect=AssertionError("validate should not run")):
+        mock.patch("components.main.provider_validate_all", side_effect=AssertionError("validate should not run")), \
+        mock.patch("components.main.provider_audit_all", side_effect=AssertionError("audit should not run")):
         rc = main([
             "--mode", mode,
             "--config", str(config_path),

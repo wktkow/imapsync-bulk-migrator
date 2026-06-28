@@ -2458,7 +2458,7 @@ class TestCliAndConfigHardening:
 
         assert rc == 0
 
-    @pytest.mark.parametrize("mode", ["export", "import", "validate"])
+    @pytest.mark.parametrize("mode", ["export", "import", "validate", "audit"])
     def test_main_checks_legacy_free_space_before_connectivity(
         self,
         tmp_path: Path,

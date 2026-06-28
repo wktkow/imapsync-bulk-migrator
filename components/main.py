@@ -684,7 +684,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     free_space_preflight_path: Optional[Path] = None
     if args.mode == "export":
         free_space_preflight_path = Path(args.output_dir)
-    elif args.mode in {"import", "validate"}:
+    elif args.mode in {"import", "validate", "audit"}:
         panel_import_will_preflight = (
             not is_provider_config
             and args.mode == "import"
@@ -973,8 +973,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                if in_root not in free_space_checked_paths:
-                    check_free_space_for_path(in_root, min_free_gb)
                 ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers))
                 if ok:
                     logging.info("Provider validation successful.")
@@ -988,7 +986,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
                 ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers))
                 if ok:
                     logging.info("Provider audit passed")
@@ -1338,7 +1335,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
             try:
                 logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
                 audit_config = Config(
