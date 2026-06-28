@@ -1565,6 +1565,14 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
     return issues
 
 
+_NON_GMAIL_TARGET_MAILBOX_ALIASES = {
+    "deleted messages": {"trash", "deleted messages"},
+    "trash": {"trash", "deleted messages"},
+    "junk": {"junk", "spam"},
+    "spam": {"junk", "spam"},
+}
+
+
 def _target_mailbox_matches_expected(
     target_mailbox: str,
     expected_target: str,
@@ -1578,6 +1586,9 @@ def _target_mailbox_matches_expected(
         target_key = _gmail_target_system_key(target_mailbox)
         if expected_key and target_key:
             return expected_key == target_key
+    expected_aliases = _NON_GMAIL_TARGET_MAILBOX_ALIASES.get(expected_target.strip().lower())
+    if expected_aliases and target_mailbox.strip().lower() in expected_aliases:
+        return True
     return False
 
 

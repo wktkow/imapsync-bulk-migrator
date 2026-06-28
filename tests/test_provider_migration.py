@@ -36,6 +36,7 @@ from components.provider_ops import (
     append_journal,
     load_import_journal,
     load_manifest,
+    offline_journal_target_mailbox_issues,
     parse_list_line,
     parse_provider_fetch_response,
     provider_audit_account,
@@ -2160,6 +2161,29 @@ def test_icloud_target_default_folder_resolution() -> None:
     assert resolve_target_mailbox("Drafts", icloud_mailboxes, target_provider="icloud") == "Drafts"
     assert resolve_target_mailbox("Deleted Messages", icloud_mailboxes, target_provider="icloud") == "Trash"
     assert resolve_target_mailbox("Junk", icloud_mailboxes, target_provider="icloud") == "Junk"
+
+
+def test_offline_journal_target_mailbox_accepts_non_gmail_special_use_alias() -> None:
+    manifest_rows = [
+        {
+            "canonical_id": "physical-trash",
+            "primary_mailbox": "Deleted Messages",
+        }
+    ]
+    journal_rows = [
+        {
+            "canonical_id": "physical-trash",
+            "target_mailbox": "Trash",
+            "target_account": "target@example.com",
+            "status": "committed",
+        }
+    ]
+
+    assert offline_journal_target_mailbox_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider="icloud",
+    ) == []
 
 
 def test_custom_folder_translation_uses_target_delimiter_and_preserves_flat_targets() -> None:
