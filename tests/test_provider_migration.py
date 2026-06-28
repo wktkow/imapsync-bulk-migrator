@@ -8167,6 +8167,15 @@ def test_provider_content_binding_rejects_malformed_route_map_shapes(field: str,
         provider_content_binding_sha256(row)
 
 
+@pytest.mark.parametrize("value", [["<m1@example.com>"], "bad\rvalue"])
+def test_provider_content_binding_rejects_malformed_message_id_header(value: object) -> None:
+    row = _default_manifest_fixture_row()
+    row["message_id_header"] = value
+
+    with pytest.raises(ValueError, match="message_id_header"):
+        provider_content_binding_sha256(row)
+
+
 def test_provider_import_audit_and_validation_reject_boolean_manifest_size(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -8192,6 +8201,8 @@ def test_provider_import_audit_and_validation_reject_boolean_manifest_size(tmp_p
         ("gmail_labels", "Project A"),
         ("source_mailboxes", "Archive"),
         ("gmail_labels", ["Project A", 42]),
+        ("message_id_header", ["<m1@example.com>"]),
+        ("message_id_header", "bad\rvalue"),
     ],
 )
 def test_provider_manifest_rejects_malformed_structured_fields_before_import(
@@ -8215,6 +8226,22 @@ def test_provider_manifest_rejects_malformed_structured_fields_before_import(
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match=f"invalid {field}"):
             provider_import_account(config, account, tmp_path)
+
+
+def test_provider_import_rejects_malformed_message_id_before_target_journal(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["message_id_header"] = ["<m1@example.com>"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir)
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="invalid message_id_header"):
+            provider_import_account(config, account, tmp_path)
+
+    assert not (account_dir / "import-target@icloud.com.journal.jsonl").exists()
 
 
 @pytest.mark.parametrize(

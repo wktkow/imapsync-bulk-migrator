@@ -1531,6 +1531,12 @@ def manifest_schema_issues(rows: List[Dict[str, Any]]) -> List[str]:
         primary_mailbox = row.get("primary_mailbox")
         if not isinstance(primary_mailbox, str) or not primary_mailbox.strip():
             issues.append(f"{identity}: missing or invalid primary_mailbox")
+        message_id_header = row.get("message_id_header")
+        if message_id_header is not None and (
+            not isinstance(message_id_header, str)
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in message_id_header)
+        ):
+            issues.append(f"{identity}: invalid message_id_header")
         for field in ("source_mailboxes", "gmail_labels"):
             value = row.get(field)
             if value is None:
@@ -3580,7 +3586,8 @@ def target_matching_message_nums(
     create_if_missing: bool = True,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> List[bytes]:
-    message_id = str(manifest_row.get("message_id_header") or "").strip()
+    message_id_raw = manifest_row.get("message_id_header")
+    message_id = message_id_raw.strip() if isinstance(message_id_raw, str) else ""
     if create_if_missing:
         ensure_mailbox(imap, mailbox)
     status, _ = select_mailbox(imap, mailbox, readonly=True)

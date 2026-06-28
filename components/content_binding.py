@@ -34,6 +34,17 @@ def _add_optional_text(fields: Dict[str, Any], record: Mapping[str, Any], key: s
         fields[key] = value
 
 
+def _add_optional_control_free_text(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
+    if key not in record or record.get(key) is None:
+        return
+    value = record.get(key)
+    if value == "":
+        return
+    if not isinstance(value, str) or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"invalid {key}")
+    fields[key] = value
+
+
 def _add_optional_int(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
     value = record.get(key)
     if type(value) is int and value >= 0:
@@ -84,13 +95,13 @@ def provider_content_binding_sha256(row: Mapping[str, Any]) -> str:
         "source_provider",
         "source_account",
         "target_account",
-        "message_id_header",
         "flags",
         "internaldate",
         "eml_path",
         "metadata_path",
     ):
         _add_optional_text(fields, row, key)
+    _add_optional_control_free_text(fields, row, "message_id_header")
     _add_optional_text(fields, row, "primary_mailbox")
     for key in ("source_mailboxes", "gmail_labels"):
         _add_optional_text_list(fields, row, key)
