@@ -635,13 +635,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         logging.error("[staged-audit] %s", issue)
                     return 4
                 legacy_staged_audit_completed = True
-            if not (args.mode == "import" and bool(getattr(args, "reset", False))):
-                pending_journal_issues = _legacy_pending_import_journal_issues(input_root, config)
-                if pending_journal_issues:
-                    logging.error("Input directory has unresolved legacy import journal entries:")
-                    for issue in pending_journal_issues:
-                        logging.error("[staged-journal] %s", issue)
-                    return 4
+            pending_journal_issues = _legacy_pending_import_journal_issues(input_root, config)
+            if pending_journal_issues:
+                logging.error("Input directory has unresolved legacy import journal entries:")
+                for issue in pending_journal_issues:
+                    logging.error("[staged-journal] %s", issue)
+                return 4
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:

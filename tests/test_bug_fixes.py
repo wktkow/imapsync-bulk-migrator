@@ -1592,6 +1592,85 @@ class TestLegacyImportJournal:
         assert list(account_dir.glob("import.journal.reset-*.jsonl"))
         import_mock.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("status", "hard_linked"),
+        [
+            ("pending", False),
+            ("committed", True),
+        ],
+    )
+    def test_reset_rejects_uncertain_import_journal_before_panel_reset(
+        self,
+        tmp_path: Path,
+        status: str,
+        hard_linked: bool,
+    ) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account_dir = in_root / "user@example.com"
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        key = _legacy_import_key(account_dir, eml, "INBOX", eml.read_bytes())
+        row = {
+            "key": key,
+            "status": status,
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+        }
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_text(json.dumps(row) + "\n")
+        if hard_linked:
+            victim = tmp_path / "outside-journal.jsonl"
+            victim.write_bytes(journal.read_bytes())
+            journal.unlink()
+            try:
+                journal.hardlink_to(victim)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"hard link creation unavailable: {exc}")
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                raise AssertionError("panel client should not be created")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin") as reset_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 4
+        assert journal.exists()
+        assert not list(account_dir.glob("import.journal.reset-*.jsonl"))
+        reset_mock.assert_not_called()
+        import_mock.assert_not_called()
+
     def test_reset_archive_failure_returns_error_without_import(self, tmp_path: Path) -> None:
         from components.main import main
         from components.models import Account, ServerConfig
