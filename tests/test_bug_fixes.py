@@ -8348,6 +8348,31 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_legacy_import_rejects_hard_linked_mailbox_marker_before_connect(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder)
+        marker = folder / ".mailbox.json"
+        marker.write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        victim = tmp_path / "outside-mailbox-marker.json"
+        victim.write_bytes(marker.read_bytes())
+        marker.unlink()
+        try:
+            marker.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard link creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="hard-linked legacy mailbox marker"):
+            import_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
     def test_legacy_import_rejects_sidecar_mailbox_folder_mismatch_before_connect(self, tmp_path: Path) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
         from components.imap_ops import import_account

@@ -819,7 +819,13 @@ def import_account(
         if marker.exists():
             staged_marker_paths.add(folder_dir.name)
             try:
-                marker_meta = json.loads(_read_file_no_symlink(marker, "legacy mailbox marker").decode("utf-8"))
+                marker_meta = json.loads(
+                    _read_file_no_symlink(
+                        marker,
+                        "legacy mailbox marker",
+                        reject_hard_links=True,
+                    ).decode("utf-8")
+                )
             except Exception as exc:
                 raise RuntimeError(f"{marker}: failed to parse mailbox marker: {exc}") from exc
             if isinstance(marker_meta, dict):
