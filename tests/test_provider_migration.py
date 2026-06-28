@@ -2446,7 +2446,7 @@ def test_offline_journal_target_mailbox_accepts_icloud_default_trash_target() ->
     ) == []
 
 
-def test_offline_journal_target_mailbox_rejects_generic_special_use_alias() -> None:
+def test_offline_journal_target_mailbox_defers_generic_special_use_alias() -> None:
     manifest_rows = [
         {
             "canonical_id": "physical-trash",
@@ -2456,7 +2456,30 @@ def test_offline_journal_target_mailbox_rejects_generic_special_use_alias() -> N
     journal_rows = [
         {
             "canonical_id": "physical-trash",
-            "target_mailbox": "Trash",
+            "target_mailbox": "Papierkorb",
+            "target_account": "target@example.com",
+            "status": "committed",
+        }
+    ]
+
+    assert offline_journal_target_mailbox_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider="imap",
+    ) == []
+
+
+def test_offline_journal_target_mailbox_rejects_generic_custom_folder_mismatch() -> None:
+    manifest_rows = [
+        {
+            "canonical_id": "custom-folder",
+            "primary_mailbox": "Projects",
+        }
+    ]
+    journal_rows = [
+        {
+            "canonical_id": "custom-folder",
+            "target_mailbox": "Other",
             "target_account": "target@example.com",
             "status": "committed",
         }
@@ -7300,6 +7323,33 @@ def test_provider_online_validation_uses_live_special_use_target_mailbox(tmp_pat
     assert report["missing"] == []
     assert report["remote_missing"] == []
     assert report["remote_checked"] == 1
+
+
+def test_provider_offline_validation_defers_generic_special_use_target_mailbox(tmp_path: Path) -> None:
+    from components.main import _provider_cli_staged_validation_issues
+
+    config = _generic_target_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Deleted Messages"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target=account.target_email)
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Papierkorb",
+        "status": "committed",
+    })) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    cli_issues = _provider_cli_staged_validation_issues(tmp_path, config, mode="import")
+
+    assert not any("wrong target mailbox" in issue for issue in audit_issues)
+    assert report["ok"], report
+    assert not any("wrong target mailbox" in issue for issue in cli_issues)
 
 
 def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:

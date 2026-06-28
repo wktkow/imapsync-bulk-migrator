@@ -1634,13 +1634,32 @@ def _target_mailbox_matches_expected(
     return False
 
 
+_GENERIC_IMAP_OFFLINE_SPECIAL_USE_TARGETS = {
+    "archive",
+    "deleted messages",
+    "drafts",
+    "junk",
+    "sent",
+}
+
+
+def _generic_imap_offline_target_requires_live_special_use(target_mailbox: str, expected_target: str) -> bool:
+    return bool(
+        target_mailbox
+        and target_mailbox != expected_target
+        and expected_target.strip().lower() in _GENERIC_IMAP_OFFLINE_SPECIAL_USE_TARGETS
+    )
+
+
 def committed_journal_target_mailbox_issues(
     rows: List[Dict[str, Any]],
     expected_target_by_id: Dict[str, str],
     *,
     target_provider: str = "imap",
+    defer_generic_special_use: bool = False,
 ) -> List[str]:
     issues: List[str] = []
+    provider = (target_provider or "imap").lower()
     for row in latest_committed_journal_rows(rows).values():
         identity = str(row.get("canonical_id") or "")
         if not identity:
@@ -1654,6 +1673,12 @@ def committed_journal_target_mailbox_issues(
             expected_target,
             target_provider=target_provider,
         ):
+            if (
+                defer_generic_special_use
+                and provider == "imap"
+                and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
+            ):
+                continue
             issues.append(
                 f"journal committed identity in wrong target mailbox: {identity} "
                 f"expected {expected_target!r} got {target_mailbox!r}"
@@ -1666,8 +1691,10 @@ def pending_journal_target_mailbox_issues(
     expected_target_by_id: Dict[str, str],
     *,
     target_provider: str = "imap",
+    defer_generic_special_use: bool = False,
 ) -> List[str]:
     issues: List[str] = []
+    provider = (target_provider or "imap").lower()
     for row in rows:
         if row.get("status") != "pending":
             continue
@@ -1683,6 +1710,12 @@ def pending_journal_target_mailbox_issues(
             expected_target,
             target_provider=target_provider,
         ):
+            if (
+                defer_generic_special_use
+                and provider == "imap"
+                and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
+            ):
+                continue
             issues.append(
                 f"journal pending identity in wrong target mailbox: {identity} "
                 f"expected {expected_target!r} got {target_mailbox!r}"
@@ -1735,12 +1768,14 @@ def offline_journal_target_mailbox_issues(
         journal_rows,
         expected,
         target_provider=target_provider,
+        defer_generic_special_use=True,
     )
     issues.extend(
         pending_journal_target_mailbox_issues(
             journal_rows,
             expected,
             target_provider=target_provider,
+            defer_generic_special_use=True,
         )
     )
     return issues
