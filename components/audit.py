@@ -15,7 +15,9 @@ from .imap_ops import (
     _imap_append_wire_bytes,
     _legacy_symlink_component,
     _read_file_no_symlink,
+    _require_legacy_payload_integrity,
     _validate_legacy_delivery_metadata,
+    _validate_legacy_sidecar_integrity,
     imap_connection,
     legacy_reserved_mailbox_path_issue,
     legacy_server_endpoint,
@@ -44,6 +46,26 @@ def _message_id_header(data: bytes) -> str:
 
 def _read_staged_artifact(path: Path, label: str) -> bytes:
     return _read_file_no_symlink(path, label, reject_hard_links=True)
+
+
+def _read_bound_legacy_message(eml_path: Path, *, require_integrity_metadata: bool) -> bytes:
+    meta_path = eml_path.with_suffix(".json")
+    if not meta_path.exists():
+        if not require_integrity_metadata:
+            return _read_staged_artifact(eml_path, "legacy message file")
+        raise RuntimeError(f"{meta_path}: missing message metadata")
+    meta = json.loads(_read_staged_artifact(meta_path, "legacy message metadata").decode("utf-8"))
+    if not isinstance(meta, dict):
+        if not require_integrity_metadata:
+            return _read_staged_artifact(eml_path, "legacy message file")
+        raise RuntimeError(f"{meta_path}: message metadata is not an object")
+    integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
+    if not require_integrity_metadata and not integrity_keys_present:
+        return _read_staged_artifact(eml_path, "legacy message file")
+    expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
+    data = _read_staged_artifact(eml_path, "legacy message file")
+    _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
+    return data
 
 
 def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
@@ -510,7 +532,10 @@ def audit_account(
                     if folder in count_mismatched:
                         continue
                     try:
-                        data = _read_staged_artifact(eml_path, "legacy message file")
+                        data = _read_bound_legacy_message(
+                            eml_path,
+                            require_integrity_metadata=require_integrity_metadata,
+                        )
                         used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
                         if not _remote_has_message(imap, mailbox, data, used_remote_nums):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")

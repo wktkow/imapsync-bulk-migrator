@@ -11680,6 +11680,127 @@ class TestRound7ConfirmedBugs:
         assert started == ["a@example.com"]
         assert finished == ["a@example.com"]
 
+    def test_remote_audit_rechecks_regular_message_file_against_sidecar(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        original = b"Message-ID: <regular-swap@example.com>\r\nFrom: a\r\nTo: b\r\n\r\noriginal"
+        swapped = b"Message-ID: <regular-swap@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nswapped"
+        eml = _write_legacy_message_fixture(folder, data=original, source_server=server)
+        swapped_once = False
+
+        class FakeRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, *_args, **_kwargs):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs):
+            nonlocal swapped_once
+            eml.write_bytes(swapped)
+            swapped_once = True
+            yield FakeRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection), \
+            mock.patch("components.audit._remote_has_message", return_value=True):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert swapped_once
+        assert not ok
+        assert any("mismatch" in issue for issue in issues)
+
+    def test_validate_rechecks_regular_message_file_against_sidecar_after_audit(self, tmp_path: Path) -> None:
+        from components.audit import audit_export as real_audit_export
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        folder = input_root / "user@example.com" / "INBOX"
+        source_server = {
+            "host": "source.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        target_server = {
+            "host": "target.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        original = b"Message-ID: <validate-regular-swap@example.com>\r\nFrom: a\r\nTo: b\r\n\r\noriginal"
+        swapped = b"Message-ID: <validate-regular-swap@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nswapped"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=original,
+            source_server=ServerConfig(**source_server),
+        )
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": source_server,
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        calls = 0
+
+        class FakeRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, *_args, **_kwargs):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs):
+            yield FakeRemote()
+
+        def audit_then_swap(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = real_audit_export(*args, **kwargs)
+            if calls == 2:
+                eml.write_bytes(swapped)
+            return result
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=audit_then_swap), \
+            mock.patch("components.imap_ops.imap_connection", fake_connection), \
+            mock.patch("components.imap_ops._legacy_remote_has_message", return_value=True):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert calls == 2
+        assert eml.read_bytes() == swapped
+        assert rc == 4
+
     def test_main_signal_handler_sets_stop_without_logging_first(self, tmp_path: Path) -> None:
         from components.main import main
 

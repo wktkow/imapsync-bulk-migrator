@@ -1344,7 +1344,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 email = acc.email
                 account_dir_fd: Optional[int] = None
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _open_legacy_dir, _raise_if_legacy_parent_replaced, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _open_legacy_dir, _raise_if_legacy_parent_replaced, _read_file_no_symlink, _require_legacy_payload_integrity, _unresolved_legacy_pending_keys, _validate_legacy_sidecar_integrity, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
@@ -1430,21 +1430,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                         for eml_path in eml_paths:
                             mailbox = default_mailbox
                             metadata_path = eml_path.with_suffix(".json")
-                            if metadata_path.exists():
-                                try:
-                                    guard_account_dir()
-                                    metadata_bytes = _read_file_no_symlink(
-                                        metadata_path,
-                                        "legacy message metadata",
-                                        reject_hard_links=True,
-                                    )
-                                    guard_account_dir()
-                                    metadata = json.loads(metadata_bytes.decode("utf-8"))
-                                except Exception as exc:
-                                    raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
-                                metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
-                                if isinstance(metadata_mailbox, str) and metadata_mailbox:
-                                    mailbox = metadata_mailbox
+                            if not metadata_path.exists():
+                                raise RuntimeError(f"{metadata_path}: missing message metadata")
+                            try:
+                                guard_account_dir()
+                                metadata_bytes = _read_file_no_symlink(
+                                    metadata_path,
+                                    "legacy message metadata",
+                                    reject_hard_links=True,
+                                )
+                                guard_account_dir()
+                                metadata = json.loads(metadata_bytes.decode("utf-8"))
+                            except Exception as exc:
+                                raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
+                            if not isinstance(metadata, dict):
+                                raise RuntimeError(f"{metadata_path}: message metadata is not an object")
+                            expected_size, expected_hash = _validate_legacy_sidecar_integrity(metadata_path, metadata)
+                            metadata_mailbox = metadata.get("mailbox")
+                            if isinstance(metadata_mailbox, str) and metadata_mailbox:
+                                mailbox = metadata_mailbox
                             key = sanitize_for_path(mailbox)
                             local_mailboxes_by_key.setdefault(key, mailbox)
                             local_counts[key] = local_counts.get(key, 0) + 1
@@ -1455,6 +1459,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 reject_hard_links=True,
                             )
                             guard_account_dir()
+                            _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
                             local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
