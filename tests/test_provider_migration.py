@@ -398,6 +398,56 @@ def test_provider_validation_reports_broken_orphan_symlink_artifacts(
             provider_import_account(config, account, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("root_name", "needle"),
+    [
+        ("messages", "symlinked provider message artifact directory"),
+        ("metadata", "symlinked provider metadata artifact directory"),
+    ],
+)
+def test_provider_validation_reports_broken_artifact_root_symlinks(
+    tmp_path: Path,
+    root_name: str,
+    needle: str,
+) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target@icloud.com", password="secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = tmp_path / account.source_email
+    account_dir.mkdir()
+    (account_dir / "manifest.jsonl").write_text("")
+    _write_provider_export_state(account_dir, source=account.source_email, target=account.target_email, canonical_messages=0)
+    symlink_path = account_dir / root_name
+    try:
+        symlink_path.symlink_to(tmp_path / "missing-artifact-root", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    assert symlink_path.is_symlink()
+    assert not symlink_path.exists()
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any(needle in issue for issue in audit_issues)
+    assert any(needle in issue for issue in report["failed"])
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match=needle):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

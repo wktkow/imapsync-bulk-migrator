@@ -1753,10 +1753,10 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
         ("metadata", "*.json", expected_metadata, "metadata"),
     ):
         root = account_dir / root_name
-        if not root.exists():
-            continue
         if root.is_symlink():
             issues.append(f"symlinked provider {label} artifact directory: {root_name}")
+            continue
+        if not root.exists():
             continue
         reported_symlinks: set[str] = set()
         for path in sorted(root.rglob("*")):
