@@ -323,18 +323,26 @@ def is_transient_imap_error(exc: BaseException) -> bool:
     return any(word in text for word in ("timeout", "throttle", "rate", "temporar", "disconnect", "try again"))
 
 
-def with_retry(fn: Callable[[], Any], *, attempts: int, label: str) -> Any:
+def with_retry(fn: Callable[[], Any], *, attempts: int, label: str, stop_event: Optional[object] = None) -> Any:
     last_exc: Optional[BaseException] = None
     for attempt in range(1, max(1, attempts) + 1):
+        _raise_if_stopped(stop_event, label)
         try:
             return fn()
         except Exception as exc:
             last_exc = exc
+            _raise_if_stopped(stop_event, label)
             if attempt >= attempts or not is_transient_imap_error(exc):
                 raise
             delay = min(60.0, 2.0 ** (attempt - 1))
             logging.warning("%s failed transiently on attempt %d/%d: %s; retrying in %.1fs", label, attempt, attempts, exc, delay)
-            time.sleep(delay)
+            wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+            if callable(wait):
+                if wait(delay):
+                    raise RuntimeError(f"{label}: stop requested before retry")
+            else:
+                time.sleep(delay)
+            _raise_if_stopped(stop_event, label)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"{label} did not run")
@@ -2506,6 +2514,7 @@ def provider_export_all(
             lambda: provider_export_account(config, acc, out_root, stop_event=stop_event, limiter=limiter),
             attempts=config.limits.retry_max_attempts,
             label=f"provider export {acc.source_email}",
+            stop_event=stop_event,
         )
 
     parallel_process_accounts("provider-export", worker, config.accounts, max_workers, stop_on_error=not ignore_errors)
@@ -4316,6 +4325,7 @@ def provider_import_all(
             lambda: provider_import_account(config, acc, in_root, stop_event=stop_event, limiter=limiter),
             attempts=config.limits.retry_max_attempts,
             label=f"provider import {acc.target_email}",
+            stop_event=stop_event,
         )
 
     if provider_account_merge_enabled(config):

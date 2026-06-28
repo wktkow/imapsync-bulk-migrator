@@ -456,6 +456,75 @@ def test_provider_import_rejects_symlinked_input_root_before_target_contact(tmp_
             provider_import_all(config, in_root, max_workers=1, ignore_errors=False)
 
 
+def test_provider_retry_stops_during_backoff_wait() -> None:
+    from components.provider_ops import with_retry
+
+    class StopDuringWait:
+        def __init__(self) -> None:
+            self.stopped = False
+            self.delays: List[float] = []
+
+        def is_set(self) -> bool:
+            return self.stopped
+
+        def wait(self, delay: float) -> bool:
+            self.delays.append(delay)
+            self.stopped = True
+            return True
+
+    stop = StopDuringWait()
+    calls = 0
+
+    def flaky() -> None:
+        nonlocal calls
+        calls += 1
+        raise imaplib.IMAP4.abort("temporary disconnect")
+
+    with pytest.raises(RuntimeError, match="stop requested before retry"):
+        with_retry(flaky, attempts=2, label="provider export source@example.com", stop_event=stop)
+
+    assert calls == 1
+    assert stop.delays == [1.0]
+
+
+def test_provider_export_all_stops_retry_when_stop_event_is_set(tmp_path: Path) -> None:
+    config = _provider_config()
+    stop = mock.Mock()
+    stop.is_set.return_value = False
+    calls = 0
+
+    def fake_export(*_args, **_kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        stop.is_set.return_value = True
+        raise imaplib.IMAP4.abort("temporary disconnect")
+
+    with mock.patch("components.provider_ops.provider_export_account", fake_export):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_export_all(config, tmp_path, max_workers=1, ignore_errors=False, stop_event=stop)
+
+    assert calls == 1
+
+
+def test_provider_import_all_stops_retry_when_stop_event_is_set(tmp_path: Path) -> None:
+    config = _provider_config()
+    stop = mock.Mock()
+    stop.is_set.return_value = False
+    calls = 0
+
+    def fake_import(*_args, **_kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        stop.is_set.return_value = True
+        raise imaplib.IMAP4.abort("temporary disconnect")
+
+    with mock.patch("components.provider_ops.provider_import_account", fake_import):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_import_all(config, tmp_path, max_workers=1, ignore_errors=False, stop_event=stop)
+
+    assert calls == 1
+
+
 def test_provider_audit_and_validate_reject_symlinked_input_root(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
