@@ -5747,6 +5747,31 @@ class TestImapsyncPasswordHandling:
         assert "--password1" not in imapsync_args
         assert "super-secret" not in imapsync_args
 
+    def test_justconnect_executes_validated_imapsync_binary(self) -> None:
+        from components.imapsync_cli import run_imapsync_justconnect
+
+        captured_args: List[List[str]] = []
+
+        def fake_run(args, **_kwargs):
+            captured_args.append(list(args))
+            return subprocess.CompletedProcess(args, 0, "ok", "")
+
+        with mock.patch("components.utils.shutil.which", return_value="/safe/bin/imapsync"), \
+            mock.patch("components.utils.subprocess.run", side_effect=fake_run), \
+            mock.patch("components.imapsync_cli.subprocess.run", side_effect=fake_run):
+            ok, _out = run_imapsync_justconnect(
+                host="imap.example.com",
+                port=993,
+                ssl_enabled=True,
+                starttls=False,
+                user="user@example.com",
+                password="super-secret",
+            )
+
+        assert ok
+        assert captured_args[0][0] == "/safe/bin/imapsync"
+        assert captured_args[-1][0] == "/safe/bin/imapsync"
+
     def test_justconnect_terminates_subprocess_when_stop_requested(self) -> None:
         from components.imapsync_cli import run_imapsync_justconnect
 

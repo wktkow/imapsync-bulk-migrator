@@ -92,7 +92,7 @@ def decode_imap_utf7(value: str) -> str:
     return "".join(result)
 
 
-def ensure_imapsync_available() -> None:
+def ensure_imapsync_available() -> str:
     path = shutil.which("imapsync")
     if not path:
         raise RuntimeError(
@@ -110,6 +110,7 @@ def ensure_imapsync_available() -> None:
         raise RuntimeError(
             f"The 'imapsync' binary did not respond to --version within {IMAPSYNC_VERSION_TIMEOUT_SEC} seconds."
         ) from exc
+    return path
 
 
 def check_environment(min_free_gb: float = 1.0) -> None:

@@ -24,7 +24,8 @@ def run_imapsync_justconnect(
     Legacy `test_accounts` performs credential validation with imaplib before
     invoking this connection-only imapsync check.
     """
-    ensure_imapsync_available()
+    resolved_imapsync = ensure_imapsync_available()
+    imapsync_bin = resolved_imapsync if isinstance(resolved_imapsync, str) and resolved_imapsync else "imapsync"
     passfile_path = ""
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="imapsync-pass-", delete=False) as passfile:
@@ -33,7 +34,7 @@ def run_imapsync_justconnect(
             passfile_path = passfile.name
         os.chmod(passfile_path, 0o600)
         args = [
-            "imapsync",
+            imapsync_bin,
             "--justconnect",
             "--host1", host,
             "--user1", user,
