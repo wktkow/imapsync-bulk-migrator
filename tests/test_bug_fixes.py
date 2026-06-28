@@ -4611,9 +4611,12 @@ class TestCPanelProvisioning:
     def test_cpanel_dry_run_exits_before_imap_import(self, tmp_path: Path) -> None:
         from components.main import main
 
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
 
@@ -4628,7 +4631,7 @@ class TestCPanelProvisioning:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
-                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--input-dir", str(input_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
@@ -4648,9 +4651,12 @@ class TestCPanelProvisioning:
     def test_cpanel_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
         from components.main import main
 
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
 
@@ -4666,7 +4672,7 @@ class TestCPanelProvisioning:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
-                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--input-dir", str(input_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
@@ -4685,9 +4691,12 @@ class TestCPanelProvisioning:
     def test_directadmin_dry_run_exits_before_imap_import(self, tmp_path: Path) -> None:
         from components.main import main
 
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
 
@@ -4702,7 +4711,7 @@ class TestCPanelProvisioning:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
-                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--input-dir", str(input_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
@@ -4722,9 +4731,12 @@ class TestCPanelProvisioning:
     def test_directadmin_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
         from components.main import main
 
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
 
@@ -4740,7 +4752,7 @@ class TestCPanelProvisioning:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
-                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--input-dir", str(input_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
@@ -4759,9 +4771,12 @@ class TestCPanelProvisioning:
     def test_cpanel_dry_run_failure_is_fatal_even_with_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
         config_path = tmp_path / "import.pass.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
             "accounts": [{"email": "a@example.com", "password": "secret"}],
         }))
 
@@ -4776,7 +4791,7 @@ class TestCPanelProvisioning:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
-                "--input-dir", str(tmp_path / "does-not-need-to-exist"),
+                "--input-dir", str(input_root),
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--max-workers", "1",
@@ -4791,6 +4806,123 @@ class TestCPanelProvisioning:
 
         assert rc == 3
         import_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("backend_flag", "dry_run_flag", "client_path", "ensure_path", "panel_args"),
+        [
+            (
+                "--auto-provision-cpanel",
+                "--cpanel-dry-run",
+                "components.main.CPanelClient",
+                "components.main.ensure_accounts_exist_cpanel",
+                ["--cpanel-url", "https://panel.example.com:2083", "--cpanel-username", "cpuser", "--cpanel-token", "api-token"],
+            ),
+            (
+                "--auto-provision-da",
+                "--da-dry-run",
+                "components.main.DirectAdminClient",
+                "components.main.ensure_accounts_exist_directadmin",
+                ["--da-url", "https://panel.example.com:2222", "--da-username", "admin", "--da-password", "login-key"],
+            ),
+        ],
+    )
+    def test_panel_dry_run_rejects_missing_input_before_panel_calls(
+        self,
+        tmp_path: Path,
+        backend_flag: str,
+        dry_run_flag: str,
+        client_path: str,
+        ensure_path: str,
+        panel_args: List[str],
+    ) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch(client_path) as client_cls, \
+            mock.patch(ensure_path) as ensure_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "missing-export"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                backend_flag,
+                dry_run_flag,
+                *panel_args,
+            ])
+
+        assert rc == 2
+        client_cls.assert_not_called()
+        ensure_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("backend_flag", "dry_run_flag", "client_path", "ensure_path", "panel_args"),
+        [
+            (
+                "--auto-provision-cpanel",
+                "--cpanel-dry-run",
+                "components.main.CPanelClient",
+                "components.main.ensure_accounts_exist_cpanel",
+                ["--cpanel-url", "https://panel.example.com:2083", "--cpanel-username", "cpuser", "--cpanel-token", "api-token"],
+            ),
+            (
+                "--auto-provision-da",
+                "--da-dry-run",
+                "components.main.DirectAdminClient",
+                "components.main.ensure_accounts_exist_directadmin",
+                ["--da-url", "https://panel.example.com:2222", "--da-username", "admin", "--da-password", "login-key"],
+            ),
+        ],
+    )
+    def test_panel_dry_run_audits_staged_input_before_panel_calls(
+        self,
+        tmp_path: Path,
+        backend_flag: str,
+        dry_run_flag: str,
+        client_path: str,
+        ensure_path: str,
+        panel_args: List[str],
+    ) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        inbox = input_root / "a@example.com" / "INBOX"
+        _write_legacy_message_fixture(inbox)
+        (inbox / "u0000000001.json").write_text("{")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch(client_path) as client_cls, \
+            mock.patch(ensure_path) as ensure_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                backend_flag,
+                dry_run_flag,
+                *panel_args,
+            ])
+
+        assert rc == 4
+        client_cls.assert_not_called()
+        ensure_mock.assert_not_called()
 
     def test_create_missing_audits_staged_input_before_panel_calls(self, tmp_path: Path) -> None:
         from components.main import main

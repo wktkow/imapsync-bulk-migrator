@@ -575,7 +575,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if reset_confirm not in {target_host, "YES"}:
             logging.error("--reset-confirm must match target IMAP host %r or be YES for non-dry-run --reset", target_host)
             return 2
-    if args.mode in {"import", "validate", "audit"} and not panel_dry_run_requested:
+    if args.mode in {"import", "validate", "audit"}:
         input_root = Path(args.input_dir)
         if is_provider_config:
             assert isinstance(config, ProviderMigrationConfig)
@@ -680,7 +680,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     free_space_preflight_path: Optional[Path] = None
     if args.mode == "export":
         free_space_preflight_path = Path(args.output_dir)
-    elif args.mode in {"import", "validate"} and not panel_dry_run_requested:
+    elif args.mode in {"import", "validate"}:
         panel_import_will_preflight = (
             not is_provider_config
             and args.mode == "import"
@@ -723,54 +723,53 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 2
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
-        if not panel_dry_run_requested:
-            staged_root = Path(args.input_dir)
-            if not staged_root.exists():
-                logging.error("Input directory does not exist: %s", staged_root)
-                return 2
-            assert isinstance(config, Config)
-            missing_account_dirs = [
-                acc.email
-                for acc in config.accounts
-                if not (staged_root / sanitize_for_path(acc.email)).exists()
-            ]
-            if missing_account_dirs:
-                logging.error(
-                    "Input directory is missing staged data for %d account(s): %s",
-                    len(missing_account_dirs),
-                    ", ".join(missing_account_dirs),
-                )
-                return 2
-            try:
-                check_free_space_for_path(staged_root, min_free_gb)
-            except Exception as exc:
-                logging.error("[panel] Free-space check failed before panel changes: %s", exc)
-                return 2
-            audit_for_reset = bool(getattr(args, "reset", False))
-            try:
-                logging.info(
-                    "[panel] Running strict local staged export audit before %s...",
-                    "destructive reset" if audit_for_reset else "panel provisioning",
-                )
-                ok, staged_audit_issues = audit_export(
-                    staged_root,
-                    config,
-                    int(args.max_workers),
-                    check_remote=False,
-                    require_integrity_metadata=True,
-                )
-            except Exception as exc:
-                logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
-                return 4
-            if not ok:
-                logging.error(
-                    "[panel] Refusing %s because staged export audit found %d issue(s)",
-                    "destructive reset" if audit_for_reset else "panel provisioning",
-                    len(staged_audit_issues),
-                )
-                for issue in staged_audit_issues:
-                    logging.error("[panel-staged-audit] %s", issue)
-                return 4
+        staged_root = Path(args.input_dir)
+        if not staged_root.exists():
+            logging.error("Input directory does not exist: %s", staged_root)
+            return 2
+        assert isinstance(config, Config)
+        missing_account_dirs = [
+            acc.email
+            for acc in config.accounts
+            if not (staged_root / sanitize_for_path(acc.email)).exists()
+        ]
+        if missing_account_dirs:
+            logging.error(
+                "Input directory is missing staged data for %d account(s): %s",
+                len(missing_account_dirs),
+                ", ".join(missing_account_dirs),
+            )
+            return 2
+        try:
+            check_free_space_for_path(staged_root, min_free_gb)
+        except Exception as exc:
+            logging.error("[panel] Free-space check failed before panel changes: %s", exc)
+            return 2
+        audit_for_reset = bool(getattr(args, "reset", False))
+        try:
+            logging.info(
+                "[panel] Running strict local staged export audit before %s...",
+                "destructive reset" if audit_for_reset else "panel provisioning",
+            )
+            ok, staged_audit_issues = audit_export(
+                staged_root,
+                config,
+                int(args.max_workers),
+                check_remote=False,
+                require_integrity_metadata=True,
+            )
+        except Exception as exc:
+            logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
+            return 4
+        if not ok:
+            logging.error(
+                "[panel] Refusing %s because staged export audit found %d issue(s)",
+                "destructive reset" if audit_for_reset else "panel provisioning",
+                len(staged_audit_issues),
+            )
+            for issue in staged_audit_issues:
+                logging.error("[panel-staged-audit] %s", issue)
+            return 4
     if (not is_provider_config) and args.mode == "import" and use_da_panel:
         missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
         if missing:
