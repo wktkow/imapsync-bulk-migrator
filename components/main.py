@@ -138,6 +138,20 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
     raise ValueError("cPanel provisioning requires one of: --cpanel-token-file, --cpanel-token-env, --cpanel-token, --cpanel-password-file, --cpanel-password-env, --cpanel-password")
 
 
+def _ensure_directadmin_client_dependency() -> None:
+    from . import da_client as da_client_module
+
+    if da_client_module.requests is None:  # type: ignore[attr-defined]
+        raise RuntimeError("DirectAdmin auto-provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
+
+
+def _ensure_cpanel_client_dependency() -> None:
+    from . import cpanel_client as cpanel_client_module
+
+    if cpanel_client_module.requests is None:  # type: ignore[attr-defined]
+        raise RuntimeError("cPanel provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
+
+
 def _write_secure_json_file(path: Path, payload: Dict) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -716,6 +730,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     da_client: Optional[DirectAdminClient] = None
     da_password: Optional[str] = None
     cpanel_client: Optional[CPanelClient] = None
+    cpanel_password: Optional[str] = None
+    cpanel_token: Optional[str] = None
     panel_reset_failed_accounts: set[str] = set()
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
@@ -749,6 +765,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as exc:
             logging.error("[panel] Free-space check failed before panel changes: %s", exc)
             return 2
+        if use_da_panel:
+            missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
+            if missing:
+                logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
+                return 2
+            try:
+                da_password = _resolve_da_password(args)
+                _ensure_directadmin_client_dependency()
+            except Exception as exc:
+                logging.error("[da] Auto-provisioning setup failed: %s", exc)
+                return 2
+        if use_cpanel:
+            missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
+            if missing:
+                logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
+                return 2
+            try:
+                cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+                _ensure_cpanel_client_dependency()
+            except Exception as exc:
+                logging.error("[cpanel] Auto-provisioning setup failed: %s", exc)
+                return 2
         audit_for_reset = bool(getattr(args, "reset", False))
         try:
             logging.info(
@@ -775,12 +813,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logging.error("[panel-staged-audit] %s", issue)
             return 4
     if (not is_provider_config) and args.mode == "import" and use_da_panel:
-        missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
-        if missing:
-            logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
-            return 2
         try:
-            da_password = _resolve_da_password(args)
+            assert da_password is not None
             logging.info("[da] Auto-provisioning missing mailboxes before import...")
             da_client = DirectAdminClient(
                 base_url=str(args.da_url),
@@ -814,12 +848,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if da_client is None or bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
                 return 3
     if (not is_provider_config) and args.mode == "import" and use_cpanel:
-        missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
-        if missing:
-            logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
-            return 2
         try:
-            cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+            assert cpanel_password is not None or cpanel_token is not None
             logging.info("[cpanel] Auto-provisioning missing mailboxes before import...")
             cpanel_client = CPanelClient(
                 base_url=str(args.cpanel_url),

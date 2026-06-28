@@ -5908,14 +5908,33 @@ class TestRound2ConfirmedBugs:
         }))
         return config_path, in_root
 
-    def test_panel_setup_failure_stays_fatal_with_ignore_errors(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "backend_args",
+        [
+            [
+                "--auto-provision-da",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+            ],
+            [
+                "--auto-provision-cpanel",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+            ],
+        ],
+    )
+    def test_panel_auth_setup_failure_returns_config_error_with_ignore_errors(
+        self,
+        tmp_path: Path,
+        backend_args: List[str],
+    ) -> None:
         from components.main import main
 
         config_path, in_root = self._legacy_zero_message_import_fixture(tmp_path)
 
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
-            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.main.audit_export", return_value=(True, [])) as audit_mock, \
             mock.patch("components.main.import_account") as import_mock:
             rc = main([
                 "--mode", "import",
@@ -5924,14 +5943,103 @@ class TestRound2ConfirmedBugs:
                 "--log-dir", str(tmp_path / "logs"),
                 "--min-free-gb", "0",
                 "--no-connectivity-test",
-                "--auto-provision-da",
-                "--da-url", "https://panel.example.com:2222",
-                "--da-username", "admin",
                 "--ignore-errors",
+                *backend_args,
             ])
 
-        assert rc == 3
+        assert rc == 2
+        audit_mock.assert_not_called()
         import_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("backend_args", "dependency_patch"),
+        [
+            (
+                [
+                    "--auto-provision-da",
+                    "--da-url", "https://panel.example.com:2222",
+                    "--da-username", "admin",
+                    "--da-password", "login-key",
+                ],
+                "components.da_client.requests",
+            ),
+            (
+                [
+                    "--auto-provision-cpanel",
+                    "--cpanel-url", "https://panel.example.com:2083",
+                    "--cpanel-username", "cpuser",
+                    "--cpanel-token", "api-token",
+                ],
+                "components.cpanel_client.requests",
+            ),
+        ],
+    )
+    def test_panel_missing_requests_returns_config_error_before_staged_audit(
+        self,
+        tmp_path: Path,
+        backend_args: List[str],
+        dependency_patch: str,
+    ) -> None:
+        from components.main import main
+
+        config_path, in_root = self._legacy_zero_message_import_fixture(tmp_path)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=AssertionError("staged audit should not run")) as audit_mock, \
+            mock.patch(dependency_patch, None):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+                *backend_args,
+            ])
+
+        assert rc == 2
+        audit_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "backend_args",
+        [
+            [
+                "--auto-provision-da",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ],
+            [
+                "--auto-provision-cpanel",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-token", "api-token",
+            ],
+        ],
+    )
+    def test_panel_missing_endpoint_fields_return_config_error_before_staged_audit(
+        self,
+        tmp_path: Path,
+        backend_args: List[str],
+    ) -> None:
+        from components.main import main
+
+        config_path, in_root = self._legacy_zero_message_import_fixture(tmp_path)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=AssertionError("staged audit should not run")) as audit_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+                *backend_args,
+            ])
+
+        assert rc == 2
+        audit_mock.assert_not_called()
 
     def test_audit_reports_remote_mailbox_count_failures(self, tmp_path: Path) -> None:
         from components.audit import audit_export
