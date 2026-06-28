@@ -40,6 +40,26 @@ def _add_optional_int(fields: Dict[str, Any], record: Mapping[str, Any], key: st
         fields[key] = value
 
 
+def _add_optional_text_list(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
+    value = record.get(key)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        fields[key] = list(value)
+
+
+def _add_optional_text_list_map(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
+    value = record.get(key)
+    if not isinstance(value, Mapping):
+        return
+    normalized: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str):
+            return
+        if not isinstance(raw_value, list) or any(not isinstance(item, str) for item in raw_value):
+            return
+        normalized[raw_key] = list(raw_value)
+    fields[key] = normalized
+
+
 def _content_binding_sha256(kind: str, fields: Mapping[str, Any]) -> str:
     return _sha256_json({"binding": "email-content-v1", "kind": kind, "fields": dict(fields)})
 
@@ -69,6 +89,11 @@ def provider_content_binding_sha256(row: Mapping[str, Any]) -> str:
         "metadata_path",
     ):
         _add_optional_text(fields, row, key)
+    _add_optional_text(fields, row, "primary_mailbox")
+    for key in ("source_mailboxes", "gmail_labels"):
+        _add_optional_text_list(fields, row, key)
+    for key in ("source_mailbox_paths", "source_mailbox_attributes"):
+        _add_optional_text_list_map(fields, row, key)
     return _content_binding_sha256("provider-manifest", fields)
 
 

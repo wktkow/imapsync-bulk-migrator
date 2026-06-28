@@ -4389,6 +4389,29 @@ def _write_single_manifest_row(account_dir: Path, row: dict, *, refresh_binding:
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
 
 
+def test_provider_audit_rejects_route_tamper_with_recomputed_manifest_state(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    original_binding = row[CONTENT_BINDING_FIELD]
+    row["primary_mailbox"] = "Sent"
+    row["source_mailboxes"] = ["[Gmail]/Sent Mail"]
+    row["source_mailbox_paths"] = {"[Gmail]/Sent Mail": ["[Gmail]", "Sent Mail"]}
+    row["source_mailbox_attributes"] = {"[Gmail]/Sent Mail": ["\\Sent"]}
+    row["gmail_labels"] = ["\\Sent"]
+    assert row[CONTENT_BINDING_FIELD] == original_binding
+    (account_dir / str(row["metadata_path"])).write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    state = json.loads((account_dir / "export-state.json").read_text())
+    state["manifest_sha256"] = provider_manifest_digest([row])
+    (account_dir / "export-state.json").write_text(json.dumps(state))
+
+    _email, issues = provider_audit_account(config, account, tmp_path)
+
+    assert any(CONTENT_BINDING_FIELD in issue for issue in issues)
+
+
 def _journal_fixture(
     config: ProviderMigrationConfig,
     row: dict,
@@ -5725,7 +5748,7 @@ def test_provider_import_resume_uses_journaled_gmail_target_msgid(tmp_path: Path
     row["gmail_labels"] = ["\\Inbox", "Project A"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -5789,7 +5812,7 @@ def test_provider_import_merge_fails_closed_when_journaled_gmail_msgid_missing(t
     row["gmail_labels"] = ["\\Inbox", "Project A"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -6369,7 +6392,7 @@ def test_provider_import_empty_mode_allows_restored_secondary_system_view_on_rer
     row["gmail_labels"] = ["\\Sent", "\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "[Gmail]/Sent Mail",
@@ -6676,6 +6699,7 @@ def test_provider_import_rejects_mismatched_export_state_before_target_connect(t
     _write_provider_export_state(account_dir)
     row = json.loads((account_dir / "manifest.jsonl").read_text())
     row["primary_mailbox"] = "INBOX"
+    _refresh_provider_binding(row)
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
         with pytest.raises(RuntimeError, match="export-state manifest_sha256"):
@@ -7133,7 +7157,8 @@ def test_provider_import_empty_mode_rejects_unmatched_generic_all_view(tmp_path:
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target=account.target_email)
-    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": account.target_email,
         "target_mailbox": "Archive",
@@ -7162,7 +7187,8 @@ def test_provider_import_empty_mode_rejects_duplicate_matches_in_concrete_generi
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target=account.target_email)
-    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": account.target_email,
         "target_mailbox": "All Mail",
@@ -7205,7 +7231,8 @@ def test_provider_import_empty_mode_permits_journaled_gmail_all_mail_message(tmp
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "[Gmail]/All Mail",
@@ -7252,7 +7279,7 @@ def test_provider_import_and_validation_match_googlemail_all_mail_journal_alias(
     row["primary_mailbox"] = "Archive"
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "[GoogleMail]/All Mail",
@@ -7312,7 +7339,7 @@ def test_provider_import_recovers_pending_localized_gmail_sent_journal(tmp_path:
     row["primary_mailbox"] = "Sent"
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "Gesendet",
@@ -7485,7 +7512,8 @@ def test_provider_import_empty_mode_permits_journaled_gmail_important_view_plain
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -7818,7 +7846,7 @@ def test_provider_offline_validation_defers_localized_gmail_special_use_target_m
     row["gmail_labels"] = ["\\Sent"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "Gesendet",
@@ -7965,7 +7993,7 @@ def test_provider_validation_requires_gmail_target_extensions(tmp_path: Path) ->
     row["primary_mailbox"] = "INBOX"
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -8013,7 +8041,7 @@ def test_provider_validation_requires_gmail_target_all_mail_visibility(tmp_path:
     row["primary_mailbox"] = "INBOX"
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -8057,7 +8085,7 @@ def test_provider_validation_requires_gmail_target_selectable_all_mail(tmp_path:
     row["primary_mailbox"] = "INBOX"
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -8226,7 +8254,7 @@ def test_provider_configured_gmail_rejects_export_state_with_wrong_source_provid
     state["source_provider"] = "imap"
     state.pop("gmail_full_visibility_verified", None)
     (account_dir / "export-state.json").write_text(json.dumps(state))
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "Archive",
@@ -8891,7 +8919,8 @@ def test_provider_validation_checks_gmail_target_labels(tmp_path: Path) -> None:
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
     (account_dir / "metadata" / "gmail-123.json").write_text(json.dumps(row))
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9195,7 +9224,7 @@ def test_provider_audit_validation_and_import_reject_invalid_gmail_target_msgid(
     row["gmail_labels"] = ["\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9238,7 +9267,7 @@ def test_provider_validation_reports_and_import_repairs_missing_journaled_gmail_
     row["gmail_labels"] = ["\\Inbox", "Project A"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9316,7 +9345,7 @@ def test_provider_import_rejects_ambiguous_missing_journaled_gmail_target_msgid(
     row["gmail_labels"] = ["\\Inbox", "Project A"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9477,7 +9506,7 @@ def test_provider_validation_rejects_extra_matching_gmail_target_copy(tmp_path: 
     row["gmail_labels"] = ["\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9541,7 +9570,7 @@ def test_provider_validation_rejects_extra_matching_gmail_copy_in_restored_label
     row["gmail_labels"] = ["\\Inbox", "Project A"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9620,7 +9649,7 @@ def test_provider_validation_rejects_gmail_copy_missing_from_primary_target_mail
     row["gmail_labels"] = ["\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9681,7 +9710,7 @@ def test_provider_validation_checks_bare_gmail_starred_label(tmp_path: Path) -> 
     row["gmail_labels"] = ["\\Inbox", "Starred"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",
@@ -9750,7 +9779,7 @@ def test_provider_validation_checks_secondary_gmail_system_label(tmp_path: Path)
     row["gmail_labels"] = ["\\Sent", "\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com")
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "[Gmail]/Sent Mail",
@@ -11286,7 +11315,7 @@ def test_main_allows_provider_import_missing_gmail_msgid_to_repair_path(tmp_path
     row["gmail_labels"] = ["\\Inbox"]
     _write_single_manifest_row(account_dir, row)
     _write_provider_export_state(account_dir, target="target@gmail.com", target_endpoint=config.target)
-    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
         "canonical_id": "gmail-123",
         "target_account": "target@gmail.com",
         "target_mailbox": "INBOX",

@@ -2579,6 +2579,7 @@ def provider_export_account(
     preserve_complete_state_until_ready = False
     trusted_payload_identities: set[str] = set()
     active_identities: set[str] = set()
+    previous_rows_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
@@ -2590,6 +2591,11 @@ def provider_export_account(
             _manifest_path(account_dir, row, "metadata_path")
         messages = {
             str(row["canonical_id"]): _existing_record_for_rescan(row)
+            for row in existing_rows
+            if row.get("canonical_id")
+        }
+        previous_rows_by_identity = {
+            str(row["canonical_id"]): dict(row)
             for row in existing_rows
             if row.get("canonical_id")
         }
@@ -2746,7 +2752,7 @@ def provider_export_account(
                         if existing_eml_path.exists():
                             try:
                                 require_manifest_payload_matches(
-                                    messages[identity_hint],
+                                    previous_rows_by_identity.get(identity_hint, messages[identity_hint]),
                                     _read_provider_artifact_bytes(existing_eml_path, "provider message artifact"),
                                 )
                             except Exception as exc:
@@ -2762,6 +2768,7 @@ def provider_export_account(
                                 _refresh_export_delivery_metadata(messages[identity_hint], pre_parsed)
                                 update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
                                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+                                previous_rows_by_identity[identity_hint] = dict(messages[identity_hint])
                                 continue
                 _provider_throttle_wait(
                     limiter,
@@ -2836,7 +2843,10 @@ def provider_export_account(
                     if not write_payload:
                         try:
                             existing_payload = _read_provider_artifact_bytes(eml_path, "provider message artifact")
-                            require_manifest_payload_matches(record, existing_payload)
+                            require_manifest_payload_matches(
+                                previous_rows_by_identity.get(identity, record),
+                                existing_payload,
+                            )
                         except Exception as exc:
                             if _is_provider_artifact_safety_error(exc):
                                 raise
@@ -2865,6 +2875,7 @@ def provider_export_account(
                 record = messages[identity]
                 update_membership(identity, mailbox, uid, uidvalidity, parsed)
                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+                previous_rows_by_identity[identity] = dict(record)
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")
