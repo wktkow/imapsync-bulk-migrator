@@ -220,6 +220,38 @@ def test_provider_validation_rejects_hard_linked_message_artifacts(tmp_path: Pat
             provider_import_account(config, account, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("rel_path", "needle"),
+    [
+        ("messages/broken-orphan.eml", "symlinked provider message artifact"),
+        ("metadata/broken-orphan.json", "symlinked provider metadata artifact"),
+    ],
+)
+def test_provider_validation_reports_broken_orphan_symlink_artifacts(
+    tmp_path: Path,
+    rel_path: str,
+    needle: str,
+) -> None:
+    from verify_export import verify_account
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    symlink_path = account_dir / rel_path
+    try:
+        symlink_path.symlink_to(tmp_path / "missing-artifact")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    stats = verify_account(account_dir)
+
+    assert any(needle in issue for issue in audit_issues)
+    assert any(needle in issue for issue in report["failed"])
+    assert stats["errors"] >= 1
+
+
 def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
