@@ -101,6 +101,7 @@ class DirectAdminClient:
         if json_obj is not None:
             # Newer DA returns {"list": ["example.com", ...]}
             if isinstance(json_obj, dict):
+                has_error = "error" in json_obj
                 err = str(json_obj.get("error", "0"))
                 if err not in {"0", "false", "False"}:
                     msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
@@ -110,11 +111,13 @@ class DirectAdminClient:
                 # Some variants nest under "domains"
                 if "domains" in json_obj and isinstance(json_obj["domains"], list):
                     return [str(d) for d in json_obj["domains"]]
-                if err in {"0", "false", "False"}:
+                if has_error:
                     return []
+                raise RuntimeError("Unable to parse domains response from API")
             elif isinstance(json_obj, list):
                 return [str(d) for d in json_obj]
         if kv is not None:
+            has_error = "error" in kv
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
                 msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
@@ -122,7 +125,9 @@ class DirectAdminClient:
             # Expect keys like list[]=domain
             items = kv.get("list[]") or kv.get("list")
             if items is None:
-                return []
+                if has_error or not kv:
+                    return []
+                raise RuntimeError("Unable to parse domains response from API")
             return [str(d) for d in items]
         raise RuntimeError("Unable to parse domains response from API")
 
@@ -138,6 +143,7 @@ class DirectAdminClient:
             # {"list": ["user1", "user2"]}
             # {"users": ["user1", ...]}
             if isinstance(json_obj, dict):
+                has_error = "error" in json_obj
                 err = str(json_obj.get("error", "0"))
                 if err not in {"0", "false", "False"}:
                     msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
@@ -155,18 +161,22 @@ class DirectAdminClient:
                             dynamic_values.append(v)
                 if dynamic_values:
                     return [str(u) for u in dynamic_values]
-                if str(json_obj.get("error", "0")) in {"0", "false", "False"}:
+                if has_error:
                     return []
+                raise RuntimeError(f"Unable to parse POP account list response for {domain}")
             elif isinstance(json_obj, list):
                 return [str(u) for u in json_obj]
         if kv is not None:
+            has_error = "error" in kv
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
                 msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
                 raise RuntimeError(msg)
             items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
             if items is None:
-                return []
+                if has_error:
+                    return []
+                raise RuntimeError(f"Unable to parse POP account list response for {domain}")
             return [str(u) for u in items]
         # Some installs place names under index keys like list0=user
         if json_obj and isinstance(json_obj, dict):

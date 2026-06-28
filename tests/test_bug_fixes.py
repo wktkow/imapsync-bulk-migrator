@@ -5533,6 +5533,25 @@ class TestRound1ConfirmedBugs:
             client._get = lambda *_args, **_kwargs: ([], None)
             assert client.list_pop_accounts("example.com") == []
 
+    def test_directadmin_list_pop_accounts_rejects_malformed_empty_shapes(self) -> None:
+        from components.da_client import DirectAdminClient
+        from directadmin_indexer import DirectAdminClient as IndexerDirectAdminClient
+
+        for client_cls in (DirectAdminClient, IndexerDirectAdminClient):
+            client = object.__new__(client_cls)
+            client._get = lambda *_args, **_kwargs: (None, {"<html>login</html>": [""]})
+            with pytest.raises(RuntimeError, match="parse POP account list"):
+                client.list_pop_accounts("example.com")
+
+    def test_directadmin_indexer_list_domains_rejects_malformed_empty_shapes(self) -> None:
+        from directadmin_indexer import DirectAdminClient as IndexerDirectAdminClient
+
+        client = object.__new__(IndexerDirectAdminClient)
+        client._get = lambda *_args, **_kwargs: (None, {"<html>login</html>": [""]})
+
+        with pytest.raises(RuntimeError, match="parse domains"):
+            client.list_domains()
+
     def test_cpanel_indexer_import_survives_missing_requests(self) -> None:
         code = r'''
 import builtins
