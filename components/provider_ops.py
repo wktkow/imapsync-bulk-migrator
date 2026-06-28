@@ -178,6 +178,11 @@ def _read_provider_artifact_bytes(path: Path, label: str) -> bytes:
         return f.read()
 
 
+def _is_provider_artifact_safety_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "symlinked provider file" in message or "hard-linked provider file" in message
+
+
 def _read_provider_artifact_text(path: Path, label: str) -> str:
     return _read_provider_artifact_bytes(path, label).decode("utf-8")
 
@@ -2075,8 +2080,13 @@ def provider_export_account(
                     else:
                         if existing_eml_path.exists():
                             try:
-                                require_manifest_payload_matches(messages[identity_hint], existing_eml_path.read_bytes())
+                                require_manifest_payload_matches(
+                                    messages[identity_hint],
+                                    _read_provider_artifact_bytes(existing_eml_path, "provider message artifact"),
+                                )
                             except Exception as exc:
+                                if _is_provider_artifact_safety_error(exc):
+                                    raise
                                 logging.warning(
                                     "[provider-export] %s: existing payload for %s is invalid; refetching body: %s",
                                     account.source_email,
@@ -2153,9 +2163,11 @@ def provider_export_account(
                     write_payload = not eml_path.exists()
                     if not write_payload:
                         try:
-                            existing_payload = eml_path.read_bytes()
+                            existing_payload = _read_provider_artifact_bytes(eml_path, "provider message artifact")
                             require_manifest_payload_matches(record, existing_payload)
                         except Exception as exc:
+                            if _is_provider_artifact_safety_error(exc):
+                                raise
                             logging.warning(
                                 "[provider-export] %s: replacing invalid existing payload for %s: %s",
                                 account.source_email,

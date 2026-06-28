@@ -2420,6 +2420,42 @@ def test_provider_export_resume_rewrites_corrupt_existing_payload(tmp_path: Path
     assert updated_row["content_sha256"] == hashlib.sha256(original_payload).hexdigest()
 
 
+def test_provider_export_resume_rejects_hard_linked_existing_payload(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    first_fake = FakeSourceImap()
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield first_fake
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    eml_path = account_dir / row["eml_path"]
+    victim = tmp_path / "outside-copy.eml"
+    try:
+        os.link(eml_path, victim)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"hard link creation unavailable: {exc}")
+
+    second_fake = FakeSourceChangedMetadataNoBody()
+
+    @contextlib.contextmanager
+    def second_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceChangedMetadataNoBody]:
+        yield second_fake
+
+    with mock.patch("components.provider_ops.imap_connection", second_source_connection):
+        with pytest.raises(RuntimeError, match="hard-linked provider file"):
+            provider_export_account(config, account, tmp_path)
+
+    assert second_fake.body_fetches == 0
+    assert os.stat(eml_path).st_ino == os.stat(victim).st_ino
+    assert os.stat(eml_path).st_nlink > 1
+
+
 def test_provider_export_incomplete_resume_refetches_self_consistent_payload(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
