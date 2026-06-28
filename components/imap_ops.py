@@ -31,6 +31,10 @@ _IMAP_INTERNALDATE_RE = re.compile(
 )
 
 
+class _LegacyAppendOutcomeUncertain(RuntimeError):
+    """Raised when APPEND may have reached the target but no outcome was confirmed."""
+
+
 def quote_mailbox_name(mailbox: str) -> str:
     if mailbox.upper() == "INBOX":
         return "INBOX"
@@ -1029,7 +1033,13 @@ def import_account(
                         "path": rel_path,
                         "timestamp": str(int(time.time())),
                     })
-                    status, _ = imap.append(quote_mailbox_name(mailbox), flags_str, date_time, append_data)
+                    try:
+                        status, _ = imap.append(quote_mailbox_name(mailbox), flags_str, date_time, append_data)
+                    except Exception as exc:
+                        raise _LegacyAppendOutcomeUncertain(
+                            f"append outcome is uncertain for {eml_path}; "
+                            "target state is uncertain, inspect the mailbox before retrying"
+                        ) from exc
                     if status != "OK":
                         _append_legacy_import_journal(account_dir, {
                             "key": import_key,
@@ -1051,6 +1061,9 @@ def import_account(
                     })
                     pending_keys.discard(import_key)
                     committed_keys.add(import_key)
+            except _LegacyAppendOutcomeUncertain as exc:
+                logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
+                raise
             except Exception as exc:
                 logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if _stop_requested(stop_event):

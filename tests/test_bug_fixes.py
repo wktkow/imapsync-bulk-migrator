@@ -1216,6 +1216,57 @@ class TestLegacyImportJournal:
         assert statuses == ["pending", "failed", "pending", "committed"]
         assert fake_imap.append_count == 2
 
+    def test_import_stops_after_uncertain_append_exception_even_with_ignore_errors(self, tmp_path: Path) -> None:
+        import imaplib
+
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        _write_legacy_message_fixture(
+            tmp_path / "user@example.com" / "Archive",
+            mailbox="Archive",
+            data=b"Message-ID: <archive@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\narchive",
+        )
+        account_dir = tmp_path / "user@example.com"
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+
+        class AppendRaisesThenOk:
+            def __init__(self) -> None:
+                self.appended: List[str] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+                self.appended.append(mailbox)
+                if len(self.appended) == 1:
+                    raise imaplib.IMAP4.abort("connection lost after APPEND")
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        fake_imap = AppendRaisesThenOk()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[AppendRaisesThenOk]:
+            yield fake_imap
+
+        with pytest.raises(RuntimeError, match="append outcome is uncertain"):
+            import_account(account, server, in_root, ignore_errors=True, imap_factory=fake_factory)
+
+        statuses = [
+            json.loads(line)["status"]
+            for line in (account_dir / "import.journal.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert statuses == ["pending"]
+        assert fake_imap.appended == ['"Archive"']
+
     def test_import_rejects_invalid_legacy_journal_status(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
         from components.models import Account, ServerConfig
