@@ -16,6 +16,7 @@ from .imap_ops import (
     _read_file_no_symlink,
     _validate_legacy_delivery_metadata,
     imap_connection,
+    legacy_reserved_mailbox_path_issue,
     legacy_server_endpoint,
     legacy_server_endpoint_digest,
     list_all_mailboxes,
@@ -153,6 +154,9 @@ def _legacy_export_state_issues(
         if not isinstance(path, str) or path != expected_path:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} path mismatch")
             path = expected_path
+        reserved_issue = legacy_reserved_mailbox_path_issue(mailbox, path)
+        if reserved_issue is not None:
+            issues.append(f"{account.email}: export-state {reserved_issue}")
         if type(message_count) is not int or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
@@ -257,6 +261,10 @@ def audit_account(
             remote_safe = False
             continue
         if child.is_dir():
+            reserved_issue = legacy_reserved_mailbox_path_issue(child.name, child.name)
+            if reserved_issue is not None:
+                issues.append(f"{account.email}:{child.name}: {reserved_issue}")
+                remote_safe = False
             folder_dirs.append(child)
     if not folder_dirs:
         issues.append(f"{account.email}: no mailbox folders found")

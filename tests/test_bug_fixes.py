@@ -205,6 +205,57 @@ class TestBug5SanitizeCollisionDetection:
             assert key not in seen or seen[key] == name, f"Unexpected collision: {name}"
             seen[key] = name
 
+    @pytest.mark.parametrize("mailbox_name", ["import.journal.jsonl", "export-state.json", "manifest.jsonl", "Import.Journal.Jsonl"])
+    def test_reserved_account_artifact_mailbox_names_raise_before_folder_write(
+        self,
+        tmp_path: Path,
+        mailbox_name: str,
+    ) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        fake_imap = mock.MagicMock()
+        fake_imap.list.return_value = ("OK", [f'(\\HasNoChildren) "/" "{mailbox_name}"'.encode("ascii")])
+
+        with mock.patch("components.imap_ops.imap_connection") as mock_conn:
+            mock_conn.return_value.__enter__ = mock.MagicMock(return_value=fake_imap)
+            mock_conn.return_value.__exit__ = mock.MagicMock(return_value=False)
+
+            with pytest.raises(RuntimeError, match="reserved legacy account artifact path"):
+                export_account(account, server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        assert not (account_dir / mailbox_name).is_dir()
+
+    def test_audit_and_verify_reject_import_journal_mailbox_directory(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+        from verify_export import verify_account
+
+        account = Account(email="user@example.com", password="pass")
+        folder = tmp_path / "user@example.com" / "import.journal.jsonl"
+        _write_legacy_message_fixture(folder, mailbox="import.journal.jsonl")
+
+        _email, audit_issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        stats = verify_account(tmp_path / "user@example.com")
+        output = capsys.readouterr().out
+
+        assert any("reserved legacy account artifact path" in issue for issue in audit_issues)
+        assert stats["errors"] >= 1
+        assert "reserved legacy account artifact path" in output
+
 
 # ---------------------------------------------------------------------------
 # BUG #7 — Auto-generated import config must NOT use export server address

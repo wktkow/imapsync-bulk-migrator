@@ -14,7 +14,7 @@ from email.policy import default as default_policy
 import re
 
 from components.content_binding import legacy_content_binding_issue, provider_content_binding_issue
-from components.imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate
+from components.imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate, legacy_reserved_mailbox_path_issue
 from components.provider_ops import (
     _manifest_path,
     _provider_artifact_orphan_issues,
@@ -415,6 +415,10 @@ def analyze_export_state(account_path, folder_counts):
         state_paths.add(path)
         if isinstance(mailbox, str) and mailbox.strip() and sanitize_for_path(mailbox) != path:
             issues.append(f"export-state mailbox {mailbox!r} path mismatch (path={path})")
+        if isinstance(mailbox, str) and mailbox.strip():
+            reserved_issue = legacy_reserved_mailbox_path_issue(mailbox, path)
+            if reserved_issue is not None:
+                issues.append(f"export-state {reserved_issue}")
         if type(message_count) is not int or message_count < 0:
             issues.append(f"export-state mailbox {label!r} has invalid message_count")
         elif path in folder_counts and message_count != folder_counts[path]:
@@ -711,6 +715,9 @@ def verify_account(account_path):
         mailbox_folders_found += 1
             
         folder_name = folder_path.name
+        reserved_issue = legacy_reserved_mailbox_path_issue(folder_name, folder_name)
+        if reserved_issue is not None:
+            errors.append(f"{folder_name}: {reserved_issue}")
         folder_messages = 0
         folder_attachments = 0
         folder_errors = 0

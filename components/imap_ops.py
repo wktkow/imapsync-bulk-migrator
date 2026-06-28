@@ -23,6 +23,8 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+LEGACY_ACCOUNT_RESERVED_PATHS = frozenset({"export-state.json", "import.journal.jsonl", "manifest.jsonl"})
+_LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGACY_ACCOUNT_RESERVED_PATHS)
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
 _SHA256_HEX_RE = re.compile(r"[0-9a-fA-F]{64}")
 _IMAP_INTERNALDATE_RE = re.compile(
@@ -52,6 +54,13 @@ def ensure_private_dir(path: Path) -> None:
         raise RuntimeError(f"refusing to use symlinked directory: {path}")
     with contextlib.suppress(Exception):
         os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def legacy_reserved_mailbox_path_issue(mailbox: str, path: Optional[str] = None) -> Optional[str]:
+    sanitized = sanitize_for_path(mailbox) if path is None else path
+    if sanitized.casefold() not in _LEGACY_ACCOUNT_RESERVED_PATH_KEYS:
+        return None
+    return f"mailbox {mailbox!r} maps to reserved legacy account artifact path {sanitized!r}"
 
 
 def _raise_if_symlink(path: Path, label: str) -> None:
@@ -370,6 +379,9 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
     path = _legacy_import_journal_path(account_dir)
     rows: List[Dict[str, str]] = []
     _raise_if_symlink(path, "legacy import journal")
+    if path.is_dir():
+        issue = legacy_reserved_mailbox_path_issue(path.name, path.name)
+        raise RuntimeError(f"invalid legacy account layout: {issue}")
     if not path.exists():
         return rows
     try:
@@ -566,6 +578,9 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         seen_paths: Dict[str, Tuple[str, str]] = {}  # filesystem key -> (original mailbox, sanitized path)
         for mb in mailboxes:
             path = sanitize_for_path(mb)
+            reserved_issue = legacy_reserved_mailbox_path_issue(mb, path)
+            if reserved_issue is not None:
+                raise RuntimeError(f"Cannot export mailbox for account {account.email}: {reserved_issue}")
             key = sanitized_path_key(mb)
             previous = seen_paths.get(key)
             if previous is not None and previous[0] != mb:
