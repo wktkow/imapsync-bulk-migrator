@@ -9,6 +9,7 @@ import math
 import socket
 import os
 import signal
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -1191,8 +1192,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
                 email = acc.email
+                account_dir_fd: Optional[int] = None
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
+                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _open_legacy_dir, _raise_if_legacy_parent_replaced, _read_file_no_symlink, _unresolved_legacy_pending_keys, imap_connection, list_export_scope_mailboxes, quote_mailbox_name
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
@@ -1200,6 +1202,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         with mismatches_lock:
                             validation_errors.append((email, f"account directory missing: {account_dir}"))
                         return
+                    account_dir_fd, account_dir_path = _open_legacy_dir(account_dir, "legacy account")
+
+                    def guard_account_dir() -> None:
+                        if account_dir_fd is None:
+                            raise RuntimeError(f"legacy account directory is not pinned: {account_dir}")
+                        _raise_if_legacy_parent_replaced(account_dir_path, account_dir_fd, "legacy account")
+
                     ok, audit_issues = audit_export(
                         in_root,
                         Config(server=config.server, accounts=[acc], source_server=config.source_server),
@@ -1207,15 +1216,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                         check_remote=False,
                         require_integrity_metadata=True,
                     )
+                    guard_account_dir()
                     if not ok:
                         with mismatches_lock:
                             validation_errors.extend((email, issue) for issue in audit_issues)
                         return
                     current_target = _legacy_import_target_id(config.server, acc)
-                    unresolved_pending_keys = _unresolved_legacy_pending_keys(
-                        _load_legacy_import_journal(account_dir, repair_trailing=False),
-                        current_target,
-                    )
+                    journal_rows = _load_legacy_import_journal(account_dir, repair_trailing=False)
+                    guard_account_dir()
+                    unresolved_pending_keys = _unresolved_legacy_pending_keys(journal_rows, current_target)
                     if unresolved_pending_keys:
                         with mismatches_lock:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
@@ -1238,21 +1247,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                         return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
 
                     folder_dirs: List[Path] = []
-                    for child in account_dir.iterdir():
-                        if child.is_symlink():
+                    for child_name in sorted(os.listdir(account_dir_fd)):
+                        try:
+                            child_stat = os.stat(child_name, dir_fd=account_dir_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(child_stat.st_mode):
                             with mismatches_lock:
-                                validation_errors.append((email, f"{child.name}: mailbox path is a symlink"))
+                                validation_errors.append((email, f"{child_name}: mailbox path is a symlink"))
                             return
-                        if child.is_dir():
-                            folder_dirs.append(child)
+                        if stat.S_ISDIR(child_stat.st_mode):
+                            folder_dirs.append(account_dir / child_name)
+                    guard_account_dir()
                     if not folder_dirs:
                         with mismatches_lock:
                             validation_errors.append((email, "no mailbox folders found"))
                         return
                     local_mailboxes_by_key: Dict[str, str] = {}
                     for folder_dir in folder_dirs:
+                        guard_account_dir()
                         default_mailbox = marker_mailbox(folder_dir)
+                        guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
+                        guard_account_dir()
                         if not eml_paths:
                             key = sanitize_for_path(default_mailbox)
                             local_mailboxes_by_key.setdefault(key, default_mailbox)
@@ -1264,11 +1281,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                             metadata_path = eml_path.with_suffix(".json")
                             if metadata_path.exists():
                                 try:
+                                    guard_account_dir()
                                     metadata_bytes = _read_file_no_symlink(
                                         metadata_path,
                                         "legacy message metadata",
                                         reject_hard_links=True,
                                     )
+                                    guard_account_dir()
                                     metadata = json.loads(metadata_bytes.decode("utf-8"))
                                 except Exception as exc:
                                     raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
@@ -1278,16 +1297,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                             key = sanitize_for_path(mailbox)
                             local_mailboxes_by_key.setdefault(key, mailbox)
                             local_counts[key] = local_counts.get(key, 0) + 1
+                            guard_account_dir()
                             message_bytes = _read_file_no_symlink(
                                 eml_path,
                                 "legacy message file",
                                 reject_hard_links=True,
                             )
+                            guard_account_dir()
                             local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
                     remote_name_mismatch_keys: Set[str] = set()
+                    guard_account_dir()
                     with imap_connection(config.server, acc) as imap:
                         mailboxes = list_export_scope_mailboxes(imap)
                         for mailbox in mailboxes:
@@ -1376,6 +1398,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except Exception as exc:
                     with mismatches_lock:
                         validation_errors.append((email, str(exc)))
+                finally:
+                    if account_dir_fd is not None:
+                        os.close(account_dir_fd)
             parallel_process_accounts("validate", do_validate, config.accounts, int(args.max_workers), stop_on_error=False)
             if validation_errors:
                 logging.warning("Validation account failures found:")

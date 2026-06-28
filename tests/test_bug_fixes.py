@@ -10467,6 +10467,73 @@ class TestRound7ConfirmedBugs:
         assert folder.is_symlink()
         assert rc == 4
 
+    def test_validate_rejects_account_dir_swap_after_journal_load_before_remote_check(self, tmp_path: Path) -> None:
+        from components import imap_ops
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        account_dir = input_root / "user@example.com"
+        folder = account_dir / "INBOX"
+        source_server = {
+            "host": "source.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        target_server = {
+            "host": "target.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        _write_legacy_empty_mailbox_fixture(folder, source_server=ServerConfig(**source_server))
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": source_server,
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside-account"
+        _write_legacy_empty_mailbox_fixture(outside / "INBOX", source_server=ServerConfig(**source_server))
+        checked_account = tmp_path / "checked-account"
+        real_load = imap_ops._load_legacy_import_journal
+        load_calls = 0
+        swapped = False
+
+        def racing_load(path: Path, *args, **kwargs):
+            nonlocal load_calls, swapped
+            result = real_load(path, *args, **kwargs)
+            if path == account_dir:
+                load_calls += 1
+                if load_calls == 2:
+                    account_dir.rename(checked_account)
+                    try:
+                        account_dir.symlink_to(outside, target_is_directory=True)
+                    except (OSError, NotImplementedError) as exc:
+                        pytest.skip(f"symlink creation unavailable: {exc}")
+                    swapped = True
+            return result
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.imap_ops._load_legacy_import_journal", side_effect=racing_load), \
+            mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("remote validate should not run")):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert load_calls == 2
+        assert swapped
+        assert account_dir.is_symlink()
+        assert rc == 4
+
     def test_remote_audit_rejects_symlinked_mailbox_marker_without_following_or_connecting(self, tmp_path: Path) -> None:
         from components.audit import _folder_mailbox_name, audit_export
         from components.models import Account, Config, ServerConfig
