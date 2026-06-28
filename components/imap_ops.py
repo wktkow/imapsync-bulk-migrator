@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import ssl
 import stat
 import time
@@ -168,6 +167,11 @@ def _open_legacy_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
     except Exception:
         os.close(fd)
         raise
+
+
+def _open_legacy_dir(path: Path, label: str) -> Tuple[int, Path]:
+    fd, _probe_name, dir_path = _open_legacy_parent_dir(path / ".legacy-dir-probe", label)
+    return fd, dir_path
 
 
 def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = False) -> bytes:
@@ -676,24 +680,98 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
     return msg_bytes, flags, internaldate
 
 
+def _stale_legacy_export_stem(name: str) -> Optional[str]:
+    if name.endswith(".eml"):
+        return name[:-4]
+    if name.endswith(".json") and name != ".mailbox.json":
+        return name[:-5]
+    return None
+
+
 def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> None:
-    for path in list(folder_dir.glob("*.eml")):
-        if path.stem not in expected_stems:
-            path.unlink()
-    for path in list(folder_dir.glob("*.json")):
-        if path.name != ".mailbox.json" and path.stem not in expected_stems:
-            path.unlink()
+    dir_fd, dir_path = _open_legacy_dir(folder_dir, "legacy mailbox")
+    try:
+        for name in sorted(os.listdir(dir_fd)):
+            stem = _stale_legacy_export_stem(name)
+            if stem is None or stem in expected_stems:
+                continue
+            artifact_path = folder_dir / name
+            try:
+                stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(stat_result.st_mode):
+                raise RuntimeError(f"refusing to delete symlinked legacy export artifact: {artifact_path}")
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise RuntimeError(f"refusing to delete non-regular legacy export artifact: {artifact_path}")
+            _raise_if_legacy_parent_replaced(dir_path, dir_fd, "legacy mailbox")
+            os.unlink(name, dir_fd=dir_fd)
+            _raise_if_legacy_parent_replaced(dir_path, dir_fd, "legacy mailbox")
+    finally:
+        os.close(dir_fd)
+
+
+def _remove_legacy_dir_tree_at(
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+    guard: Callable[[], None],
+) -> None:
+    try:
+        stat_result = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise RuntimeError(f"refusing to delete symlinked legacy mailbox directory: {display_path}")
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise RuntimeError(f"refusing to delete non-directory legacy mailbox path: {display_path}")
+    guard()
+    child_fd = os.open(name, _legacy_dir_open_flags(), dir_fd=parent_fd)
+    try:
+        child_stat = os.fstat(child_fd)
+        if not stat.S_ISDIR(child_stat.st_mode):
+            raise RuntimeError(f"refusing to delete non-directory legacy mailbox path: {display_path}")
+        if child_stat.st_dev != stat_result.st_dev or child_stat.st_ino != stat_result.st_ino:
+            raise RuntimeError(f"refusing to delete replaced legacy mailbox directory: {display_path}")
+        for child_name in sorted(os.listdir(child_fd)):
+            child_path = display_path / child_name
+            try:
+                child_entry_stat = os.stat(child_name, dir_fd=child_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(child_entry_stat.st_mode):
+                _remove_legacy_dir_tree_at(child_fd, child_name, child_path, guard)
+                continue
+            guard()
+            os.unlink(child_name, dir_fd=child_fd)
+            guard()
+    finally:
+        os.close(child_fd)
+    guard()
+    os.rmdir(name, dir_fd=parent_fd)
+    guard()
 
 
 def _remove_stale_mailbox_dirs(account_dir: Path, expected_paths: set[str]) -> None:
-    for child in sorted(account_dir.iterdir()):
-        if child.name in {"export-state.json", "import.journal.jsonl"}:
-            continue
-        if not child.is_dir() or child.is_symlink():
-            continue
-        rel = child.relative_to(account_dir).as_posix()
-        if rel not in expected_paths:
-            shutil.rmtree(child)
+    dir_fd, dir_path = _open_legacy_dir(account_dir, "legacy account")
+
+    def guard() -> None:
+        _raise_if_legacy_parent_replaced(dir_path, dir_fd, "legacy account")
+
+    try:
+        for name in sorted(os.listdir(dir_fd)):
+            if name in {"export-state.json", "import.journal.jsonl"}:
+                continue
+            try:
+                stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(stat_result.st_mode) or stat.S_ISLNK(stat_result.st_mode):
+                continue
+            if name not in expected_paths:
+                _remove_legacy_dir_tree_at(dir_fd, name, account_dir / name, guard)
+    finally:
+        os.close(dir_fd)
 
 
 def legacy_export_output_symlink_issues(out_root: Path, accounts: List[Account]) -> List[str]:

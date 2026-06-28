@@ -6190,6 +6190,89 @@ print("ok")
         assert ok
         assert issues == []
 
+    def test_legacy_export_stale_file_cleanup_rejects_mailbox_dir_swap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        folder_dir = tmp_path / "user@example.com" / "INBOX"
+        folder_dir.mkdir(parents=True)
+        stale = folder_dir / "u0000000002.eml"
+        stale.write_text("stale\n")
+        outside = tmp_path / "outside-inbox"
+        outside.mkdir()
+        outside_stale = outside / stale.name
+        outside_stale.write_text("do not delete\n")
+        checked_folder = tmp_path / "checked-inbox"
+        real_listdir = imap_ops.os.listdir
+        swapped = False
+
+        def racing_listdir(fd):
+            nonlocal swapped
+            names = real_listdir(fd)
+            if not swapped:
+                folder_dir.rename(checked_folder)
+                try:
+                    folder_dir.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return names
+
+        monkeypatch.setattr(imap_ops.os, "listdir", racing_listdir)
+
+        with pytest.raises(RuntimeError, match="replaced legacy mailbox directory"):
+            imap_ops._remove_stale_export_files(folder_dir, set())
+
+        assert swapped
+        assert folder_dir.is_symlink()
+        assert outside_stale.exists()
+        assert (checked_folder / stale.name).exists()
+
+    def test_legacy_export_stale_mailbox_cleanup_rejects_account_dir_swap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        stale_dir = account_dir / "Archive"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "u0000000001.eml").write_text("stale\n")
+        outside = tmp_path / "outside-account"
+        outside_stale_dir = outside / "Archive"
+        outside_stale_dir.mkdir(parents=True)
+        outside_file = outside_stale_dir / "u0000000001.eml"
+        outside_file.write_text("do not delete\n")
+        checked_account = tmp_path / "checked-account"
+        real_listdir = imap_ops.os.listdir
+        swapped = False
+
+        def racing_listdir(fd):
+            nonlocal swapped
+            names = real_listdir(fd)
+            if not swapped:
+                account_dir.rename(checked_account)
+                try:
+                    account_dir.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return names
+
+        monkeypatch.setattr(imap_ops.os, "listdir", racing_listdir)
+
+        with pytest.raises(RuntimeError, match="replaced legacy account directory"):
+            imap_ops._remove_stale_mailbox_dirs(account_dir, set())
+
+        assert swapped
+        assert account_dir.is_symlink()
+        assert outside_file.exists()
+        assert (checked_account / "Archive" / "u0000000001.eml").exists()
+
     def test_legacy_export_rejects_existing_provider_layout_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
