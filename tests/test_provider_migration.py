@@ -638,6 +638,42 @@ def test_provider_prune_rejects_symlinked_artifact_root(tmp_path: Path) -> None:
     assert stale.exists()
 
 
+def test_provider_prune_rejects_artifact_root_swap_before_unlink(tmp_path: Path) -> None:
+    account_dir = tmp_path / "source@example.com"
+    messages = account_dir / "messages"
+    messages.mkdir(parents=True)
+    stale = messages / "stale.eml"
+    stale.write_bytes(b"stale")
+    outside = tmp_path / "outside-messages"
+    outside.mkdir()
+    outside_stale = outside / "stale.eml"
+    outside_stale.write_bytes(b"do not delete")
+    checked_messages = tmp_path / "checked-messages"
+    real_listdir = os.listdir
+    swapped = False
+
+    def racing_listdir(fd):
+        nonlocal swapped
+        names = real_listdir(fd)
+        if not swapped:
+            messages.rename(checked_messages)
+            try:
+                messages.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                pytest.skip(f"symlink creation unavailable: {exc}")
+            swapped = True
+        return names
+
+    with mock.patch("components.provider_ops.os.listdir", racing_listdir):
+        with pytest.raises(RuntimeError, match="replaced provider artifact directory"):
+            _prune_provider_artifact_orphans(account_dir, [])
+
+    assert swapped
+    assert messages.is_symlink()
+    assert outside_stale.exists()
+    assert (checked_messages / "stale.eml").exists()
+
+
 def test_provider_prune_rejects_non_regular_orphan_artifact(tmp_path: Path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFO creation unavailable")

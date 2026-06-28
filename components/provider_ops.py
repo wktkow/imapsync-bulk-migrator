@@ -218,6 +218,11 @@ def _open_provider_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
         raise
 
 
+def _open_provider_dir(path: Path, label: str) -> Tuple[int, Path]:
+    fd, _probe_name, dir_path = _open_provider_parent_dir(path / ".provider-dir-probe", label)
+    return fd, dir_path
+
+
 def _json_values_match(left: Any, right: Any) -> bool:
     if type(left) is not type(right):
         return False
@@ -1756,24 +1761,82 @@ def _prune_provider_artifact_orphans(account_dir: Path, rows: List[Dict[str, Any
     _raise_if_provider_path_symlink(account_dir, "account directory")
     expected_messages = _manifest_relative_paths(account_dir, rows, "eml_path")
     expected_metadata = _manifest_relative_paths(account_dir, rows, "metadata_path")
-    for root_name, suffix, expected in (
-        ("messages", "*.eml", expected_messages),
-        ("metadata", "*.json", expected_metadata),
+    for root_name, file_suffix, expected in (
+        ("messages", ".eml", expected_messages),
+        ("metadata", ".json", expected_metadata),
     ):
         root = account_dir / root_name
         _raise_if_provider_path_symlink(root, "artifact directory")
         if not root.exists():
             continue
-        for path in sorted(root.rglob(suffix)):
-            if path.is_symlink():
-                raise RuntimeError(f"refusing to prune symlinked provider artifact: {path}")
-            rel_path = path.relative_to(account_dir).as_posix()
-            if not path.is_file():
-                if rel_path not in expected:
-                    raise RuntimeError(f"refusing to prune non-regular provider artifact: {path}")
-                continue
+        root_fd, root_path = _open_provider_dir(root, "artifact directory")
+
+        def guard() -> None:
+            _raise_if_provider_parent_replaced(root_path, root_fd, "artifact directory")
+
+        try:
+            _prune_provider_artifact_orphans_at(
+                root_fd,
+                account_dir,
+                root_name,
+                (),
+                file_suffix,
+                expected,
+                guard,
+            )
+        finally:
+            os.close(root_fd)
+
+
+def _prune_provider_artifact_orphans_at(
+    parent_fd: int,
+    account_dir: Path,
+    root_name: str,
+    relative_parts: Tuple[str, ...],
+    file_suffix: str,
+    expected: set[str],
+    guard: Callable[[], None],
+) -> None:
+    for name in sorted(os.listdir(parent_fd)):
+        child_parts = relative_parts + (name,)
+        rel_path = "/".join((root_name, *child_parts))
+        display_path = account_dir / rel_path
+        try:
+            stat_result = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise RuntimeError(f"refusing to prune symlinked provider artifact: {display_path}")
+        if stat.S_ISDIR(stat_result.st_mode):
+            child_fd = os.open(name, _provider_dir_open_flags(), dir_fd=parent_fd)
+            try:
+                child_stat = os.fstat(child_fd)
+                if not stat.S_ISDIR(child_stat.st_mode):
+                    raise RuntimeError(f"refusing to prune non-directory provider artifact path: {display_path}")
+                if child_stat.st_dev != stat_result.st_dev or child_stat.st_ino != stat_result.st_ino:
+                    raise RuntimeError(f"refusing to prune replaced provider artifact directory: {display_path}")
+                _prune_provider_artifact_orphans_at(
+                    child_fd,
+                    account_dir,
+                    root_name,
+                    child_parts,
+                    file_suffix,
+                    expected,
+                    guard,
+                )
+            finally:
+                os.close(child_fd)
+            continue
+        if not name.endswith(file_suffix):
+            continue
+        if not stat.S_ISREG(stat_result.st_mode):
             if rel_path not in expected:
-                path.unlink()
+                raise RuntimeError(f"refusing to prune non-regular provider artifact: {display_path}")
+            continue
+        if rel_path not in expected:
+            guard()
+            os.unlink(name, dir_fd=parent_fd)
+            guard()
 
 
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:
