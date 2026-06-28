@@ -3065,6 +3065,47 @@ class TestCliAndConfigHardening:
         assert rc == 4
         assert events == []
 
+    def test_legacy_import_allows_trailing_journal_repair_before_import(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        data = b"Message-ID: <trailing-import@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(account_dir / "INBOX", data=data, source_server=source)
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_text('{"key": ')
+        imported: List[str] = []
+
+        def record_import(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.import_account", record_import):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-trailing-import"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+        assert imported == [account.email]
+        assert journal.read_text() == ""
+
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest

@@ -4329,6 +4329,8 @@ def provider_validate_account(
     check_target: bool = False,
     write_report: bool = True,
     allow_unresolved_pending: bool = False,
+    repair_trailing_journal: bool = False,
+    allow_missing_gmail_target_msgid: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     account_dir = account_export_dir(in_root, account)
     report: Dict[str, Any] = {
@@ -4349,7 +4351,7 @@ def provider_validate_account(
         return account.email, report
     try:
         _raise_if_provider_path_symlink(account_dir, "account directory")
-        journal_rows = load_import_journal(account_dir, account)
+        journal_rows = load_import_journal(account_dir, account, repair_trailing=repair_trailing_journal)
         manifest_rows = load_manifest(account_dir)
     except Exception as exc:
         report["failed"].append(str(exc))
@@ -4435,7 +4437,7 @@ def provider_validate_account(
             report["failed"].append(merge_group_stage_error)
     journal_gmail_msgid_missing = (
         missing_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids)
-        if config.target.provider == "gmail"
+        if config.target.provider == "gmail" and not allow_missing_gmail_target_msgid
         else []
     )
     journal_gmail_msgid_invalid = (

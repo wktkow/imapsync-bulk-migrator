@@ -391,6 +391,8 @@ def _provider_cli_staged_validation_issues(
             check_target=False,
             write_report=False,
             allow_unresolved_pending=(mode == "import"),
+            repair_trailing_journal=(mode == "import"),
+            allow_missing_gmail_target_msgid=(mode == "import"),
         )
         keys = ("duplicates", "failed", "missing") if mode == "validate" else ("duplicates", "failed")
         for key in keys:
@@ -399,7 +401,7 @@ def _provider_cli_staged_validation_issues(
     return issues
 
 
-def _legacy_pending_import_journal_issues(root: Path, config: Config) -> List[str]:
+def _legacy_pending_import_journal_issues(root: Path, config: Config, *, repair_trailing: bool = False) -> List[str]:
     from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys
 
     issues: List[str] = []
@@ -409,7 +411,7 @@ def _legacy_pending_import_journal_issues(root: Path, config: Config) -> List[st
             continue
         try:
             pending_keys = _unresolved_legacy_pending_keys(
-                _load_legacy_import_journal(account_dir, repair_trailing=False),
+                _load_legacy_import_journal(account_dir, repair_trailing=repair_trailing),
                 _legacy_import_target_id(config.server, account),
             )
         except Exception as exc:
@@ -635,7 +637,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         logging.error("[staged-audit] %s", issue)
                     return 4
                 legacy_staged_audit_completed = True
-            pending_journal_issues = _legacy_pending_import_journal_issues(input_root, config)
+            pending_journal_issues = _legacy_pending_import_journal_issues(
+                input_root,
+                config,
+                repair_trailing=(args.mode == "import"),
+            )
             if pending_journal_issues:
                 logging.error("Input directory has unresolved legacy import journal entries:")
                 for issue in pending_journal_issues:

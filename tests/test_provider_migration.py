@@ -9032,6 +9032,27 @@ def _write_provider_config_file(tmp_path: Path) -> Path:
     return path
 
 
+def _write_provider_gmail_target_config_file(tmp_path: Path) -> Path:
+    path = tmp_path / "migration.gmail-target.config.json"
+    path.write_text(json.dumps({
+        "source": {
+            "provider": "gmail",
+            "host": "imap.gmail.com",
+            "auth": {"method": "xoauth2", "password": "token"},
+            "gmail_full_visibility_verified": True,
+        },
+        "target": {
+            "provider": "gmail",
+            "host": "imap.gmail.com",
+            "auth": {"method": "xoauth2", "password": "target-token"},
+            "gmail_full_visibility_verified": True,
+        },
+        "accounts": [{"source_email": "source@example.com", "target_email": "target@gmail.com"}],
+        "migration": {"target_mode": "merge"},
+    }))
+    return path
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_roles"),
     [
@@ -9455,6 +9476,93 @@ def test_main_allows_provider_import_pending_journal_to_recovery_path(tmp_path: 
 
     assert rc == 0
     assert events == ["connectivity", "import"]
+
+
+def test_main_allows_provider_import_missing_gmail_msgid_to_repair_path(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_gmail_target_config_file(tmp_path)
+    config = load_config_file(config_path)
+    assert isinstance(config, ProviderMigrationConfig)
+    root = tmp_path / "provider-root-gmail-msgid-import"
+    account_dir = _write_manifest_fixture(root)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["gmail_labels"] = ["\\Inbox"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com", target_endpoint=config.target)
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+    })) + "\n")
+    events: List[str] = []
+
+    def record_connectivity(*_args, **_kwargs) -> None:
+        events.append("connectivity")
+
+    def record_import(*_args, **_kwargs) -> None:
+        events.append("import")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.provider_test_accounts", record_connectivity), \
+        mock.patch("components.main.provider_import_all", record_import):
+        rc = main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-gmail-msgid-import"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 0
+    assert events == ["connectivity", "import"]
+
+
+def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    config = load_config_file(config_path)
+    assert isinstance(config, ProviderMigrationConfig)
+    root = tmp_path / "provider-root-trailing-import"
+    account_dir = _write_manifest_fixture(root)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    valid = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": config.accounts[0].target_email,
+        "target_mailbox": "Archive",
+        "status": "pending",
+    })
+    journal.write_text(json.dumps(valid) + "\n" + '{"canonical_id": ')
+    events: List[str] = []
+
+    def record_connectivity(*_args, **_kwargs) -> None:
+        events.append("connectivity")
+
+    def record_import(*_args, **_kwargs) -> None:
+        events.append("import")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.provider_test_accounts", record_connectivity), \
+        mock.patch("components.main.provider_import_all", record_import):
+        rc = main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-provider-trailing-import"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 0
+    assert events == ["connectivity", "import"]
+    assert json.loads(journal.read_text()) == valid
 
 
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
