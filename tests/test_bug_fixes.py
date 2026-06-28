@@ -5420,6 +5420,23 @@ class TestRound2ConfirmedBugs:
 
         assert stats["errors"] == 1
 
+    def test_verify_export_rejects_duplicate_provider_manifest_identity(self, tmp_path: Path) -> None:
+        from components.provider_ops import provider_manifest_digest
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        row = _write_verify_provider_account_fixture(account_dir)
+        rows = [row, dict(row)]
+        (account_dir / "manifest.jsonl").write_text("".join(json.dumps(item) + "\n" for item in rows))
+        state = json.loads((account_dir / "export-state.json").read_text(encoding="utf-8"))
+        state["canonical_messages"] = 2
+        state["manifest_sha256"] = provider_manifest_digest(rows)
+        (account_dir / "export-state.json").write_text(json.dumps(state))
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 1
+
     def test_verify_export_rejects_provider_account_directory_mismatch(
         self,
         tmp_path: Path,
