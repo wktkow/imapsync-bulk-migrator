@@ -2308,7 +2308,7 @@ def test_icloud_target_default_folder_resolution() -> None:
     assert resolve_target_mailbox("Junk", icloud_mailboxes, target_provider="icloud") == "Junk"
 
 
-def test_offline_journal_target_mailbox_accepts_non_gmail_special_use_alias() -> None:
+def test_offline_journal_target_mailbox_accepts_icloud_default_trash_target() -> None:
     manifest_rows = [
         {
             "canonical_id": "physical-trash",
@@ -2329,6 +2329,31 @@ def test_offline_journal_target_mailbox_accepts_non_gmail_special_use_alias() ->
         manifest_rows,
         target_provider="icloud",
     ) == []
+
+
+def test_offline_journal_target_mailbox_rejects_generic_special_use_alias() -> None:
+    manifest_rows = [
+        {
+            "canonical_id": "physical-trash",
+            "primary_mailbox": "Deleted Messages",
+        }
+    ]
+    journal_rows = [
+        {
+            "canonical_id": "physical-trash",
+            "target_mailbox": "Trash",
+            "target_account": "target@example.com",
+            "status": "committed",
+        }
+    ]
+
+    issues = offline_journal_target_mailbox_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider="imap",
+    )
+
+    assert any("wrong target mailbox" in issue for issue in issues)
 
 
 def test_custom_folder_translation_uses_target_delimiter_and_preserves_flat_targets() -> None:
@@ -7029,6 +7054,45 @@ def test_provider_import_merge_mode_rejects_wrong_mailbox_committed_journal_row(
             provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
+
+
+def test_provider_import_merge_mode_rejects_generic_special_use_alias_journal_before_append(tmp_path: Path) -> None:
+    config = _generic_target_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Deleted Messages"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target=account.target_email)
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Trash",
+        "status": "committed",
+    })) + "\n")
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+
+    class TrashAndDeletedTarget(StoredMessageTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Trash) "/" "Deleted Messages"',
+                b'(\\HasNoChildren \\Trash) "/" "Trash"',
+            ]
+
+    fake = TrashAndDeletedTarget({"Trash": [body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[TrashAndDeletedTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="wrong target mailbox"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.bodies_by_mailbox == {"Trash": [body]}
 
 
 def test_provider_validation_is_manifest_exact(tmp_path: Path) -> None:
