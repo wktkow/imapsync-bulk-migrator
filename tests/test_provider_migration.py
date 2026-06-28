@@ -4233,6 +4233,69 @@ def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_pat
     assert '"action": "existing"' in second_journal
 
 
+@pytest.mark.parametrize(
+    ("defect", "needle"),
+    [
+        ("corrupt-payload", "payload does not match manifest for merge source a@example.com"),
+        ("orphan-artifacts", "invalid provider artifacts for merge source a@example.com"),
+    ],
+)
+def test_provider_many_to_one_rejects_peer_stage_artifact_defects(
+    tmp_path: Path,
+    defect: str,
+    needle: str,
+) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    second_row = json.loads((second_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    (second_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, second_row, {
+        "canonical_id": "physical-b",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=second)) + "\n")
+
+    if defect == "corrupt-payload":
+        (first_dir / first_row["eml_path"]).write_bytes(b"corrupted")
+    else:
+        (first_dir / "messages" / "stale.eml").write_bytes(b"stale")
+        (first_dir / "metadata" / "stale.json").write_text(json.dumps({"stale": True}))
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+        with pytest.raises(RuntimeError, match=re.escape(needle)):
+            provider_import_account(config, second, tmp_path)
+
+    assert not report["ok"]
+    assert any(needle in item for item in report["failed"])
+
+
 def test_provider_import_all_many_to_one_serializes_same_target_group(tmp_path: Path) -> None:
     config = _many_to_one_config()
     first, second = config.accounts

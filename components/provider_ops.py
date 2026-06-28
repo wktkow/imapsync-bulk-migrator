@@ -3577,6 +3577,18 @@ def _validated_group_stage(
             f"metadata does not match manifest for merge source {account.source_email}: "
             + "; ".join(metadata_issues)
         )
+    payload_issues = manifest_payload_issues(account_dir, manifest_rows)
+    if payload_issues:
+        raise RuntimeError(
+            f"payload does not match manifest for merge source {account.source_email}: "
+            + "; ".join(payload_issues)
+        )
+    artifact_issues = _provider_artifact_orphan_issues(account_dir, manifest_rows)
+    if artifact_issues:
+        raise RuntimeError(
+            f"invalid provider artifacts for merge source {account.source_email}: "
+            + "; ".join(artifact_issues)
+        )
     mixed_layout_issues = provider_mixed_legacy_layout_issues(account_dir)
     if mixed_layout_issues:
         raise RuntimeError(
