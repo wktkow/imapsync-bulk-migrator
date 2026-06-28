@@ -93,6 +93,49 @@ def _write_legacy_message_fixture(
     state_path.write_text(json.dumps(state))
     return eml
 
+
+def _write_verify_provider_account_fixture(
+    account_dir: Path,
+    *,
+    canonical_id: str = "provider-1",
+    body: bytes = b"Message-ID: <provider@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+) -> dict:
+    from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+    from components.provider_ops import provider_manifest_digest
+
+    (account_dir / "messages").mkdir(parents=True, exist_ok=True)
+    (account_dir / "metadata").mkdir(exist_ok=True)
+    eml_rel = f"messages/{canonical_id}.eml"
+    meta_rel = f"metadata/{canonical_id}.json"
+    (account_dir / eml_rel).write_bytes(body)
+    row = {
+        "canonical_id": canonical_id,
+        "source_provider": "imap",
+        "source_account": "source@example.com",
+        "target_account": "target@example.com",
+        "primary_mailbox": "Archive",
+        "message_id_header": "<provider@example.com>",
+        "content_sha256": hashlib.sha256(body).hexdigest(),
+        "rfc822_size": len(body),
+        "flags": "\\Seen",
+        "internaldate": "01-Jan-2024 00:00:00 +0000",
+        "eml_path": eml_rel,
+        "metadata_path": meta_rel,
+    }
+    row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+    (account_dir / meta_rel).write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "source_provider": "imap",
+        "source_account": "source@example.com",
+        "target_account": "target@example.com",
+        "target_provider": "imap",
+        "complete": True,
+        "canonical_messages": 1,
+        "manifest_sha256": provider_manifest_digest([row]),
+    }))
+    return row
+
 # ---------------------------------------------------------------------------
 # BUG #5 — sanitize_for_path collision detection during export
 # ---------------------------------------------------------------------------
@@ -5360,6 +5403,22 @@ class TestRound2ConfirmedBugs:
         assert stats["errors"] == 0
         assert stats["total_messages"] == 1
         assert main() == 0
+
+    def test_verify_export_rejects_mixed_provider_and_legacy_layout(self, tmp_path: Path) -> None:
+        from verify_export import verify_account
+
+        account_dir = tmp_path / "exported" / "source@example.com"
+        _write_verify_provider_account_fixture(account_dir)
+        legacy_folder = account_dir / "INBOX"
+        legacy_folder.mkdir()
+        (legacy_folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        (legacy_folder / "u0000000001.eml").write_bytes(
+            b"Message-ID: <legacy@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nlegacy"
+        )
+
+        stats = verify_account(account_dir)
+
+        assert stats["errors"] == 1
 
     def test_verify_export_rejects_provider_account_directory_mismatch(
         self,
