@@ -8470,6 +8470,64 @@ class TestRound7ConfirmedBugs:
         assert name == account.email
         assert any("account path is not a directory" in issue for issue in issues)
 
+    def test_legacy_import_rejects_provider_manifest_layout(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import import_account
+        from components.main import main
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        input_root = tmp_path / "exported"
+        folder = input_root / account.email / "INBOX"
+        _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <mixed-layout@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=server,
+        )
+        (folder.parent / "manifest.jsonl").write_text(json.dumps({"provider": True}) + "\n")
+
+        ok, issues = audit_export(
+            input_root,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        assert not ok
+        assert any("provider manifest present in legacy account directory" in issue for issue in issues)
+
+        with pytest.raises(RuntimeError, match="provider manifest present"):
+            import_account(
+                account,
+                server,
+                input_root,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+            )
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+        import_mock.assert_not_called()
+
     def test_legacy_import_rejects_symlinked_message_file_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

@@ -246,6 +246,10 @@ def audit_account(
     if not account_dir.is_dir():
         issues.append(f"{account.email}: account path is not a directory: {account_dir}")
         return account.email, issues
+    provider_manifest = account_dir / "manifest.jsonl"
+    if provider_manifest.exists() or provider_manifest.is_symlink():
+        issues.append(f"{account.email}: provider manifest present in legacy account directory: {provider_manifest}")
+        remote_safe = False
     folder_dirs: List[Path] = []
     for child in account_dir.iterdir():
         if child.is_symlink():

@@ -743,6 +743,9 @@ def import_account(
     _raise_if_symlink(account_dir, "legacy account directory")
     if not account_dir.exists():
         raise RuntimeError(f"Input account directory not found: {account_dir}")
+    provider_manifest = account_dir / "manifest.jsonl"
+    if provider_manifest.exists() or provider_manifest.is_symlink():
+        raise RuntimeError(f"{account.email}: provider manifest present in legacy account directory: {provider_manifest}")
     logging.info("[import] %s: starting", account.email)
     target_id = _legacy_import_target_id(server, account)
     journal_rows = _load_legacy_import_journal(account_dir)
