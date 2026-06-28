@@ -3839,6 +3839,90 @@ def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_ta
     assert '"action": "appended"' in second_journal
 
 
+def test_provider_import_many_to_one_rejects_missing_group_committed_target_before_append(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    fake = StoredMessageTarget({"Archive": []})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="merge group journal says physical-a"):
+            provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+
+
+def test_provider_import_many_to_one_rejects_group_pending_before_append(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }, account=first)) + "\n")
+    fake = StoredMessageTarget({"Archive": [first_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="unresolved pending import journal row"):
+            provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+
+
 def test_provider_import_many_to_one_rejects_cross_source_canonical_id_collision_before_target_contact(
     tmp_path: Path,
 ) -> None:
@@ -4008,6 +4092,55 @@ def test_provider_validation_many_to_one_empty_mode_rejects_unjournaled_group_ta
 
     assert not report["ok"]
     assert any("target_mode=empty" in item for item in report["failed"])
+
+
+def test_provider_validation_many_to_one_rejects_missing_group_committed_target(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    second_row = json.loads((second_dir / "manifest.jsonl").read_text())
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=first)) + "\n")
+    (second_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, second_row, {
+        "canonical_id": "physical-b",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=second)) + "\n")
+    fake = StoredMessageTarget({"Archive": [second_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any("merge group journal says physical-a" in item for item in report["failed"])
 
 
 def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_path: Path) -> None:
@@ -4370,7 +4503,7 @@ def test_provider_import_many_to_one_gmail_rejects_stale_group_target_msgid(tmp_
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="target_mode=empty"):
+        with pytest.raises(RuntimeError, match="Gmail target message 9001"):
             provider_import_account(config, second, tmp_path)
 
 

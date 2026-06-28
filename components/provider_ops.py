@@ -3659,6 +3659,80 @@ def require_merge_group_target_translation_safe(
     )
 
 
+def require_merge_group_journals_remote_complete(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    *,
+    target_provider: str,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+) -> None:
+    used_by_mailbox: Dict[str, set[bytes]] = {}
+    used_gmail_msgids: set[str] = set()
+    for group_account, _account_dir, manifest_rows, journal_rows in stages:
+        committed_keys = set(latest_committed_journal_rows(journal_rows))
+        for row in journal_rows:
+            if row.get("status") != "pending":
+                continue
+            identity = str(row.get("canonical_id") or "<missing>")
+            target_mailbox = str(row.get("target_mailbox") or "<missing>")
+            if (identity, target_mailbox) in committed_keys:
+                continue
+            raise RuntimeError(
+                f"merge group source {group_account.source_email} has unresolved pending import journal row: "
+                f"{identity} in {target_mailbox}"
+            )
+        row_by_id = {
+            str(row.get("canonical_id") or ""): row
+            for row in manifest_rows
+            if row.get("canonical_id")
+        }
+        for (identity, target_mailbox), journal_row in latest_committed_journal_rows(journal_rows).items():
+            manifest_row = row_by_id.get(identity)
+            if manifest_row is None:
+                continue
+            expected_content_identities = expected_content_identities_by_id.get(identity)
+            if target_provider == "gmail":
+                target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
+                matching_mailboxes = gmail_expected_target_mailboxes_for_row(
+                    manifest_row,
+                    target_mailbox,
+                    target_mailboxes,
+                )
+                matched = consume_target_gmail_match_in_mailboxes(
+                    imap,
+                    matching_mailboxes,
+                    manifest_row,
+                    used_by_mailbox,
+                    target_gmail_msgid=target_gmail_msgid,
+                    used_gmail_msgids=used_gmail_msgids,
+                    expected_content_identities=expected_content_identities,
+                )
+                if matched is not None:
+                    continue
+                if target_gmail_msgid:
+                    raise RuntimeError(
+                        f"merge group journal says {identity} from {group_account.source_email} "
+                        f"is committed to Gmail target message {target_gmail_msgid} in {target_mailbox!r}, "
+                        "but that exact target message was not found"
+                    )
+            else:
+                matched_num = consume_target_match_num(
+                    imap,
+                    target_mailbox,
+                    manifest_row,
+                    used_by_mailbox,
+                    create_if_missing=False,
+                    expected_content_identities=expected_content_identities,
+                )
+                if matched_num is not None:
+                    continue
+            raise RuntimeError(
+                f"merge group journal says {identity} from {group_account.source_email} "
+                f"is committed to {target_mailbox!r}, but the target message was not found"
+            )
+
+
 def merge_group_empty_target_context(
     config: ProviderMigrationConfig,
     target_mailboxes: List[MailboxInfo],
@@ -3882,6 +3956,13 @@ def provider_import_account(
                     config,
                     target_mailboxes,
                     merge_group_stages,
+                )
+                require_merge_group_journals_remote_complete(
+                    imap,
+                    target_mailboxes,
+                    merge_group_stages,
+                    target_provider=config.target.provider,
+                    expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
                 )
             enforce_empty_target(
                 imap,
@@ -4552,6 +4633,13 @@ def provider_validate_account(
                             config,
                             target_mailboxes,
                             merge_group_stages,
+                        )
+                        require_merge_group_journals_remote_complete(
+                            imap,
+                            target_mailboxes,
+                            merge_group_stages,
+                            target_provider=config.target.provider,
+                            expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
                         )
                     try:
                         enforce_empty_target(
