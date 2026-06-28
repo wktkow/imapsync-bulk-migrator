@@ -2713,7 +2713,7 @@ def _internaldate_for_append(internaldate: str) -> str:
 
 
 def _quote_gmail_label(label: str) -> str:
-    if label.startswith("\\"):
+    if label.startswith("\\") and _gmail_system_key_for_label(label):
         return label
     encoded = encode_imap_utf7(label)
     escaped = encoded.replace("\\", "\\\\").replace('"', r"\"")

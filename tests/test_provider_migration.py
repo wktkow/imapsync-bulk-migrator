@@ -5741,6 +5741,21 @@ def test_restore_gmail_labels_can_match_without_message_id() -> None:
     assert fake.stored_labels == [(b"1", "+X-GM-LABELS", '("Project A")')]
 
 
+def test_restore_gmail_labels_quotes_unknown_backslash_labels() -> None:
+    fake = FakeGmailTargetImap(has_existing=True, existing_mailbox="INBOX", messages_by_mailbox={"INBOX": 1})
+    row = {
+        "canonical_id": "m",
+        "gmail_labels": ["\\Bad Label", "Project A"],
+        "message_id_header": "<m1@example.com>",
+        "content_sha256": "995d8eb3156d06d7386db1ff7e5311221731ee1e67235155b521b4e71929c9df",
+        "rfc822_size": 36,
+    }
+
+    restore_gmail_labels(fake, "INBOX", row)
+
+    assert fake.stored_labels == [(b"99", "+X-GM-LABELS", '("\\\\Bad Label" "Project A")')]
+
+
 def test_restore_gmail_labels_updates_only_one_matching_target_message() -> None:
     class DuplicateGmailTarget(FakeGmailTargetImap):
         def search(self, charset: Optional[str], *criteria):
