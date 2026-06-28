@@ -8815,16 +8815,19 @@ def test_provider_audit_and_validation_reject_orphan_provider_artifacts(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("root_name", "filename", "needle"),
+    ("root_name", "filename", "broken", "needle"),
     [
-        ("messages", "outside.eml", "symlinked provider message artifact directory: messages/linked-dir"),
-        ("metadata", "outside.json", "symlinked provider metadata artifact directory: metadata/linked-dir"),
+        ("messages", "outside.eml", False, "symlinked provider message artifact directory: messages/linked-dir"),
+        ("metadata", "outside.json", False, "symlinked provider metadata artifact directory: metadata/linked-dir"),
+        ("messages", "outside.eml", True, "symlinked provider message artifact directory: messages/linked-dir"),
+        ("metadata", "outside.json", True, "symlinked provider metadata artifact directory: metadata/linked-dir"),
     ],
 )
 def test_provider_audit_and_validation_reject_symlinked_artifact_subdirectories(
     tmp_path: Path,
     root_name: str,
     filename: str,
+    broken: bool,
     needle: str,
 ) -> None:
     from verify_export import verify_account
@@ -8833,8 +8836,9 @@ def test_provider_audit_and_validation_reject_symlinked_artifact_subdirectories(
     account = config.accounts[0]
     account_dir = _write_manifest_fixture(tmp_path)
     outside = tmp_path / f"outside-{root_name}"
-    outside.mkdir()
-    (outside / filename).write_text("outside", encoding="utf-8")
+    if not broken:
+        outside.mkdir()
+        (outside / filename).write_text("outside", encoding="utf-8")
     link_dir = account_dir / root_name / "linked-dir"
     try:
         link_dir.symlink_to(outside, target_is_directory=True)

@@ -1485,7 +1485,7 @@ def _provider_artifact_orphan_issues(account_dir: Path, rows: List[Dict[str, Any
             continue
         reported_symlinks: set[str] = set()
         for path in sorted(root.rglob("*")):
-            if not path.is_symlink() or not path.is_dir():
+            if not path.is_symlink():
                 continue
             rel_path = path.relative_to(account_dir).as_posix()
             reported_symlinks.add(rel_path)
