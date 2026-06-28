@@ -9623,6 +9623,19 @@ class FakePreflightSourceMissingSize(FakePreflightSourceFailure):
         raise AssertionError(command)
 
 
+class FakePreflightSourceMissingGmailMsgid(FakePreflightSourceFailure):
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = " ".join(str(arg) for arg in args)
+            assert "X-GM-MSGID" in query
+            return "OK", [
+                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" RFC822.SIZE 42)'
+            ]
+        raise AssertionError(command)
+
+
 class FakePreflightTarget:
     def capability(self):
         return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
@@ -9700,6 +9713,20 @@ def test_provider_preflight_reports_missing_metadata_size(tmp_path: Path) -> Non
 
     assert not ok
     assert any("metadata fetch missing RFC822.SIZE" in issue for issue in issues)
+
+
+def test_provider_preflight_reports_missing_gmail_msgid(tmp_path: Path) -> None:
+    config = _provider_config()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakePreflightSourceMissingGmailMsgid() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("metadata fetch missing X-GM-MSGID" in issue for issue in issues)
 
 
 def test_provider_preflight_ignores_gmail_identity_metadata_for_generic_imap(tmp_path: Path) -> None:

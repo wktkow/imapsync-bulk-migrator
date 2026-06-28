@@ -5051,6 +5051,9 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                             account_issues.append(f"metadata fetch missing RFC822.SIZE in {mailbox.name} for UID {uid}")
                             continue
                         parsed = parse_provider_fetch_response(data or [])
+                        if gmail_extensions and not parsed.get("gmail_msgid"):
+                            account_issues.append(f"metadata fetch missing X-GM-MSGID in {mailbox.name} for UID {uid}")
+                            continue
                         identity = (
                             str(parsed.get("gmail_msgid") or f"{mailbox.name}:{uid}")
                             if use_gmail_metadata
