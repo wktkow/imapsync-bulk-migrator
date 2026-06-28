@@ -608,13 +608,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for issue in provider_local_issues:
                     logging.error("[provider-local] %s", issue)
                 return 2
-            if args.mode in {"import", "validate"}:
-                provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config, mode=args.mode)
-                if provider_staged_issues:
-                    logging.error("Provider %s staged data failed local validation:", args.mode)
-                    for issue in provider_staged_issues:
-                        logging.error("[provider-staged] %s", issue)
-                    return 4
         elif _legacy_symlink_component(input_root) is not None:
             logging.error("Input directory is a symlink: %s", input_root)
             return 2
@@ -632,39 +625,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for issue in symlink_issues:
                     logging.error("[staged-local] %s", issue)
                 return 2
-            if not use_da_panel and not use_cpanel:
-                try:
-                    logging.info("Running strict local staged export audit before connectivity...")
-                    ok, staged_audit_issues = audit_export(
-                        input_root,
-                        config,
-                        int(args.max_workers),
-                        check_remote=False,
-                        require_integrity_metadata=True,
-                    )
-                except Exception as exc:
-                    logging.error("Staged export audit failed before connectivity: %s", exc)
-                    return 4
-                if not ok:
-                    logging.error(
-                        "Refusing %s because staged export audit found %d issue(s)",
-                        args.mode,
-                        len(staged_audit_issues),
-                    )
-                    for issue in staged_audit_issues:
-                        logging.error("[staged-audit] %s", issue)
-                    return 4
-                legacy_staged_audit_completed = True
-            pending_journal_issues = _legacy_pending_import_journal_issues(
-                input_root,
-                config,
-                repair_trailing=(args.mode == "import"),
-            )
-            if pending_journal_issues:
-                logging.error("Input directory has unresolved legacy import journal entries:")
-                for issue in pending_journal_issues:
-                    logging.error("[staged-journal] %s", issue)
-                return 4
     if args.mode == "export":
         output_root = Path(args.output_dir)
         if is_provider_config:
@@ -699,13 +659,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.mode == "export":
         free_space_preflight_path = Path(args.output_dir)
     elif args.mode in {"import", "validate", "audit"}:
-        panel_import_will_preflight = (
-            not is_provider_config
-            and args.mode == "import"
-            and (use_da_panel or use_cpanel)
-        )
-        if not panel_import_will_preflight:
-            free_space_preflight_path = Path(args.input_dir)
+        free_space_preflight_path = Path(args.input_dir)
     if free_space_preflight_path is not None:
         try:
             check_free_space_for_path(free_space_preflight_path, min_free_gb)
@@ -713,6 +667,52 @@ def main(argv: Optional[List[str]] = None) -> int:
             logging.error("Free-space check failed before connectivity: %s", exc)
             return 2
         free_space_checked_paths.add(free_space_preflight_path)
+
+    if args.mode in {"import", "validate"}:
+        input_root = Path(args.input_dir)
+        if is_provider_config:
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config, mode=args.mode)
+            if provider_staged_issues:
+                logging.error("Provider %s staged data failed local validation:", args.mode)
+                for issue in provider_staged_issues:
+                    logging.error("[provider-staged] %s", issue)
+                return 4
+        else:
+            assert isinstance(config, Config)
+            if not use_da_panel and not use_cpanel:
+                try:
+                    logging.info("Running strict local staged export audit before connectivity...")
+                    ok, staged_audit_issues = audit_export(
+                        input_root,
+                        config,
+                        int(args.max_workers),
+                        check_remote=False,
+                        require_integrity_metadata=True,
+                    )
+                except Exception as exc:
+                    logging.error("Staged export audit failed before connectivity: %s", exc)
+                    return 4
+                if not ok:
+                    logging.error(
+                        "Refusing %s because staged export audit found %d issue(s)",
+                        args.mode,
+                        len(staged_audit_issues),
+                    )
+                    for issue in staged_audit_issues:
+                        logging.error("[staged-audit] %s", issue)
+                    return 4
+                legacy_staged_audit_completed = True
+            pending_journal_issues = _legacy_pending_import_journal_issues(
+                input_root,
+                config,
+                repair_trailing=(args.mode == "import"),
+            )
+            if pending_journal_issues:
+                logging.error("Input directory has unresolved legacy import journal entries:")
+                for issue in pending_journal_issues:
+                    logging.error("[staged-journal] %s", issue)
+                return 4
 
     try:
         if (
@@ -760,11 +760,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ", ".join(missing_account_dirs),
             )
             return 2
-        try:
-            check_free_space_for_path(staged_root, min_free_gb)
-        except Exception as exc:
-            logging.error("[panel] Free-space check failed before panel changes: %s", exc)
-            return 2
+        if staged_root not in free_space_checked_paths:
+            try:
+                check_free_space_for_path(staged_root, min_free_gb)
+            except Exception as exc:
+                logging.error("[panel] Free-space check failed before panel changes: %s", exc)
+                return 2
+            free_space_checked_paths.add(staged_root)
         if use_da_panel:
             missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
             if missing:

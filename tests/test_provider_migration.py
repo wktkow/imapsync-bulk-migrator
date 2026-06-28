@@ -10100,6 +10100,38 @@ def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path
     assert json.loads(journal.read_text()) == valid
 
 
+def test_main_provider_import_low_disk_does_not_repair_trailing_journal(tmp_path: Path) -> None:
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    config = load_config_file(config_path)
+    assert isinstance(config, ProviderMigrationConfig)
+    root = tmp_path / "provider-root-trailing-low-disk"
+    account_dir = _write_manifest_fixture(root)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    original = '{"canonical_id": '
+    journal.write_text(original)
+
+    def fail_free_space(*_args, **_kwargs) -> None:
+        raise RuntimeError("low disk")
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path", fail_free_space), \
+        mock.patch("components.main.provider_test_accounts", side_effect=AssertionError("connectivity should not run")), \
+        mock.patch("components.main.provider_import_all", side_effect=AssertionError("import should not run")):
+        rc = main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-provider-trailing-low-disk"),
+            "--min-free-gb", "1000",
+            "--max-workers", "1",
+        ])
+
+    assert rc == 2
+    assert journal.read_text() == original
+
+
 def test_main_routes_provider_preflight(tmp_path: Path) -> None:
     from components.main import main
 

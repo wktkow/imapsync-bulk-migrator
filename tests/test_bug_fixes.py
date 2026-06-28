@@ -3116,7 +3116,7 @@ class TestCliAndConfigHardening:
             ])
 
         assert rc == 4
-        assert events == []
+        assert events == ["free-space"]
 
     def test_legacy_import_rejects_pending_journal_before_connectivity_test(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
@@ -3166,7 +3166,7 @@ class TestCliAndConfigHardening:
             ])
 
         assert rc == 4
-        assert events == []
+        assert events == ["free-space"]
 
     def test_legacy_audit_rejects_pending_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
@@ -3288,6 +3288,50 @@ class TestCliAndConfigHardening:
         assert rc == 0
         assert imported == [account.email]
         assert journal.read_text() == ""
+
+    def test_legacy_import_low_disk_does_not_repair_trailing_journal(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        _write_legacy_message_fixture(
+            account_dir / "INBOX",
+            data=b"Message-ID: <trailing-low-disk@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=source,
+        )
+        journal = account_dir / "import.journal.jsonl"
+        original = '{"key": '
+        journal.write_text(original)
+
+        def fail_free_space(*_args, **_kwargs) -> None:
+            raise RuntimeError("low disk")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path", fail_free_space), \
+            mock.patch("components.main.audit_export", side_effect=AssertionError("staged audit should not run")), \
+            mock.patch("components.main.import_account", side_effect=AssertionError("import should not run")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-trailing-low-disk"),
+                "--min-free-gb", "1000",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 2
+        assert journal.read_text() == original
 
     def test_legacy_validate_allows_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.main import main
