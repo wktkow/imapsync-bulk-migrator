@@ -104,6 +104,27 @@ def _write_legacy_message_fixture(
     return eml
 
 
+def _write_legacy_empty_mailbox_fixture(folder: Path, *, mailbox: str = "INBOX", source_server=None) -> None:
+    eml = _write_legacy_message_fixture(
+        folder,
+        mailbox=mailbox,
+        data=b"Message-ID: <placeholder@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+        source_server=source_server,
+    )
+    eml.with_suffix(".json").unlink()
+    eml.unlink()
+    (folder / ".mailbox.json").write_text(json.dumps({"mailbox": mailbox, "message_count": 0}))
+    state_path = folder.parent / "export-state.json"
+    state = json.loads(state_path.read_text())
+    state["mailboxes"] = [
+        entry
+        for entry in state.get("mailboxes", [])
+        if not isinstance(entry, dict) or entry.get("path") != folder.name
+    ]
+    state["mailboxes"].append({"mailbox": mailbox, "path": folder.name, "message_count": 0})
+    state_path.write_text(json.dumps(state))
+
+
 def _write_verify_provider_account_fixture(
     account_dir: Path,
     *,
@@ -10140,6 +10161,56 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("u0000000001.eml: message file is a symlink" in issue for issue in issues)
 
+    def test_remote_audit_rechecks_empty_mailbox_directory_symlink_after_local_audit(self, tmp_path: Path) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_empty_mailbox_fixture(folder, source_server=server)
+        outside = tmp_path / "outside-inbox"
+        swapped = False
+
+        class FakeRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[FakeRemote]:
+            nonlocal swapped
+            (folder / ".mailbox.json").unlink()
+            folder.rmdir()
+            outside.mkdir()
+            try:
+                folder.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlink creation unavailable: {exc}")
+            swapped = True
+            yield FakeRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            ok, issues = audit_export(
+                tmp_path,
+                Config(server, [Account("user@example.com", "secret")], source_server=server),
+                1,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert swapped
+        assert folder.is_symlink()
+        assert not ok
+        assert any("INBOX: mailbox path is a symlink" in issue for issue in issues)
+
     def test_validate_rejects_message_symlink_swapped_after_audit_before_remote_check(self, tmp_path: Path) -> None:
         from components.audit import audit_export as real_audit_export
         from components.main import main
@@ -10203,6 +10274,67 @@ class TestRound7ConfirmedBugs:
 
         assert calls == 2
         assert eml.is_symlink()
+        assert rc == 4
+
+    def test_validate_rejects_empty_mailbox_symlink_swapped_after_audit_before_remote_check(self, tmp_path: Path) -> None:
+        from components.audit import audit_export as real_audit_export
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        folder = input_root / "user@example.com" / "INBOX"
+        source_server = {
+            "host": "source.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        target_server = {
+            "host": "target.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        _write_legacy_empty_mailbox_fixture(folder, source_server=ServerConfig(**source_server))
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": source_server,
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        outside = tmp_path / "outside-inbox"
+        calls = 0
+
+        def audit_then_swap(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = real_audit_export(*args, **kwargs)
+            if calls == 2:
+                (folder / ".mailbox.json").unlink()
+                folder.rmdir()
+                outside.mkdir()
+                try:
+                    folder.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+            return result
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=audit_then_swap), \
+            mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("remote validate should not run")):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert calls == 2
+        assert folder.is_symlink()
         assert rc == 4
 
     def test_remote_audit_rejects_symlinked_mailbox_marker_without_following_or_connecting(self, tmp_path: Path) -> None:

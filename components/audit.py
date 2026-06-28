@@ -450,6 +450,14 @@ def audit_account(
                 identity_candidates: List[Tuple[Path, str, str]] = []
                 for folder_dir in folder_dirs:
                     folder = folder_dir.name
+                    if folder_dir.is_symlink():
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: mailbox path is a symlink")
+                        continue
+                    if not folder_dir.is_dir():
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: mailbox path is not a directory")
+                        continue
                     local_mailbox = _folder_mailbox_name(folder_dir)
                     local_count = len(list(folder_dir.glob("*.eml")))
                     remote_count = remote_counts.get(folder, -1)

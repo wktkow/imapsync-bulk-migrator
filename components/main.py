@@ -1230,7 +1230,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
                         return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
 
-                    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+                    folder_dirs: List[Path] = []
+                    for child in account_dir.iterdir():
+                        if child.is_symlink():
+                            with mismatches_lock:
+                                validation_errors.append((email, f"{child.name}: mailbox path is a symlink"))
+                            return
+                        if child.is_dir():
+                            folder_dirs.append(child)
                     if not folder_dirs:
                         with mismatches_lock:
                             validation_errors.append((email, "no mailbox folders found"))
