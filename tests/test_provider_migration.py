@@ -7550,6 +7550,67 @@ def test_provider_offline_validation_defers_generic_special_use_target_mailbox(t
     assert not any("wrong target mailbox" in issue for issue in cli_issues)
 
 
+@pytest.mark.parametrize("status", ["committed", "pending"])
+def test_provider_offline_validation_defers_icloud_special_use_target_mailbox(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    from components.main import _provider_cli_staged_validation_issues
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Sent"
+    row["gmail_labels"] = ["\\Sent"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target=account.target_email)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Sent Messages",
+        "status": status,
+    })) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(
+        config,
+        account,
+        tmp_path,
+        check_target=False,
+        allow_unresolved_pending=status == "pending",
+    )
+    cli_issues = _provider_cli_staged_validation_issues(tmp_path, config, mode="import")
+
+    assert not any("wrong target mailbox" in issue for issue in audit_issues)
+    assert not any("wrong target mailbox" in issue for issue in report["failed"])
+    assert not any("wrong target mailbox" in issue for issue in cli_issues)
+
+
+def test_provider_offline_validation_rejects_icloud_custom_target_mismatch(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Projects"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target=account.target_email)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Other Projects",
+        "status": "committed",
+    })) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert any("wrong target mailbox" in issue for issue in audit_issues)
+    assert any("wrong target mailbox" in issue for issue in report["failed"])
+
+
 def test_provider_offline_validation_defers_localized_gmail_special_use_target_mailbox(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(

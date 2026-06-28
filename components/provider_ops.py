@@ -1896,8 +1896,27 @@ _GENERIC_IMAP_OFFLINE_SPECIAL_USE_TARGETS = {
     "sent",
 }
 
+_GENERIC_IMAP_OFFLINE_TARGET_SYSTEM_KEYS = {
+    "all mail": "archive",
+    "archive": "archive",
+    "deleted messages": "trash",
+    "trash": "trash",
+    "bin": "trash",
+    "drafts": "drafts",
+    "inbox": "inbox",
+    "junk": "junk",
+    "spam": "junk",
+    "sent": "sent",
+    "sent mail": "sent",
+    "sent messages": "sent",
+}
+
 
 def _generic_imap_offline_target_requires_live_special_use(target_mailbox: str, expected_target: str) -> bool:
+    expected_key = _GENERIC_IMAP_OFFLINE_TARGET_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
+    target_key = _GENERIC_IMAP_OFFLINE_TARGET_SYSTEM_KEYS.get(target_mailbox.strip().lower(), "")
+    if target_key:
+        return target_key == expected_key and target_mailbox != expected_target
     return bool(
         target_mailbox
         and target_mailbox != expected_target
@@ -1936,7 +1955,7 @@ def committed_journal_target_mailbox_issues(
         ):
             if (
                 defer_generic_special_use
-                and provider == "imap"
+                and provider in {"imap", "icloud"}
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
@@ -1980,7 +1999,7 @@ def pending_journal_target_mailbox_issues(
         ):
             if (
                 defer_generic_special_use
-                and provider == "imap"
+                and provider in {"imap", "icloud"}
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
