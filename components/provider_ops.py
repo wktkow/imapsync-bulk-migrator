@@ -3667,8 +3667,6 @@ def require_merge_group_journals_remote_complete(
     target_provider: str,
     expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
 ) -> None:
-    used_by_mailbox: Dict[str, set[bytes]] = {}
-    used_gmail_msgids: set[str] = set()
     for group_account, _account_dir, manifest_rows, journal_rows in stages:
         committed_keys = set(latest_committed_journal_rows(journal_rows))
         for row in journal_rows:
@@ -3692,7 +3690,9 @@ def require_merge_group_journals_remote_complete(
             if manifest_row is None:
                 continue
             expected_content_identities = expected_content_identities_by_id.get(identity)
+            row_used_by_mailbox: Dict[str, set[bytes]] = {}
             if target_provider == "gmail":
+                row_used_gmail_msgids: set[str] = set()
                 target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
                 matching_mailboxes = gmail_expected_target_mailboxes_for_row(
                     manifest_row,
@@ -3703,9 +3703,9 @@ def require_merge_group_journals_remote_complete(
                     imap,
                     matching_mailboxes,
                     manifest_row,
-                    used_by_mailbox,
+                    row_used_by_mailbox,
                     target_gmail_msgid=target_gmail_msgid,
-                    used_gmail_msgids=used_gmail_msgids,
+                    used_gmail_msgids=row_used_gmail_msgids,
                     expected_content_identities=expected_content_identities,
                 )
                 if matched is not None:
@@ -3721,7 +3721,7 @@ def require_merge_group_journals_remote_complete(
                     imap,
                     target_mailbox,
                     manifest_row,
-                    used_by_mailbox,
+                    row_used_by_mailbox,
                     create_if_missing=False,
                     expected_content_identities=expected_content_identities,
                 )

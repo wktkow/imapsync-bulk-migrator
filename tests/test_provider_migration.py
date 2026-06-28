@@ -3281,8 +3281,54 @@ class FakeGmailTargetImap(FakeTargetImap):
             b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
         ]
 
+    def _visible_existing_mailboxes(self) -> set[str]:
+        visible = {self.existing_mailbox}
+        for label in self.gmail_labels:
+            label_key = str(label).casefold()
+            if label_key in {"\\inbox", "inbox"}:
+                visible.add("INBOX")
+            elif label_key in {"\\sent", "sent", "[gmail]/sent mail"}:
+                visible.add("[Gmail]/Sent Mail")
+            elif not str(label).startswith("\\"):
+                visible.add(str(label))
+        return visible
+
+    def _message_count(self, mailbox: str) -> int:
+        base = super()._message_count(mailbox)
+        if self.has_existing and mailbox in self._visible_existing_mailboxes():
+            return max(base, 1)
+        return base
+
+    def search(self, charset: Optional[str], *criteria):
+        if (
+            len(criteria) == 3
+            and criteria[0] == "HEADER"
+            and criteria[1] == "Message-ID"
+            and str(criteria[2]) == self.existing_message_id
+            and self.has_existing
+            and self.selected_mailbox in self._visible_existing_mailboxes()
+        ):
+            self.search_queries.append(criteria)
+            return "OK", [b"99"]
+        return super().search(charset, *criteria)
+
     def store(self, num: bytes, command: str, labels: str):
         self.stored_labels.append((num, command, labels))
+        tokens = [
+            quoted or atom
+            for quoted, atom in re.findall(r'"([^"]*)"|(\\\S+|[^()\s]+)', labels.strip("()"))
+            if quoted or atom
+        ]
+        if command == "+X-GM-LABELS":
+            for label in tokens:
+                if label not in self.gmail_labels:
+                    self.gmail_labels.append(label)
+        elif command == "+FLAGS":
+            current = [flag for flag in self.gmail_flags.split() if flag]
+            for flag in tokens:
+                if flag not in current:
+                    current.append(flag)
+            self.gmail_flags = " ".join(current)
         return "OK", [b""]
 
     def fetch(self, num: bytes, query: str):
@@ -4179,8 +4225,10 @@ def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_pat
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, second, tmp_path)
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
 
     assert fake.appended == []
+    assert report["ok"]
     second_journal = (second_dir / "import-merged@example.com.journal.jsonl").read_text()
     assert '"action": "existing"' in second_journal
 
@@ -4450,8 +4498,10 @@ def test_provider_import_many_to_one_gmail_dedupes_cross_label_existing_message(
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, second, tmp_path)
+        _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
 
     assert fake.appended == []
+    assert report["ok"]
     assert any(command == "+X-GM-LABELS" and "\\Inbox" in labels for _num, command, labels in fake.stored_labels)
     second_journal = (second_dir / "import-merged@gmail.com.journal.jsonl").read_text()
     assert '"target_mailbox": "INBOX"' in second_journal
