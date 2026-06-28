@@ -2967,6 +2967,85 @@ class FakeGenericInboxAndAllSourceImap:
         return "OK", []
 
 
+class FakeGenericAllDuplicateMessagesSourceImap:
+    def __init__(self) -> None:
+        self.selected = ""
+        self.fetch_queries_by_mailbox: dict[str, List[str]] = {}
+        self.body = b"Message-ID: <identical@example.com>\r\n\r\nsame"
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren \\All) "/" "All Mail"']
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r"\"", '"')
+        return "OK", [b"2"]
+
+    def response(self, name: str):
+        return "OK", [b"777"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1 2"]
+        if command == "fetch":
+            query = str(args[-1])
+            self.fetch_queries_by_mailbox.setdefault(self.selected, []).append(query)
+            uid = str(args[0])
+            meta = (
+                f'{uid} (UID {uid} RFC822.SIZE {len(self.body)} FLAGS (\\Seen) '
+                'INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            ).encode("ascii")
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + f" BODY[] {{{len(self.body)}}}".encode("ascii"), self.body)]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
+class FakeGenericAllBeforeProjectSourceImap:
+    def __init__(self, *, all_uidvalidity: str = "111") -> None:
+        self.selected = ""
+        self.all_uidvalidity = all_uidvalidity
+        self.body = b"Message-ID: <all-project-overlap@example.com>\r\n\r\noverlap"
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren \\All) "/" "All Mail"',
+            b'(\\HasNoChildren) "/" "Projects"',
+        ]
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r"\"", '"')
+        return "OK", [b"1"]
+
+    def response(self, name: str):
+        return "OK", [self.all_uidvalidity.encode("ascii") if self.selected == "All Mail" else b"222"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = str(args[-1])
+            meta = (
+                b'1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) '
+                b'INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            ) % len(self.body)
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + f" BODY[] {{{len(self.body)}}}".encode("ascii"), self.body)]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
 @contextlib.contextmanager
 def _fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
     yield FakeSourceImap()
@@ -3692,6 +3771,80 @@ def test_provider_export_scans_generic_all_view_when_it_is_only_source_mailbox(t
     assert manifest[0]["primary_mailbox"] == "Archive"
     assert manifest[0]["source_mailboxes"] == ["Archive"]
     assert source.fetch_queries
+
+
+def test_provider_export_keeps_identical_generic_all_only_messages_distinct(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    source = FakeGenericAllDuplicateMessagesSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericAllDuplicateMessagesSourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 2
+    assert {row["uid_by_mailbox"]["All Mail"] for row in manifest} == {1, 2}
+    assert len({row["canonical_id"] for row in manifest}) == 2
+    assert all(row["source_mailboxes"] == ["All Mail"] for row in manifest)
+
+
+def test_provider_export_resume_checks_stripped_generic_all_uidvalidity(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def first_connection(*_args, **_kwargs) -> Iterator[FakeGenericAllBeforeProjectSourceImap]:
+        yield FakeGenericAllBeforeProjectSourceImap(all_uidvalidity="111")
+
+    @contextlib.contextmanager
+    def changed_all_connection(*_args, **_kwargs) -> Iterator[FakeGenericAllBeforeProjectSourceImap]:
+        yield FakeGenericAllBeforeProjectSourceImap(all_uidvalidity="999")
+
+    with mock.patch("components.provider_ops.imap_connection", first_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert len(manifest) == 1
+    assert manifest[0]["source_mailboxes"] == ["Projects"]
+    assert "All Mail" not in manifest[0]["uidvalidity_by_mailbox"]
+    assert state["scanned_uidvalidity_by_mailbox"]["All Mail"] == "111"
+
+    with mock.patch("components.provider_ops.imap_connection", changed_all_connection):
+        with pytest.raises(RuntimeError, match="UIDVALIDITY changed since previous export for All Mail"):
+            provider_export_account(config, account, tmp_path)
 
 
 def test_provider_export_scans_generic_all_when_only_flagged_view_is_alternative(tmp_path: Path) -> None:
@@ -10795,6 +10948,38 @@ def test_provider_preflight_dedupes_generic_all_overlap_for_capacity(tmp_path: P
         "BODY.PEEK[]" in query
         for queries in source.fetch_queries_by_mailbox.values()
         for query in queries
+    )
+
+
+def test_provider_preflight_counts_identical_generic_all_only_occurrences(tmp_path: Path) -> None:
+    source = FakeGenericAllDuplicateMessagesSourceImap()
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=len(source.body),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield source if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any(
+        f"estimated source bytes {len(source.body) * 2} exceed target.available_bytes {len(source.body)}" in issue
+        for issue in issues
     )
 
 

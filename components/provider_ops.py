@@ -605,6 +605,15 @@ def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: L
     return False
 
 
+def _source_mailbox_scan_order(provider_key: str, mailboxes: List[MailboxInfo]) -> List[MailboxInfo]:
+    indexed = list(enumerate(mailboxes))
+    indexed.sort(key=lambda item: (
+        1 if _is_non_gmail_all_mailbox(provider_key, item[1]) else 0,
+        item[0],
+    ))
+    return [mailbox for _idx, mailbox in indexed]
+
+
 def is_virtual_target_mailbox(provider: str, mailbox: MailboxInfo) -> bool:
     return provider.lower() == "icloud" and mailbox.name.lower() == "vip"
 
@@ -2615,8 +2624,8 @@ def provider_export_account(
     active_identities: set[str] = set()
     previous_rows_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
-    ordinary_identity_by_content: Dict[Tuple[int, str], str] = {}
-    aggregate_all_identity_by_content: Dict[Tuple[int, str], str] = {}
+    ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
+    scanned_uidvalidity_by_mailbox: Dict[str, str] = {}
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
         require_unique_manifest_identities(existing_rows)
@@ -2658,6 +2667,11 @@ def provider_export_account(
             for mailbox_name, value in uidvalidities.items():
                 if value:
                     previous_uidvalidities_by_mailbox.setdefault(str(mailbox_name), set()).add(str(value))
+        state_uidvalidities = existing_state.get("scanned_uidvalidity_by_mailbox")
+        if isinstance(state_uidvalidities, dict):
+            for mailbox_name, value in state_uidvalidities.items():
+                if value:
+                    previous_uidvalidities_by_mailbox.setdefault(str(mailbox_name), set()).add(str(value))
         if isinstance(existing_state, dict) and existing_state.get("complete") is True:
             state_issues = provider_export_state_issues(
                 account_dir,
@@ -2696,35 +2710,6 @@ def provider_export_account(
     if not preserve_complete_state_until_ready:
         write_in_progress_state()
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
-
-    def remove_non_gmail_all_membership(record: Dict[str, Any]) -> None:
-        attrs_by_mailbox = record.get("source_mailbox_attributes")
-        if not isinstance(attrs_by_mailbox, dict):
-            return
-        all_mailboxes = [
-            str(mailbox_name)
-            for mailbox_name, attrs in attrs_by_mailbox.items()
-            if isinstance(attrs, list) and any(str(attr).lower() == "\\all" for attr in attrs)
-        ]
-        if not all_mailboxes:
-            return
-        all_mailbox_set = set(all_mailboxes)
-        source_mailboxes = record.get("source_mailboxes")
-        if isinstance(source_mailboxes, list):
-            record["source_mailboxes"] = [
-                value for value in source_mailboxes if str(value) not in all_mailbox_set
-            ]
-        for field in (
-            "source_mailbox_attributes",
-            "source_mailbox_delimiters",
-            "source_mailbox_paths",
-            "uid_by_mailbox",
-            "uidvalidity_by_mailbox",
-        ):
-            value = record.get(field)
-            if isinstance(value, dict):
-                for mailbox_name in all_mailboxes:
-                    value.pop(mailbox_name, None)
 
     def update_membership(identity: str, mailbox: MailboxInfo, uid: int, uidvalidity: str, parsed: Dict[str, Any]) -> None:
         record = messages[identity]
@@ -2776,7 +2761,8 @@ def provider_export_account(
                 raise RuntimeError(f"Gmail source is not export-ready for {account.source_email}: {'; '.join(gmail_issues)}")
         if preserve_complete_state_until_ready:
             write_in_progress_state()
-        for mailbox in mailboxes:
+        provider_key = config.source.provider.lower()
+        for mailbox in _source_mailbox_scan_order(provider_key, mailboxes):
             if is_noselect(mailbox):
                 logging.info("[provider-export] %s: skipping non-selectable mailbox %s", account.source_email, mailbox.name)
                 continue
@@ -2785,6 +2771,8 @@ def provider_export_account(
                 continue
             _raise_if_stopped(stop_event, f"provider export {account.source_email}")
             uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox.name)
+            if uidvalidity:
+                scanned_uidvalidity_by_mailbox[mailbox.name] = uidvalidity
             previous_uidvalidities = previous_uidvalidities_by_mailbox.get(mailbox.name, set())
             if previous_uidvalidities and uidvalidity and uidvalidity not in previous_uidvalidities:
                 raise RuntimeError(
@@ -2872,19 +2860,13 @@ def provider_export_account(
                 )
                 size = int(parsed.get("rfc822_size") or len(msg_bytes))
                 content_identity = (size, sha256)
-                provider_key = config.source.provider.lower()
                 non_gmail_all_source = _is_non_gmail_all_mailbox(provider_key, mailbox)
                 non_gmail_flagged_source = _is_non_gmail_flagged_mailbox(provider_key, mailbox)
                 if non_gmail_all_source:
-                    ordinary_identity = ordinary_identity_by_content.get(content_identity)
-                    if ordinary_identity and ordinary_identity in messages:
+                    remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
+                    if remaining_ordinary > 0:
+                        ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - 1
                         continue
-                    identity = aggregate_all_identity_by_content.get(content_identity, identity)
-                elif provider_key != "gmail" and not non_gmail_flagged_source:
-                    aggregate_identity = aggregate_all_identity_by_content.get(content_identity)
-                    if aggregate_identity and content_identity not in ordinary_identity_by_content and aggregate_identity in messages:
-                        identity = aggregate_identity
-                        remove_non_gmail_all_membership(messages[identity])
                 safe_id = _safe_identity(identity)
                 if identity not in messages:
                     eml_rel = f"messages/{safe_id}.eml"
@@ -2956,11 +2938,10 @@ def provider_export_account(
                 update_membership(identity, mailbox, uid, uidvalidity, parsed)
                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
                 previous_rows_by_identity[identity] = dict(record)
-                if provider_key != "gmail":
-                    if non_gmail_all_source:
-                        aggregate_all_identity_by_content.setdefault(content_identity, identity)
-                    elif not non_gmail_flagged_source:
-                        ordinary_identity_by_content.setdefault(content_identity, identity)
+                if provider_key != "gmail" and not non_gmail_all_source and not non_gmail_flagged_source:
+                    ordinary_content_remaining_for_all[content_identity] = (
+                        ordinary_content_remaining_for_all.get(content_identity, 0) + 1
+                    )
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")
@@ -3001,6 +2982,7 @@ def provider_export_account(
             "complete": True,
             "canonical_messages": len(final_manifest_rows),
             "manifest_sha256": provider_manifest_digest(final_manifest_rows),
+            "scanned_uidvalidity_by_mailbox": scanned_uidvalidity_by_mailbox,
             "completed_at": _utc_now(),
         },
     )
@@ -5752,18 +5734,17 @@ def provider_preflight(
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
                     account_issues.extend(gmail_account_decommission_issues(config.source, acc))
-                retained_source_mailboxes = [
+                provider_key = config.source.provider.lower()
+                retained_source_mailboxes = _source_mailbox_scan_order(provider_key, [
                     mailbox
                     for mailbox in source_mailboxes
                     if not should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes)
-                ]
-                provider_key = config.source.provider.lower()
+                ])
                 fetch_body_for_identity = (
                     provider_key != "gmail"
                     and any(_is_non_gmail_all_mailbox(provider_key, mailbox) for mailbox in retained_source_mailboxes)
                 )
-                ordinary_content_identities: set[Tuple[int, str]] = set()
-                aggregate_all_content_identities: set[Tuple[int, str]] = set()
+                ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
                 for mailbox in retained_source_mailboxes:
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     try:
@@ -5808,22 +5789,16 @@ def provider_preflight(
                             non_gmail_all_source = _is_non_gmail_all_mailbox(provider_key, mailbox)
                             non_gmail_flagged_source = _is_non_gmail_flagged_mailbox(provider_key, mailbox)
                             if non_gmail_all_source:
-                                if (
-                                    content_identity in ordinary_content_identities
-                                    or content_identity in aggregate_all_content_identities
-                                ):
+                                remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
+                                if remaining_ordinary > 0:
+                                    ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - 1
                                     continue
-                                aggregate_all_content_identities.add(content_identity)
                                 source_total += size
                                 continue
                             if not non_gmail_flagged_source:
-                                if (
-                                    content_identity in aggregate_all_content_identities
-                                    and content_identity not in ordinary_content_identities
-                                ):
-                                    ordinary_content_identities.add(content_identity)
-                                    continue
-                                ordinary_content_identities.add(content_identity)
+                                ordinary_content_remaining_for_all[content_identity] = (
+                                    ordinary_content_remaining_for_all.get(content_identity, 0) + 1
+                                )
                             else:
                                 identity = f"{mailbox.name}:{uid}"
                                 if identity in seen_identity:
