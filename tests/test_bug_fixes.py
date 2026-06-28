@@ -584,6 +584,50 @@ class TestBug2NoDoubleSelect:
 class TestLegacyExportCompleteness:
     """A searched UID must not disappear silently when FETCH lacks a message literal."""
 
+    def test_export_rejects_multiple_fetch_message_bodies_for_one_uid(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        first = b"Message-ID: <one@example.com>\r\nFrom: a\r\nTo: b\r\n\r\none"
+        second = b"Message-ID: <two@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ntwo"
+
+        class MultiBodyFetchImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [
+                        (b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")', first),
+                        (b'2 (UID 2 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")', second),
+                    ]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[MultiBodyFetchImap]:
+            yield MultiBodyFetchImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="multiple message bodies"):
+                export_account(account, server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        state_path = account_dir / "export-state.json"
+        if state_path.exists():
+            assert json.loads(state_path.read_text())["complete"] is False
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        assert not eml.exists() or eml.read_bytes() != first + second
+
     def test_export_raises_when_fetch_has_no_message_bytes(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig

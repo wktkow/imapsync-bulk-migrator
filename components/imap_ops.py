@@ -477,8 +477,10 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
             m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str)
             if m_int:
                 internaldate = m_int.group(1)
+    if len(joinable) > 1:
+        raise RuntimeError("fetch returned multiple message bodies for one UID")
     if joinable:
-        msg_bytes = b"".join(joinable)
+        msg_bytes = joinable[0]
     return msg_bytes, flags, internaldate
 
 
