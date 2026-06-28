@@ -5063,7 +5063,7 @@ def _provider_account_worker_results(
         if _stop_requested(stop_event):
             for fut in futures:
                 fut.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         else:
             executor.shutdown(wait=True)
 

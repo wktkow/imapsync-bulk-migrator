@@ -25,6 +25,7 @@ from components.models import (
 from components.provider_ops import (
     MailboxInfo,
     _atomic_json,
+    _provider_account_worker_results,
     _prune_provider_artifact_orphans,
     _safe_identity,
     build_xoauth2_payload,
@@ -10408,6 +10409,29 @@ def test_provider_test_accounts_stop_event_aborts_before_target_role(tmp_path: P
             provider_test_accounts(config, max_workers=1, roles=("source", "target"), stop_event=stop_event)
 
     assert target_connections == 0
+
+
+def test_provider_account_worker_results_stop_waits_for_running_worker() -> None:
+    account = MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")
+    stop_event = threading.Event()
+    worker_finished = threading.Event()
+
+    def worker(_account: MigrationAccount) -> str:
+        stop_event.set()
+        stop_event.wait(0.05)
+        worker_finished.set()
+        return "done"
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        _provider_account_worker_results(
+            "provider-test",
+            [account],
+            1,
+            worker,
+            stop_event,
+        )
+
+    assert worker_finished.is_set()
 
 
 def test_provider_preflight_reports_metadata_fetch_failures(tmp_path: Path) -> None:

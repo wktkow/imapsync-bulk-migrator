@@ -354,7 +354,7 @@ def test_accounts(
         if stop_requested():
             for fut in futures:
                 fut.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
         else:
             executor.shutdown(wait=True)
 

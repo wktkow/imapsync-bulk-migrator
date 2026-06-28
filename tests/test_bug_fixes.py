@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 from unittest import mock
@@ -11658,6 +11659,31 @@ class TestRound7ConfirmedBugs:
 
         assert imap_probes == ["a@example.com"]
         assert imapsync_probes == []
+
+    def test_legacy_test_accounts_stop_waits_for_running_probe_to_finish(self) -> None:
+        from components.main import test_accounts
+        from components.models import Account, Config, ServerConfig
+
+        stop_event = threading.Event()
+        worker_finished = threading.Event()
+        config = Config(
+            ServerConfig("imap.example.com"),
+            [Account("a@example.com", "secret-a")],
+        )
+
+        @contextlib.contextmanager
+        def fake_connection(_server, _account):
+            stop_event.set()
+            time.sleep(0.05)
+            worker_finished.set()
+            yield object()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection), \
+            mock.patch("components.main.run_imapsync_justconnect", side_effect=AssertionError("imapsync should not run after stop")):
+            with pytest.raises(RuntimeError, match="stop requested"):
+                test_accounts(config, max_workers=1, stop_event=stop_event)
+
+        assert worker_finished.is_set()
 
     def test_main_returns_130_when_signal_arrives_during_provider_preflight_success(self, tmp_path: Path) -> None:
         from components.main import main
