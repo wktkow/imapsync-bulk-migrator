@@ -6,6 +6,7 @@ including attachments, message integrity, and folder structure.
 
 import json
 import hashlib
+import errno
 import os
 import stat
 import sys
@@ -32,6 +33,9 @@ from components.provider_ops import (
 from components.utils import sanitize_for_path, sanitized_path_key
 
 
+_HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
+
+
 def _symlink_component(path):
     path = Path(path)
     if not path.is_absolute():
@@ -54,6 +58,99 @@ def _symlink_component(path):
         if current.is_symlink():
             return current
     return None
+
+
+def _normalized_absolute_path(path):
+    path = Path(path)
+    if not path.is_absolute():
+        cwd = Path.cwd()
+        pwd = Path(os.environ.get("PWD", ""))
+        if pwd.is_absolute():
+            try:
+                path = pwd / path if pwd.resolve() == cwd.resolve() else cwd / path
+            except OSError:
+                path = cwd / path
+        else:
+            path = cwd / path
+    parts = []
+    for part in path.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return Path(path.anchor).joinpath(*parts)
+
+
+def _artifact_dir_open_flags():
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _artifact_parent_matches_fd(parent_path, parent_fd):
+    try:
+        current = os.stat(parent_path, follow_symlinks=False)
+    except OSError:
+        return False
+    pinned = os.fstat(parent_fd)
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and current.st_dev == pinned.st_dev
+        and current.st_ino == pinned.st_ino
+    )
+
+
+def _raise_if_artifact_parent_replaced(parent_path, parent_fd, label):
+    if not _artifact_parent_matches_fd(parent_path, parent_fd):
+        raise RuntimeError(f"replaced {label} directory: {parent_path}")
+
+
+def _open_artifact_parent_dir(path, label):
+    if not _HAS_DESCRIPTOR_RELATIVE_OPEN:
+        raise RuntimeError("platform does not support descriptor-relative export verification")
+    original_path = Path(path)
+    absolute = _normalized_absolute_path(original_path)
+    name = absolute.name
+    if not name or name in {".", ".."}:
+        raise RuntimeError(f"invalid {label} path: {original_path}")
+    parent_path = absolute.parent
+    flags = _artifact_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:-1]:
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                symlink_component = _symlink_component(original_path)
+                if symlink_component is not None or exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"{label} path contains a symlink: {symlink_component or current / part}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    raise RuntimeError(f"{label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"{label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+            current = current / part
+        _raise_if_artifact_parent_replaced(parent_path, fd, label)
+        return fd, name, parent_path
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _empty_error_stats(account_name):
@@ -150,17 +247,19 @@ def _read_artifact_no_links(path, label):
     symlink_component = _symlink_component(path)
     if symlink_component is not None:
         raise RuntimeError(f"{label} path contains a symlink: {symlink_component}")
+    parent_fd, name, parent_path = _open_artifact_parent_dir(path, label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     try:
-        fd = os.open(path, flags)
+        fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError as exc:
+        os.close(parent_fd)
         symlink_component = _symlink_component(path)
-        if symlink_component is not None:
-            raise RuntimeError(f"{label} path contains a symlink: {symlink_component}") from exc
+        if symlink_component is not None or exc.errno in {errno.ELOOP, errno.EMLINK}:
+            raise RuntimeError(f"{label} path contains a symlink: {symlink_component or path}") from exc
         raise
     try:
         stat_result = os.fstat(fd)
@@ -168,11 +267,18 @@ def _read_artifact_no_links(path, label):
             raise RuntimeError(f"{label} is not a regular file")
         if getattr(stat_result, "st_nlink", 1) > 1:
             raise RuntimeError(f"{label} is hard-linked")
+        _raise_if_artifact_parent_replaced(parent_path, parent_fd, label)
     except Exception:
         os.close(fd)
+        os.close(parent_fd)
         raise
-    with os.fdopen(fd, "rb") as f:
-        return f.read()
+    try:
+        with os.fdopen(fd, "rb") as f:
+            data = f.read()
+        _raise_if_artifact_parent_replaced(parent_path, parent_fd, label)
+        return data
+    finally:
+        os.close(parent_fd)
 
 
 def analyze_message(

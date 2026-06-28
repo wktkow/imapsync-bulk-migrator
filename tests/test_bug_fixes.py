@@ -10062,6 +10062,41 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_verify_export_rejects_parent_swap_during_artifact_open(self, tmp_path: Path) -> None:
+        import verify_export
+        from verify_export import _read_artifact_no_links
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        folder.mkdir(parents=True)
+        message = folder / "u0000000001.eml"
+        message.write_bytes(b"original")
+        outside = tmp_path / "outside-inbox"
+        outside.mkdir()
+        (outside / message.name).write_bytes(b"outside")
+        checked_folder = tmp_path / "checked-inbox"
+        real_open = verify_export.os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == message.name and dir_fd is not None and not swapped:
+                folder.rename(checked_folder)
+                try:
+                    folder.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch("verify_export.os.open", racing_open):
+            with pytest.raises(RuntimeError, match="replaced message file directory"):
+                _read_artifact_no_links(message, "message file")
+
+        assert swapped
+        assert folder.is_symlink()
+        assert (outside / message.name).read_bytes() == b"outside"
+        assert (checked_folder / message.name).read_bytes() == b"original"
+
     def test_direct_import_rejects_append_time_hard_link_swap(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
