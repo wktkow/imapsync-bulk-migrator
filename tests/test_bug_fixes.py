@@ -11384,6 +11384,44 @@ class TestRound7ConfirmedBugs:
 
         assert rc == 130
 
+    def test_main_registers_signal_before_legacy_staged_audit(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        _write_legacy_message_fixture(input_root / "a@example.com" / "INBOX")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        handlers = {}
+
+        def fake_signal(signum, handler):
+            handlers[signum] = handler
+
+        def fake_audit(*_args, **_kwargs):
+            assert signal.SIGTERM in handlers
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return True, []
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.signal.signal", fake_signal), \
+            mock.patch("components.main.audit_export", side_effect=fake_audit), \
+            mock.patch("components.main._legacy_pending_import_journal_issues", side_effect=AssertionError("pending journal check should not run after stop")), \
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run after stop")):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 130
+
     def test_main_returns_130_when_signal_arrives_during_legacy_test_connectivity(self, tmp_path: Path) -> None:
         from components.main import main
 

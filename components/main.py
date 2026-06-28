@@ -553,6 +553,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
     legacy_staged_audit_completed = False
     free_space_checked_paths: Set[Path] = set()
+    stop_event = threading.Event()
+
+    def handle_sig(signum, _frame):
+        logging.warning("Received signal %s, requesting stop...", signum)
+        stop_event.set()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, handle_sig)
+        signal.signal(signal.SIGTERM, handle_sig)
+
+    def stop_requested_result(label: str) -> Optional[int]:
+        if not stop_event.is_set():
+            return None
+        logging.warning("%s: stop requested before completion", label)
+        return 130
+
     if (
         not is_provider_config
         and args.mode != "import"
@@ -692,8 +708,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         require_integrity_metadata=True,
                     )
                 except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Staged export audit stopped: %s", exc)
+                        return 130
                     logging.error("Staged export audit failed before connectivity: %s", exc)
                     return 4
+                stop_rc = stop_requested_result("staged export audit")
+                if stop_rc is not None:
+                    return stop_rc
                 if not ok:
                     logging.error(
                         "Refusing %s because staged export audit found %d issue(s)",
@@ -734,21 +756,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     cpanel_password: Optional[str] = None
     cpanel_token: Optional[str] = None
     panel_reset_failed_accounts: set[str] = set()
-    stop_event = threading.Event()
-
-    def handle_sig(signum, _frame):
-        logging.warning("Received signal %s, requesting stop...", signum)
-        stop_event.set()
-
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGINT, handle_sig)
-        signal.signal(signal.SIGTERM, handle_sig)
-
-    def stop_requested_result(label: str) -> Optional[int]:
-        if not stop_event.is_set():
-            return None
-        logging.warning("%s: stop requested before completion", label)
-        return 130
 
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
