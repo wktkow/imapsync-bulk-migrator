@@ -1350,6 +1350,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     check_remote=not bool(getattr(args, "audit_offline", False)),
                     require_integrity_metadata=True,
                 )
+                journal_issues = _legacy_pending_import_journal_issues(in_root, config, repair_trailing=False)
+                if journal_issues:
+                    audit_issues.extend(journal_issues)
+                    ok = False
                 if ok:
                     logging.info("Audit passed: exported data looks consistent for all accounts")
                     return 0

@@ -3065,6 +3065,86 @@ class TestCliAndConfigHardening:
         assert rc == 4
         assert events == []
 
+    def test_legacy_audit_rejects_pending_import_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        data = b"Message-ID: <pending-audit@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(account_dir / "INBOX", data=data, source_server=source)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": _legacy_import_key(account_dir, eml, "INBOX", data),
+            "target": _legacy_import_target_id(target, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "pending",
+        }) + "\n")
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.audit.imap_connection", side_effect=AssertionError("remote audit should not run")):
+            rc = main([
+                "--mode", "audit",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-pending-audit"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--audit-offline",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_audit_rejects_malformed_import_journal(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        source = ServerConfig(host="source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        input_dir = tmp_path / "exported"
+        account_dir = input_dir / account.email
+        _write_legacy_message_fixture(
+            account_dir / "INBOX",
+            data=b"Message-ID: <malformed-audit@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=source,
+        )
+        journal = account_dir / "import.journal.jsonl"
+        original = '{"key": '
+        journal.write_text(original)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"):
+            rc = main([
+                "--mode", "audit",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs-malformed-audit"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--audit-offline",
+            ])
+
+        assert rc == 4
+        assert journal.read_text() == original
+
     def test_legacy_import_allows_trailing_journal_repair_before_import(self, tmp_path: Path) -> None:
         from components.main import main
         from components.models import Account, ServerConfig
