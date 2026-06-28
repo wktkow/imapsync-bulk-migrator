@@ -56,6 +56,7 @@ from components.provider_ops import (
     provider_validate_account,
     provider_validate_all,
     quote_mailbox_name,
+    RateLimiter,
     resolve_secret,
     resolve_primary_mailbox,
     resolve_target_mailbox,
@@ -2951,6 +2952,39 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert fake.body_fetches == 1
 
 
+def test_rate_limiter_stop_event_aborts_throttled_wait() -> None:
+    limiter = RateLimiter(1)
+    limiter.wait_for(10)
+    stop_event = threading.Event()
+    stop_event.set()
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        limiter.wait_for(1, stop_event=stop_event, label="provider export source@example.com")
+
+
+def test_provider_export_stop_event_after_throttle_prevents_body_fetch(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    source = FakeSourceImap()
+    stop_event = threading.Event()
+
+    class StopAfterWaitLimiter:
+        def wait_for(self, byte_count: int) -> None:
+            assert byte_count == 36
+            stop_event.set()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_export_account(config, account, tmp_path, stop_event=stop_event, limiter=StopAfterWaitLimiter())
+
+    assert source.body_fetches == 0
+    assert not (tmp_path / account.source_email / "manifest.jsonl").exists()
+
+
 def test_provider_export_resume_rewrites_corrupt_existing_payload(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -4409,6 +4443,30 @@ def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_stop_event_after_throttle_prevents_journal_and_append(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    fake = FakeTargetImap()
+    stop_event = threading.Event()
+
+    class StopAfterWaitLimiter:
+        def wait_for(self, byte_count: int) -> None:
+            assert byte_count == 36
+            stop_event.set()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_import_account(config, account, tmp_path, stop_event=stop_event, limiter=StopAfterWaitLimiter())
+
+    assert fake.appended == []
+    assert not (account_dir / "import-target@icloud.com.journal.jsonl").exists()
 
 
 def test_provider_import_preserves_supported_imap_keywords(tmp_path: Path) -> None:

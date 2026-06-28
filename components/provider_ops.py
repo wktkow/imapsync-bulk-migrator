@@ -44,14 +44,22 @@ class RateLimiter:
         self._next_time = 0.0
         self._lock = threading.Lock()
 
-    def wait_for(self, byte_count: int) -> None:
+    def wait_for(self, byte_count: int, *, stop_event: Optional[object] = None, label: str = "rate limiter") -> None:
         if self.max_bytes_per_second <= 0 or byte_count <= 0:
             return
         with self._lock:
+            _raise_if_stopped(stop_event, label)
             now = time.monotonic()
             if now < self._next_time:
-                time.sleep(self._next_time - now)
+                delay = self._next_time - now
+                wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+                if callable(wait):
+                    if wait(delay):
+                        raise RuntimeError(f"{label}: stop requested during throttle wait")
+                else:
+                    time.sleep(delay)
                 now = time.monotonic()
+                _raise_if_stopped(stop_event, label)
             self._next_time = now + (byte_count / float(self.max_bytes_per_second))
 
 
@@ -447,6 +455,20 @@ def with_retry(fn: Callable[[], Any], *, attempts: int, label: str, stop_event: 
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"{label} did not run")
+
+
+def _provider_throttle_wait(
+    limiter: RateLimiter,
+    byte_count: int,
+    *,
+    stop_event: Optional[object],
+    label: str,
+) -> None:
+    if isinstance(limiter, RateLimiter):
+        limiter.wait_for(byte_count, stop_event=stop_event, label=label)
+    else:
+        limiter.wait_for(byte_count)
+    _raise_if_stopped(stop_event, label)
 
 
 def _read_imap_token(line: str, start: int) -> Tuple[Optional[str], int]:
@@ -2714,7 +2736,12 @@ def provider_export_account(
                                 update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
                                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
                                 continue
-                limiter.wait_for(int(pre_parsed.get("rfc822_size") or 0))
+                _provider_throttle_wait(
+                    limiter,
+                    int(pre_parsed.get("rfc822_size") or 0),
+                    stop_event=stop_event,
+                    label=f"provider export {account.source_email}",
+                )
                 status, data = imap.uid(
                     "fetch",
                     str(uid),
@@ -4665,7 +4692,12 @@ def provider_import_account(
                 target_provider=config.target.provider,
                 permanent_flags=target_permanent_flags(imap),
             )
-            limiter.wait_for(len(data))
+            _provider_throttle_wait(
+                limiter,
+                len(data),
+                stop_event=stop_event,
+                label=f"provider import {account.target_email}",
+            )
             append_journal(
                 account_dir,
                 account,
