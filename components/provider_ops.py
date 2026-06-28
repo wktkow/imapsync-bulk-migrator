@@ -107,10 +107,17 @@ def ensure_private_dir(path: Path) -> None:
     _raise_if_provider_path_symlink(path, "directory")
     path.mkdir(parents=True, exist_ok=True)
     _raise_if_provider_path_symlink(path, "directory")
-    if not path.is_dir():
-        raise RuntimeError(f"provider directory path is not a directory: {path}")
-    with contextlib.suppress(Exception):
-        os.chmod(path, PRIVATE_DIR_MODE)
+    dir_fd, dir_path = _open_provider_dir(path, "directory")
+    try:
+        stat_result = os.fstat(dir_fd)
+        if not stat.S_ISDIR(stat_result.st_mode):
+            raise RuntimeError(f"provider directory path is not a directory: {path}")
+        _raise_if_provider_parent_replaced(dir_path, dir_fd, "directory")
+        with contextlib.suppress(Exception):
+            os.fchmod(dir_fd, PRIVATE_DIR_MODE)
+        _raise_if_provider_parent_replaced(dir_path, dir_fd, "directory")
+    finally:
+        os.close(dir_fd)
 
 
 def _raise_if_provider_path_symlink(path: Path, label: str) -> None:

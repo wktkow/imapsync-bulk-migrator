@@ -9736,6 +9736,82 @@ class TestRound7ConfirmedBugs:
         assert journal.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
 
+    def test_legacy_ensure_private_dir_does_not_chmod_replaced_symlink_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target_dir = tmp_path / "user@example.com"
+        target_dir.mkdir()
+        victim = tmp_path / "outside-legacy-dir"
+        victim.mkdir()
+        victim.chmod(0o755)
+        original_mode = victim.stat().st_mode & 0o777
+        checked_dir = tmp_path / "checked-legacy-dir"
+        real_component = imap_ops._legacy_symlink_component
+        checks = 0
+
+        def racing_component(path: Path):
+            nonlocal checks
+            result = real_component(path)
+            if Path(path) == target_dir:
+                checks += 1
+                if checks == 2 and result is None:
+                    target_dir.rename(checked_dir)
+                    try:
+                        target_dir.symlink_to(victim, target_is_directory=True)
+                    except (OSError, NotImplementedError) as exc:
+                        pytest.skip(f"symlink creation unavailable: {exc}")
+            return result
+
+        monkeypatch.setattr(imap_ops, "_legacy_symlink_component", racing_component)
+
+        with pytest.raises(RuntimeError, match="symlinked directory|replaced directory"):
+            imap_ops.ensure_private_dir(target_dir)
+
+        assert target_dir.is_symlink()
+        assert victim.stat().st_mode & 0o777 == original_mode
+
+    def test_provider_ensure_private_dir_does_not_chmod_replaced_symlink_target(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import provider_ops
+
+        target_dir = tmp_path / "source@example.com"
+        target_dir.mkdir()
+        victim = tmp_path / "outside-provider-dir"
+        victim.mkdir()
+        victim.chmod(0o755)
+        original_mode = victim.stat().st_mode & 0o777
+        checked_dir = tmp_path / "checked-provider-dir"
+        real_component = provider_ops._provider_symlink_component
+        checks = 0
+
+        def racing_component(path: Path):
+            nonlocal checks
+            result = real_component(path)
+            if Path(path) == target_dir:
+                checks += 1
+                if checks == 2 and result is None:
+                    target_dir.rename(checked_dir)
+                    try:
+                        target_dir.symlink_to(victim, target_is_directory=True)
+                    except (OSError, NotImplementedError) as exc:
+                        pytest.skip(f"symlink creation unavailable: {exc}")
+            return result
+
+        monkeypatch.setattr(provider_ops, "_provider_symlink_component", racing_component)
+
+        with pytest.raises(RuntimeError, match="symlinked provider directory|replaced provider directory"):
+            provider_ops.ensure_private_dir(target_dir)
+
+        assert target_dir.is_symlink()
+        assert victim.stat().st_mode & 0o777 == original_mode
+
     def test_legacy_import_rejects_hard_linked_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

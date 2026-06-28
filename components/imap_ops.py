@@ -53,8 +53,14 @@ def ensure_private_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     if _legacy_symlink_component(path) is not None:
         raise RuntimeError(f"refusing to use symlinked directory: {path}")
-    with contextlib.suppress(Exception):
-        os.chmod(path, PRIVATE_DIR_MODE)
+    dir_fd, dir_path = _open_legacy_dir(path, "directory")
+    try:
+        _raise_if_legacy_parent_replaced(dir_path, dir_fd, "directory")
+        with contextlib.suppress(Exception):
+            os.fchmod(dir_fd, PRIVATE_DIR_MODE)
+        _raise_if_legacy_parent_replaced(dir_path, dir_fd, "directory")
+    finally:
+        os.close(dir_fd)
 
 
 def legacy_reserved_mailbox_path_issue(mailbox: str, path: Optional[str] = None) -> Optional[str]:
