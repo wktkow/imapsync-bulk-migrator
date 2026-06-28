@@ -940,7 +940,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     roles = ("source", "target")
                 logging.info("Running provider connectivity tests (roles=%s) ...", ",".join(roles))
-                provider_test_accounts(config, max_workers=int(args.max_workers), roles=roles)
+                provider_test_accounts(config, max_workers=int(args.max_workers), roles=roles, stop_event=stop_event)
             else:
                 logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
                 assert isinstance(config, Config)
@@ -975,7 +975,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if is_provider_config:
             assert isinstance(config, ProviderMigrationConfig)
             if args.mode == "preflight":
-                ok, issues = provider_preflight(config, max_workers=int(args.max_workers))
+                ok, issues = provider_preflight(config, max_workers=int(args.max_workers), stop_event=stop_event)
                 stop_rc = stop_requested_result("provider preflight")
                 if stop_rc is not None:
                     return stop_rc
@@ -1003,7 +1003,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     return stop_rc
                 logging.info("Provider export finished. Data stored under: %s", out_root)
                 if not bool(getattr(args, "no_audit_after_export", False)):
-                    ok, issues = provider_audit_all(config, out_root, max_workers=int(args.max_workers))
+                    ok, issues = provider_audit_all(config, out_root, max_workers=int(args.max_workers), stop_event=stop_event)
                     stop_rc = stop_requested_result("provider audit")
                     if stop_rc is not None:
                         return stop_rc
@@ -1044,7 +1044,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers))
+                ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers), stop_event=stop_event)
                 stop_rc = stop_requested_result("provider validate")
                 if stop_rc is not None:
                     return stop_rc
@@ -1060,7 +1060,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers))
+                ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers), stop_event=stop_event)
                 stop_rc = stop_requested_result("provider audit")
                 if stop_rc is not None:
                     return stop_rc

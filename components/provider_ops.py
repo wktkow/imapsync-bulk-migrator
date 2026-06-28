@@ -4762,8 +4762,15 @@ def _journal_row(
     return journal_row
 
 
-def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAccount, in_root: Path) -> Tuple[str, List[str]]:
+def provider_audit_account(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    in_root: Path,
+    *,
+    stop_event: Optional[object] = None,
+) -> Tuple[str, List[str]]:
     issues: List[str] = []
+    _raise_if_stopped(stop_event, f"provider audit {account.email}")
     try:
         _raise_if_provider_path_symlink(in_root, "audit root")
     except RuntimeError as exc:
@@ -4779,6 +4786,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
         rows = load_manifest(account_dir)
     except Exception as exc:
         return account.email, [f"manifest load failed: {exc}"]
+    _raise_if_stopped(stop_event, f"provider audit {account.email}")
     issues.extend(
         provider_export_state_issues(
             account_dir,
@@ -4834,6 +4842,7 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
                 )
             )
     for row in rows:
+        _raise_if_stopped(stop_event, f"provider audit {account.email}")
         identity = str(row.get("canonical_id") or "")
         if not identity:
             issues.append("manifest row missing canonical_id")
@@ -4868,19 +4877,27 @@ def provider_audit_account(config: ProviderMigrationConfig, account: MigrationAc
     return account.email, issues
 
 
-def provider_merge_group_identity_collision_issues(config: ProviderMigrationConfig, in_root: Path) -> List[str]:
+def provider_merge_group_identity_collision_issues(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    *,
+    stop_event: Optional[object] = None,
+) -> List[str]:
     if not provider_account_merge_enabled(config):
         return []
     grouped: Dict[Tuple[str, str], List[MigrationAccount]] = {}
     for account in config.accounts:
+        _raise_if_stopped(stop_event, "provider audit merge group collision scan")
         grouped.setdefault(target_merge_group_key(config, account), []).append(account)
     issues: List[str] = []
     for group_accounts in grouped.values():
+        _raise_if_stopped(stop_event, "provider audit merge group collision scan")
         if len(group_accounts) < 2:
             continue
         owners_by_identity: Dict[str, str] = {}
         target_label = group_accounts[0].target_email
         for account in group_accounts:
+            _raise_if_stopped(stop_event, "provider audit merge group collision scan")
             account_dir = account_export_dir(in_root, account)
             if _provider_symlink_component(account_dir) is not None or not account_dir.exists():
                 continue
@@ -4889,6 +4906,7 @@ def provider_merge_group_identity_collision_issues(config: ProviderMigrationConf
             except Exception:
                 continue
             for row in manifest_rows:
+                _raise_if_stopped(stop_event, "provider audit merge group collision scan")
                 identity = str(row.get("canonical_id") or "")
                 if not identity:
                     continue
@@ -4903,7 +4921,68 @@ def provider_merge_group_identity_collision_issues(config: ProviderMigrationConf
     return issues
 
 
-def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
+def _provider_account_worker_results(
+    label: str,
+    accounts: List[MigrationAccount],
+    max_workers: int,
+    worker: Callable[[MigrationAccount], Any],
+    stop_event: Optional[object],
+) -> List[Tuple[MigrationAccount, Any]]:
+    import concurrent.futures
+
+    results: List[Tuple[MigrationAccount, Any]] = []
+    account_iter = iter(accounts)
+    futures = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=label)
+    wait_timeout = 0.2 if stop_event is not None else None
+
+    def submit_next() -> bool:
+        if _stop_requested(stop_event):
+            return False
+        try:
+            acc = next(account_iter)
+        except StopIteration:
+            return False
+        futures[executor.submit(worker, acc)] = acc
+        return True
+
+    try:
+        for _ in range(min(max_workers, len(accounts))):
+            if not submit_next():
+                break
+        while futures:
+            _raise_if_stopped(stop_event, label)
+            done, _pending = concurrent.futures.wait(
+                futures,
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            for fut in done:
+                acc = futures.pop(fut)
+                results.append((acc, fut.result()))
+                _raise_if_stopped(stop_event, label)
+            for _ in range(len(done)):
+                submit_next()
+        _raise_if_stopped(stop_event, label)
+        return results
+    finally:
+        if _stop_requested(stop_event):
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
+
+
+def provider_audit_all(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    *,
+    max_workers: int,
+    stop_event: Optional[object] = None,
+) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     try:
         _raise_if_provider_path_symlink(in_root, "audit root")
@@ -4912,15 +4991,14 @@ def provider_audit_all(config: ProviderMigrationConfig, in_root: Path, *, max_wo
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> List[str]:
-        _name, account_issues = provider_audit_account(config, acc, in_root)
+        _raise_if_stopped(stop_event, f"provider audit {acc.email}")
+        _name, account_issues = provider_audit_account(config, acc, in_root, stop_event=stop_event)
+        _raise_if_stopped(stop_event, f"provider audit {acc.email}")
         return [f"{acc.email}: {issue}" for issue in account_issues]
 
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="provider-audit") as ex:
-        for result in ex.map(worker, config.accounts):
-            issues.extend(result)
-    issues.extend(provider_merge_group_identity_collision_issues(config, in_root))
+    for _acc, result in _provider_account_worker_results("provider-audit", config.accounts, max_workers, worker, stop_event):
+        issues.extend(result)
+    issues.extend(provider_merge_group_identity_collision_issues(config, in_root, stop_event=stop_event))
     return len(issues) == 0, issues
 
 
@@ -4934,7 +5012,9 @@ def provider_validate_account(
     allow_unresolved_pending: bool = False,
     repair_trailing_journal: bool = False,
     allow_missing_gmail_target_msgid: bool = False,
+    stop_event: Optional[object] = None,
 ) -> Tuple[str, Dict[str, Any]]:
+    _raise_if_stopped(stop_event, f"provider validate {account.email}")
     account_dir = account_export_dir(in_root, account)
     report: Dict[str, Any] = {
         "account": account.email,
@@ -4959,6 +5039,7 @@ def provider_validate_account(
     except Exception as exc:
         report["failed"].append(str(exc))
         return account.email, report
+    _raise_if_stopped(stop_event, f"provider validate {account.email}")
 
     report["failed"].extend(
         provider_export_state_issues(
@@ -5006,6 +5087,7 @@ def provider_validate_account(
     )
     if not allow_unresolved_pending:
         for row in journal_rows:
+            _raise_if_stopped(stop_event, f"provider validate {account.email}")
             if row.get("status") != "pending":
                 continue
             identity = str(row.get("canonical_id") or "")
@@ -5074,6 +5156,7 @@ def provider_validate_account(
             target_mailboxes=target_mailboxes,
         )
         for row in effective_committed.values():
+            _raise_if_stopped(stop_event, f"provider validate {account.email}")
             identity = str(row.get("canonical_id") or "")
             if not identity:
                 failures.append("journal committed row missing canonical_id")
@@ -5119,13 +5202,17 @@ def provider_validate_account(
 
     if check_target and merge_group_stage_error is None:
         try:
+            _raise_if_stopped(stop_event, f"provider validate {account.email}")
             with imap_connection(config.target, account, role="target") as imap:
+                _raise_if_stopped(stop_event, f"provider validate {account.email}")
                 capabilities: List[str] = []
                 if config.target.provider == "gmail":
                     capabilities = get_capabilities(imap)
+                    _raise_if_stopped(stop_event, f"provider validate {account.email}")
                     if "X-GM-EXT-1" not in capabilities:
                         raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
+                _raise_if_stopped(stop_event, f"provider validate {account.email}")
                 if merge_group_stages is not None:
                     require_merge_group_target_translation_safe(
                         merge_group_stages,
@@ -5214,6 +5301,7 @@ def provider_validate_account(
                         if target_gmail_msgid
                     }
                     for identity, row in by_id.items():
+                        _raise_if_stopped(stop_event, f"provider validate {account.email}")
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
                             continue
@@ -5358,6 +5446,8 @@ def provider_validate_account(
                                     + ", ".join(missing_flags)
                                 )
         except Exception as exc:
+            if _stop_requested(stop_event):
+                raise
             committed_by_id, _target_by_id, failures = evaluate_journal()
             report["failed"].extend(failures)
             apply_counts(committed_by_id)
@@ -5370,12 +5460,19 @@ def provider_validate_account(
     report["ok"] = not report["missing"] and not report["duplicates"] and not report["failed"]
     if report["remote_missing"]:
         report["ok"] = False
+    _raise_if_stopped(stop_event, f"provider validate {account.email}")
     if write_report:
         _atomic_json(account_dir / f"validation-{sanitize_for_path(account.target_email)}.json", report)
     return account.email, report
 
 
-def provider_validate_all(config: ProviderMigrationConfig, in_root: Path, *, max_workers: int) -> Tuple[bool, List[str]]:
+def provider_validate_all(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    *,
+    max_workers: int,
+    stop_event: Optional[object] = None,
+) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     try:
         _raise_if_provider_path_symlink(in_root, "validate root")
@@ -5384,39 +5481,52 @@ def provider_validate_all(config: ProviderMigrationConfig, in_root: Path, *, max
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> Dict[str, Any]:
-        _name, report = provider_validate_account(config, acc, in_root, check_target=True)
+        _raise_if_stopped(stop_event, f"provider validate {acc.email}")
+        _name, report = provider_validate_account(config, acc, in_root, check_target=True, stop_event=stop_event)
+        _raise_if_stopped(stop_event, f"provider validate {acc.email}")
         return report
 
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="provider-validate") as ex:
-        for report in ex.map(worker, config.accounts):
-            if report.get("ok"):
-                logging.info("[provider-validate] %s: OK exported=%s committed=%s", report["account"], report["exported"], report["committed"])
-                continue
-            prefix = str(report.get("account"))
-            for key in ("missing", "duplicates", "remote_missing", "failed"):
-                for item in report.get(key, []):
-                    issues.append(f"{prefix}: {key}: {item}")
+    for _acc, report in _provider_account_worker_results("provider-validate", config.accounts, max_workers, worker, stop_event):
+        if report.get("ok"):
+            logging.info("[provider-validate] %s: OK exported=%s committed=%s", report["account"], report["exported"], report["committed"])
+            continue
+        prefix = str(report.get("account"))
+        for key in ("missing", "duplicates", "remote_missing", "failed"):
+            for item in report.get(key, []):
+                issues.append(f"{prefix}: {key}: {item}")
     return len(issues) == 0, issues
 
 
-def provider_test_accounts(config: ProviderMigrationConfig, *, max_workers: int, roles: Tuple[str, ...] = ("source", "target")) -> None:
+def provider_test_accounts(
+    config: ProviderMigrationConfig,
+    *,
+    max_workers: int,
+    roles: Tuple[str, ...] = ("source", "target"),
+    stop_event: Optional[object] = None,
+) -> None:
     max_workers = _require_max_workers(max_workers)
 
     def worker(acc: MigrationAccount) -> None:
+        _raise_if_stopped(stop_event, f"provider test {acc.email}")
         if "source" in roles:
             with imap_connection(config.source, acc, role="source"):
                 pass
+            _raise_if_stopped(stop_event, f"provider test {acc.email}")
         if "target" in roles:
             with imap_connection(config.target, acc, role="target"):
                 pass
+            _raise_if_stopped(stop_event, f"provider test {acc.email}")
         logging.info("[provider-test] %s: OK", acc.email)
 
-    parallel_process_accounts("provider-test", worker, config.accounts, max_workers, stop_on_error=True)
+    _provider_account_worker_results("provider-test", config.accounts, max_workers, worker, stop_event)
 
 
-def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> Tuple[bool, List[str]]:
+def provider_preflight(
+    config: ProviderMigrationConfig,
+    *,
+    max_workers: int,
+    stop_event: Optional[object] = None,
+) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     issues: List[str] = []
 
@@ -5424,26 +5534,37 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
         account_issues: List[str] = []
         source_total = 0
         seen_identity: set[str] = set()
+        _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
         try:
             with imap_connection(config.source, acc, role="source") as source_imap:
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 capabilities = get_capabilities(source_imap)
                 use_gmail_metadata = config.source.provider == "gmail"
                 gmail_extensions = use_gmail_metadata and "X-GM-EXT-1" in capabilities
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 source_mailboxes = list_mailboxes(source_imap)
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 if config.source.provider == "gmail":
                     account_issues.extend(gmail_source_readiness_issues(capabilities, source_mailboxes))
+                    _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
                     account_issues.extend(gmail_account_decommission_issues(config.source, acc))
                 for mailbox in source_mailboxes:
+                    _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     if should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes):
                         continue
                     try:
                         uids, _uidvalidity = fetch_all_uids_and_uidvalidity(source_imap, mailbox.name)
                     except Exception as exc:
+                        if _stop_requested(stop_event):
+                            raise
                         account_issues.append(f"source mailbox {mailbox.name} scan failed: {exc}")
                         continue
+                    _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     for uid in uids:
+                        _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         status, data = source_imap.uid("fetch", str(uid), fetch_items(include_body=False, gmail_extensions=gmail_extensions))
+                        _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         if status != "OK":
                             account_issues.append(f"metadata fetch failed in {mailbox.name} for UID {uid}")
                             continue
@@ -5470,19 +5591,29 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
                         seen_identity.add(identity)
                         source_total += int(parsed.get("rfc822_size") or 0)
         except Exception as exc:
+            if _stop_requested(stop_event):
+                raise
             account_issues.append(f"source preflight failed: {exc}")
+        _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
         try:
             with imap_connection(config.target, acc, role="target") as target_imap:
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 target_capabilities = get_capabilities(target_imap)
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 target_mailboxes = list_mailboxes(target_imap)
+                _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                 if config.target.provider == "gmail":
                     account_issues.extend(gmail_target_readiness_issues(target_capabilities, target_mailboxes))
+                    _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     account_issues.extend(gmail_all_mail_select_issues(target_imap, target_mailboxes, role="target"))
                     account_issues.extend(gmail_target_decommission_issues(config.target, acc))
                 if not target_mailboxes:
                     account_issues.append("target returned no mailboxes")
         except Exception as exc:
+            if _stop_requested(stop_event):
+                raise
             account_issues.append(f"target preflight failed: {exc}")
+        _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
         if config.target.available_bytes is None:
             logging.warning("[provider-preflight] %s: target.available_bytes not configured; storage gate skipped", acc.email)
         elif not provider_account_merge_enabled(config) and source_total > config.target.available_bytes:
@@ -5490,17 +5621,16 @@ def provider_preflight(config: ProviderMigrationConfig, *, max_workers: int) -> 
         logging.info("[provider-preflight] %s: estimated_source_bytes=%d", acc.email, source_total)
         return account_issues, source_total
 
-    import concurrent.futures
-
     merge_group_source_totals: Dict[Tuple[str, str], int] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="provider-preflight") as ex:
-        for acc, (result, source_total) in zip(config.accounts, ex.map(worker, config.accounts)):
-            issues.extend(f"{acc.email}: {issue}" for issue in result)
-            if provider_account_merge_enabled(config) and config.target.available_bytes is not None:
-                target_key = target_merge_group_key(config, acc)
-                merge_group_source_totals[target_key] = merge_group_source_totals.get(target_key, 0) + source_total
+    for acc, (result, source_total) in _provider_account_worker_results("provider-preflight", config.accounts, max_workers, worker, stop_event):
+        issues.extend(f"{acc.email}: {issue}" for issue in result)
+        if provider_account_merge_enabled(config) and config.target.available_bytes is not None:
+            target_key = target_merge_group_key(config, acc)
+            merge_group_source_totals[target_key] = merge_group_source_totals.get(target_key, 0) + source_total
+    _raise_if_stopped(stop_event, "provider preflight")
     if provider_account_merge_enabled(config) and config.target.available_bytes is not None:
         for target_key, source_total in sorted(merge_group_source_totals.items()):
+            _raise_if_stopped(stop_event, "provider preflight")
             if source_total > config.target.available_bytes:
                 issues.append(
                     f"target merge group {target_key[0]}: estimated source bytes {source_total} "

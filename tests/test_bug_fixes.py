@@ -11437,8 +11437,11 @@ class TestRound7ConfirmedBugs:
         def fake_signal(signum, handler):
             handlers[signum] = handler
 
-        def fake_preflight(*_args, **_kwargs):
+        def fake_preflight(*_args, **kwargs):
+            stop_event = kwargs.get("stop_event")
+            assert stop_event is not None
             handlers[signal.SIGINT](signal.SIGINT, None)
+            assert stop_event.is_set()
             return True, []
 
         with mock.patch("components.main.check_environment"), \

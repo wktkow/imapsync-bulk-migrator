@@ -6,6 +6,7 @@ import imaplib
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Iterator, List, Optional
 from unittest import mock
@@ -51,6 +52,7 @@ from components.provider_ops import (
     provider_endpoint_state_digest,
     provider_target_journal_binding,
     provider_preflight,
+    provider_test_accounts,
     provider_validate_account,
     provider_validate_all,
     quote_mailbox_name,
@@ -10104,6 +10106,94 @@ class FakePreflightSourceNoExtensions(FakePreflightSourceFailure):
 class FakePreflightSourceNoAllMail(FakePreflightSourceFailure):
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+
+class FakePreflightSourceStopsDuringFetch(FakePreflightSourceFailure):
+    def __init__(self, stop_event: threading.Event) -> None:
+        self.stop_event = stop_event
+        self.fetch_count = 0
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1 2"]
+        if command == "fetch":
+            self.fetch_count += 1
+            self.stop_event.set()
+            return "OK", [
+                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" RFC822.SIZE 42)'
+            ]
+        raise AssertionError(command)
+
+
+def test_provider_preflight_stop_event_aborts_during_source_metadata_fetch(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target@icloud.com", password="secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    stop_event = threading.Event()
+    source = FakePreflightSourceStopsDuringFetch(stop_event)
+    target_connections = 0
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        nonlocal target_connections
+        if endpoint.provider == "imap":
+            yield source
+            return
+        target_connections += 1
+        yield FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_preflight(config, max_workers=1, stop_event=stop_event)
+
+    assert source.fetch_count == 1
+    assert target_connections == 0
+
+
+def test_provider_test_accounts_stop_event_aborts_before_target_role(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target@icloud.com", password="secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    stop_event = threading.Event()
+    target_connections = 0
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        nonlocal target_connections
+        if endpoint.provider == "imap":
+            stop_event.set()
+            yield object()
+            return
+        target_connections += 1
+        yield object()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_test_accounts(config, max_workers=1, roles=("source", "target"), stop_event=stop_event)
+
+    assert target_connections == 0
 
 
 def test_provider_preflight_reports_metadata_fetch_failures(tmp_path: Path) -> None:
