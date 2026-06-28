@@ -23,6 +23,7 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
+_SHA256_HEX_RE = re.compile(r"[0-9a-fA-F]{64}")
 _IMAP_INTERNALDATE_RE = re.compile(
     r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
@@ -389,6 +390,8 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
             value = row.get(required)
             if not isinstance(value, str) or not value.strip():
                 raise RuntimeError(f"import journal row {line_no} is missing {required}: {path}")
+            if not _SHA256_HEX_RE.fullmatch(value):
+                raise RuntimeError(f"import journal row {line_no} has invalid {required}: {path}")
         coerced = {str(k): str(v) for k, v in row.items()}
         status = coerced.get("status", "")
         if status not in _LEGACY_IMPORT_JOURNAL_STATUSES:

@@ -2390,7 +2390,7 @@ class TestCliAndConfigHardening:
         )
         (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
         journal = account_dir / "import.journal.jsonl"
-        original_journal = json.dumps({"key": "k", "target": "target", "status": "committed"}) + "\n{\"key\":"
+        original_journal = json.dumps({"key": "a" * 64, "target": "b" * 64, "status": "committed"}) + "\n{\"key\":"
         journal.write_text(original_journal)
 
         with mock.patch("components.main.check_environment"), \
@@ -7956,6 +7956,86 @@ class TestRound7ConfirmedBugs:
             )
 
         assert victim.read_text() == ""
+
+    @pytest.mark.parametrize(
+        ("field", "needle"),
+        [
+            ("key", "invalid key"),
+            ("target", "invalid target"),
+        ],
+    )
+    def test_legacy_load_import_journal_rejects_malformed_digest_ids(
+        self,
+        tmp_path: Path,
+        field: str,
+        needle: str,
+    ) -> None:
+        from components.imap_ops import _load_legacy_import_journal
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        row = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }
+        row[field] = "not-a-sha256"
+        (account_dir / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
+
+        with pytest.raises(RuntimeError, match=needle):
+            _load_legacy_import_journal(account_dir)
+
+    @pytest.mark.parametrize(
+        ("field", "needle"),
+        [
+            ("key", "invalid key"),
+            ("target", "invalid target"),
+        ],
+    )
+    def test_legacy_import_rejects_malformed_journal_ids_before_target_contact(
+        self,
+        tmp_path: Path,
+        field: str,
+        needle: str,
+    ) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        data = b"Message-ID: <malformed-journal-id@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(folder, data=data)
+        row = {
+            "key": _legacy_import_key(folder.parent, eml, "INBOX", data),
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }
+        row[field] = "not-a-sha256"
+        (folder.parent / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
+        opened = False
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[object]:
+            nonlocal opened
+            opened = True
+            raise AssertionError("target should not be contacted")
+            yield object()
+
+        with pytest.raises(RuntimeError, match=needle):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+            )
+
+        assert opened is False
 
     @pytest.mark.parametrize(
         ("artifact", "needle"),
