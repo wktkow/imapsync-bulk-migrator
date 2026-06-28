@@ -1715,6 +1715,199 @@ class TestLegacyListParsing:
 
         assert rc == 0
 
+    def test_import_translates_legacy_source_hierarchy_delimiter(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account, import_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-nested@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nnested"
+
+        class SlashSource:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Projects/2024"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        class DotTarget:
+            def __init__(self) -> None:
+                self.created: List[str] = []
+                self.appended: List[str] = []
+                self.subscribed: List[str] = []
+                self.mailboxes = {"INBOX"}
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "." "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                selected = mailbox.strip('"').replace(r"\"", '"')
+                return ("OK", [b"0"]) if selected in self.mailboxes else ("NO", [b"missing"])
+
+            def create(self, mailbox: str):
+                selected = mailbox.strip('"').replace(r"\"", '"')
+                self.created.append(selected)
+                self.mailboxes.add(selected)
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                self.subscribed.append(mailbox.strip('"').replace(r"\"", '"'))
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.appended.append(mailbox.strip('"').replace(r"\"", '"'))
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("source.example.com")
+        target_server = ServerConfig("target.example.com")
+        source = SlashSource()
+        target = DotTarget()
+
+        @contextlib.contextmanager
+        def source_connection(*_args, **_kwargs) -> Iterator[SlashSource]:
+            yield source
+
+        @contextlib.contextmanager
+        def target_connection(*_args, **_kwargs) -> Iterator[DotTarget]:
+            yield target
+
+        with mock.patch("components.imap_ops.imap_connection", source_connection):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert state["mailboxes"] == [{
+            "mailbox": "Projects/2024",
+            "message_count": 1,
+            "path": "Projects_2024",
+            "source_delimiter": "/",
+            "source_path_segments": ["Projects", "2024"],
+        }]
+
+        with mock.patch("components.imap_ops.imap_connection", target_connection):
+            import_account(
+                account,
+                target_server,
+                tmp_path,
+                ignore_errors=False,
+                source_server=source_server,
+            )
+
+        assert target.created == ["Projects.2024"]
+        assert target.appended == ["Projects.2024"]
+        assert target.subscribed == ["Projects.2024"]
+
+    def test_validate_translates_legacy_source_hierarchy_delimiter(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-validate-nested@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nnested"
+
+        class SlashSource:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Projects/2024"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        class DotTarget:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self, *args):
+                return "OK", [
+                    b'(\\HasNoChildren) "." "Projects.2024"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return ("OK", [b"1"]) if self.selected == "Projects.2024" else ("OK", [b"0"])
+
+            def search(self, charset, *criteria):
+                if self.selected == "Projects.2024":
+                    return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("source.example.com")
+
+        @contextlib.contextmanager
+        def source_connection(*_args, **_kwargs) -> Iterator[SlashSource]:
+            yield SlashSource()
+
+        with mock.patch("components.imap_ops.imap_connection", source_connection):
+            export_account(account, source_server, tmp_path / "exported", ignore_errors=False)
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "source.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        @contextlib.contextmanager
+        def target_connection(*_args, **_kwargs) -> Iterator[DotTarget]:
+            yield DotTarget()
+
+        with mock.patch("components.imap_ops.imap_connection", target_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+
 
 class TestLegacyImportJournal:
     """Legacy import should not blindly duplicate committed local messages on rerun."""

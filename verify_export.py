@@ -16,7 +16,12 @@ from email.policy import default as default_policy
 import re
 
 from components.content_binding import legacy_content_binding_issue, provider_content_binding_issue
-from components.imap_ops import _valid_legacy_flag_token, _valid_legacy_internaldate, legacy_reserved_mailbox_path_issue
+from components.imap_ops import (
+    _legacy_validate_path_segments,
+    _valid_legacy_flag_token,
+    _valid_legacy_internaldate,
+    legacy_reserved_mailbox_path_issue,
+)
 from components.provider_ops import (
     _manifest_path,
     _provider_artifact_orphan_issues,
@@ -404,6 +409,15 @@ def analyze_message(
                     integrity_errors.append(f'mailbox metadata mismatch (marker={mailbox_marker_mailbox} meta={mailbox})')
                 elif not mailbox_marker_present and mailbox != folder_name:
                     integrity_errors.append(f'missing mailbox marker for original mailbox {mailbox}')
+                try:
+                    _legacy_validate_path_segments(
+                        metadata.get('source_path_segments'),
+                        mailbox,
+                        metadata.get('source_delimiter'),
+                        f'{folder_name}/{Path(eml_path).name}',
+                    )
+                except RuntimeError as exc:
+                    integrity_errors.append(str(exc))
         if integrity_errors:
             return None, '; '.join(integrity_errors)
 
@@ -468,6 +482,16 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
         issues.append(f"{folder_name}: mailbox marker missing mailbox")
     elif sanitize_for_path(mailbox) != folder_name:
         issues.append(f"{folder_name}: mailbox marker name mismatch (marker={mailbox})")
+    else:
+        try:
+            _legacy_validate_path_segments(
+                marker.get('source_path_segments'),
+                mailbox,
+                marker.get('source_delimiter'),
+                f"{folder_name}: mailbox marker",
+            )
+        except RuntimeError as exc:
+            issues.append(str(exc))
     message_count = marker.get('message_count')
     if type(message_count) is not int or message_count < 0:
         issues.append(f"{folder_name}: mailbox marker has invalid message_count")
@@ -530,6 +554,15 @@ def analyze_export_state(account_path, folder_counts):
             reserved_issue = legacy_reserved_mailbox_path_issue(mailbox, path)
             if reserved_issue is not None:
                 issues.append(f"export-state {reserved_issue}")
+            try:
+                _legacy_validate_path_segments(
+                    entry.get("source_path_segments"),
+                    mailbox,
+                    entry.get("source_delimiter"),
+                    f"export-state mailbox {mailbox!r}",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
         if type(message_count) is not int or message_count < 0:
             issues.append(f"export-state mailbox {label!r} has invalid message_count")
         elif path in folder_counts and message_count != folder_counts[path]:

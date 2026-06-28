@@ -19,6 +19,7 @@ from .imap_ops import (
     _list_selectable_mailbox_entries,
     _read_file_no_symlink,
     _require_legacy_payload_integrity,
+    _legacy_validate_path_segments,
     _should_skip_legacy_source_view,
     _validate_legacy_delivery_metadata,
     _validate_legacy_sidecar_integrity,
@@ -230,6 +231,15 @@ def _legacy_export_state_issues(
         if type(message_count) is not int or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
+        try:
+            _legacy_validate_path_segments(
+                raw.get("source_path_segments"),
+                mailbox,
+                raw.get("source_delimiter"),
+                f"{account.email}: export-state mailbox {mailbox!r}",
+            )
+        except RuntimeError as exc:
+            issues.append(str(exc))
         collision_key = sanitized_path_key(mailbox)
         previous_mailbox = state_mailbox_by_path.get(collision_key)
         if previous_mailbox is not None:
@@ -378,6 +388,15 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
                 else:
                     marker_mailbox = mailbox_name
+                    try:
+                        _legacy_validate_path_segments(
+                            marker.get("source_path_segments"),
+                            marker_mailbox,
+                            marker.get("source_delimiter"),
+                            f"{account.email}:{folder}: mailbox marker",
+                        )
+                    except RuntimeError as exc:
+                        issues.append(str(exc))
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")
                 remote_safe = False
@@ -443,6 +462,16 @@ def audit_account(
                     f"{account.email}:{folder}:{eml_path.name}: missing mailbox marker "
                     f"for original mailbox {mailbox_meta}"
                 )
+            if isinstance(mailbox_meta, str) and mailbox_meta.strip():
+                try:
+                    _legacy_validate_path_segments(
+                        meta.get("source_path_segments"),
+                        mailbox_meta,
+                        meta.get("source_delimiter"),
+                        f"{account.email}:{folder}:{eml_path.name}",
+                    )
+                except RuntimeError as exc:
+                    issues.append(str(exc))
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
                 uid_meta = meta.get("uid")

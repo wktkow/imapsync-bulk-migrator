@@ -1392,6 +1392,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         _read_file_no_symlink,
                         _require_legacy_payload_integrity,
                         _should_skip_legacy_source_view,
+                        _legacy_target_hierarchy_delimiter,
+                        _legacy_target_mailbox_name,
+                        _legacy_validate_path_segments,
                         _unresolved_legacy_pending_keys,
                         _validate_legacy_sidecar_integrity,
                         imap_connection,
@@ -1434,10 +1437,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
                         return
 
-                    def marker_mailbox(folder_dir: Path) -> str:
+                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, ...]]:
                         marker_path = folder_dir / ".mailbox.json"
                         if not marker_path.exists():
-                            return folder_dir.name
+                            return folder_dir.name, ()
                         try:
                             marker_bytes = _read_file_no_symlink(
                                 marker_path,
@@ -1448,7 +1451,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                         except Exception as exc:
                             raise RuntimeError(f"{marker_path}: failed to parse mailbox marker: {exc}") from exc
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
-                        return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
+                        if not isinstance(mailbox, str) or not mailbox:
+                            return folder_dir.name, ()
+                        segments = _legacy_validate_path_segments(
+                            raw.get("source_path_segments") if isinstance(raw, dict) else None,
+                            mailbox,
+                            raw.get("source_delimiter") if isinstance(raw, dict) else None,
+                            str(marker_path),
+                        )
+                        return mailbox, segments
 
                     folder_dirs: List[Path] = []
                     for child_name in sorted(os.listdir(account_dir_fd)):
@@ -1468,17 +1479,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                             validation_errors.append((email, "no mailbox folders found"))
                         return
                     local_mailboxes_by_key: Dict[str, str] = {}
+                    local_segments_by_key: Dict[str, Tuple[str, ...]] = {}
                     for folder_dir in folder_dirs:
                         guard_account_dir()
-                        default_mailbox = marker_mailbox(folder_dir)
+                        default_mailbox, default_segments = marker_info(folder_dir)
                         guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
                         guard_account_dir()
+                        folder_key = folder_dir.name
+                        local_mailboxes_by_key.setdefault(folder_key, default_mailbox)
+                        if default_segments:
+                            local_segments_by_key[folder_key] = default_segments
                         if not eml_paths:
-                            key = sanitize_for_path(default_mailbox)
-                            local_mailboxes_by_key.setdefault(key, default_mailbox)
-                            local_counts.setdefault(key, 0)
-                            local_messages.setdefault(default_mailbox, [])
+                            local_counts.setdefault(folder_key, 0)
+                            local_messages.setdefault(folder_key, [])
                             continue
                         for eml_path in eml_paths:
                             mailbox = default_mailbox
@@ -1502,9 +1516,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                             metadata_mailbox = metadata.get("mailbox")
                             if isinstance(metadata_mailbox, str) and metadata_mailbox:
                                 mailbox = metadata_mailbox
-                            key = sanitize_for_path(mailbox)
-                            local_mailboxes_by_key.setdefault(key, mailbox)
-                            local_counts[key] = local_counts.get(key, 0) + 1
+                            message_segments = _legacy_validate_path_segments(
+                                metadata.get("source_path_segments"),
+                                mailbox,
+                                metadata.get("source_delimiter"),
+                                str(metadata_path),
+                            )
+                            local_mailboxes_by_key.setdefault(folder_key, mailbox)
+                            if message_segments:
+                                existing_segments = local_segments_by_key.get(folder_key)
+                                if existing_segments is not None and existing_segments != message_segments:
+                                    raise RuntimeError(f"{metadata_path}: source_path_segments mismatch")
+                                local_segments_by_key[folder_key] = message_segments
+                            local_counts[folder_key] = local_counts.get(folder_key, 0) + 1
                             guard_account_dir()
                             message_bytes = _read_file_no_symlink(
                                 eml_path,
@@ -1514,7 +1538,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             guard_account_dir()
                             _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
                             local_content_identities.update(_legacy_content_identity_variants(message_bytes))
-                            local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
+                            local_messages.setdefault(folder_key, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     remote_attrs_by_key: Dict[str, Tuple[str, ...]] = {}
@@ -1522,6 +1546,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                     remote_name_mismatch_keys: Set[str] = set()
                     guard_account_dir()
                     with imap_connection(config.server, acc) as imap:
+                        target_delimiter = _legacy_target_hierarchy_delimiter(imap)
+                        target_mailboxes_by_key = {
+                            key: _legacy_target_mailbox_name(
+                                mailbox,
+                                local_segments_by_key.get(key, ()),
+                                target_delimiter,
+                            )
+                            for key, mailbox in local_mailboxes_by_key.items()
+                        }
+                        target_key_by_mailbox = {
+                            mailbox: key
+                            for key, mailbox in target_mailboxes_by_key.items()
+                        }
+                        target_collision_keys: Dict[str, Tuple[str, str]] = {}
+                        for key, target_mailbox in target_mailboxes_by_key.items():
+                            alias = sanitized_path_key(target_mailbox)
+                            previous = target_collision_keys.get(alias)
+                            if previous is not None and previous[0] != key:
+                                raise RuntimeError(
+                                    f"legacy validate target mailbox collision: "
+                                    f"{previous[1]!r} and {target_mailbox!r}"
+                                )
+                            target_collision_keys[alias] = (key, target_mailbox)
                         mailbox_entries = _list_selectable_mailbox_entries(imap)
                         mailboxes = [
                             name
@@ -1541,9 +1588,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if status != "OK":
                                     raise RuntimeError(f"search failed: {mailbox}")
                                 num = len((data[0] or b"").split()) if data else 0
-                                key = sanitize_for_path(mailbox)
-                                alias_key = sanitized_path_key(mailbox)
-                                expected_mailbox = local_mailboxes_by_key.get(key)
+                                key = target_key_by_mailbox.get(mailbox, sanitize_for_path(mailbox))
+                                alias_key = sanitized_path_key(key)
+                                expected_mailbox = target_mailboxes_by_key.get(key)
                                 if expected_mailbox is not None and mailbox != expected_mailbox:
                                     remote_counts[key] = num
                                     remote_mailboxes[key] = mailbox
@@ -1585,7 +1632,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if local_count != remote:
                                 remote_mailbox = remote_mailboxes.get(
                                     folder,
-                                    local_mailboxes_by_key.get(folder, folder),
+                                    target_mailboxes_by_key.get(folder, local_mailboxes_by_key.get(folder, folder)),
                                 )
                                 remote_attrs = remote_attrs_by_key.get(folder, ())
                                 if (
@@ -1627,11 +1674,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     mismatches.append((email, folder, 0, remote_count))
-                        for mailbox, messages in local_messages.items():
-                            key = sanitize_for_path(mailbox)
+                        for key, messages in local_messages.items():
+                            mailbox = local_mailboxes_by_key.get(key, key)
                             if key in mismatched_folders or remote_counts.get(key, -1) < 0:
                                 continue
-                            remote_mailbox = remote_mailboxes.get(key, mailbox)
+                            remote_mailbox = remote_mailboxes.get(key, target_mailboxes_by_key.get(key, mailbox))
                             used_remote_nums: Set[bytes] = set()
                             for rel_path, data in messages:
                                 try:

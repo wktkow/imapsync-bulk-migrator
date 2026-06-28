@@ -12,7 +12,7 @@ from contextlib import AbstractContextManager
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import imaplib
 
@@ -37,6 +37,12 @@ _IMAP_INTERNALDATE_RE = re.compile(
 
 class _LegacyAppendOutcomeUncertain(RuntimeError):
     """Raised when APPEND may have reached the target but no outcome was confirmed."""
+
+
+class _LegacyMailboxEntry(NamedTuple):
+    name: str
+    attributes: Tuple[str, ...]
+    delimiter: str
 
 
 def quote_mailbox_name(mailbox: str) -> str:
@@ -319,6 +325,75 @@ def _mailbox_sort_key(mailbox: str) -> Tuple[int, str]:
     return (0 if mailbox.upper() == "INBOX" else 1, mailbox.lower())
 
 
+def _legacy_mailbox_path_segments(mailbox: str, delimiter: str) -> Tuple[str, ...]:
+    if delimiter and delimiter in mailbox:
+        segments = tuple(segment for segment in mailbox.split(delimiter) if segment)
+        if segments:
+            return segments
+    return (mailbox,)
+
+
+def _legacy_mailbox_metadata(mailbox: str, message_count: int, delimiter: str) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "mailbox": mailbox,
+        "message_count": message_count,
+    }
+    segments = _legacy_mailbox_path_segments(mailbox, delimiter)
+    if len(segments) > 1:
+        payload["source_delimiter"] = delimiter
+        payload["source_path_segments"] = list(segments)
+    return payload
+
+
+def _legacy_export_state_mailbox_metadata(mailbox: str, path: str, message_count: int, delimiter: str) -> Dict[str, object]:
+    payload = _legacy_mailbox_metadata(mailbox, message_count, delimiter)
+    payload["path"] = path
+    return payload
+
+
+def _legacy_validate_path_segments(value: object, mailbox: str, delimiter: object, label: str) -> Tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"{label}: invalid source_path_segments")
+    segments: List[str] = []
+    for segment in value:
+        if not isinstance(segment, str) or not segment:
+            raise RuntimeError(f"{label}: invalid source_path_segments")
+        segments.append(segment)
+    if delimiter is not None and not isinstance(delimiter, str):
+        raise RuntimeError(f"{label}: invalid source_delimiter")
+    if isinstance(delimiter, str) and delimiter and delimiter.join(segments) != mailbox:
+        raise RuntimeError(f"{label}: source_path_segments mismatch")
+    if (not delimiter) and len(segments) == 1 and segments[0] != mailbox:
+        raise RuntimeError(f"{label}: source_path_segments mismatch")
+    return tuple(segments)
+
+
+def _legacy_target_mailbox_name(source_mailbox: str, source_path_segments: Tuple[str, ...], target_delimiter: str) -> str:
+    if len(source_path_segments) > 1 and target_delimiter:
+        return target_delimiter.join(source_path_segments)
+    return source_mailbox
+
+
+def _legacy_target_hierarchy_delimiter(imap: imaplib.IMAP4) -> str:
+    try:
+        status, data = imap.list()
+    except Exception:
+        return ""
+    status_text = status.decode("ascii", errors="ignore") if isinstance(status, bytes) else str(status)
+    if status_text.upper() != "OK":
+        return ""
+    for raw in data or []:
+        with contextlib.suppress(Exception):
+            from .provider_ops import parse_list_entry
+
+            info = parse_list_entry(raw)
+            if info is not None and info.delimiter:
+                return str(info.delimiter)
+    return ""
+
+
 def _list_mailboxes_with_special_use(imap: imaplib.IMAP4) -> Tuple[str, object]:
     def _normal_status(value: object) -> str:
         return value.decode("ascii", errors="ignore") if isinstance(value, bytes) else str(value)
@@ -341,11 +416,11 @@ def _list_mailboxes_with_special_use(imap: imaplib.IMAP4) -> Tuple[str, object]:
     return _plain_list()
 
 
-def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tuple[str, ...]]]:
+def _list_selectable_mailbox_details(imap: imaplib.IMAP4) -> List[_LegacyMailboxEntry]:
     status, data = _list_mailboxes_with_special_use(imap)
     if status != "OK":
         raise RuntimeError("Failed to list mailboxes")
-    mailboxes: List[Tuple[str, Tuple[str, ...]]] = []
+    mailboxes: List[_LegacyMailboxEntry] = []
     for raw in data or []:
         if raw is None:
             continue
@@ -357,7 +432,7 @@ def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tup
         if info is not None:
             attr_lowers = {attr.lower() for attr in info.attributes}
             if not attr_lowers & {"\\noselect", "\\nonexistent"}:
-                mailboxes.append((info.name, tuple(info.attributes)))
+                mailboxes.append(_LegacyMailboxEntry(info.name, tuple(info.attributes), str(info.delimiter or "")))
             continue
         if not isinstance(raw, (bytes, bytearray)):
             continue
@@ -368,21 +443,29 @@ def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tup
             continue
         m = re.findall(r'"([^"]+)"\s*$', line)
         if m:
-            mailboxes.append((decode_imap_utf7(m[0].replace(r"\"", '"').replace(r"\\", "\\")), attrs))
+            mailboxes.append(_LegacyMailboxEntry(
+                decode_imap_utf7(m[0].replace(r"\"", '"').replace(r"\\", "\\")),
+                attrs,
+                "",
+            ))
         else:
             parts = line.rsplit(" ", 1)
             if parts:
                 candidate = parts[-1].strip().strip('"')
                 if candidate:
-                    mailboxes.append((decode_imap_utf7(candidate), attrs))
-    unique: List[Tuple[str, Tuple[str, ...]]] = []
+                    mailboxes.append(_LegacyMailboxEntry(decode_imap_utf7(candidate), attrs, ""))
+    unique: List[_LegacyMailboxEntry] = []
     seen = set()
-    for mb, attrs in mailboxes:
-        if mb not in seen:
-            seen.add(mb)
-            unique.append((mb, attrs))
-    unique.sort(key=lambda item: _mailbox_sort_key(item[0]))
+    for entry in mailboxes:
+        if entry.name not in seen:
+            seen.add(entry.name)
+            unique.append(entry)
+    unique.sort(key=lambda item: _mailbox_sort_key(item.name))
     return unique
+
+
+def _list_selectable_mailbox_entries(imap: imaplib.IMAP4) -> List[Tuple[str, Tuple[str, ...]]]:
+    return [(entry.name, entry.attributes) for entry in _list_selectable_mailbox_details(imap)]
 
 
 def _is_legacy_all_source_view(attributes: Tuple[str, ...]) -> bool:
@@ -854,8 +937,10 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     exported_regular_content: set[Tuple[int, str]] = set()
     exported_virtual_content: set[Tuple[int, str]] = set()
     with imap_connection(server, account) as imap:
-        mailbox_entries = _list_selectable_mailbox_entries(imap)
-        mailbox_attrs_by_name = {name: attrs for name, attrs in mailbox_entries}
+        mailbox_details = _list_selectable_mailbox_details(imap)
+        mailbox_entries = [(entry.name, entry.attributes) for entry in mailbox_details]
+        mailbox_attrs_by_name = {entry.name: entry.attributes for entry in mailbox_details}
+        mailbox_delimiter_by_name = {entry.name: entry.delimiter for entry in mailbox_details}
         mailboxes = [
             name
             for name, attrs in mailbox_entries
@@ -905,13 +990,15 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                     if virtual_source:
                         continue
                     ensure_private_dir(folder_dir)
-                    _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": 0})
+                    delimiter = mailbox_delimiter_by_name.get(mailbox, "")
+                    _secure_atomic_json(folder_dir / ".mailbox.json", _legacy_mailbox_metadata(mailbox, 0, delimiter))
                     _remove_stale_export_files(folder_dir, set())
-                    export_state_mailboxes.append({
-                        "mailbox": mailbox,
-                        "path": sanitize_for_path(mailbox),
-                        "message_count": 0,
-                    })
+                    export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
+                        mailbox,
+                        sanitize_for_path(mailbox),
+                        0,
+                        delimiter,
+                    ))
                     continue
 
                 ensure_private_dir(folder_dir)
@@ -953,17 +1040,29 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "rfc822_size": len(msg_bytes),
                             "content_sha256": digest,
                         }
+                        source_segments = _legacy_mailbox_path_segments(
+                            mailbox,
+                            mailbox_delimiter_by_name.get(mailbox, ""),
+                        )
+                        if len(source_segments) > 1:
+                            meta["source_delimiter"] = mailbox_delimiter_by_name.get(mailbox, "")
+                            meta["source_path_segments"] = list(source_segments)
                         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
                         _secure_atomic_json(meta_path, meta)
                         written_stems.add(base)
                 _remove_stale_export_files(folder_dir, written_stems)
                 if written_stems or not virtual_source:
-                    _secure_atomic_json(folder_dir / ".mailbox.json", {"mailbox": mailbox, "message_count": len(written_stems)})
-                    export_state_mailboxes.append({
-                        "mailbox": mailbox,
-                        "path": sanitize_for_path(mailbox),
-                        "message_count": len(written_stems),
-                    })
+                    delimiter = mailbox_delimiter_by_name.get(mailbox, "")
+                    _secure_atomic_json(
+                        folder_dir / ".mailbox.json",
+                        _legacy_mailbox_metadata(mailbox, len(written_stems), delimiter),
+                    )
+                    export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
+                        mailbox,
+                        sanitize_for_path(mailbox),
+                        len(written_stems),
+                        delimiter,
+                    ))
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
                 if _stop_requested(stop_event):
@@ -1168,6 +1267,7 @@ def import_account(
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str], Optional[int], Optional[str]]]] = {}
+    source_segments_by_mailbox: Dict[str, Tuple[str, ...]] = {}
     staged_marker_paths: set[str] = set()
     staged_markers: Dict[str, Dict[str, object]] = {}
     folder_dirs: List[Path] = []
@@ -1214,6 +1314,14 @@ def import_account(
                     raise RuntimeError(f"{marker}: mailbox marker missing mailbox")
                 if sanitize_for_path(marker_mailbox) != folder_dir.name:
                     raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
+                marker_segments = _legacy_validate_path_segments(
+                    marker_meta.get("source_path_segments"),
+                    marker_mailbox,
+                    marker_meta.get("source_delimiter"),
+                    str(marker),
+                )
+                if marker_segments:
+                    source_segments_by_mailbox[marker_mailbox] = marker_segments
                 mailbox_meta = marker_mailbox
                 marker_mailbox_present = True
             else:
@@ -1253,11 +1361,25 @@ def import_account(
                 raise RuntimeError(f"{meta_path}: missing mailbox metadata")
             if sanitize_for_path(mbox) != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
+            message_segments = _legacy_validate_path_segments(
+                meta.get("source_path_segments"),
+                mbox,
+                meta.get("source_delimiter"),
+                str(meta_path),
+            )
             if marker_mailbox_present:
                 if mbox != default_mailbox:
                     raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
+                marker_segments = source_segments_by_mailbox.get(default_mailbox, ())
+                if marker_segments and message_segments and message_segments != marker_segments:
+                    raise RuntimeError(f"{meta_path}: source_path_segments mismatch")
             elif mbox != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
+            if message_segments:
+                existing_segments = source_segments_by_mailbox.get(mbox)
+                if existing_segments is not None and existing_segments != message_segments:
+                    raise RuntimeError(f"{meta_path}: source_path_segments mismatch")
+                source_segments_by_mailbox[mbox] = message_segments
             data = _read_file_no_symlink(eml_path, "legacy message file", reject_hard_links=True)
             _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
             mailbox_meta = mbox
@@ -1330,9 +1452,28 @@ def import_account(
     folder_errors: List[str] = []
     used_remote_nums_by_folder: Dict[str, set[bytes]] = {}
     with _imap_ctx() as imap:
+        target_delimiter = _legacy_target_hierarchy_delimiter(imap)
+        target_mailbox_by_source = {
+            source_mailbox: _legacy_target_mailbox_name(
+                source_mailbox,
+                source_segments_by_mailbox.get(source_mailbox, ()),
+                target_delimiter,
+            )
+            for source_mailbox in per_folder
+        }
+        target_collision_by_key: Dict[str, Tuple[str, str]] = {}
+        for source_mailbox, target_mailbox in target_mailbox_by_source.items():
+            collision_key = sanitized_path_key(target_mailbox)
+            previous = target_collision_by_key.get(collision_key)
+            if previous is not None and previous[0] != source_mailbox:
+                raise RuntimeError(
+                    f"legacy import target mailbox collision: "
+                    f"{previous[0]!r} -> {previous[1]!r} and {source_mailbox!r} -> {target_mailbox!r}"
+                )
+            target_collision_by_key[collision_key] = (source_mailbox, target_mailbox)
         for folder, entries in per_folder.items():
             _raise_if_stopped(stop_event, f"legacy import {account.email}")
-            mailbox = folder
+            mailbox = target_mailbox_by_source.get(folder, folder)
             try:
                 status, _ = imap.select(quote_mailbox_name(mailbox))
                 if status != "OK":
