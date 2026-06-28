@@ -519,12 +519,13 @@ def audit_export(
     expected_source_server = config.source_server if config.source_server is not None else None
     if expected_source_server is None and not require_integrity_metadata:
         expected_source_server = config.server
+    remote_server = config.source_server or config.server
 
     def worker(acc: Account) -> List[str]:
         _email, issues = audit_account(
             acc,
             in_root,
-            config.server if check_remote else None,
+            remote_server if check_remote else None,
             check_remote=check_remote,
             require_integrity_metadata=require_integrity_metadata,
             expected_source_server=expected_source_server,

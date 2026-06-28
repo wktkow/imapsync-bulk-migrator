@@ -403,6 +403,68 @@ class TestBug7ImportConfigPlaceholder:
 
         assert rc == 0
 
+    def test_audit_mode_remote_checks_use_source_server_from_import_config(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        source = ServerConfig("source.example.com", port=993, ssl=True, starttls=False)
+        target = ServerConfig("target.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": target.host, "port": target.port, "ssl": target.ssl, "starttls": target.starttls},
+            "source_server": {"host": source.host, "port": source.port, "ssl": source.ssl, "starttls": source.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        body = b"Message-ID: <source-audit@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        folder = input_dir / "a@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder, data=body, source_server=source)
+        (folder / ".mailbox.json").write_text(json.dumps({"mailbox": "INBOX", "message_count": 1}))
+        seen_hosts: list[str] = []
+
+        class SourceAuditImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num, query):
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(server: ServerConfig, *_args, **_kwargs) -> Iterator[SourceAuditImap]:
+            seen_hosts.append(server.host)
+            if server.host != source.host:
+                raise AssertionError(f"audit contacted target server: {server.host}")
+            yield SourceAuditImap()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.audit.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "audit",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+            ])
+
+        assert rc == 0
+        assert seen_hosts == [source.host]
+
     def test_generated_config_has_placeholder_host_and_private_permissions(self, tmp_path: Path) -> None:
         config_data = {
             "server": {"host": "real-export-server.example.com", "port": 993, "ssl": True, "starttls": False},
