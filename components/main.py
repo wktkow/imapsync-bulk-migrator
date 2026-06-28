@@ -1333,9 +1333,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             check_free_space_for_path(in_root, min_free_gb)
             try:
                 logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
+                audit_config = Config(
+                    server=config.server,
+                    accounts=config.accounts,
+                    source_server=config.source_server or config.server,
+                )
                 ok, audit_issues = audit_export(
                     in_root,
-                    config,
+                    audit_config,
                     int(args.max_workers),
                     check_remote=not bool(getattr(args, "audit_offline", False)),
                     require_integrity_metadata=True,
