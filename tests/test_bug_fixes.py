@@ -5840,6 +5840,27 @@ print("ok")
         assert _legacy_remote_has_message(fake, "INBOX", message, set())
         assert fake.criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"')
 
+    def test_imap_search_value_rejects_control_characters(self) -> None:
+        from components.utils import quote_imap_search_value
+
+        with pytest.raises(ValueError, match="control characters"):
+            quote_imap_search_value("<x\r\nNOOP@example.com>")
+
+    def test_legacy_remote_message_search_rejects_decoded_crlf_message_id(self) -> None:
+        from components.imap_ops import _legacy_remote_has_message
+
+        message = b"Message-ID: =?utf-8?q?<x=0D=0ANOOP@example.com>?=\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class NoSearchImap:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                raise AssertionError("unsafe Message-ID should not reach IMAP search")
+
+        with pytest.raises(ValueError, match="control characters"):
+            _legacy_remote_has_message(NoSearchImap(), "INBOX", message, set())
+
     def test_validate_remote_identity_matches_imaplib_append_wire_bytes(self) -> None:
         import imaplib
 

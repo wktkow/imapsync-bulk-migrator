@@ -27,6 +27,8 @@ _IMAP_ATOM_SPECIALS = set('(){ %*"\\]')
 
 def quote_imap_search_value(value: str) -> str:
     """Return an IMAP search string safe for imaplib's raw argument joining."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError("IMAP search value contains control characters")
     if value and not any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _IMAP_ATOM_SPECIALS for ch in value):
         return value
     escaped = value.replace("\\", "\\\\").replace('"', r"\"")
