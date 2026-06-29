@@ -30,6 +30,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import urllib.parse
 
+from components.secret_files import read_secret_file_no_links
+
 try:
     import requests
 except Exception:  # pragma: no cover
@@ -428,7 +430,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
 
 
 def read_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").rstrip("\r\n")
+    value = read_secret_file_no_links(path, label=label)
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value

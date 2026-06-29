@@ -43,6 +43,7 @@ from .imap_ops import (
 )
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config, ProviderMigrationConfig, load_config_file
+from .secret_files import read_secret_file_no_links
 from .provider_ops import (
     provider_audit_all,
     provider_export_all,
@@ -71,7 +72,7 @@ def _utc_log_timestamp() -> str:
 
 
 def _read_required_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").rstrip("\r\n")
+    value = read_secret_file_no_links(path, label=label)
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value

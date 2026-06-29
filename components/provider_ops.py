@@ -29,6 +29,7 @@ from .content_binding import (
 from .executor import parallel_process_accounts
 from .imap_ops import _imap_append_wire_bytes, _valid_legacy_flag_token, _valid_legacy_internaldate
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
+from .secret_files import read_secret_file_no_links
 from .utils import (
     decode_imap_utf7,
     encode_imap_utf7,
@@ -107,9 +108,9 @@ def resolve_secret(auth: AuthConfig) -> str:
         if value is None:
             raise RuntimeError(f"environment variable {auth.env_var} is not set")
     elif auth.token_file:
-        value = Path(auth.token_file).read_text(encoding="utf-8").rstrip("\r\n")
+        value = read_secret_file_no_links(auth.token_file, label="token file")
     elif auth.password_file:
-        value = Path(auth.password_file).read_text(encoding="utf-8").rstrip("\r\n")
+        value = read_secret_file_no_links(auth.password_file, label="password file")
     elif auth.password is not None:
         value = auth.password
     else:
