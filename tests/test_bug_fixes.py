@@ -13314,6 +13314,99 @@ class TestRound7ConfirmedBugs:
         assert (real_account_dir / "import.journal.jsonl").exists()
         assert not list(real_account_dir.glob("import.journal.reset-*.jsonl"))
 
+    def test_reset_journal_archive_rejects_journal_symlink_swap_after_validation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        row = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_text(json.dumps(row) + "\n")
+        victim = tmp_path / "victim.jsonl"
+        victim.write_text("outside\n")
+        real_load = imap_ops._load_legacy_import_journal_with_stat
+        swapped = False
+
+        def racing_load(path: Path, *args, **kwargs):
+            nonlocal swapped
+            result = real_load(path, *args, **kwargs)
+            if path == account_dir and not swapped:
+                journal.unlink()
+                try:
+                    journal.symlink_to(victim)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return result
+
+        monkeypatch.setattr(imap_ops, "_load_legacy_import_journal_with_stat", racing_load)
+
+        with pytest.raises(RuntimeError, match="legacy import journal changed during archive"):
+            imap_ops.archive_legacy_import_journal_for_reset(account_dir)
+
+        assert swapped
+        assert journal.is_symlink()
+        assert not list(account_dir.glob("import.journal.reset-*.jsonl"))
+        assert victim.read_text() == "outside\n"
+
+    def test_reset_journal_archive_rejects_journal_file_swap_after_validation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        validated = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+        }
+        replacement = {
+            "key": "c" * 64,
+            "target": "d" * 64,
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000002.eml",
+            "status": "committed",
+        }
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_text(json.dumps(validated) + "\n")
+        saved = account_dir / "validated-import.journal.jsonl"
+        real_load = imap_ops._load_legacy_import_journal_with_stat
+        swapped = False
+
+        def racing_load(path: Path, *args, **kwargs):
+            nonlocal swapped
+            result = real_load(path, *args, **kwargs)
+            if path == account_dir and not swapped:
+                journal.rename(saved)
+                journal.write_text(json.dumps(replacement) + "\n")
+                swapped = True
+            return result
+
+        monkeypatch.setattr(imap_ops, "_load_legacy_import_journal_with_stat", racing_load)
+
+        with pytest.raises(RuntimeError, match="legacy import journal changed during archive"):
+            imap_ops.archive_legacy_import_journal_for_reset(account_dir)
+
+        assert swapped
+        assert saved.exists()
+        assert json.loads(journal.read_text())["key"] == replacement["key"]
+        assert not list(account_dir.glob("import.journal.reset-*.jsonl"))
+
     def test_reset_journal_archive_rejects_account_dir_swap_after_validation(
         self,
         tmp_path: Path,
@@ -13335,7 +13428,7 @@ class TestRound7ConfirmedBugs:
         outside.mkdir()
         (outside / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
         checked_account_dir = tmp_path / "checked-account"
-        real_load = imap_ops._load_legacy_import_journal
+        real_load = imap_ops._load_legacy_import_journal_with_stat
         swapped = False
 
         def racing_load(path: Path, *args, **kwargs):
@@ -13350,7 +13443,7 @@ class TestRound7ConfirmedBugs:
                 swapped = True
             return result
 
-        monkeypatch.setattr(imap_ops, "_load_legacy_import_journal", racing_load)
+        monkeypatch.setattr(imap_ops, "_load_legacy_import_journal_with_stat", racing_load)
 
         with pytest.raises(RuntimeError, match="replaced legacy import journal directory"):
             imap_ops.archive_legacy_import_journal_for_reset(account_dir)

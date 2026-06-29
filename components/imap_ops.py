@@ -239,7 +239,12 @@ def _fsync_legacy_directory_fd(dir_fd: int, path: Path, label: str) -> None:
         raise RuntimeError(f"unable to fsync {label} directory for durability: {path}") from exc
 
 
-def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = False) -> bytes:
+def _read_file_no_symlink_with_stat(
+    path: Path,
+    label: str,
+    *,
+    reject_hard_links: bool = False,
+) -> Tuple[bytes, os.stat_result]:
     parent_fd, name, parent_path = _open_legacy_parent_dir(path, label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -266,7 +271,16 @@ def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = F
     finally:
         os.close(parent_fd)
     with os.fdopen(fd, "rb") as f:
-        return f.read()
+        return f.read(), stat_result
+
+
+def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = False) -> bytes:
+    content, _stat_result = _read_file_no_symlink_with_stat(
+        path,
+        label,
+        reject_hard_links=reject_hard_links,
+    )
+    return content
 
 
 def _raise_if_hard_linked_private_file_fd(fd: int, path: Path, label: str) -> None:
@@ -817,12 +831,10 @@ def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]
     _raise_if_symlink(path, "legacy import journal")
     parent_fd, name, parent_path = _open_legacy_parent_dir(path, "legacy import journal")
     try:
-        try:
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
+        _journal_rows, journal_stat = _load_legacy_import_journal_with_stat(account_dir, repair_trailing=False)
+        if journal_stat is None:
             _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
             return None
-        _load_legacy_import_journal(account_dir, repair_trailing=False)
         _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
         stamp = int(time.time())
         for idx in range(1000):
@@ -832,6 +844,18 @@ def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]
                 os.stat(archive_name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+                try:
+                    visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(f"legacy import journal changed during archive: {path}") from exc
+                if (
+                    visible_stat.st_dev != journal_stat.st_dev
+                    or visible_stat.st_ino != journal_stat.st_ino
+                    or stat.S_ISLNK(visible_stat.st_mode)
+                    or not stat.S_ISREG(visible_stat.st_mode)
+                    or getattr(visible_stat, "st_nlink", 1) > 1
+                ):
+                    raise RuntimeError(f"legacy import journal changed during archive: {path}")
                 os.rename(name, archive_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
                 _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy import journal")
@@ -1015,7 +1039,11 @@ def _legacy_journal_content_counts(
     return counts
 
 
-def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = True) -> List[Dict[str, str]]:
+def _load_legacy_import_journal_with_stat(
+    account_dir: Path,
+    *,
+    repair_trailing: bool = True,
+) -> Tuple[List[Dict[str, str]], Optional[os.stat_result]]:
     path = _legacy_import_journal_path(account_dir)
     rows: List[Dict[str, str]] = []
     _raise_if_symlink(path, "legacy import journal")
@@ -1023,12 +1051,16 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
         issue = legacy_reserved_mailbox_path_issue(path.name, path.name)
         raise RuntimeError(f"invalid legacy account layout: {issue}")
     if not path.exists():
-        return rows
+        return rows, None
     try:
-        raw = _read_file_no_symlink(path, "legacy import journal", reject_hard_links=True)
+        raw, journal_stat = _read_file_no_symlink_with_stat(
+            path,
+            "legacy import journal",
+            reject_hard_links=True,
+        )
     except OSError as exc:
         if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
-            return rows
+            return rows, None
         raise
     lines = raw.splitlines()
     needs_rewrite = False
@@ -1069,6 +1101,15 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
         rows.append(coerced)
     if needs_rewrite:
         _write_legacy_import_journal(account_dir, rows)
+        journal_stat = None
+    return rows, journal_stat
+
+
+def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = True) -> List[Dict[str, str]]:
+    rows, _journal_stat = _load_legacy_import_journal_with_stat(
+        account_dir,
+        repair_trailing=repair_trailing,
+    )
     return rows
 
 
