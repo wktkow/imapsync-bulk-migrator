@@ -13063,6 +13063,28 @@ class TestRound7ConfirmedBugs:
 
         assert fsync_targets == ["file", "dir"]
 
+    def test_legacy_atomic_write_preserves_visible_target_after_directory_fsync_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target = tmp_path / "user@example.com" / "export-state.json"
+        target.parent.mkdir()
+        target.write_bytes(b"old\n")
+
+        def fail_directory_fsync(*_args, **_kwargs) -> None:
+            raise RuntimeError("simulated directory fsync failure")
+
+        monkeypatch.setattr(imap_ops, "_fsync_legacy_directory_fd", fail_directory_fsync)
+
+        with pytest.raises(RuntimeError, match="simulated directory fsync failure"):
+            imap_ops._secure_atomic_write_bytes(target, b"new\n")
+
+        assert target.exists()
+        assert target.read_bytes() == b"new\n"
+
     def test_legacy_append_journal_fsyncs_parent_directory_after_create(
         self,
         tmp_path: Path,
