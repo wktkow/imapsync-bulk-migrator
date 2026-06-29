@@ -18,6 +18,7 @@ import re
 from components.content_binding import legacy_content_binding_issue, provider_content_binding_issue
 from components.imap_ops import (
     _legacy_hierarchy_metadata,
+    _legacy_uidvalidity_metadata,
     _legacy_validate_path_segments,
     _valid_legacy_flag_token,
     _valid_legacy_internaldate,
@@ -298,6 +299,7 @@ def analyze_message(
     mailbox_marker_present=True,
     mailbox_marker_mailbox=None,
     mailbox_marker_hierarchy=("", ()),
+    mailbox_marker_uidvalidity="",
 ):
     """Analyze a single exported message"""
     try:
@@ -381,6 +383,16 @@ def analyze_message(
                 stem = Path(eml_path).stem
                 if stem.startswith('u') and stem[1:].isdigit() and uid != int(stem[1:]):
                     integrity_errors.append(f'uid mismatch (name={int(stem[1:])} meta={uid})')
+        try:
+            message_uidvalidity = _legacy_uidvalidity_metadata(
+                metadata,
+                f'{folder_name}/{Path(eml_path).name}' if folder_name is not None else str(eml_path),
+            )
+        except RuntimeError as exc:
+            integrity_errors.append(str(exc))
+            message_uidvalidity = ""
+        if mailbox_marker_mailbox is not None and message_uidvalidity != mailbox_marker_uidvalidity:
+            integrity_errors.append('uidvalidity mismatch with mailbox marker')
         if 'flags' in metadata:
             flags = metadata.get('flags')
             if not isinstance(flags, str):
@@ -438,6 +450,7 @@ def analyze_message(
             'date': msg.get('Date', ''),
             'flags': metadata.get('flags', ''),
             'mailbox': metadata.get('mailbox', ''),
+            'uidvalidity': metadata.get('uidvalidity', ''),
             'content_types': [],
             'multiple_messages_detected': (
                 return_path_count > 1
@@ -494,6 +507,10 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
                     mailbox,
                     f"{folder_name}: mailbox marker",
                 )
+            except RuntimeError as exc:
+                issues.append(str(exc))
+            try:
+                _legacy_uidvalidity_metadata(marker, f"{folder_name}: mailbox marker")
             except RuntimeError as exc:
                 issues.append(str(exc))
     message_count = marker.get('message_count')
@@ -567,6 +584,14 @@ def analyze_export_state(account_path, folder_counts):
             except RuntimeError as exc:
                 issues.append(str(exc))
                 state_hierarchy = ("", ())
+            try:
+                state_uidvalidity = _legacy_uidvalidity_metadata(
+                    entry,
+                    f"export-state mailbox {mailbox!r}",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
+                state_uidvalidity = ""
             marker_path = account_path / path / ".mailbox.json"
             if marker_path.exists() and not marker_path.is_symlink():
                 try:
@@ -588,6 +613,18 @@ def analyze_export_state(account_path, folder_counts):
                                 issues.append(
                                     f"export-state mailbox {mailbox!r} source_path_segments mismatch with mailbox marker"
                                 )
+                            try:
+                                marker_uidvalidity = _legacy_uidvalidity_metadata(
+                                    marker,
+                                    f"{path}: mailbox marker",
+                                )
+                            except RuntimeError as exc:
+                                issues.append(str(exc))
+                            else:
+                                if marker_uidvalidity != state_uidvalidity:
+                                    issues.append(
+                                        f"export-state mailbox {mailbox!r} uidvalidity mismatch with mailbox marker"
+                                    )
         if type(message_count) is not int or message_count < 0:
             issues.append(f"export-state mailbox {label!r} has invalid message_count")
         elif path in folder_counts and message_count != folder_counts[path]:
@@ -894,6 +931,8 @@ def verify_account(account_path):
         mailbox_marker_present = mailbox_marker.exists() or mailbox_marker.is_symlink()
         mailbox_marker_mailbox = None
         mailbox_marker_hierarchy = ("", ())
+        mailbox_marker_uidvalidity = ""
+        folder_uidvalidity = None
         if mailbox_marker.exists() and not mailbox_marker.is_symlink():
             try:
                 marker = json.loads(_read_artifact_no_links(mailbox_marker, "mailbox marker").decode("utf-8"))
@@ -905,6 +944,12 @@ def verify_account(account_path):
                         mailbox,
                         f"{folder_name}: mailbox marker",
                     )
+                    mailbox_marker_uidvalidity = _legacy_uidvalidity_metadata(
+                        marker,
+                        f"{folder_name}: mailbox marker",
+                    )
+                    if mailbox_marker_uidvalidity:
+                        folder_uidvalidity = mailbox_marker_uidvalidity
             except Exception:
                 pass
         
@@ -942,10 +987,20 @@ def verify_account(account_path):
                 mailbox_marker_present=mailbox_marker_present,
                 mailbox_marker_mailbox=mailbox_marker_mailbox,
                 mailbox_marker_hierarchy=mailbox_marker_hierarchy,
+                mailbox_marker_uidvalidity=mailbox_marker_uidvalidity,
             )
             
             if error:
                 errors.append(f"{folder_name}/{eml_file.name}: {error}")
+                folder_errors += 1
+                continue
+            message_uidvalidity = analysis.get('uidvalidity', '')
+            if not isinstance(message_uidvalidity, str):
+                message_uidvalidity = ''
+            if folder_uidvalidity is None:
+                folder_uidvalidity = message_uidvalidity
+            elif message_uidvalidity != folder_uidvalidity:
+                errors.append(f"{folder_name}/{eml_file.name}: uidvalidity mismatch within mailbox")
                 folder_errors += 1
                 continue
             

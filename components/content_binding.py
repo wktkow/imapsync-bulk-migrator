@@ -92,6 +92,7 @@ def legacy_content_binding_sha256(meta: Mapping[str, Any]) -> str:
     _add_optional_text(fields, meta, "account")
     _add_optional_text(fields, meta, "mailbox")
     _add_optional_int(fields, meta, "uid")
+    _add_optional_text(fields, meta, "uidvalidity")
     _add_optional_text(fields, meta, "flags")
     _add_optional_text(fields, meta, "internaldate")
     _add_optional_text(fields, meta, "message_id_header")

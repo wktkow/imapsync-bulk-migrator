@@ -29,6 +29,7 @@ LEGACY_ACCOUNT_RESERVED_PATHS = frozenset({"export-state.json", "import.journal.
 _LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGACY_ACCOUNT_RESERVED_PATHS)
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_LEGACY_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
 _IMAP_INTERNALDATE_RE = re.compile(
     r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
@@ -334,11 +335,18 @@ def _legacy_mailbox_path_segments(mailbox: str, delimiter: str) -> Tuple[str, ..
     return (mailbox,)
 
 
-def _legacy_mailbox_metadata(mailbox: str, message_count: int, delimiter: str) -> Dict[str, object]:
+def _legacy_mailbox_metadata(
+    mailbox: str,
+    message_count: int,
+    delimiter: str,
+    uidvalidity: str = "",
+) -> Dict[str, object]:
     payload: Dict[str, object] = {
         "mailbox": mailbox,
         "message_count": message_count,
     }
+    if uidvalidity:
+        payload["uidvalidity"] = uidvalidity
     segments = _legacy_mailbox_path_segments(mailbox, delimiter)
     if len(segments) > 1:
         payload["source_delimiter"] = delimiter
@@ -346,8 +354,14 @@ def _legacy_mailbox_metadata(mailbox: str, message_count: int, delimiter: str) -
     return payload
 
 
-def _legacy_export_state_mailbox_metadata(mailbox: str, path: str, message_count: int, delimiter: str) -> Dict[str, object]:
-    payload = _legacy_mailbox_metadata(mailbox, message_count, delimiter)
+def _legacy_export_state_mailbox_metadata(
+    mailbox: str,
+    path: str,
+    message_count: int,
+    delimiter: str,
+    uidvalidity: str = "",
+) -> Dict[str, object]:
+    payload = _legacy_mailbox_metadata(mailbox, message_count, delimiter, uidvalidity)
     payload["path"] = path
     return payload
 
@@ -390,6 +404,26 @@ def _legacy_hierarchy_metadata(
         return "", ()
     delimiter = record.get("source_delimiter")
     return (delimiter if isinstance(delimiter, str) else "", segments)
+
+
+def _legacy_uidvalidity_metadata(record: Mapping[str, object], label: str) -> str:
+    value = record.get("uidvalidity")
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or not _LEGACY_UIDVALIDITY_RE.fullmatch(value):
+        raise RuntimeError(f"{label}: invalid uidvalidity metadata")
+    return value
+
+
+def selected_uidvalidity(imap: imaplib.IMAP4) -> str:
+    with contextlib.suppress(Exception):
+        _typ, data = imap.response("UIDVALIDITY")
+        if data and data[0]:
+            value = data[0].decode(errors="ignore") if isinstance(data[0], bytes) else str(data[0])
+            value = value.strip()
+            if _LEGACY_UIDVALIDITY_RE.fullmatch(value):
+                return value
+    return ""
 
 
 def _legacy_target_mailbox_name(source_mailbox: str, source_path_segments: Tuple[str, ...], target_delimiter: str) -> str:
@@ -533,9 +567,16 @@ def list_all_mailboxes(imap: imaplib.IMAP4) -> List[str]:
 
 def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     """Select a mailbox and return all message UIDs in ascending order."""
+    uids, _uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox)
+    return uids
+
+
+def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[List[int], str]:
+    """Select a mailbox and return all message UIDs plus the selected UIDVALIDITY."""
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         raise RuntimeError(f"Failed to select mailbox {mailbox}")
+    uidvalidity = selected_uidvalidity(imap)
     status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"Failed to search UIDs in {mailbox}")
@@ -548,7 +589,7 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
                 continue
     # Ensure stable ascending order
     uids.sort()
-    return uids
+    return uids, uidvalidity
 
 
 def _legacy_import_journal_path(account_dir: Path) -> Path:
@@ -1006,20 +1047,24 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 attrs = mailbox_attrs_by_name.get(mailbox, ())
                 virtual_source = _is_legacy_all_source_view(attrs) or _is_legacy_flagged_source_view(attrs)
                 folder_dir = account_dir / sanitize_for_path(mailbox)
-                uids = fetch_all_uids(imap, mailbox)
+                uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
                     if virtual_source:
                         continue
                     ensure_private_dir(folder_dir)
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
-                    _secure_atomic_json(folder_dir / ".mailbox.json", _legacy_mailbox_metadata(mailbox, 0, delimiter))
+                    _secure_atomic_json(
+                        folder_dir / ".mailbox.json",
+                        _legacy_mailbox_metadata(mailbox, 0, delimiter, uidvalidity),
+                    )
                     _remove_stale_export_files(folder_dir, set())
                     export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
                         mailbox,
                         sanitize_for_path(mailbox),
                         0,
                         delimiter,
+                        uidvalidity,
                     ))
                     continue
 
@@ -1063,6 +1108,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             "rfc822_size": len(msg_bytes),
                             "content_sha256": digest,
                         }
+                        if uidvalidity:
+                            meta["uidvalidity"] = uidvalidity
                         source_segments = _legacy_mailbox_path_segments(
                             mailbox,
                             mailbox_delimiter_by_name.get(mailbox, ""),
@@ -1076,15 +1123,26 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 _remove_stale_export_files(folder_dir, written_stems)
                 if written_stems or not virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
+                    if uidvalidity:
+                        status, response = imap.select(quote_mailbox_name(mailbox), readonly=True)
+                        if status != "OK":
+                            raise RuntimeError(f"Failed to reselect mailbox {mailbox} after export: {response}")
+                        final_uidvalidity = selected_uidvalidity(imap)
+                        if final_uidvalidity and final_uidvalidity != uidvalidity:
+                            raise RuntimeError(
+                                f"UIDVALIDITY changed during export of {mailbox}: "
+                                f"{uidvalidity} -> {final_uidvalidity}"
+                            )
                     _secure_atomic_json(
                         folder_dir / ".mailbox.json",
-                        _legacy_mailbox_metadata(mailbox, len(written_stems), delimiter),
+                        _legacy_mailbox_metadata(mailbox, len(written_stems), delimiter, uidvalidity),
                     )
                     export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
                         mailbox,
                         sanitize_for_path(mailbox),
                         len(written_stems),
                         delimiter,
+                        uidvalidity,
                     ))
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
@@ -1302,6 +1360,8 @@ def import_account(
         _raise_if_stopped(stop_event, f"legacy import {account.email}")
         mailbox_meta = folder_dir.name
         marker_mailbox_present = False
+        marker_uidvalidity = ""
+        folder_uidvalidity: Optional[str] = None
         marker = folder_dir / ".mailbox.json"
         _raise_if_symlink(marker, "legacy mailbox marker")
         eml_paths = sorted(folder_dir.glob("*.eml"))
@@ -1338,6 +1398,9 @@ def import_account(
                 if sanitize_for_path(marker_mailbox) != folder_dir.name:
                     raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
                 marker_hierarchy = _legacy_hierarchy_metadata(marker_meta, marker_mailbox, str(marker))
+                marker_uidvalidity = _legacy_uidvalidity_metadata(marker_meta, str(marker))
+                if marker_uidvalidity:
+                    folder_uidvalidity = marker_uidvalidity
                 if marker_hierarchy[1]:
                     source_hierarchy_by_mailbox[marker_mailbox] = marker_hierarchy
                 mailbox_meta = marker_mailbox
@@ -1367,6 +1430,7 @@ def import_account(
             if not isinstance(meta, dict):
                 raise RuntimeError(f"{meta_path}: message metadata is not an object")
             _validate_legacy_uid_metadata(meta_path, eml_path, meta)
+            message_uidvalidity = _legacy_uidvalidity_metadata(meta, str(meta_path))
             expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
             flags, internaldate = _validate_legacy_delivery_metadata(meta, meta_path)
             account_meta = meta.get("account")
@@ -1386,8 +1450,14 @@ def import_account(
                 marker_hierarchy = source_hierarchy_by_mailbox.get(default_mailbox, ("", ()))
                 if message_hierarchy != marker_hierarchy:
                     raise RuntimeError(f"{meta_path}: source_path_segments mismatch")
+                if message_uidvalidity != marker_uidvalidity:
+                    raise RuntimeError(f"{meta_path}: uidvalidity mismatch")
             elif mbox != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
+            if folder_uidvalidity is None:
+                folder_uidvalidity = message_uidvalidity
+            elif message_uidvalidity != folder_uidvalidity:
+                raise RuntimeError(f"{meta_path}: uidvalidity mismatch")
             if message_hierarchy[1]:
                 existing_hierarchy = source_hierarchy_by_mailbox.get(mbox)
                 if existing_hierarchy is not None and existing_hierarchy != message_hierarchy:

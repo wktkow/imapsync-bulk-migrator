@@ -1401,6 +1401,162 @@ class TestLegacyListParsing:
         }
         assert metadata_uids == {1, 2}
 
+    def test_export_persists_and_binds_legacy_uidvalidity(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-uidvalidity@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class UIDValiditySource:
+            def __init__(self) -> None:
+                self.selected = ""
+                self.response_calls: List[str] = []
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                self.response_calls.append(name)
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = UIDValiditySource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[UIDValiditySource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        marker = json.loads((account_dir / "INBOX" / ".mailbox.json").read_text())
+        metadata = json.loads((account_dir / "INBOX" / "u0000000001.json").read_text())
+        state = json.loads((account_dir / "export-state.json").read_text())
+
+        assert source.response_calls == ["UIDVALIDITY", "UIDVALIDITY"]
+        assert marker["uidvalidity"] == "123"
+        assert metadata["uidvalidity"] == "123"
+        assert state["mailboxes"][0]["uidvalidity"] == "123"
+
+    def test_export_fails_when_legacy_uidvalidity_changes(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-uidvalidity-changed@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class ChangingUIDValiditySource:
+            def __init__(self) -> None:
+                self.select_count = 0
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.select_count += 1
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"111" if self.select_count == 1 else b"222"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[ChangingUIDValiditySource]:
+            yield ChangingUIDValiditySource()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="UIDVALIDITY changed during export of INBOX"):
+                export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+    def test_audit_import_and_verify_reject_legacy_uidvalidity_mismatch(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import export_account, import_account
+        from components.models import Account, ServerConfig
+        from verify_export import verify_account
+
+        body = b"Message-ID: <legacy-uidvalidity-mismatch@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class UIDValiditySource:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[UIDValiditySource]:
+            yield UIDValiditySource()
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        metadata_path = tmp_path / "user@example.com" / "INBOX" / "u0000000001.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["uidvalidity"] = "456"
+        metadata[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(metadata)
+        metadata_path.write_text(json.dumps(metadata))
+
+        _email, audit_issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        stats = verify_account(tmp_path / "user@example.com")
+
+        assert any("uidvalidity mismatch" in issue for issue in audit_issues)
+        assert stats["errors"] > 0
+        with pytest.raises(RuntimeError, match="uidvalidity mismatch"):
+            import_account(account, server, tmp_path, ignore_errors=False)
+
     def test_export_uses_generic_all_instead_of_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
