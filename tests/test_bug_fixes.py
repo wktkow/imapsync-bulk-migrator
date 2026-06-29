@@ -69,6 +69,7 @@ def _write_legacy_message_fixture(
     uid: int = 1,
     mailbox: str = "INBOX",
     data: bytes = b"From: a\r\nTo: b\r\n\r\nbody",
+    flags: str = "\\Seen",
     source_server=None,
 ) -> Path:
     from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
@@ -83,7 +84,7 @@ def _write_legacy_message_fixture(
         account=folder.parent.name,
         mailbox=mailbox,
         uid=uid,
-        flags="\\Seen",
+        flags=flags,
         internaldate="01-Jan-2024 00:00:00 +0000",
     )
     eml.with_suffix(".json").write_text(json.dumps(meta))
@@ -447,7 +448,7 @@ class TestBug7ImportConfigPlaceholder:
                 return "OK", [b"1"]
 
             def fetch(self, num, query):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2191,7 +2192,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 73 BODY[] {73}", body)]
+                return "OK", [(b"1 (RFC822.SIZE 73 FLAGS (\\Seen) BODY[] {73}", body)]
 
             def logout(self):
                 return "OK", []
@@ -2261,7 +2262,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 76 BODY[] {76}", body)]
+                return "OK", [(b"1 (RFC822.SIZE 76 FLAGS (\\Seen) BODY[] {76}", body)]
 
             def logout(self):
                 return "OK", []
@@ -2348,7 +2349,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2445,7 +2446,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2591,7 +2592,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2786,7 +2787,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2891,7 +2892,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3038,7 +3039,7 @@ class TestLegacyImportJournal:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 77 BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
+                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -3104,7 +3105,7 @@ class TestLegacyImportJournal:
             def fetch(self, num: bytes, query: str):
                 self.fetch_count += 1
                 body = self.stored[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3239,7 +3240,7 @@ class TestLegacyImportJournal:
 
             def fetch(self, num: bytes, query: str):
                 body = self.stored[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3443,7 +3444,7 @@ class TestLegacyImportJournal:
             def fetch(self, num: bytes, query: str):
                 payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
                 payload = payloads[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(payload), len(payload)), payload)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(payload), len(payload)), payload)]
 
             def logout(self):
                 return "OK", []
@@ -3523,7 +3524,7 @@ class TestLegacyImportJournal:
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
 
             def append(self, *_args, **_kwargs):
                 self.append_count += 1
@@ -4047,7 +4048,7 @@ class TestLegacyImportJournal:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
 
             def append(self, *_args, **_kwargs):
                 self.append_count += 1
@@ -4106,7 +4107,7 @@ class TestLegacyImportJournal:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 77 BODY[] {77}", data)]
+                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) BODY[] {77}", data)]
 
             def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
                 self.append_count += 1
@@ -5142,6 +5143,66 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
+    def test_legacy_validate_rejects_remote_message_missing_flags(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        config_path = tmp_path / "import.pass.config.json"
+        server_json = {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls}
+        config_path.write_text(json.dumps({
+            "server": server_json,
+            "source_server": server_json,
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        body = b"Message-ID: <flag-mismatch@example.com>\r\n\r\nbody"
+        _write_legacy_message_fixture(
+            input_dir / "a@example.com" / "INBOX",
+            data=body,
+            flags="\\Seen \\Answered",
+            source_server=server,
+        )
+
+        class MissingFlagRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<flag-mismatch@example.com>":
+                        return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                assert "FLAGS" in query
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[MissingFlagRemote]:
+            yield MissingFlagRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
     def test_legacy_validate_consumes_remote_identity_matches_for_duplicates(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -5176,8 +5237,8 @@ class TestCliAndConfigHardening:
 
             def fetch(self, num: bytes, *_args, **_kwargs):
                 if num == b"1":
-                    return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", duplicate)]
-                return "OK", [(b"2 (RFC822.SIZE 37 BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
+                    return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) BODY[] {36}", duplicate)]
+                return "OK", [(b"2 (RFC822.SIZE 37 FLAGS (\\Seen) BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -5236,7 +5297,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
+                return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -5355,7 +5416,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
 
             def logout(self):
                 return "OK", []
@@ -5410,7 +5471,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
 
             def logout(self):
                 return "OK", []
@@ -6024,7 +6085,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 39 BODY[] {39}", data)]
+                return "OK", [(b"1 (RFC822.SIZE 39 FLAGS (\\Seen) BODY[] {39}", data)]
 
             def logout(self):
                 return "OK", []
@@ -6206,6 +6267,57 @@ class TestAuditHardening:
             _email, issues = audit_account(account, tmp_path, ServerConfig(host="imap.example.com"), check_remote=True)
 
         assert any("remote message identity missing" in issue for issue in issues)
+
+    def test_audit_account_flags_remote_message_missing_flags(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="imap.example.com")
+        account = Account(email="a@example.com", password="secret")
+        body = b"Message-ID: <audit-flag-mismatch@example.com>\r\n\r\nbody"
+        _write_legacy_message_fixture(
+            tmp_path / account.email / "INBOX",
+            data=body,
+            flags="\\Seen \\Answered",
+            source_server=server,
+        )
+
+        class CountAndBodyMatchMissingFlagRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<audit-flag-mismatch@example.com>":
+                        return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                assert "FLAGS" in query
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CountAndBodyMatchMissingFlagRemote]:
+            yield CountAndBodyMatchMissingFlagRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(account, tmp_path, server, check_remote=True)
+
+        assert any("remote flags missing" in issue and "\\ANSWERED" in issue for issue in issues)
 
     def test_audit_account_flags_metadata_mailbox_mismatch(self, tmp_path: Path) -> None:
         from components.audit import audit_account
@@ -8707,7 +8819,7 @@ print("ok")
                 return "BAD", [b"bad search"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 49 BODY[] {49}", message)]
+                return "OK", [(b"1 (RFC822.SIZE 49 FLAGS (\\Seen) BODY[] {49}", message)]
 
         fake = SpecialMessageIdImap()
 
@@ -8751,7 +8863,7 @@ print("ok")
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(stored), len(stored)), stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(stored), len(stored)), stored)]
 
         assert _legacy_remote_has_message(NormalizedRemote(), "INBOX", message, set())
 
@@ -10393,7 +10505,7 @@ class TestRound7ConfirmedBugs:
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(stored), len(stored)), stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(stored), len(stored)), stored)]
 
         @contextlib.contextmanager
         def fake_connection(_server, _account):

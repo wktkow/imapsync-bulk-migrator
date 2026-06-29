@@ -622,11 +622,36 @@ def _canonical_legacy_flag_set(flags: Optional[str]) -> frozenset[str]:
     return frozenset(normalized)
 
 
+def _legacy_target_flag_set(flags: Optional[str]) -> frozenset[str]:
+    return frozenset(flag for flag in _canonical_legacy_flag_set(flags) if flag != "\\RECENT")
+
+
+def _legacy_flags_from_fetch_response(fetch_response: List[object]) -> Optional[str]:
+    for part in fetch_response:
+        meta = part[0] if isinstance(part, tuple) and part else part
+        if isinstance(meta, (bytes, bytearray)):
+            meta_str = bytes(meta).decode(errors="ignore")
+        else:
+            meta_str = str(meta or "")
+        m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
+        if m_flags:
+            return m_flags.group(1)
+    return None
+
+
+def _legacy_missing_target_flags(expected_flags: Optional[str], actual_flags: Optional[str]) -> List[str]:
+    expected = _legacy_target_flag_set(expected_flags)
+    if not expected:
+        return []
+    actual = _legacy_target_flag_set(actual_flags)
+    return sorted(expected - actual, key=str.upper)
+
+
 def _fetch_legacy_flags_for_uid(imap: imaplib.IMAP4, mailbox: str, uid: int) -> str:
     status, data = imap.uid("fetch", str(uid), "(FLAGS)")
     if status != "OK":
         raise RuntimeError(f"fetch flags failed in {mailbox} for UID {uid}")
-    _msg_bytes, flags, _internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))
+    flags = _legacy_flags_from_fetch_response(list(data or []))
     if flags is None:
         raise RuntimeError(f"fetch returned no flags in {mailbox} for UID {uid}")
     return flags

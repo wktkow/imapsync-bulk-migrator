@@ -24,6 +24,8 @@ from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
 from .imap_ops import (
+    _legacy_flags_from_fetch_response,
+    _legacy_missing_target_flags,
     _open_legacy_dir,
     _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
@@ -184,7 +186,13 @@ def _message_id_header(data: bytes) -> str:
         return ""
 
 
-def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
+def _legacy_remote_has_message(
+    imap,
+    mailbox: str,
+    data: bytes,
+    used_nums: Optional[Set[bytes]] = None,
+    expected_flags: str = "",
+) -> bool:
     from .imap_ops import _imap_append_wire_bytes, quote_mailbox_name
 
     data = _imap_append_wire_bytes(data)
@@ -200,20 +208,31 @@ def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optio
         status, search_data = imap.search(None, "ALL")
     if status != "OK" or not search_data or not search_data[0]:
         return False
+    flag_mismatches: List[List[str]] = []
     for num in search_data[0].split():
         if used_nums is not None and num in used_nums:
             continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS BODY.PEEK[])")
         if status != "OK":
             continue
+        missing_flags = _legacy_missing_target_flags(
+            expected_flags,
+            _legacy_flags_from_fetch_response(list(fetched or [])),
+        )
         for part in fetched or []:
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                if missing_flags:
+                    flag_mismatches.append(missing_flags)
+                    continue
                 if used_nums is not None:
                     used_nums.add(num)
                 return True
+    if flag_mismatches:
+        missing = sorted({flag for flags in flag_mismatches for flag in flags}, key=str.upper)
+        raise RuntimeError("remote flags missing: " + ", ".join(missing))
     return False
 
 
@@ -1459,13 +1478,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         _legacy_target_mailbox_name,
                         _legacy_validate_path_segments,
                         _unresolved_legacy_pending_keys,
+                        _validate_legacy_delivery_metadata,
                         _validate_legacy_sidecar_integrity,
                         imap_connection,
                         quote_mailbox_name,
                     )
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
-                    local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
+                    local_messages: Dict[str, List[Tuple[str, bytes, str]]] = {}
                     local_content_identity_slots: List[Set[Tuple[int, str]]] = []
                     if not account_dir.exists():
                         with mismatches_lock:
@@ -1577,6 +1597,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if not isinstance(metadata, dict):
                                 raise RuntimeError(f"{metadata_path}: message metadata is not an object")
                             expected_size, expected_hash = _validate_legacy_sidecar_integrity(metadata_path, metadata)
+                            expected_flags, _expected_internaldate = _validate_legacy_delivery_metadata(
+                                metadata,
+                                str(metadata_path),
+                            )
                             metadata_mailbox = metadata.get("mailbox")
                             if isinstance(metadata_mailbox, str) and metadata_mailbox:
                                 mailbox = metadata_mailbox
@@ -1603,7 +1627,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                             guard_account_dir()
                             _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
                             local_content_identity_slots.append(_legacy_content_identity_variants(message_bytes))
-                            local_messages.setdefault(folder_key, []).append((eml_path.relative_to(account_dir).as_posix(), message_bytes))
+                            local_messages.setdefault(folder_key, []).append((
+                                eml_path.relative_to(account_dir).as_posix(),
+                                message_bytes,
+                                expected_flags,
+                            ))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
                     remote_attrs_by_key: Dict[str, Tuple[str, ...]] = {}
@@ -1760,9 +1788,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 continue
                             remote_mailbox = remote_mailboxes.get(key, target_mailboxes_by_key.get(key, mailbox))
                             used_remote_nums: Set[bytes] = set()
-                            for rel_path, data in messages:
+                            for rel_path, data, expected_flags in messages:
                                 try:
-                                    found = _legacy_remote_has_message(imap, remote_mailbox, data, used_remote_nums)
+                                    found = _legacy_remote_has_message(
+                                        imap,
+                                        remote_mailbox,
+                                        data,
+                                        used_remote_nums,
+                                        expected_flags,
+                                    )
                                 except Exception as exc:
                                     with mismatches_lock:
                                         validation_errors.append((email, f"{mailbox}: identity check failed for {rel_path}: {exc}"))

@@ -15,8 +15,10 @@ from .imap_ops import (
     _imap_append_wire_bytes,
     _is_legacy_all_source_view,
     _is_legacy_flagged_source_view,
+    _legacy_flags_from_fetch_response,
     _legacy_symlink_component,
     _legacy_hierarchy_metadata,
+    _legacy_missing_target_flags,
     _legacy_uidvalidity_metadata,
     _list_selectable_mailbox_entries,
     _read_file_no_symlink,
@@ -61,24 +63,25 @@ def _read_staged_artifact(path: Path, label: str) -> bytes:
     return _read_file_no_symlink(path, label, reject_hard_links=True)
 
 
-def _read_bound_legacy_message(eml_path: Path, *, require_integrity_metadata: bool) -> bytes:
+def _read_bound_legacy_message(eml_path: Path, *, require_integrity_metadata: bool) -> Tuple[bytes, str]:
     meta_path = eml_path.with_suffix(".json")
     if not meta_path.exists():
         if not require_integrity_metadata:
-            return _read_staged_artifact(eml_path, "legacy message file")
+            return _read_staged_artifact(eml_path, "legacy message file"), ""
         raise RuntimeError(f"{meta_path}: missing message metadata")
     meta = json.loads(_read_staged_artifact(meta_path, "legacy message metadata").decode("utf-8"))
     if not isinstance(meta, dict):
         if not require_integrity_metadata:
-            return _read_staged_artifact(eml_path, "legacy message file")
+            return _read_staged_artifact(eml_path, "legacy message file"), ""
         raise RuntimeError(f"{meta_path}: message metadata is not an object")
     integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
+    flags = str(meta.get("flags") or "") if isinstance(meta.get("flags", ""), str) else ""
     if not require_integrity_metadata and not integrity_keys_present:
-        return _read_staged_artifact(eml_path, "legacy message file")
+        return _read_staged_artifact(eml_path, "legacy message file"), flags
     expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
     data = _read_staged_artifact(eml_path, "legacy message file")
     _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
-    return data
+    return data, flags
 
 
 def _content_identity_variants(data: bytes) -> Set[Tuple[int, str]]:
@@ -151,7 +154,13 @@ def _remote_mailbox_content_covered(imap, mailbox: str, local_identity_slots: Li
     return _identity_variant_slots_cover(remote_slots, local_identity_slots)
 
 
-def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
+def _remote_has_message(
+    imap,
+    mailbox: str,
+    data: bytes,
+    used_nums: Optional[Set[bytes]] = None,
+    expected_flags: str = "",
+) -> bool:
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
@@ -170,21 +179,32 @@ def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set
         status, search_data = imap.search(None, "ALL")
     if status != "OK" or not search_data or not search_data[0]:
         return False
+    flag_mismatches: List[List[str]] = []
     for num in search_data[0].split():
         if used_nums is not None and num in used_nums:
             continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS BODY.PEEK[])")
         if status != "OK":
             continue
+        missing_flags = _legacy_missing_target_flags(
+            expected_flags,
+            _legacy_flags_from_fetch_response(list(fetched or [])),
+        )
         for part in fetched or []:
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             body = bytes(part[1])
             body_identity = (len(body), hashlib.sha256(body).hexdigest())
             if body_identity in expected_identities:
+                if missing_flags:
+                    flag_mismatches.append(missing_flags)
+                    continue
                 if used_nums is not None:
                     used_nums.add(num)
                 return True
+    if flag_mismatches:
+        missing = sorted({flag for flags in flag_mismatches for flag in flags}, key=str.upper)
+        raise RuntimeError("remote flags missing: " + ", ".join(missing))
     return False
 
 
@@ -687,7 +707,7 @@ def audit_account(
                     remote_counts[path] = num
                     remote_mailbox_by_key[key] = (mbox, path)
                     remote_mailbox_by_path[path] = mbox
-                identity_candidates: List[Tuple[Path, str, str, bytes]] = []
+                identity_candidates: List[Tuple[Path, str, str, bytes, str]] = []
                 local_content_identity_slots: List[Set[Tuple[int, str]]] = []
                 local_folder_info: Dict[str, Tuple[str, int]] = {}
                 for folder_dir in folder_dirs:
@@ -710,7 +730,7 @@ def audit_account(
                         if eml_path.is_symlink():
                             continue
                         try:
-                            data = _read_bound_legacy_message(
+                            data, expected_flags = _read_bound_legacy_message(
                                 eml_path,
                                 require_integrity_metadata=require_integrity_metadata,
                             )
@@ -718,7 +738,7 @@ def audit_account(
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
                             continue
                         local_content_identity_slots.append(_content_identity_variants(data))
-                        identity_candidates.append((eml_path, folder, local_mailbox, data))
+                        identity_candidates.append((eml_path, folder, local_mailbox, data, expected_flags))
                 for folder, (local_mailbox, local_count) in local_folder_info.items():
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     remote_count = remote_counts.get(folder, -1)
@@ -763,13 +783,13 @@ def audit_account(
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
                 used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}
-                for eml_path, folder, mailbox, data in identity_candidates:
+                for eml_path, folder, mailbox, data, expected_flags in identity_candidates:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if folder in count_mismatched:
                         continue
                     try:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
-                        if not _remote_has_message(imap, mailbox, data, used_remote_nums):
+                        if not _remote_has_message(imap, mailbox, data, used_remote_nums, expected_flags):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
