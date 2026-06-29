@@ -2258,7 +2258,7 @@ def test_list_and_gmail_fetch_parsers() -> None:
     assert literal_label["rfc822_size"] == 35
 
     empty_body = parse_provider_fetch_response([
-        (b'1 (UID 8 RFC822.SIZE 0 FLAGS () INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {0}', b""),
+        (b'1 (UID 8 RFC822.SIZE 0 FLAGS () INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {0}', b""),
     ])
     assert empty_body["message_bytes"] == b""
     assert empty_body["rfc822_size"] == 0
@@ -4681,7 +4681,7 @@ class StoredMessageTarget(FakeTargetImap):
             return "OK", [num + b' (INTERNALDATE "' + internaldates[index].encode("ascii") + b'")']
         return "OK", [(
             num
-            + f" (RFC822.SIZE {len(body)} FLAGS ({flags}) BODY[] {{{len(body)}}}".encode("ascii"),
+            + f" (RFC822.SIZE {len(body)} FLAGS ({flags}) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {{{len(body)}}}".encode("ascii"),
             body,
         )]
 

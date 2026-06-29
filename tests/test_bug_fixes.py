@@ -448,7 +448,7 @@ class TestBug7ImportConfigPlaceholder:
                 return "OK", [b"1"]
 
             def fetch(self, num, query):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -983,7 +983,7 @@ class TestLegacyExportCompleteness:
         fake_imap.uid.side_effect = [
             ("OK", [b"1"]),
             ("OK", [(
-                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {0}',
+                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {0}',
                 b"",
             )]),
             ("OK", [b"1"]),
@@ -2313,7 +2313,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 73 FLAGS (\\Seen) BODY[] {73}", body)]
+                return "OK", [(b"1 (RFC822.SIZE 73 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {73}", body)]
 
             def logout(self):
                 return "OK", []
@@ -2383,7 +2383,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 76 FLAGS (\\Seen) BODY[] {76}", body)]
+                return "OK", [(b"1 (RFC822.SIZE 76 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {76}", body)]
 
             def logout(self):
                 return "OK", []
@@ -2470,7 +2470,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2567,7 +2567,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2713,7 +2713,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2908,7 +2908,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3013,7 +3013,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3160,7 +3160,7 @@ class TestLegacyImportJournal:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
+                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -3243,7 +3243,7 @@ class TestLegacyImportJournal:
                 flags = " ".join(sorted(self.flags))
                 if query == "(FLAGS)":
                     return "OK", [f"1 (FLAGS ({flags}))".encode("ascii")]
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (%s) BODY[] {%d}" % (
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (%s) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (
                     len(append_data),
                     flags.encode("ascii"),
                     len(append_data),
@@ -3316,7 +3316,7 @@ class TestLegacyImportJournal:
             def fetch(self, num: bytes, query: str):
                 self.fetch_count += 1
                 body = self.stored[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3465,7 +3465,7 @@ class TestLegacyImportJournal:
 
             def fetch(self, num: bytes, query: str):
                 body = self.stored[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
                 self.append_count += 1
@@ -3525,7 +3525,7 @@ class TestLegacyImportJournal:
 
             def fetch(self, num: bytes, query: str):
                 body = self.stored[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3729,7 +3729,7 @@ class TestLegacyImportJournal:
             def fetch(self, num: bytes, query: str):
                 payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
                 payload = payloads[int(num) - 1]
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(payload), len(payload)), payload)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(payload), len(payload)), payload)]
 
             def logout(self):
                 return "OK", []
@@ -3809,7 +3809,7 @@ class TestLegacyImportJournal:
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
 
             def append(self, *_args, **_kwargs):
                 self.append_count += 1
@@ -4333,7 +4333,7 @@ class TestLegacyImportJournal:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
 
             def append(self, *_args, **_kwargs):
                 self.append_count += 1
@@ -4392,7 +4392,7 @@ class TestLegacyImportJournal:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) BODY[] {77}", data)]
+                return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {77}", data)]
 
             def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
                 self.append_count += 1
@@ -5467,7 +5467,7 @@ class TestCliAndConfigHardening:
 
             def fetch(self, num: bytes, query: str):
                 assert "FLAGS" in query
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -5522,8 +5522,8 @@ class TestCliAndConfigHardening:
 
             def fetch(self, num: bytes, *_args, **_kwargs):
                 if num == b"1":
-                    return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) BODY[] {36}", duplicate)]
-                return "OK", [(b"2 (RFC822.SIZE 37 FLAGS (\\Seen) BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
+                    return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {36}", duplicate)]
+                return "OK", [(b"2 (RFC822.SIZE 37 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -5582,7 +5582,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
+                return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
 
             def logout(self):
                 return "OK", []
@@ -5701,7 +5701,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
 
             def logout(self):
                 return "OK", []
@@ -5756,7 +5756,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b"1"]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(data), len(data)), data)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
 
             def logout(self):
                 return "OK", []
@@ -6370,7 +6370,7 @@ class TestCliAndConfigHardening:
                 return "OK", [b""]
 
             def fetch(self, *_args, **_kwargs):
-                return "OK", [(b"1 (RFC822.SIZE 39 FLAGS (\\Seen) BODY[] {39}", data)]
+                return "OK", [(b"1 (RFC822.SIZE 39 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {39}", data)]
 
             def logout(self):
                 return "OK", []
@@ -6590,7 +6590,7 @@ class TestAuditHardening:
 
             def fetch(self, num: bytes, query: str):
                 assert "FLAGS" in query
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -9104,7 +9104,7 @@ print("ok")
                 return "BAD", [b"bad search"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 49 FLAGS (\\Seen) BODY[] {49}", message)]
+                return "OK", [(b"1 (RFC822.SIZE 49 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {49}", message)]
 
         fake = SpecialMessageIdImap()
 
@@ -9148,7 +9148,7 @@ print("ok")
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(stored), len(stored)), stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(stored), len(stored)), stored)]
 
         assert _legacy_remote_has_message(NormalizedRemote(), "INBOX", message, set())
 
@@ -10790,7 +10790,7 @@ class TestRound7ConfirmedBugs:
                 return "OK", [b"1"]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(stored), len(stored)), stored)]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(stored), len(stored)), stored)]
 
         @contextlib.contextmanager
         def fake_connection(_server, _account):
@@ -12809,6 +12809,186 @@ class TestRound7ConfirmedBugs:
             )
 
         assert opened is False
+
+    def test_legacy_import_rerun_reappends_committed_wrong_internaldate(self, tmp_path: Path) -> None:
+        from components.imap_ops import _legacy_import_key, _legacy_import_target_id, import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / "user@example.com" / "INBOX"
+        data = b"Message-ID: <legacy-stale-date@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(folder, data=data, source_server=server)
+        (folder.parent / "import.journal.jsonl").write_text(json.dumps({
+            "key": _legacy_import_key(folder.parent, eml, "INBOX", data),
+            "target": _legacy_import_target_id(server, account),
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "status": "committed",
+            "rfc822_size": str(len(data)),
+            "content_sha256": hashlib.sha256(data).hexdigest(),
+            "timestamp": "1",
+        }) + "\n")
+
+        class WrongDateTarget:
+            def __init__(self) -> None:
+                self.appended: List[Tuple[str, str, str, bytes]] = []
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(
+                    b'1 (RFC822.SIZE '
+                    + str(len(data)).encode("ascii")
+                    + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                    + str(len(data)).encode("ascii")
+                    + b"}",
+                    data,
+                )]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.appended.append((mailbox, flags, date_time, payload))
+                return "OK", [b""]
+
+        target = WrongDateTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[WrongDateTarget]:
+            yield target
+
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=server,
+        )
+
+        assert len(target.appended) == 1
+        assert target.appended[0][2] == '"01-Jan-2024 00:00:00 +0000"'
+        assert target.appended[0][3] == data
+
+    def test_legacy_validate_rejects_wrong_remote_internaldate(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        folder = input_root / "user@example.com" / "INBOX"
+        server = ServerConfig("source.example.com", port=993, ssl=True, starttls=False)
+        target_server = {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False}
+        data = b"Message-ID: <legacy-validate-date@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(folder, data=data, source_server=server)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": {
+                "host": server.host,
+                "port": server.port,
+                "ssl": server.ssl,
+                "starttls": server.starttls,
+            },
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+
+        class WrongDateTarget:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(
+                    b'1 (RFC822.SIZE '
+                    + str(len(data)).encode("ascii")
+                    + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                    + str(len(data)).encode("ascii")
+                    + b"}",
+                    data,
+                )]
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[WrongDateTarget]:
+            yield WrongDateTarget()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_audit_rejects_wrong_remote_internaldate(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        folder = tmp_path / "user@example.com" / "INBOX"
+        data = b"Message-ID: <legacy-audit-date@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(folder, data=data, source_server=server)
+
+        class WrongDateTarget:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(
+                    b'1 (RFC822.SIZE '
+                    + str(len(data)).encode("ascii")
+                    + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                    + str(len(data)).encode("ascii")
+                    + b"}",
+                    data,
+                )]
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[WrongDateTarget]:
+            yield WrongDateTarget()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(
+                Account("user@example.com", "secret"),
+                tmp_path,
+                server=server,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert any("remote INTERNALDATE mismatch" in issue for issue in issues)
 
     @pytest.mark.parametrize(
         ("artifact", "needle"),

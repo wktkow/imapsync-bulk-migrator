@@ -639,6 +639,19 @@ def _legacy_flags_from_fetch_response(fetch_response: List[object]) -> Optional[
     return None
 
 
+def _legacy_internaldate_from_fetch_response(fetch_response: List[object]) -> Optional[str]:
+    for part in fetch_response:
+        meta = part[0] if isinstance(part, tuple) and part else part
+        if isinstance(meta, (bytes, bytearray)):
+            meta_str = bytes(meta).decode(errors="ignore")
+        else:
+            meta_str = str(meta or "")
+        match = re.search(r'INTERNALDATE\s+"([^"]+)"', meta_str, flags=re.IGNORECASE)
+        if match:
+            return _normalized_legacy_internaldate(match.group(1))
+    return None
+
+
 def _legacy_missing_target_flags(expected_flags: Optional[str], actual_flags: Optional[str]) -> List[str]:
     expected = _legacy_target_flag_set(expected_flags)
     if not expected:
@@ -797,6 +810,7 @@ def _legacy_remote_has_message(
     data: bytes,
     used_nums: set[bytes],
     expected_flags: str = "",
+    expected_internaldate: str = "",
     *,
     restore_missing_flags: bool = False,
 ) -> bool:
@@ -816,7 +830,7 @@ def _legacy_remote_has_message(
     for num in search_data[0].split():
         if num in used_nums:
             continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS BODY.PEEK[])")
+        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
         if status != "OK":
             continue
         fetched_parts = list(fetched or [])
@@ -825,6 +839,10 @@ def _legacy_remote_has_message(
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                expected_date = _normalized_legacy_internaldate(expected_internaldate)
+                actual_date = _legacy_internaldate_from_fetch_response(fetched_parts)
+                if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+                    continue
                 missing_flags = _legacy_missing_target_flags(
                     expected_flags,
                     _legacy_flags_from_fetch_response(fetched_parts),
@@ -1939,6 +1957,7 @@ def import_account(
                             data,
                             used_remote_nums,
                             flags,
+                            internaldate or "",
                             restore_missing_flags=True,
                         ):
                             if committed_content_remaining[content_identity] > 0:
@@ -1960,6 +1979,7 @@ def import_account(
                             data,
                             used_remote_nums,
                             flags,
+                            internaldate or "",
                             restore_missing_flags=True,
                         ):
                             committed_content_remaining[content_identity] -= 1
