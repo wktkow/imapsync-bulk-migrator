@@ -4750,6 +4750,8 @@ def _validated_group_stage(
     current_account: MigrationAccount,
     current_manifest_rows: List[Dict[str, Any]],
     current_journal_rows: List[Dict[str, Any]],
+    *,
+    repair_trailing_journal: bool = False,
 ) -> Tuple[Path, List[Dict[str, Any]], List[Dict[str, Any]]]:
     if account is current_account or account.source_email == current_account.source_email:
         account_dir = account_export_dir(in_root, current_account)
@@ -4797,7 +4799,7 @@ def _validated_group_stage(
             f"invalid provider account layout for merge source {account.source_email}: "
             + "; ".join(mixed_layout_issues)
         )
-    journal_rows = load_import_journal(account_dir, account)
+    journal_rows = load_import_journal(account_dir, account, repair_trailing=repair_trailing_journal)
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
     if journal_target_issues:
@@ -4845,6 +4847,8 @@ def validated_merge_group_stages(
     account: MigrationAccount,
     current_manifest_rows: List[Dict[str, Any]],
     current_journal_rows: List[Dict[str, Any]],
+    *,
+    repair_trailing_journal: bool = False,
 ) -> List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]:
     stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]] = []
     for group_account in same_target_accounts(config, account):
@@ -4855,6 +4859,7 @@ def validated_merge_group_stages(
             account,
             current_manifest_rows,
             current_journal_rows,
+            repair_trailing_journal=repair_trailing_journal,
         )
         stages.append((group_account, account_dir, manifest_rows, journal_rows))
     return stages
@@ -5134,6 +5139,7 @@ def provider_import_account(
             account,
             manifest_rows,
             journal_rows,
+            repair_trailing_journal=True,
         )
         require_merge_group_unique_manifest_identities(merge_group_stages)
 

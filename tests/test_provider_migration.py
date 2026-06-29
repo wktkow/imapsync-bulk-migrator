@@ -13276,6 +13276,44 @@ def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path
     assert json.loads(journal.read_text()) == valid
 
 
+def test_provider_import_repairs_many_to_one_peer_trailing_journal_before_target_contact(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_config()
+    peer, current = config.accounts
+    peer_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=peer.source_email,
+        target=peer.target_email,
+        canonical_id="peer-1",
+        message_id="<peer-1@example.com>",
+        body=b"Message-ID: <peer-1@example.com>\r\n\r\npeer",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=current.source_email,
+        target=current.target_email,
+        canonical_id="current-1",
+        message_id="<current-1@example.com>",
+        body=b"Message-ID: <current-1@example.com>\r\n\r\ncurrent",
+    )
+    peer_row = json.loads((peer_dir / "manifest.jsonl").read_text(encoding="utf-8"))
+    valid = _journal_fixture_for_manifest_row(config, peer_row, {
+        "canonical_id": "peer-1",
+        "target_account": peer.target_email,
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }, account=peer)
+    journal = peer_dir / "import-merged@example.com.journal.jsonl"
+    journal.write_text(json.dumps(valid) + "\n" + '{"canonical_id": ', encoding="utf-8")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target contacted")):
+        with pytest.raises(AssertionError, match="target contacted"):
+            provider_import_account(config, current, tmp_path)
+
+    assert journal.read_text(encoding="utf-8").strip() == json.dumps(valid, sort_keys=True)
+
+
 def test_main_provider_import_low_disk_does_not_repair_trailing_journal(tmp_path: Path) -> None:
     from components.main import main
 
