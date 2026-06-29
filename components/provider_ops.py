@@ -1994,6 +1994,9 @@ def provider_mixed_legacy_layout_issues(account_dir: Path) -> List[str]:
     issues: List[str] = []
     provider_dirs = {"messages", "metadata"}
     for path in sorted(account_dir.iterdir()):
+        if path.is_symlink():
+            issues.append(f"symlinked provider account entry: {path.name}")
+            continue
         if path.name in provider_dirs or not path.is_dir():
             continue
         marker = path / ".mailbox.json"

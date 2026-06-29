@@ -482,6 +482,33 @@ def test_provider_read_paths_reject_symlinked_account_dir(tmp_path: Path) -> Non
             provider_import_account(config, account, tmp_path)
 
 
+def test_provider_audit_validate_verify_reject_account_root_symlink_child(tmp_path: Path) -> None:
+    from verify_export import verify_account
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    outside = tmp_path / "outside-root-child"
+    outside.mkdir()
+    link = account_dir / "unexpected"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    stats = verify_account(account_dir)
+
+    assert any("symlinked provider account entry: unexpected" in issue for issue in audit_issues)
+    assert any("symlinked provider account entry: unexpected" in issue for issue in report["failed"])
+    assert stats["errors"] >= 1
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="symlinked provider account entry: unexpected"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_export_rejects_symlinked_output_root_before_source_contact(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -680,7 +707,7 @@ def test_provider_read_paths_reject_symlinked_control_artifacts(
     assert any(re.search(needle, issue) for issue in report["failed"])
 
     with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
-        with pytest.raises(RuntimeError, match="symlinked provider file|export-state"):
+        with pytest.raises(RuntimeError, match="symlinked provider file|symlinked provider account entry|export-state"):
             provider_import_account(config, account, tmp_path)
 
 
