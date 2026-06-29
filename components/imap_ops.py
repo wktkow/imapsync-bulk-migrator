@@ -1225,9 +1225,13 @@ def _remove_legacy_dir_tree_at(
                 child_entry_stat = os.stat(child_name, dir_fd=child_fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
+            if stat.S_ISLNK(child_entry_stat.st_mode):
+                raise RuntimeError(f"refusing to delete symlinked legacy mailbox path: {child_path}")
             if stat.S_ISDIR(child_entry_stat.st_mode):
                 _remove_legacy_dir_tree_at(child_fd, child_name, child_path, guard)
                 continue
+            if not stat.S_ISREG(child_entry_stat.st_mode):
+                raise RuntimeError(f"refusing to delete non-regular legacy mailbox path: {child_path}")
             guard()
             os.unlink(child_name, dir_fd=child_fd)
             guard()

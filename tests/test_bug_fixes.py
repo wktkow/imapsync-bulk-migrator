@@ -9376,6 +9376,43 @@ print("ok")
         assert outside_file.exists()
         assert (checked_account / "Archive" / "u0000000001.eml").exists()
 
+    def test_legacy_export_stale_mailbox_cleanup_rejects_nested_symlink(self, tmp_path: Path) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        stale_dir = account_dir / "Archive"
+        nested = stale_dir / "nested"
+        nested.mkdir(parents=True)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("do not delete\n")
+        try:
+            (nested / "link.eml").symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked legacy mailbox path"):
+            imap_ops._remove_stale_mailbox_dirs(account_dir, set())
+
+        assert outside.read_text() == "do not delete\n"
+        assert (nested / "link.eml").is_symlink()
+        assert stale_dir.exists()
+
+    def test_legacy_export_stale_mailbox_cleanup_rejects_nested_non_regular_file(self, tmp_path: Path) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        stale_dir = account_dir / "Archive"
+        nested = stale_dir / "nested"
+        nested.mkdir(parents=True)
+        fifo = nested / "pipe.eml"
+        _mkfifo_or_skip(fifo)
+
+        with pytest.raises(RuntimeError, match="non-regular legacy mailbox path"):
+            imap_ops._remove_stale_mailbox_dirs(account_dir, set())
+
+        assert fifo.exists()
+        assert stale_dir.exists()
+
     def test_legacy_export_rejects_existing_provider_layout_before_connect(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
