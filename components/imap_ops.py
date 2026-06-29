@@ -1352,6 +1352,9 @@ def _parse_fetch_response_for_uid(
         elif isinstance(part, (bytes, bytearray)):
             meta_str = part.decode(errors="ignore")
             if active_body_meta_chunks is not None:
+                if _FETCH_RESPONSE_START_RE.match(meta_str):
+                    active_body_meta_chunks = None
+                    continue
                 response_uids = _fetch_response_uids(meta_str)
                 if response_uids:
                     if expected_uid in response_uids:
@@ -1360,9 +1363,6 @@ def _parse_fetch_response_for_uid(
                         active_body_meta_chunks.append(meta_str)
                     else:
                         active_body_meta_chunks = None
-                    continue
-                if _FETCH_RESPONSE_START_RE.match(meta_str):
-                    active_body_meta_chunks = None
                     continue
                 active_body_meta_chunks.append(meta_str)
     if len(body_parts) > 1:

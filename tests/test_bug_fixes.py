@@ -950,6 +950,18 @@ class TestLegacyExportCompleteness:
                 42,
             )
 
+    def test_fetch_parser_rejects_body_bound_only_to_later_fetch_response(self) -> None:
+        from components.imap_ops import _parse_fetch_response_for_uid
+
+        with pytest.raises(RuntimeError, match="did not include UID metadata"):
+            _parse_fetch_response_for_uid(
+                [
+                    (b"1 (BODY[] {10}", b"wrong-body"),
+                    b"2 (UID 42 FLAGS (\\Seen))",
+                ],
+                42,
+            )
+
     def test_fetch_parser_ignores_later_metadata_for_other_uid(self) -> None:
         from components.imap_ops import _parse_fetch_response_for_uid
 
