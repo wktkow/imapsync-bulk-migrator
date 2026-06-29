@@ -7479,6 +7479,31 @@ class TestDirectAdminIndexerHardening:
 
         assert fsync_targets == ["file", "dir"]
 
+    def test_write_json_fsyncs_new_output_parent_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import directadmin_indexer
+        from directadmin_indexer import write_json
+
+        out = tmp_path / "generated" / "nested" / "export.pass.config.json"
+        fsynced_dir_inodes: List[int] = []
+        real_fsync = directadmin_indexer.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            st = directadmin_indexer.os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                fsynced_dir_inodes.append(st.st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(directadmin_indexer.os, "fsync", recording_fsync)
+
+        write_json({"accounts": []}, str(out), overwrite=False)
+
+        assert tmp_path.stat().st_ino in fsynced_dir_inodes
+        assert (tmp_path / "generated").stat().st_ino in fsynced_dir_inodes
+
     @pytest.mark.parametrize("overwrite", [False, True])
     def test_write_json_does_not_chmod_replaced_symlink_target(
         self,
@@ -13304,6 +13329,7 @@ class TestRound7ConfirmedBugs:
         from components import imap_ops
 
         target = tmp_path / "user@example.com" / "export-state.json"
+        target.parent.mkdir()
         fsync_targets: List[str] = []
         real_fsync = imap_ops.os.fsync
 
@@ -13317,6 +13343,30 @@ class TestRound7ConfirmedBugs:
         imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
 
         assert fsync_targets == ["file", "dir"]
+
+    def test_legacy_ensure_private_dir_fsyncs_parent_after_mkdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target = tmp_path / "user@example.com" / "INBOX"
+        fsynced_dir_inodes: List[int] = []
+        real_fsync = imap_ops.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            st = imap_ops.os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                fsynced_dir_inodes.append(st.st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", recording_fsync)
+
+        imap_ops.ensure_private_dir(target)
+
+        assert tmp_path.stat().st_ino in fsynced_dir_inodes
+        assert (tmp_path / "user@example.com").stat().st_ino in fsynced_dir_inodes
 
     def test_legacy_atomic_write_preserves_visible_target_after_directory_fsync_failure(
         self,

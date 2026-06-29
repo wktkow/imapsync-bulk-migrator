@@ -282,6 +282,7 @@ def test_provider_atomic_json_fsyncs_parent_directory_after_rename(
     from components import provider_ops
 
     target = tmp_path / "source@example.com" / "export-state.json"
+    target.parent.mkdir()
     fsync_targets: List[str] = []
     real_fsync = provider_ops.os.fsync
 
@@ -297,6 +298,30 @@ def test_provider_atomic_json_fsyncs_parent_directory_after_rename(
     assert fsync_targets == ["file", "dir"]
 
 
+def test_provider_ensure_private_dir_fsyncs_parent_after_mkdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "source@example.com" / "messages"
+    fsynced_dir_inodes: List[int] = []
+    real_fsync = provider_ops.os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        st = provider_ops.os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            fsynced_dir_inodes.append(st.st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", recording_fsync)
+
+    provider_ops.ensure_private_dir(target)
+
+    assert tmp_path.stat().st_ino in fsynced_dir_inodes
+    assert (tmp_path / "source@example.com").stat().st_ino in fsynced_dir_inodes
+
+
 def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -304,6 +329,7 @@ def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
     from components import provider_ops
 
     target = tmp_path / "source@example.com" / "manifest.jsonl"
+    target.parent.mkdir()
     fsync_targets: List[str] = []
     real_fsync = provider_ops.os.fsync
 

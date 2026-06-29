@@ -331,8 +331,10 @@ def _open_or_create_indexer_parent_dir(path: Path, label: str) -> Tuple[int, str
     current = Path(absolute.anchor)
     try:
         for part in absolute.parts[1:-1]:
+            created = False
             try:
                 os.mkdir(part, PRIVATE_DIR_MODE, dir_fd=fd)
+                created = True
             except FileExistsError:
                 pass
             except OSError as exc:
@@ -340,6 +342,8 @@ def _open_or_create_indexer_parent_dir(path: Path, label: str) -> Tuple[int, str
                     raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
                 if exc.errno != errno.EEXIST:
                     raise
+            if created:
+                _fsync_indexer_directory_fd(fd, current, label)
             try:
                 next_fd = os.open(part, flags, dir_fd=fd)
             except OSError as exc:
