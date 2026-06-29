@@ -191,6 +191,13 @@ def _raise_if_provider_parent_replaced(parent_path: Path, parent_fd: int, label:
         raise RuntimeError(f"refusing to use replaced provider {label} directory: {parent_path}")
 
 
+def _fsync_provider_directory_fd(dir_fd: int, path: Path, label: str) -> None:
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise RuntimeError(f"unable to fsync provider {label} directory for durability: {path}") from exc
+
+
 def _provider_dir_open_flags() -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -1264,6 +1271,8 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             try:
                 _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+                _fsync_provider_directory_fd(parent_fd, parent_path, "file")
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(name, dir_fd=parent_fd)
@@ -1306,6 +1315,8 @@ def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+                _fsync_provider_directory_fd(parent_fd, parent_path, "file")
                 _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
@@ -2768,6 +2779,8 @@ def append_journal(account_dir: Path, account: MigrationAccount, row: Dict[str, 
             or getattr(visible_stat, "st_nlink", 1) > 1
         ):
             raise RuntimeError(f"provider import journal changed during append: {path}")
+        _fsync_provider_directory_fd(parent_fd, parent_path, "file")
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
     finally:
         if fd >= 0:
             os.close(fd)

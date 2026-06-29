@@ -6,6 +6,7 @@ import imaplib
 import json
 import os
 import re
+import stat
 import threading
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -274,6 +275,50 @@ def test_provider_atomic_writers_do_not_chmod_replaced_symlink_target(
     assert victim.stat().st_mode & 0o777 == original_mode
 
 
+def test_provider_atomic_json_fsyncs_parent_directory_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "source@example.com" / "export-state.json"
+    fsync_targets: List[str] = []
+    real_fsync = provider_ops.os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        mode = provider_ops.os.fstat(fd).st_mode
+        fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", recording_fsync)
+
+    _atomic_json(target, {"complete": False})
+
+    assert fsync_targets == ["file", "dir"]
+
+
+def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "source@example.com" / "manifest.jsonl"
+    fsync_targets: List[str] = []
+    real_fsync = provider_ops.os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        mode = provider_ops.os.fstat(fd).st_mode
+        fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", recording_fsync)
+
+    provider_ops._write_jsonl(target, [{"canonical_id": "id"}])
+
+    assert fsync_targets == ["file", "dir"]
+
+
 def test_provider_append_journal_rejects_replaced_symlink_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,6 +398,30 @@ def test_provider_append_journal_rejects_visible_path_replaced_after_open(
     assert journal.read_text(encoding="utf-8") == ""
     assert '"canonical_id": "id"' in old_journal.read_text(encoding="utf-8")
     assert load_import_journal(account_dir, account) == []
+
+
+def test_provider_append_journal_fsyncs_parent_directory_after_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    fsync_targets: List[str] = []
+    real_fsync = provider_ops.os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        mode = provider_ops.os.fstat(fd).st_mode
+        fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", recording_fsync)
+
+    provider_ops.append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+    assert fsync_targets == ["file", "dir"]
 
 
 @pytest.mark.parametrize("rel_path", ["messages/gmail-123.eml", "metadata/gmail-123.json"])
