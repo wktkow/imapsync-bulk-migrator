@@ -2541,6 +2541,64 @@ def test_provider_safe_identity_hashes_truncated_names() -> None:
     assert _safe_identity(first) != _safe_identity(second)
 
 
+def test_provider_target_fetch_helpers_bind_to_requested_sequence() -> None:
+    from components import provider_ops
+
+    requested_body = b"Message-ID: <requested-target@example.com>\r\n\r\nbody"
+    unsolicited_body = b"Message-ID: <wrong-target@example.com>\r\n\r\nbody"
+
+    class UnsolicitedTargetFetch:
+        def fetch(self, num: bytes, query: str):
+            if "FLAGS" in query:
+                return "OK", [b"99 (FLAGS (\\Deleted))", b"42 (FLAGS (\\Seen))"]
+            if "X-GM-MSGID" in query:
+                return "OK", [b"99 (X-GM-MSGID 999)", b"42 (X-GM-MSGID 123)"]
+            if "BODY.PEEK[]" in query:
+                return "OK", [
+                    (b"99 (RFC822.SIZE 44 BODY[] {44}", unsolicited_body),
+                    (b"42 (RFC822.SIZE 48 BODY[] {48}", requested_body),
+                ]
+            raise AssertionError(query)
+
+    fake = UnsolicitedTargetFetch()
+
+    assert provider_ops.target_message_flag_set(fake, b"42") == {"\\SEEN"}
+    assert provider_ops.target_message_content_identity(fake, b"42") == (
+        len(requested_body),
+        hashlib.sha256(requested_body).hexdigest(),
+    )
+    assert provider_ops._target_gmail_msgid(fake, b"42") == "123"
+
+
+def test_provider_target_matching_ignores_body_from_wrong_sequence() -> None:
+    from components.provider_ops import target_matching_message_nums
+
+    body = b"Message-ID: <wrong-sequence@example.com>\r\n\r\nbody"
+
+    class WrongSequenceTarget:
+        def select(self, mailbox: str, readonly: bool = False):
+            return "OK", [b"1"]
+
+        def search(self, charset, *criteria):
+            return "OK", [b"42"]
+
+        def fetch(self, num: bytes, query: str):
+            return "OK", [(b"99 (RFC822.SIZE 48 BODY[] {48}", body)]
+
+    row = {
+        "message_id_header": "",
+        "rfc822_size": len(body),
+        "content_sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+    assert target_matching_message_nums(
+        WrongSequenceTarget(),
+        "INBOX",
+        row,
+        create_if_missing=False,
+    ) == []
+
+
 def test_provider_gmail_canonical_identity_scopes_source_for_merge() -> None:
     body = b"Message-ID: <m1@example.com>\r\n\r\nhello"
     parsed = {"gmail_msgid": "123", "rfc822_size": len(body)}
@@ -4966,11 +5024,12 @@ class FakeTargetImap:
     def fetch(self, num: bytes, query: str):
         self.fetch_queries.append(query)
         if "FLAGS" in query and "BODY" not in query and "RFC822" not in query:
-            return "OK", [b"99 (FLAGS (" + self.existing_flags.encode("ascii") + b"))"]
+            return "OK", [num + b" (FLAGS (" + self.existing_flags.encode("ascii") + b"))"]
         if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
-            return "OK", [b'99 (INTERNALDATE "' + self.existing_internaldate.encode("ascii") + b'")']
+            return "OK", [num + b' (INTERNALDATE "' + self.existing_internaldate.encode("ascii") + b'")']
         return "OK", [(
-            b"99 (RFC822.SIZE "
+            num
+            + b" (RFC822.SIZE "
             + str(len(self.existing_body)).encode("ascii")
             + b" FLAGS ("
             + self.existing_flags.encode("ascii")
@@ -5064,7 +5123,8 @@ class FakeGmailTargetImap(FakeTargetImap):
                 else:
                     labels.append(f'"{label}"')
             flags = self.gmail_flags or "\\Seen"
-            return "OK", [f'99 (FLAGS ({flags}) X-GM-LABELS ({" ".join(labels)}))'.encode("ascii")]
+            sequence = num.decode("ascii", errors="ignore")
+            return "OK", [f'{sequence} (FLAGS ({flags}) X-GM-LABELS ({" ".join(labels)}))'.encode("ascii")]
         return super().fetch(num, query)
 
 

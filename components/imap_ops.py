@@ -801,14 +801,33 @@ def _fetch_response_sequence_number(meta_str: str) -> Optional[int]:
     return None
 
 
+def _imap_sequence_number(value: bytes) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid IMAP sequence number {value!r}") from exc
+    if number <= 0:
+        raise RuntimeError(f"invalid IMAP sequence number {value!r}")
+    return number
+
+
+def _legacy_fetch_body_part_matches_sequence(part: object, expected_sequence: bytes) -> bool:
+    if not (isinstance(part, tuple) and len(part) == 2):
+        return False
+    meta = part[0]
+    if isinstance(meta, (bytes, bytearray)):
+        meta_str = bytes(meta).decode(errors="ignore")
+    else:
+        meta_str = str(meta or "")
+    sequence_num = _fetch_response_sequence_number(meta_str)
+    return sequence_num == _imap_sequence_number(expected_sequence)
+
+
 def _legacy_fetch_metadata_for_sequence(
     fetch_response: List[object],
     expected_sequence: bytes,
 ) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        expected_num = int(expected_sequence)
-    except ValueError as exc:
-        raise RuntimeError(f"invalid IMAP sequence number {expected_sequence!r}") from exc
+    expected_num = _imap_sequence_number(expected_sequence)
     meta_chunks: List[str] = []
     active_expected = False
     for part in fetch_response:
@@ -1058,6 +1077,8 @@ def _legacy_remote_has_message(
         fetched_parts = list(fetched or [])
         for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:

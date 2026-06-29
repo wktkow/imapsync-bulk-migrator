@@ -1191,6 +1191,31 @@ class TestLegacyExportCompleteness:
             expected_flags="\\Seen",
         )
 
+    def test_legacy_target_checks_ignore_body_from_wrong_sequence(self) -> None:
+        from components import audit as audit_module
+        from components import main as main_module
+        from components.imap_ops import _legacy_remote_has_message
+
+        body = b"Message-ID: <wrong-sequence-legacy@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class WrongSequenceTarget:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [(b"2 (FLAGS (\\Seen) BODY[] {76}", body)]
+
+        assert not _legacy_remote_has_message(WrongSequenceTarget(), "INBOX", body, set())
+        used_main: set[bytes] = set()
+        assert not main_module._legacy_remote_has_message(WrongSequenceTarget(), "INBOX", body, used_main)
+        assert used_main == set()
+        used_audit: set[bytes] = set()
+        assert not audit_module._remote_has_message(WrongSequenceTarget(), "INBOX", body, used_audit)
+        assert used_audit == set()
+
     def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
@@ -2887,7 +2912,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"%d (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (int(num), len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -2984,7 +3009,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"%d (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (int(num), len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3130,7 +3155,7 @@ class TestLegacyListParsing:
                 return "OK", [b""]
 
             def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"%d (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (int(num), len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []
@@ -3430,7 +3455,7 @@ class TestLegacyListParsing:
 
             def fetch(self, num: bytes, query: str):
                 body = inbox_body if int(num) == 1 else archived_body
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                return "OK", [(b"%d (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (int(num), len(body), len(body)), body)]
 
             def logout(self):
                 return "OK", []

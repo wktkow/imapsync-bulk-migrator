@@ -971,6 +971,48 @@ _MAX_GMAIL_UINT64 = (1 << 64) - 1
 _PROVIDER_FETCH_RESPONSE_START_RE = re.compile(r"^\s*\d+\s+\(")
 
 
+def _provider_fetch_response_sequence_number(meta_text: str) -> Optional[int]:
+    match = _PROVIDER_FETCH_RESPONSE_START_RE.match(meta_text)
+    if not match:
+        return None
+    with contextlib.suppress(ValueError):
+        return int(meta_text[: match.end() - 1].strip())
+    return None
+
+
+def _provider_imap_sequence_number(value: bytes) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid target IMAP sequence number {value!r}") from exc
+    if number <= 0:
+        raise RuntimeError(f"invalid target IMAP sequence number {value!r}")
+    return number
+
+
+def _provider_fetch_response_for_sequence(fetch_response: Iterable[Any], expected_sequence: bytes) -> List[Any]:
+    expected_num = _provider_imap_sequence_number(expected_sequence)
+    selected: List[Any] = []
+    active_expected = False
+    for part in fetch_response:
+        meta = part[0] if isinstance(part, tuple) and part else part
+        if isinstance(meta, (bytes, bytearray)):
+            meta_text = bytes(meta).decode(errors="ignore")
+        else:
+            meta_text = str(meta or "")
+        sequence_num = _provider_fetch_response_sequence_number(meta_text)
+        if sequence_num is not None:
+            active_expected = sequence_num == expected_num
+            if active_expected:
+                selected.append(part)
+            continue
+        if active_expected:
+            selected.append(part)
+    if not selected:
+        raise RuntimeError(f"fetch response for sequence {expected_num} did not include matching data")
+    return selected
+
+
 def _provider_fetch_response_uids(meta_str: str) -> List[int]:
     uids: List[int] = []
     for match in re.finditer(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE):
@@ -3821,7 +3863,7 @@ def target_message_flag_set(imap: imaplib.IMAP4, num: bytes) -> set[str]:
     status, fetched = imap.fetch(num, "(FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch target flags for message {num!r}")
-    parsed = parse_provider_fetch_response(fetched or [])
+    parsed = parse_provider_fetch_response(_provider_fetch_response_for_sequence(fetched or [], num))
     return {token.upper() for token in str(parsed.get("flags") or "").split()}
 
 
@@ -3838,7 +3880,7 @@ def target_message_internaldate(imap: imaplib.IMAP4, num: bytes) -> str:
     status, fetched = imap.fetch(num, "(INTERNALDATE)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch target INTERNALDATE for message {num!r}")
-    parsed = parse_provider_fetch_response(fetched or [])
+    parsed = parse_provider_fetch_response(_provider_fetch_response_for_sequence(fetched or [], num))
     return _normalized_provider_internaldate(parsed.get("internaldate"))
 
 
@@ -4258,7 +4300,11 @@ def target_matching_message_nums(
         status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
         if status != "OK":
             continue
-        for part in fetched or []:
+        try:
+            fetched_for_num = _provider_fetch_response_for_sequence(fetched or [], num)
+        except RuntimeError:
+            continue
+        for part in fetched_for_num:
             raw = part[0] if isinstance(part, tuple) else part
             if not isinstance(raw, (bytes, bytearray)):
                 continue
@@ -4297,7 +4343,11 @@ def target_message_content_identity(
     status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
     if status != "OK":
         return None
-    for part in fetched or []:
+    try:
+        fetched_for_num = _provider_fetch_response_for_sequence(fetched or [], num)
+    except RuntimeError:
+        return None
+    for part in fetched_for_num:
         if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
             body = bytes(part[1])
             return (len(body), hashlib.sha256(body).hexdigest())
@@ -4352,7 +4402,7 @@ def _target_gmail_msgid(imap: imaplib.IMAP4, num: bytes) -> str:
     status, fetched = imap.fetch(num, "(X-GM-MSGID)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail message id for target message {num!r}")
-    parsed = parse_provider_fetch_response(fetched or [])
+    parsed = parse_provider_fetch_response(_provider_fetch_response_for_sequence(fetched or [], num))
     gmail_msgid = str(parsed.get("gmail_msgid") or "")
     if not gmail_msgid:
         raise RuntimeError(f"target Gmail did not return X-GM-MSGID for message {num!r}")

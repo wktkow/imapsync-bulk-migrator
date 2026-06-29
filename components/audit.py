@@ -15,6 +15,7 @@ from .imap_ops import (
     _imap_append_wire_bytes,
     _is_legacy_all_source_view,
     _is_legacy_flagged_source_view,
+    _legacy_fetch_body_part_matches_sequence,
     _legacy_metadata_for_fetch_body_part,
     _legacy_symlink_component,
     _legacy_hierarchy_metadata,
@@ -175,6 +176,8 @@ def _remote_mailbox_content_covered(
         for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
+                continue
             if body_part_index is None:
                 body_part_index = index
             remote_identities.update(_content_identity_variants(bytes(part[1])))
@@ -227,6 +230,8 @@ def _remote_has_message(
         fetched_parts = list(fetched or [])
         for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
                 continue
             body = bytes(part[1])
             body_identity = (len(body), hashlib.sha256(body).hexdigest())

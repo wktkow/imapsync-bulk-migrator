@@ -26,6 +26,7 @@ from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
 from .imap_ops import (
     _is_legacy_flagged_source_view,
+    _legacy_fetch_body_part_matches_sequence,
     _legacy_metadata_for_fetch_body_part,
     _legacy_missing_target_flags,
     _normalized_legacy_internaldate,
@@ -259,6 +260,8 @@ def _legacy_remote_has_message(
         for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
+                continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
                 actual_flags, actual_date = _legacy_metadata_for_fetch_body_part(fetched_parts, index)
@@ -371,6 +374,8 @@ def _legacy_remote_mailbox_content_covered(
         body_part_index: Optional[int] = None
         for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+                continue
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
                 continue
             if body_part_index is None:
                 body_part_index = index
