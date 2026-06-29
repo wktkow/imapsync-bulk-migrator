@@ -6774,6 +6774,69 @@ class TestCPanelProvisioning:
         assert ensure_mock.call_args.kwargs["dry_run"] is True
         import_mock.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("panel_args", "client_path"),
+        [
+            (
+                [
+                    "--auto-provision-da",
+                    "--da-dry-run",
+                    "--da-url", "https://panel.example.com:2222",
+                    "--da-username", "admin",
+                    "--da-password", "login-key",
+                ],
+                "components.main.DirectAdminClient",
+            ),
+            (
+                [
+                    "--auto-provision-cpanel",
+                    "--cpanel-dry-run",
+                    "--cpanel-url", "https://panel.example.com:2083",
+                    "--cpanel-username", "cpuser",
+                    "--cpanel-token", "api-token",
+                ],
+                "components.main.CPanelClient",
+            ),
+        ],
+    )
+    def test_panel_dry_run_does_not_repair_trailing_import_journal(
+        self,
+        tmp_path: Path,
+        panel_args: List[str],
+        client_path: str,
+    ) -> None:
+        from components.main import main
+
+        input_root = tmp_path / "exported"
+        account_dir = input_root / "a@example.com"
+        _write_legacy_message_fixture(account_dir / "INBOX")
+        journal = account_dir / "import.journal.jsonl"
+        original = '{"key": '
+        journal.write_text(original)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch(client_path) as client_cls:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                *panel_args,
+            ])
+
+        assert rc == 4
+        assert journal.read_text() == original
+        client_cls.assert_not_called()
+
     def test_cpanel_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
         from components.main import main
 

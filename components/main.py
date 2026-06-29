@@ -871,7 +871,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pending_journal_issues = _legacy_pending_import_journal_issues(
                 input_root,
                 config,
-                repair_trailing=(args.mode == "import"),
+                repair_trailing=(args.mode == "import" and not panel_dry_run_requested),
             )
             if pending_journal_issues:
                 logging.error("Input directory has unresolved legacy import journal entries:")
