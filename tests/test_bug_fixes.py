@@ -936,6 +936,71 @@ class TestLegacyExportCompleteness:
         assert flags == "\\Seen"
         assert internaldate == "01-Jan-2024 00:00:00 +0000"
 
+    def test_fetch_parser_ignores_later_metadata_for_other_uid(self) -> None:
+        from components.imap_ops import _parse_fetch_response_for_uid
+
+        body = b"Message-ID: <later-other-uid@example.com>\r\n\r\nbody"
+
+        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(
+            [
+                (b"1 (UID 42 BODY[] {46}", body),
+                b'99 (UID 99 FLAGS (\\Deleted) INTERNALDATE "02-Jan-2024 00:00:00 +0000")',
+            ],
+            42,
+        )
+
+        assert msg_bytes == body
+        assert flags is None
+        assert internaldate is None
+
+    def test_legacy_flag_fetch_binds_flags_to_requested_uid(self) -> None:
+        from components.imap_ops import _fetch_legacy_flags_for_uid
+
+        class UnsolicitedFlagFetchImap:
+            def __init__(self) -> None:
+                self.fetch_args: Optional[Tuple[str, str, str]] = None
+
+            def uid(self, command: str, uid: str, query: str):
+                self.fetch_args = (command, uid, query)
+                return "OK", [
+                    b"99 (UID 99 FLAGS (\\Deleted))",
+                    b"42 (UID 42 FLAGS (\\Seen))",
+                ]
+
+        fake = UnsolicitedFlagFetchImap()
+
+        assert _fetch_legacy_flags_for_uid(fake, "INBOX", 42) == "\\Seen"
+        assert fake.fetch_args == ("fetch", "42", "(UID FLAGS)")
+
+    def test_legacy_stability_detects_requested_uid_flag_change(self) -> None:
+        from components.imap_ops import verify_legacy_mailbox_uid_set_stable
+
+        class ChangedRequestedUidFlagsImap:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"42"]
+                if command == "fetch":
+                    return "OK", [
+                        b"99 (UID 99 FLAGS (\\Seen))",
+                        b"42 (UID 42 FLAGS (\\Answered))",
+                    ]
+                raise AssertionError(command)
+
+        with pytest.raises(RuntimeError, match="FLAGS changed"):
+            verify_legacy_mailbox_uid_set_stable(
+                ChangedRequestedUidFlagsImap(),
+                "INBOX",
+                [42],
+                "123",
+                {42: "\\Seen"},
+            )
+
     def test_export_rejects_multiple_fetch_message_bodies_for_one_uid(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
@@ -1073,6 +1138,32 @@ class TestLegacyExportCompleteness:
         assert meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
         assert meta["uid"] == 7
         assert meta["uidvalidity"] == "123"
+
+    def test_remote_has_message_uses_flags_from_matched_body(self) -> None:
+        from components.imap_ops import _legacy_remote_has_message
+
+        body = b"Message-ID: <matched-flags@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class UnsolicitedTargetFlagsImap:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                return "OK", [
+                    b"2 (FLAGS (\\Seen))",
+                    (b"1 (FLAGS (\\Deleted) BODY[] {65}", body),
+                ]
+
+        assert not _legacy_remote_has_message(
+            UnsolicitedTargetFlagsImap(),
+            "INBOX",
+            body,
+            set(),
+            expected_flags="\\Seen",
+        )
 
     def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -2331,7 +2422,7 @@ class TestLegacyListParsing:
                     return "OK", [b"1"]
                 if command == "fetch":
                     query = str(args[-1])
-                    if query == "(FLAGS)":
+                    if query == "(UID FLAGS)":
                         return "OK", [b"1 (UID 1 FLAGS (\\Seen \\Answered))"]
                     return "OK", [(
                         b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',

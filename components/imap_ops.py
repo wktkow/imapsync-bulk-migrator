@@ -44,6 +44,7 @@ _IMAP_INTERNALDATE_RE = re.compile(
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
     r'\d{4} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d [+-]\d{4}$'
 )
+_FETCH_RESPONSE_START_RE = re.compile(r"^\s*\d+\s+\(")
 
 
 class _LegacyAppendOutcomeUncertain(RuntimeError):
@@ -739,6 +740,123 @@ def _legacy_internaldate_from_fetch_response(fetch_response: List[object]) -> Op
     return None
 
 
+def _legacy_fetch_metadata_values(meta_chunks: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    meta_str = " ".join(chunk for chunk in meta_chunks if chunk)
+    flags: Optional[str] = None
+    internaldate: Optional[str] = None
+    m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
+    if m_flags:
+        flags = m_flags.group(1)
+    m_int = re.search(r'INTERNALDATE\s+"([^"]+)"', meta_str, flags=re.IGNORECASE)
+    if m_int:
+        internaldate = _normalized_legacy_internaldate(m_int.group(1))
+    return flags, internaldate
+
+
+def _legacy_fetch_metadata_for_uid(
+    fetch_response: List[object],
+    expected_uid: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    meta_chunks: List[str] = []
+    active_expected = False
+    for part in fetch_response:
+        meta = part[0] if isinstance(part, tuple) and part else part
+        if isinstance(meta, (bytes, bytearray)):
+            meta_str = bytes(meta).decode(errors="ignore")
+        else:
+            meta_str = str(meta or "")
+        if not meta_str:
+            continue
+        response_uids = _fetch_response_uids(meta_str)
+        if response_uids:
+            if expected_uid in response_uids:
+                if any(uid != expected_uid for uid in response_uids):
+                    raise RuntimeError(f"fetch response for UID {expected_uid} included multiple UIDs")
+                meta_chunks.append(meta_str)
+                active_expected = True
+            else:
+                active_expected = False
+            continue
+        if _FETCH_RESPONSE_START_RE.match(meta_str):
+            active_expected = False
+            continue
+        if active_expected:
+            meta_chunks.append(meta_str)
+    if not meta_chunks:
+        raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
+    return _legacy_fetch_metadata_values(meta_chunks)
+
+
+def _fetch_response_sequence_number(meta_str: str) -> Optional[int]:
+    match = _FETCH_RESPONSE_START_RE.match(meta_str)
+    if not match:
+        return None
+    with contextlib.suppress(ValueError):
+        return int(meta_str[: match.end() - 1].strip())
+    return None
+
+
+def _legacy_fetch_metadata_for_sequence(
+    fetch_response: List[object],
+    expected_sequence: bytes,
+) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        expected_num = int(expected_sequence)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid IMAP sequence number {expected_sequence!r}") from exc
+    meta_chunks: List[str] = []
+    active_expected = False
+    for part in fetch_response:
+        meta = part[0] if isinstance(part, tuple) and part else part
+        if isinstance(meta, (bytes, bytearray)):
+            meta_str = bytes(meta).decode(errors="ignore")
+        else:
+            meta_str = str(meta or "")
+        if not meta_str:
+            continue
+        sequence_num = _fetch_response_sequence_number(meta_str)
+        if sequence_num is not None:
+            if sequence_num == expected_num:
+                meta_chunks.append(meta_str)
+                active_expected = True
+            else:
+                active_expected = False
+            continue
+        if active_expected:
+            meta_chunks.append(meta_str)
+    if not meta_chunks:
+        raise RuntimeError(f"fetch response for sequence {expected_num} did not include matching metadata")
+    return _legacy_fetch_metadata_values(meta_chunks)
+
+
+def _legacy_metadata_for_fetch_body_part(
+    fetch_response: List[object],
+    body_part_index: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    meta_chunks: List[str] = []
+    active = False
+    for index, part in enumerate(fetch_response):
+        if isinstance(part, tuple) and len(part) == 2:
+            active = index == body_part_index
+            if active:
+                meta = part[0]
+                if isinstance(meta, (bytes, bytearray)):
+                    meta_str = bytes(meta).decode(errors="ignore")
+                else:
+                    meta_str = str(meta or "")
+                if meta_str:
+                    meta_chunks.append(meta_str)
+            continue
+        if not active or not isinstance(part, (bytes, bytearray)):
+            continue
+        meta_str = bytes(part).decode(errors="ignore")
+        if _FETCH_RESPONSE_START_RE.match(meta_str):
+            active = False
+            continue
+        meta_chunks.append(meta_str)
+    return _legacy_fetch_metadata_values(meta_chunks)
+
+
 def _legacy_missing_target_flags(expected_flags: Optional[str], actual_flags: Optional[str]) -> List[str]:
     expected = _legacy_target_flag_set(expected_flags)
     if not expected:
@@ -768,10 +886,10 @@ def _legacy_flags_arg_from_tokens(tokens: Iterable[str]) -> str:
 
 
 def _fetch_legacy_flags_for_uid(imap: imaplib.IMAP4, mailbox: str, uid: int) -> str:
-    status, data = imap.uid("fetch", str(uid), "(FLAGS)")
+    status, data = imap.uid("fetch", str(uid), "(UID FLAGS)")
     if status != "OK":
         raise RuntimeError(f"fetch flags failed in {mailbox} for UID {uid}")
-    flags = _legacy_flags_from_fetch_response(list(data or []))
+    flags, _internaldate = _legacy_fetch_metadata_for_uid(list(data or []), int(uid))
     if flags is None:
         raise RuntimeError(f"fetch returned no flags in {mailbox} for UID {uid}")
     return flags
@@ -933,18 +1051,18 @@ def _legacy_remote_has_message(
         if status != "OK":
             continue
         fetched_parts = list(fetched or [])
-        for part in fetched or []:
+        for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
                 expected_date = _normalized_legacy_internaldate(expected_internaldate)
-                actual_date = _legacy_internaldate_from_fetch_response(fetched_parts)
+                actual_flags, actual_date = _legacy_metadata_for_fetch_body_part(fetched_parts, index)
                 if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
                     continue
                 missing_flags = _legacy_missing_target_flags(
                     expected_flags,
-                    _legacy_flags_from_fetch_response(fetched_parts),
+                    actual_flags,
                 )
                 if missing_flags:
                     if not restore_missing_flags:
@@ -956,9 +1074,13 @@ def _legacy_remote_has_message(
                     status, refetched = imap.fetch(num, "(FLAGS)")
                     if status != "OK":
                         raise RuntimeError(f"failed to verify restored legacy flags in {mailbox}: {refetched}")
+                    refetched_flags, _refetched_date = _legacy_fetch_metadata_for_sequence(
+                        list(refetched or []),
+                        num,
+                    )
                     remaining = _legacy_missing_target_flags(
                         expected_flags,
-                        _legacy_flags_from_fetch_response(list(refetched or [])),
+                        refetched_flags,
                     )
                     if remaining:
                         raise RuntimeError(
@@ -1228,6 +1350,18 @@ def _parse_fetch_response_for_uid(
         elif isinstance(part, (bytes, bytearray)):
             meta_str = part.decode(errors="ignore")
             if active_body_meta_chunks is not None:
+                response_uids = _fetch_response_uids(meta_str)
+                if response_uids:
+                    if expected_uid in response_uids:
+                        if any(uid != expected_uid for uid in response_uids):
+                            raise RuntimeError(f"fetch response for UID {expected_uid} included multiple UIDs")
+                        active_body_meta_chunks.append(meta_str)
+                    else:
+                        active_body_meta_chunks = None
+                    continue
+                if _FETCH_RESPONSE_START_RE.match(meta_str):
+                    active_body_meta_chunks = None
+                    continue
                 active_body_meta_chunks.append(meta_str)
     if len(body_parts) > 1:
         raise RuntimeError("fetch returned multiple message bodies for one UID")
@@ -1239,12 +1373,7 @@ def _parse_fetch_response_for_uid(
             if response_uids:
                 raise RuntimeError(f"fetch returned message bytes for unexpected UID {response_uids[0]}")
             raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
-        m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
-        if m_flags:
-            flags = m_flags.group(1)
-        m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
-        if m_int:
-            internaldate = m_int.group(1)
+        flags, internaldate = _legacy_fetch_metadata_values(body_meta_chunks)
     return msg_bytes, flags, internaldate
 
 
