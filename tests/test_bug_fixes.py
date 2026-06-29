@@ -1108,9 +1108,23 @@ class TestLegacyListParsing:
         assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
         assert state["mailboxes"] == [
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {
+                "mailbox": "All Mail",
+                "path": "All_Mail",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "uidvalidity": "123",
+            },
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
-        assert not (account_dir / "All_Mail").exists()
+        all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
+        assert all_marker == {
+            "mailbox": "All Mail",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+            "uidvalidity": "123",
+        }
+        assert not list((account_dir / "All_Mail").glob("u*.eml"))
         assert not (account_dir / "Flagged").exists()
 
     def test_export_keeps_generic_all_archived_only_messages_with_inbox(self, tmp_path: Path) -> None:
@@ -1296,9 +1310,18 @@ class TestLegacyListParsing:
         assert _unique_ordered(source.selected) == ["Projects", "All Mail"]
         assert state["mailboxes"] == [
             {"mailbox": "Projects", "path": "Projects", "message_count": 1, "uidvalidity": "123"},
+            {
+                "mailbox": "All Mail",
+                "path": "All_Mail",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "uidvalidity": "123",
+            },
         ]
         assert (account_dir / "Projects" / "u0000000001.eml").read_bytes() == body
-        assert not (account_dir / "All_Mail").exists()
+        all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
+        assert all_marker["covered_by_regular_content"] is True
+        assert all_marker["message_count"] == 0
 
     def test_export_keeps_generic_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -1357,6 +1380,81 @@ class TestLegacyListParsing:
             {"mailbox": "Flagged", "path": "Flagged", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
+
+    def test_export_records_covered_generic_flagged_view(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-covered-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class CoveredFlaggedSource:
+            response = _stable_uidvalidity_response
+
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "Archive"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    flags = "\\Seen \\Flagged" if self.selected_mailbox == "Flagged" else "\\Seen"
+                    return "OK", [(
+                        f'1 (UID 1 FLAGS ({flags}) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = CoveredFlaggedSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[CoveredFlaggedSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert _unique_ordered(source.selected) == ["Archive", "Flagged"]
+        assert state["mailboxes"] == [
+            {"mailbox": "Archive", "path": "Archive", "message_count": 1, "uidvalidity": "123"},
+            {
+                "mailbox": "Flagged",
+                "path": "Flagged",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "uidvalidity": "123",
+            },
+        ]
+        assert (account_dir / "Archive" / "u0000000001.eml").read_bytes() == body
+        flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
+        assert flagged_marker == {
+            "mailbox": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+            "uidvalidity": "123",
+        }
+        assert not list((account_dir / "Flagged").glob("u*.eml"))
 
     def test_export_keeps_generic_all_when_it_is_only_source_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -1960,8 +2058,18 @@ class TestLegacyListParsing:
         state = json.loads((account_dir / "export-state.json").read_text())
         assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
         assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
-        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"}]
-        assert not (account_dir / "All_Mail").exists()
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {
+                "mailbox": "All Mail",
+                "path": "All_Mail",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "uidvalidity": "123",
+            },
+        ]
+        all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
+        assert all_marker["covered_by_regular_content"] is True
 
     def test_remote_audit_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
         from components.audit import audit_export
@@ -3003,6 +3111,89 @@ class TestLegacyImportJournal:
                 ignore_errors=False,
                 imap_factory=fake_factory,
             )
+
+    def test_import_skips_covered_virtual_marker_only_mailbox(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com")
+        account = Account("user@example.com", "secret")
+        account_dir = tmp_path / account.email
+        body = b"Message-ID: <covered-virtual-import@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(
+            account_dir / "Archive",
+            mailbox="Archive",
+            data=body,
+            source_server=server,
+        )
+        flagged = account_dir / "Flagged"
+        flagged.mkdir()
+        (flagged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"].append({
+            "mailbox": "Flagged",
+            "path": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        })
+        state_path.write_text(json.dumps(state))
+
+        class Target:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.subscribed: List[str] = []
+                self.appended: List[str] = []
+
+            def _normalize(self, mailbox: str) -> str:
+                return mailbox.strip('"').replace(r"\"", '"')
+
+            def select(self, mailbox: str, readonly: bool = False):
+                selected = self._normalize(mailbox)
+                if selected == "Flagged":
+                    raise AssertionError("covered virtual mailbox should not be selected")
+                self.selected.append(selected)
+                return "OK", [b"0"]
+
+            def subscribe(self, mailbox: str):
+                selected = self._normalize(mailbox)
+                if selected == "Flagged":
+                    raise AssertionError("covered virtual mailbox should not be subscribed")
+                self.subscribed.append(selected)
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                selected = self._normalize(mailbox)
+                if selected == "Flagged":
+                    raise AssertionError("covered virtual mailbox should not receive appends")
+                self.appended.append(selected)
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        target = Target()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[Target]:
+            yield target
+
+        import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=server,
+        )
+
+        assert target.selected == ["Archive"]
+        assert target.subscribed == ["Archive"]
+        assert target.appended == ["Archive"]
 
     def test_import_recognizes_existing_raw_committed_key_for_lf_only_message(self, tmp_path: Path) -> None:
         import imaplib

@@ -340,11 +340,14 @@ def _legacy_mailbox_metadata(
     message_count: int,
     delimiter: str,
     uidvalidity: str = "",
+    covered_by_regular_content: bool = False,
 ) -> Dict[str, object]:
     payload: Dict[str, object] = {
         "mailbox": mailbox,
         "message_count": message_count,
     }
+    if covered_by_regular_content:
+        payload["covered_by_regular_content"] = True
     if uidvalidity:
         payload["uidvalidity"] = uidvalidity
     segments = _legacy_mailbox_path_segments(mailbox, delimiter)
@@ -360,8 +363,15 @@ def _legacy_export_state_mailbox_metadata(
     message_count: int,
     delimiter: str,
     uidvalidity: str = "",
+    covered_by_regular_content: bool = False,
 ) -> Dict[str, object]:
-    payload = _legacy_mailbox_metadata(mailbox, message_count, delimiter, uidvalidity)
+    payload = _legacy_mailbox_metadata(
+        mailbox,
+        message_count,
+        delimiter,
+        uidvalidity,
+        covered_by_regular_content,
+    )
     payload["path"] = path
     return payload
 
@@ -1228,12 +1238,19 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             )
                         )
                 _remove_stale_export_files(folder_dir, written_stems)
-                if written_stems or not virtual_source:
+                covered_virtual_source = virtual_source and bool(uids) and not written_stems
+                if written_stems or not virtual_source or covered_virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
                     verify_legacy_mailbox_uid_set_stable(imap, mailbox, uids, uidvalidity)
                     _secure_atomic_json(
                         folder_dir / ".mailbox.json",
-                        _legacy_mailbox_metadata(mailbox, len(written_stems), delimiter, uidvalidity),
+                        _legacy_mailbox_metadata(
+                            mailbox,
+                            len(written_stems),
+                            delimiter,
+                            uidvalidity,
+                            covered_virtual_source,
+                        ),
                     )
                     export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
                         mailbox,
@@ -1241,6 +1258,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         len(written_stems),
                         delimiter,
                         uidvalidity,
+                        covered_virtual_source,
                     ))
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
@@ -1505,7 +1523,8 @@ def import_account(
                 marker_mailbox_present = True
             else:
                 raise RuntimeError(f"{marker}: mailbox marker is not an object")
-            per_folder.setdefault(mailbox_meta, [])
+            if marker_meta.get("covered_by_regular_content") is not True:
+                per_folder.setdefault(mailbox_meta, [])
         default_mailbox = mailbox_meta
         for eml_path in eml_paths:
             _raise_if_symlink(eml_path, "legacy message file")
