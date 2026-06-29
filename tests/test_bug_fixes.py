@@ -9786,6 +9786,63 @@ print("ok")
         assert ok
         assert issues == []
 
+    def test_legacy_stale_export_file_cleanup_fsyncs_parent_after_unlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        folder_dir = tmp_path / "user@example.com" / "INBOX"
+        folder_dir.mkdir(parents=True)
+        stale = folder_dir / "u0000000002.eml"
+        stale.write_text("stale\n")
+        fsynced_dir_inodes: List[int] = []
+        real_fsync = imap_ops.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            st = imap_ops.os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                fsynced_dir_inodes.append(st.st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", recording_fsync)
+
+        imap_ops._remove_stale_export_files(folder_dir, set())
+
+        assert not stale.exists()
+        assert folder_dir.stat().st_ino in fsynced_dir_inodes
+
+    def test_legacy_stale_mailbox_cleanup_fsyncs_removed_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        stale_dir = account_dir / "Archive"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "u0000000001.eml").write_text("stale\n")
+        account_inode = account_dir.stat().st_ino
+        stale_dir_inode = stale_dir.stat().st_ino
+        fsynced_dir_inodes: List[int] = []
+        real_fsync = imap_ops.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            st = imap_ops.os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                fsynced_dir_inodes.append(st.st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", recording_fsync)
+
+        imap_ops._remove_stale_mailbox_dirs(account_dir, set())
+
+        assert not stale_dir.exists()
+        assert stale_dir_inode in fsynced_dir_inodes
+        assert account_inode in fsynced_dir_inodes
+
     def test_legacy_export_stale_file_cleanup_rejects_mailbox_dir_swap(
         self,
         tmp_path: Path,

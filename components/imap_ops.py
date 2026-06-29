@@ -1426,6 +1426,7 @@ def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> No
                 raise RuntimeError(f"refusing to delete non-regular legacy export artifact: {artifact_path}")
             _raise_if_legacy_parent_replaced(dir_path, dir_fd, "legacy mailbox")
             os.unlink(name, dir_fd=dir_fd)
+            _fsync_legacy_directory_fd(dir_fd, dir_path, "legacy mailbox")
             _raise_if_legacy_parent_replaced(dir_path, dir_fd, "legacy mailbox")
     finally:
         os.close(dir_fd)
@@ -1468,11 +1469,13 @@ def _remove_legacy_dir_tree_at(
                 raise RuntimeError(f"refusing to delete non-regular legacy mailbox path: {child_path}")
             guard()
             os.unlink(child_name, dir_fd=child_fd)
+            _fsync_legacy_directory_fd(child_fd, display_path, "legacy mailbox directory")
             guard()
     finally:
         os.close(child_fd)
     guard()
     os.rmdir(name, dir_fd=parent_fd)
+    _fsync_legacy_directory_fd(parent_fd, display_path.parent, "legacy mailbox directory")
     guard()
 
 

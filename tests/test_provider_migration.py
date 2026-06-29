@@ -930,6 +930,35 @@ def test_provider_prune_rejects_artifact_root_swap_before_unlink(tmp_path: Path)
     assert (checked_messages / "stale.eml").exists()
 
 
+def test_provider_prune_fsyncs_parent_after_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    messages = account_dir / "messages"
+    messages.mkdir(parents=True)
+    stale = messages / "stale.eml"
+    stale.write_bytes(b"stale")
+    messages_inode = messages.stat().st_ino
+    fsynced_dir_inodes: List[int] = []
+    real_fsync = provider_ops.os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        st = provider_ops.os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            fsynced_dir_inodes.append(st.st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", recording_fsync)
+
+    _prune_provider_artifact_orphans(account_dir, [])
+
+    assert not stale.exists()
+    assert messages_inode in fsynced_dir_inodes
+
+
 def test_provider_prune_rejects_non_regular_orphan_artifact(tmp_path: Path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFO creation unavailable")

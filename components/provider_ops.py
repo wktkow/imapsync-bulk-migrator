@@ -2198,6 +2198,9 @@ def _prune_provider_artifact_orphans_at(
     expected: set[str],
     guard: Callable[[], None],
 ) -> None:
+    parent_path = account_dir / root_name
+    for part in relative_parts:
+        parent_path /= part
     for name in sorted(os.listdir(parent_fd)):
         child_parts = relative_parts + (name,)
         rel_path = "/".join((root_name, *child_parts))
@@ -2237,6 +2240,7 @@ def _prune_provider_artifact_orphans_at(
         if rel_path not in expected:
             guard()
             os.unlink(name, dir_fd=parent_fd)
+            _fsync_provider_directory_fd(parent_fd, parent_path, "artifact directory")
             guard()
 
 
