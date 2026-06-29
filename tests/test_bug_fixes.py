@@ -6348,6 +6348,54 @@ class TestCliAndConfigHardening:
         assert imported == [account.email]
         assert journal.read_text() == ""
 
+    def test_legacy_import_repairs_trailing_journal_with_partial_utf8(self, tmp_path: Path) -> None:
+        from components.imap_ops import _load_legacy_import_journal
+
+        account_dir = tmp_path / "a@example.com"
+        account_dir.mkdir()
+        valid = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "status": "committed",
+            "mailbox": "INBOX",
+        }
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_bytes(
+            (json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            + b'{"key":"'
+            + b"c" * 64
+            + b'","target":"'
+            + b"d" * 64
+            + b'","status":"pending","mailbox":"F\xc3'
+        )
+
+        rows = _load_legacy_import_journal(account_dir, repair_trailing=True)
+
+        assert rows == [valid]
+        assert journal.read_bytes() == (
+            json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+
+    def test_legacy_import_rejects_non_trailing_invalid_utf8_journal(self, tmp_path: Path) -> None:
+        from components.imap_ops import _load_legacy_import_journal
+
+        account_dir = tmp_path / "a@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        original = (
+            b'{"key":"\xc3\n{"key":"'
+            + b"a" * 64
+            + b'","target":"'
+            + b"b" * 64
+            + b'","status":"committed"}\n'
+        )
+        journal.write_bytes(original)
+
+        with pytest.raises(RuntimeError, match="import journal row 1 is malformed UTF-8"):
+            _load_legacy_import_journal(account_dir, repair_trailing=True)
+
+        assert journal.read_bytes() == original
+
     def test_legacy_import_low_disk_does_not_repair_trailing_journal(self, tmp_path: Path) -> None:
         from components.main import main
         from components.models import Account, ServerConfig

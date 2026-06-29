@@ -1019,9 +1019,17 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
         if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
             return rows
         raise
-    lines = raw.decode("utf-8").splitlines()
+    lines = raw.splitlines()
     needs_rewrite = False
-    for line_no, line in enumerate(lines, 1):
+    for line_no, raw_line in enumerate(lines, 1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            if repair_trailing and line_no == len(lines):
+                logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
+                needs_rewrite = True
+                break
+            raise RuntimeError(f"import journal row {line_no} is malformed UTF-8: {path}") from None
         line = line.strip()
         if not line:
             continue
