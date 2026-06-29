@@ -11772,6 +11772,49 @@ def test_load_import_journal_recovers_incomplete_trailing_row(tmp_path: Path) ->
     assert journal.read_text().strip() == json.dumps(valid, sort_keys=True)
 
 
+def test_load_import_journal_repairs_trailing_partial_utf8_row(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    valid = {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }
+    journal.write_bytes(
+        (json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        + b'{"canonical_id":"gmail-456","target_account":"target@icloud.com",'
+        + b'"target_mailbox":"F\xc3'
+    )
+
+    rows = load_import_journal(account_dir, account, repair_trailing=True)
+
+    assert rows == [valid]
+    assert journal.read_bytes() == (
+        json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def test_load_import_journal_rejects_non_trailing_invalid_utf8_row(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    original = (
+        b'{"canonical_id":"gmail-\xc3\n'
+        b'{"canonical_id":"gmail-123","status":"pending",'
+        b'"target_account":"target@icloud.com","target_mailbox":"Archive"}\n'
+    )
+    journal.write_bytes(original)
+
+    with pytest.raises(UnicodeDecodeError):
+        load_import_journal(account_dir, account, repair_trailing=True)
+
+    assert journal.read_bytes() == original
+
+
 def test_provider_audit_and_validation_do_not_repair_incomplete_trailing_journal(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
