@@ -1311,6 +1311,23 @@ def latest_committed_journal_rows(
     target_provider: str = "imap",
     target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    return {
+        key: row
+        for key, row in latest_journal_rows(
+            rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        ).items()
+        if row.get("status") == "committed"
+    }
+
+
+def latest_journal_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         identity = _non_empty_json_string(row, "canonical_id") or ""
@@ -1323,10 +1340,8 @@ def latest_committed_journal_rows(
             target_provider=target_provider,
             target_mailboxes=target_mailboxes,
         )
-        if row.get("status") == "committed":
+        if row.get("status") in {"pending", "committed", "failed"}:
             latest[key] = row
-        else:
-            latest.pop(key, None)
     return latest
 
 
@@ -1961,7 +1976,7 @@ def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) ->
             continue
         raw_status = row.get("status")
         status = raw_status if isinstance(raw_status, str) else ""
-        if status not in {"pending", "committed"}:
+        if status not in {"pending", "committed", "failed"}:
             if raw_status in (None, ""):
                 shown_status = "<missing>"
             elif isinstance(raw_status, str):
@@ -2104,7 +2119,7 @@ def pending_journal_target_mailbox_issues(
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
-    for row in rows:
+    for row in latest_journal_rows(rows, target_provider=target_provider).values():
         if row.get("status") != "pending":
             continue
         identity = str(row.get("canonical_id") or "")
@@ -4411,7 +4426,11 @@ def require_merge_group_journals_remote_complete(
             target_mailboxes=target_mailboxes,
         )
         committed_keys = set(latest_committed)
-        for row in journal_rows:
+        for row in latest_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        ).values():
             if row.get("status") != "pending":
                 continue
             identity = str(row.get("canonical_id") or "<missing>")
@@ -4639,12 +4658,12 @@ def provider_import_account(
                 )
         target_mailboxes = list_mailboxes(imap)
         pending = {
-            journal_row_target_key(
-                row,
+            key
+            for key, row in latest_journal_rows(
+                journal_rows,
                 target_provider=config.target.provider,
                 target_mailboxes=target_mailboxes,
-            )
-            for row in journal_rows
+            ).items()
             if row.get("status") == "pending"
         }
         if merge_group_stages is not None:
@@ -4905,6 +4924,11 @@ def provider_import_account(
                 data,
             )
             if status != "OK":
+                append_journal(
+                    account_dir,
+                    account,
+                    _journal_row(row, target_mailbox, "failed", "append-failed", target_binding=target_binding),
+                )
                 raise RuntimeError(f"append failed for {identity}: {response}")
             appended_num = consume_target_match_num(
                 imap,
@@ -5352,13 +5376,16 @@ def provider_validate_account(
         )
     )
     if not allow_unresolved_pending:
-        for row in journal_rows:
+        for key, row in latest_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+        ).items():
             _raise_if_stopped(stop_event, f"provider validate {account.email}")
             if row.get("status") != "pending":
                 continue
             identity = str(row.get("canonical_id") or "")
             target_mailbox = str(row.get("target_mailbox") or "")
-            if journal_row_target_key(row, target_provider=config.target.provider) not in committed_journal_keys:
+            if key not in committed_journal_keys:
                 report["failed"].append(
                     f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
                 )

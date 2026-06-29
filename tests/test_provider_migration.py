@@ -4877,6 +4877,49 @@ def test_provider_import_rejects_unsupported_imap_keywords_before_pending_journa
     assert not journal.exists() or '"status": "pending"' not in journal.read_text()
 
 
+def test_provider_import_records_failed_journal_for_tagged_append_failure(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    _write_provider_export_state(account_dir)
+
+    class AppendNoTarget(FakeTargetImap):
+        def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+            self.appended.append(self._normalize_mailbox(mailbox))
+            return "NO", [b"quota exceeded"]
+
+    failing_target = AppendNoTarget()
+
+    @contextlib.contextmanager
+    def failing_connection(*_args, **_kwargs) -> Iterator[AppendNoTarget]:
+        yield failing_target
+
+    with mock.patch("components.provider_ops.imap_connection", failing_connection):
+        with pytest.raises(RuntimeError, match="append failed for gmail-123"):
+            provider_import_account(config, account, tmp_path)
+
+    journal = load_import_journal(account_dir, account)
+    assert [row["status"] for row in journal] == ["pending", "failed"]
+    assert [row["action"] for row in journal] == ["append-started", "append-failed"]
+    _name, report = provider_validate_account(config, account, tmp_path)
+    assert not report["ok"]
+    assert report["missing"] == ["gmail-123"]
+    assert not any("pending identity has no committed resolution" in issue for issue in report["failed"])
+
+    succeeding_target = FakeTargetImap()
+
+    @contextlib.contextmanager
+    def succeeding_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield succeeding_target
+
+    with mock.patch("components.provider_ops.imap_connection", succeeding_connection):
+        provider_import_account(config, account, tmp_path)
+
+    journal = load_import_journal(account_dir, account)
+    assert [row["status"] for row in journal] == ["pending", "failed", "pending", "committed"]
+    assert succeeding_target.appended == ["Archive"]
+
+
 def test_provider_import_merge_mode_restores_supported_imap_keywords_on_existing_match(tmp_path: Path) -> None:
     config = _provider_config(target_mode="merge")
     account = config.accounts[0]
