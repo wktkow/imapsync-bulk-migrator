@@ -3485,6 +3485,41 @@ def target_message_flag_set(imap: imaplib.IMAP4, num: bytes) -> set[str]:
     return {token.upper() for token in str(parsed.get("flags") or "").split()}
 
 
+def _normalized_provider_internaldate(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized.startswith('"') and normalized.endswith('"'):
+        normalized = normalized[1:-1]
+    return normalized
+
+
+def target_message_internaldate(imap: imaplib.IMAP4, num: bytes) -> str:
+    status, fetched = imap.fetch(num, "(INTERNALDATE)")
+    if status != "OK":
+        raise RuntimeError(f"failed to fetch target INTERNALDATE for message {num!r}")
+    parsed = parse_provider_fetch_response(fetched or [])
+    return _normalized_provider_internaldate(parsed.get("internaldate"))
+
+
+def append_target_internaldate_failure(
+    failures: List[str],
+    *,
+    identity: str,
+    target_mailbox: str,
+    row: Dict[str, Any],
+    actual_internaldate: str,
+) -> None:
+    expected_internaldate = _normalized_provider_internaldate(row.get("internaldate"))
+    if not expected_internaldate:
+        return
+    if actual_internaldate != expected_internaldate:
+        failures.append(
+            f"target INTERNALDATE mismatch for {identity} in {target_mailbox}: "
+            f"expected {expected_internaldate!r} got {(actual_internaldate or '<missing>')!r}"
+        )
+
+
 def restore_imap_flags(
     imap: imaplib.IMAP4,
     target_mailbox: str,
@@ -4110,6 +4145,11 @@ def _target_gmail_label_and_flag_keys(imap: imaplib.IMAP4, num: bytes) -> Tuple[
     return {label for label in labels if label}, flags
 
 
+def _target_gmail_label_flag_internaldate(imap: imaplib.IMAP4, num: bytes) -> Tuple[set[str], set[str], str]:
+    labels, flags = _target_gmail_label_and_flag_keys(imap, num)
+    return labels, flags, target_message_internaldate(imap, num)
+
+
 def _target_gmail_label_keys(imap: imaplib.IMAP4, num: bytes) -> set[str]:
     labels, _flags = _target_gmail_label_and_flag_keys(imap, num)
     return labels
@@ -4124,7 +4164,7 @@ def consume_target_match_with_gmail_state(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
-) -> Optional[Tuple[set[str], set[str]]]:
+) -> Optional[Tuple[set[str], set[str], str]]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
     for num in target_matching_message_nums(
@@ -4143,7 +4183,7 @@ def consume_target_match_with_gmail_state(
             if gmail_msgid:
                 used_gmail_msgids.add(gmail_msgid)
         used.add(num)
-        return _target_gmail_label_and_flag_keys(imap, num)
+        return _target_gmail_label_flag_internaldate(imap, num)
     return None
 
 
@@ -4233,6 +4273,27 @@ def target_gmail_labels_and_flags_for_msgid(
     *,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
 ) -> Optional[Tuple[set[str], set[str]]]:
+    result = target_gmail_labels_flags_internaldate_for_msgid(
+        imap,
+        row,
+        mailboxes,
+        target_gmail_msgid,
+        expected_content_identities=expected_content_identities,
+    )
+    if result is None:
+        return None
+    labels, flags, _internaldate = result
+    return labels, flags
+
+
+def target_gmail_labels_flags_internaldate_for_msgid(
+    imap: imaplib.IMAP4,
+    row: Dict[str, Any],
+    mailboxes: List[str],
+    target_gmail_msgid: str,
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+) -> Optional[Tuple[set[str], set[str], str]]:
     used_by_mailbox: Dict[str, set[bytes]] = {}
     for mailbox in mailboxes:
         for num in target_matching_message_nums(
@@ -4247,7 +4308,7 @@ def target_gmail_labels_and_flags_for_msgid(
                 continue
             used.add(num)
             if _target_gmail_msgid(imap, num) == target_gmail_msgid:
-                return _target_gmail_label_and_flag_keys(imap, num)
+                return _target_gmail_label_flag_internaldate(imap, num)
     return None
 
 
@@ -5889,11 +5950,12 @@ def provider_validate_account(
                             journal_target_gmail_msgid = target_gmail_msgid_by_id.get(identity, "")
                             primary_actual_labels: Optional[set[str]] = None
                             primary_actual_flags: Optional[set[str]] = None
+                            primary_actual_internaldate: Optional[str] = None
                             if journal_target_gmail_msgid:
                                 if journal_target_gmail_msgid not in matching_gmail_msgids:
                                     report["remote_missing"].append(identity)
                                     continue
-                                primary_actual_state = target_gmail_labels_and_flags_for_msgid(
+                                primary_actual_state = target_gmail_labels_flags_internaldate_for_msgid(
                                     imap,
                                     row,
                                     [target_mailbox],
@@ -5903,7 +5965,11 @@ def provider_validate_account(
                                 if primary_actual_state is None:
                                     report["remote_missing"].append(identity)
                                     continue
-                                primary_actual_labels, primary_actual_flags = primary_actual_state
+                                (
+                                    primary_actual_labels,
+                                    primary_actual_flags,
+                                    primary_actual_internaldate,
+                                ) = primary_actual_state
                                 extra_gmail_msgids = matching_gmail_msgids - committed_target_gmail_msgids
                             else:
                                 extra_gmail_msgids = matching_gmail_msgids if len(matching_gmail_msgids) > 1 else set()
@@ -5918,6 +5984,7 @@ def provider_validate_account(
                             if journal_target_gmail_msgid:
                                 actual_labels = primary_actual_labels
                                 actual_flags = primary_actual_flags
+                                actual_internaldate = primary_actual_internaldate
                             else:
                                 actual_state = consume_target_match_with_gmail_state(
                                     imap,
@@ -5930,9 +5997,17 @@ def provider_validate_account(
                                 )
                                 actual_labels = actual_state[0] if actual_state is not None else None
                                 actual_flags = actual_state[1] if actual_state is not None else None
+                                actual_internaldate = actual_state[2] if actual_state is not None else None
                             if actual_labels is None or actual_flags is None:
                                 report["remote_missing"].append(identity)
                                 continue
+                            append_target_internaldate_failure(
+                                report["failed"],
+                                identity=identity,
+                                target_mailbox=target_mailbox,
+                                row=row,
+                                actual_internaldate=actual_internaldate or "",
+                            )
                             expected_labels = {
                                 _gmail_label_key(label)
                                 for label in gmail_labels_for_restore(row, target_mailbox, target_mailboxes)
@@ -6023,9 +6098,17 @@ def provider_validate_account(
                                     permanent_flags=target_permanent_flags(imap),
                                 )
                                 actual_flags = target_message_flag_set(imap, target_num)
+                                actual_internaldate = target_message_internaldate(imap, target_num)
                             except Exception as exc:
-                                report["failed"].append(f"target IMAP flag validation failed for {identity}: {exc}")
+                                report["failed"].append(f"target IMAP delivery validation failed for {identity}: {exc}")
                                 continue
+                            append_target_internaldate_failure(
+                                report["failed"],
+                                identity=identity,
+                                target_mailbox=target_mailbox,
+                                row=row,
+                                actual_internaldate=actual_internaldate,
+                            )
                             missing_flags = sorted(required_flags - actual_flags)
                             if missing_flags:
                                 report["failed"].append(

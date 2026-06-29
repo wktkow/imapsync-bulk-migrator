@@ -4406,6 +4406,7 @@ class FakeTargetImap:
         messages_by_mailbox: Optional[dict[str, int]] = None,
         permanent_flags: Optional[str] = None,
         existing_flags: str = "\\Seen",
+        existing_internaldate: str = "01-Jan-2024 00:00:00 +0000",
     ) -> None:
         self.appended: List[str] = []
         self.appended_flags: List[str] = []
@@ -4415,6 +4416,7 @@ class FakeTargetImap:
         self.existing_body = existing_body
         self.existing_mailbox = existing_mailbox
         self.existing_flags = existing_flags
+        self.existing_internaldate = existing_internaldate
         self.permanent_flags = permanent_flags
         self.messages = 0
         self.messages_by_mailbox = dict(messages_by_mailbox or {})
@@ -4460,6 +4462,7 @@ class FakeTargetImap:
         target = self._normalize_mailbox(mailbox)
         self.appended.append(target)
         self.appended_flags.append(flags)
+        self.existing_internaldate = date_time.strip().strip('"')
         if flags:
             self.existing_flags = flags.strip("()")
         self.messages_by_mailbox[target] = self._message_count(target) + 1
@@ -4495,6 +4498,8 @@ class FakeTargetImap:
         self.fetch_queries.append(query)
         if "FLAGS" in query and "BODY" not in query and "RFC822" not in query:
             return "OK", [b"99 (FLAGS (" + self.existing_flags.encode("ascii") + b"))"]
+        if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
+            return "OK", [b'99 (INTERNALDATE "' + self.existing_internaldate.encode("ascii") + b'")']
         return "OK", [(
             b"99 (RFC822.SIZE "
             + str(len(self.existing_body)).encode("ascii")
@@ -4619,6 +4624,10 @@ class StoredMessageTarget(FakeTargetImap):
             mailbox: ["\\Seen" for _body in bodies]
             for mailbox, bodies in self.bodies_by_mailbox.items()
         }
+        self.internaldates_by_mailbox = {
+            mailbox: ["01-Jan-2024 00:00:00 +0000" for _body in bodies]
+            for mailbox, bodies in self.bodies_by_mailbox.items()
+        }
 
     def _message_count(self, mailbox: str) -> int:
         return len(self.bodies_by_mailbox.get(mailbox, []))
@@ -4633,6 +4642,7 @@ class StoredMessageTarget(FakeTargetImap):
         self.appended_flags.append(flags)
         self.bodies_by_mailbox.setdefault(target, []).append(bytes(data))
         self.flags_by_mailbox.setdefault(target, []).append(flags.strip("()") if flags else "")
+        self.internaldates_by_mailbox.setdefault(target, []).append(date_time.strip().strip('"'))
         return "OK", [b""]
 
     def _message_id_for_body(self, body: bytes) -> str:
@@ -4663,6 +4673,12 @@ class StoredMessageTarget(FakeTargetImap):
         flags = self.flags_by_mailbox.get(self.selected_mailbox, [""] * len(self.bodies_by_mailbox.get(self.selected_mailbox, [])))[index]
         if "FLAGS" in query and "BODY" not in query and "RFC822" not in query:
             return "OK", [num + b" (FLAGS (" + flags.encode("ascii") + b"))"]
+        if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
+            internaldates = self.internaldates_by_mailbox.get(
+                self.selected_mailbox,
+                ["01-Jan-2024 00:00:00 +0000"] * len(self.bodies_by_mailbox.get(self.selected_mailbox, [])),
+            )
+            return "OK", [num + b' (INTERNALDATE "' + internaldates[index].encode("ascii") + b'")']
         return "OK", [(
             num
             + f" (RFC822.SIZE {len(body)} FLAGS ({flags}) BODY[] {{{len(body)}}}".encode("ascii"),
@@ -10233,6 +10249,96 @@ def test_provider_validation_rejects_missing_gmail_imap_flags(tmp_path: Path) ->
     assert report["ok"]
 
 
+def test_provider_validation_rejects_wrong_target_internaldate(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+    wrong_date = FakeTargetImap(
+        has_existing=True,
+        existing_mailbox="Archive",
+        existing_internaldate="02-Jan-2024 00:00:00 +0000",
+    )
+
+    @contextlib.contextmanager
+    def wrong_date_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield wrong_date
+
+    with mock.patch("components.provider_ops.imap_connection", wrong_date_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any(
+        "target INTERNALDATE mismatch for gmail-123 in Archive" in item
+        and "'01-Jan-2024 00:00:00 +0000'" in item
+        and "'02-Jan-2024 00:00:00 +0000'" in item
+        for item in report["failed"]
+    )
+
+
+def test_provider_validation_rejects_wrong_gmail_target_internaldate(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@example.com", password="gmail-token"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _mark_manifest_source_provider(row, "gmail")
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["gmail_labels"] = ["\\Inbox"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })) + "\n")
+    wrong_date = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1},
+        gmail_labels=["\\Inbox"],
+        existing_internaldate="02-Jan-2024 00:00:00 +0000",
+    )
+
+    @contextlib.contextmanager
+    def wrong_date_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield wrong_date
+
+    with mock.patch("components.provider_ops.imap_connection", wrong_date_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert any(
+        "target INTERNALDATE mismatch for gmail-123 in INBOX" in item
+        and "'01-Jan-2024 00:00:00 +0000'" in item
+        and "'02-Jan-2024 00:00:00 +0000'" in item
+        for item in report["failed"]
+    )
+
+
 def test_provider_validation_accepts_journaled_gmail_target_ids_for_identical_source_messages(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -10320,6 +10426,8 @@ def test_provider_validation_accepts_journaled_gmail_target_ids_for_identical_so
                 return "OK", [num + b" (X-GM-MSGID " + gmail_msgid + b")"]
             if "X-GM-LABELS" in query:
                 return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS (\\Inbox))"]
+            if "INTERNALDATE" in query:
+                return "OK", [num + b' (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
             return "OK", [(num + b" (RFC822.SIZE 36 BODY[] {36}", body)]
 
     fake = DuplicateSourceGmailTarget()
