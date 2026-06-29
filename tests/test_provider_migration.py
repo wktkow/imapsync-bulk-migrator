@@ -5298,8 +5298,12 @@ def test_provider_import_many_to_one_empty_mode_accepts_journaled_merge_group_ta
     assert '"action": "appended"' in second_journal
 
 
-def test_provider_import_many_to_one_rejects_missing_group_committed_target_before_append(tmp_path: Path) -> None:
-    config = _many_to_one_config()
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_rejects_missing_group_committed_target_before_append(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
     first, second = config.accounts
     target = first.target_email
     first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
@@ -5553,8 +5557,12 @@ def test_provider_validation_many_to_one_empty_mode_rejects_unjournaled_group_ta
     assert any("target_mode=empty" in item for item in report["failed"])
 
 
-def test_provider_validation_many_to_one_rejects_missing_group_committed_target(tmp_path: Path) -> None:
-    config = _many_to_one_config()
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_validation_many_to_one_rejects_missing_group_committed_target(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
     first, second = config.accounts
     target = first.target_email
     first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"

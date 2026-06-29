@@ -4999,6 +4999,14 @@ def provider_import_account(
             target_mailboxes=target_mailboxes,
         )
         committed = set(latest_committed)
+        if merge_group_stages is not None:
+            require_merge_group_journals_remote_complete(
+                imap,
+                target_mailboxes,
+                merge_group_stages,
+                target_provider=config.target.provider,
+                expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
+            )
         if config.migration.target_mode == "empty":
             empty_target_rows = manifest_rows
             empty_target_journaled = committed | pending
@@ -5012,13 +5020,6 @@ def provider_import_account(
                     config,
                     target_mailboxes,
                     merge_group_stages,
-                )
-                require_merge_group_journals_remote_complete(
-                    imap,
-                    target_mailboxes,
-                    merge_group_stages,
-                    target_provider=config.target.provider,
-                    expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
                 )
             enforce_empty_target(
                 imap,
@@ -5871,6 +5872,14 @@ def provider_validate_account(
                     target_readiness_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))
                     if target_readiness_issues:
                         raise RuntimeError("; ".join(target_readiness_issues))
+                if merge_group_stages is not None:
+                    require_merge_group_journals_remote_complete(
+                        imap,
+                        target_mailboxes,
+                        merge_group_stages,
+                        target_provider=config.target.provider,
+                        expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
+                    )
                 if config.migration.target_mode == "empty":
                     empty_target_rows = manifest_rows
                     effective_committed_rows = latest_committed_journal_rows(
@@ -5889,13 +5898,6 @@ def provider_validate_account(
                             config,
                             target_mailboxes,
                             merge_group_stages,
-                        )
-                        require_merge_group_journals_remote_complete(
-                            imap,
-                            target_mailboxes,
-                            merge_group_stages,
-                            target_provider=config.target.provider,
-                            expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
                         )
                     try:
                         enforce_empty_target(
