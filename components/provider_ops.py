@@ -2747,6 +2747,20 @@ def _refresh_export_delivery_metadata(record: Dict[str, Any], parsed: Dict[str, 
     record["internaldate"] = parsed.get("internaldate") or ""
 
 
+def _provider_export_flag_set(flags: object) -> set[str]:
+    return {
+        str(token).upper()
+        for token in str(flags or "").split()
+        if str(token).strip() and str(token).upper() != "\\RECENT"
+    }
+
+
+def _provider_export_gmail_label_set(labels: object) -> set[str]:
+    if not isinstance(labels, list):
+        return set()
+    return {_gmail_label_key(str(label)) for label in labels if str(label).strip()}
+
+
 def provider_export_account(
     config: ProviderMigrationConfig,
     account: MigrationAccount,
@@ -2768,6 +2782,7 @@ def provider_export_account(
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
     scanned_uidvalidity_by_mailbox: Dict[str, str] = {}
+    exported_delivery_by_mailbox_uid: Dict[str, Dict[int, Dict[str, Any]]] = {}
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
         require_unique_manifest_identities(existing_rows)
@@ -2879,6 +2894,41 @@ def provider_export_account(
             for identity in sorted(active_identities)
             if identity in messages
         }
+
+    def record_export_delivery_snapshot(mailbox_name: str, uid: int, parsed: Dict[str, Any]) -> None:
+        exported_delivery_by_mailbox_uid.setdefault(mailbox_name, {})[int(uid)] = {
+            "flags": parsed.get("flags") or "",
+            "gmail_labels": list(parsed.get("gmail_labels") or []),
+        }
+
+    def verify_export_delivery_stable(
+        imap: imaplib.IMAP4,
+        mailbox_name: str,
+        uids: List[int],
+        *,
+        gmail_extensions: bool,
+    ) -> None:
+        expected_by_uid = exported_delivery_by_mailbox_uid.get(mailbox_name, {})
+        if sorted(expected_by_uid) != [int(uid) for uid in uids]:
+            raise RuntimeError(f"internal delivery snapshot mismatch during export of {mailbox_name}")
+        for uid in uids:
+            status, data = imap.uid(
+                "fetch",
+                str(uid),
+                fetch_items(include_body=False, gmail_extensions=gmail_extensions),
+            )
+            if status != "OK":
+                raise RuntimeError(f"failed final metadata fetch in {mailbox_name} for UID {uid}: {data}")
+            parsed = parse_provider_fetch_response(data or [])
+            expected = expected_by_uid[int(uid)]
+            if _provider_export_flag_set(parsed.get("flags")) != _provider_export_flag_set(expected.get("flags")):
+                raise RuntimeError(f"FLAGS changed during export of {mailbox_name} for UID {uid}")
+            if (
+                gmail_extensions
+                and _provider_export_gmail_label_set(parsed.get("gmail_labels"))
+                != _provider_export_gmail_label_set(expected.get("gmail_labels"))
+            ):
+                raise RuntimeError(f"Gmail labels changed during export of {mailbox_name} for UID {uid}")
 
     def persist_fetched_message(
         identity: str,
@@ -3046,6 +3096,7 @@ def provider_export_account(
                             else:
                                 _refresh_export_delivery_metadata(messages[identity_hint], pre_parsed)
                                 update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
+                                record_export_delivery_snapshot(mailbox.name, int(uid), pre_parsed)
                                 persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
                                 previous_rows_by_identity[identity_hint] = dict(messages[identity_hint])
                                 continue
@@ -3066,6 +3117,7 @@ def provider_export_account(
                 for key, value in pre_parsed.items():
                     if key != "message_bytes" and not parsed.get(key):
                         parsed[key] = value
+                record_export_delivery_snapshot(mailbox.name, int(uid), parsed)
                 if config.source.provider == "gmail" and not parsed.get("gmail_msgid"):
                     raise RuntimeError(
                         f"Gmail source fetch for {account.source_email} UID {uid} in {mailbox.name} "
@@ -3143,6 +3195,12 @@ def provider_export_account(
                     f"UID set changed during export of {mailbox.name}: "
                     f"initial={len(uids)} final={len(final_uids)}; rerun export after mailbox quiesces"
                 )
+            verify_export_delivery_stable(
+                imap,
+                mailbox.name,
+                uids,
+                gmail_extensions=gmail_extensions,
+            )
 
     final_records = active_export_records()
     persist_export_records(account_dir, final_records, config.migration.folder_map)

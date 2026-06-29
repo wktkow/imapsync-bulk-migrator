@@ -3336,6 +3336,85 @@ def test_provider_export_resume_refreshes_delivery_metadata_without_body_fetch(t
     assert updated_row[CONTENT_BINDING_FIELD] == provider_content_binding_sha256(updated_row)
 
 
+def test_provider_export_fails_when_source_flags_change_during_export(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(provider="imap", host="mail.example.com"),
+        target=ProviderEndpoint(provider="imap", host="target.example.com"),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@example.com")],
+    )
+    account = config.accounts[0]
+    body = b"Message-ID: <provider-flags-change@example.com>\r\n\r\nbody"
+
+    class ChangingFlagsSource(FakeIcloudInboxSourceImap):
+        def __init__(self) -> None:
+            self.metadata_fetches = 0
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                return "OK", [b"1"]
+            if command == "fetch":
+                query = args[-1]
+                flags = "\\Seen"
+                if "BODY.PEEK[]" not in query:
+                    self.metadata_fetches += 1
+                    if self.metadata_fetches > 1:
+                        flags = "\\Seen \\Flagged"
+                meta = (
+                    f'1 (UID 1 RFC822.SIZE {len(body)} FLAGS ({flags}) '
+                    'INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+                ).encode("ascii")
+                if "BODY.PEEK[]" not in query:
+                    return "OK", [meta]
+                return "OK", [(meta + f" BODY[] {{{len(body)}}}".encode("ascii"), body)]
+            raise AssertionError(command)
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[ChangingFlagsSource]:
+        yield ChangingFlagsSource()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        with pytest.raises(RuntimeError, match=r"FLAGS changed during export of INBOX for UID 1"):
+            provider_export_account(config, account, tmp_path)
+
+
+def test_provider_export_fails_when_gmail_labels_change_during_export(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+
+    class ChangingLabelsSource(FakeSourceImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metadata_fetches_by_mailbox: dict[str, int] = {}
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                return "OK", [b"1"]
+            if command == "fetch":
+                query = args[-1]
+                labels = b"(\\Inbox \"Project A\")" if self.selected == "INBOX" else b"(\"Project A\")"
+                if "BODY.PEEK[]" not in query:
+                    count = self.metadata_fetches_by_mailbox.get(self.selected, 0) + 1
+                    self.metadata_fetches_by_mailbox[self.selected] = count
+                    if self.selected == "INBOX" and count > 1:
+                        labels = b"(\\Inbox \"Project B\")"
+                meta = (
+                    b'1 (UID 1 RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                    b"X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS " + labels + b")"
+                )
+                if "BODY.PEEK[]" not in query:
+                    return "OK", [meta]
+                return "OK", [(meta + b" BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
+            raise AssertionError(command)
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[ChangingLabelsSource]:
+        yield ChangingLabelsSource()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        with pytest.raises(RuntimeError, match=r"Gmail labels changed during export of INBOX for UID 1"):
+            provider_export_account(config, account, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("fake_cls", "needle"),
     [
