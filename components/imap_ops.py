@@ -1051,6 +1051,11 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 _mailbox_sort_key(name),
             )
         )
+        export_scope_only_virtual = bool(mailboxes) and all(
+            _is_legacy_all_source_view(mailbox_attrs_by_name.get(name, ()))
+            or _is_legacy_flagged_source_view(mailbox_attrs_by_name.get(name, ()))
+            for name in mailboxes
+        )
 
         # Detect sanitize_for_path collisions before writing any data.
         # Two distinct mailbox names that map to the same directory would
@@ -1081,7 +1086,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
-                    if virtual_source:
+                    if virtual_source and not export_scope_only_virtual:
                         continue
                     ensure_private_dir(folder_dir)
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")

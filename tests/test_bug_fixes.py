@@ -1415,6 +1415,116 @@ class TestLegacyListParsing:
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
 
+    def test_export_keeps_empty_generic_all_when_it_is_only_source_mailbox(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.imap_ops import export_account, import_account
+        from components.models import Account, ServerConfig
+        from verify_export import verify_account
+
+        class EmptyAllOnlySource:
+            response = _stable_uidvalidity_response
+
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"0"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b""]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        class EmptyImportTarget:
+            def __init__(self) -> None:
+                self.mailboxes = {"INBOX"}
+                self.created: List[str] = []
+                self.selected: List[str] = []
+                self.subscribed: List[str] = []
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                selected = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(selected)
+                return ("OK", [b"0"]) if selected in self.mailboxes else ("NO", [b"missing"])
+
+            def create(self, mailbox: str):
+                selected = mailbox.strip('"').replace(r"\"", '"')
+                self.created.append(selected)
+                self.mailboxes.add(selected)
+                return "OK", [b""]
+
+            def subscribe(self, mailbox: str):
+                self.subscribed.append(mailbox.strip('"').replace(r"\"", '"'))
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("source.example.com")
+        target_server = ServerConfig("target.example.com")
+        source = EmptyAllOnlySource()
+        target = EmptyImportTarget()
+
+        @contextlib.contextmanager
+        def source_connection(*_args, **_kwargs) -> Iterator[EmptyAllOnlySource]:
+            yield source
+
+        @contextlib.contextmanager
+        def target_connection(*_args, **_kwargs) -> Iterator[EmptyImportTarget]:
+            yield target
+
+        with mock.patch("components.imap_ops.imap_connection", source_connection):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
+
+        assert _unique_ordered(source.selected) == ["All Mail"]
+        assert state["mailboxes"] == [
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 0, "uidvalidity": "123"},
+        ]
+        assert marker == {"mailbox": "All Mail", "message_count": 0, "uidvalidity": "123"}
+        assert not list((account_dir / "All_Mail").glob("u*.eml"))
+
+        _email, audit_issues = audit_account(
+            account,
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+            expected_source_server=source_server,
+        )
+        assert audit_issues == []
+        assert verify_account(account_dir)["errors"] == 0
+
+        import_account(
+            account,
+            target_server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=target_connection,
+            source_server=source_server,
+        )
+
+        assert target.created == ["All Mail"]
+        assert target.subscribed == ["All Mail"]
+
     def test_export_keeps_identical_generic_all_only_messages_distinct(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
