@@ -9415,6 +9415,46 @@ def test_committed_journal_accepts_legacy_mailbox_attribute_order_binding() -> N
     assert committed_journal_manifest_content_issues([journal_row], [manifest_row]) == []
 
 
+def test_provider_import_rejects_stale_gmail_journal_content_before_target_contact(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@example.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["gmail_labels"] = ["\\Inbox"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    journal_row = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "INBOX",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })
+    journal_row["content_sha256"] = "0" * 64
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(json.dumps(journal_row) + "\n")
+
+    with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
+        with pytest.raises(RuntimeError, match="journal committed content_sha256 does not match manifest"):
+            provider_import_account(config, account, tmp_path)
+
+
 def test_provider_finalize_canonicalizes_mailbox_attributes() -> None:
     from components.provider_ops import _finalize_export_record
 

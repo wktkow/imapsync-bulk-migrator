@@ -4967,14 +4967,13 @@ def provider_import_account(
     if journal_target_issues:
         raise RuntimeError("invalid import journal: " + "; ".join(journal_target_issues))
     manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
-    if config.target.provider != "gmail":
-        journal_content_issues = committed_journal_manifest_content_issues(
-            journal_rows,
-            manifest_rows,
-            target_provider=config.target.provider,
-        )
-        if journal_content_issues:
-            raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
+    journal_content_issues = committed_journal_manifest_content_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider=config.target.provider,
+    )
+    if journal_content_issues:
+        raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
     if config.target.provider == "gmail":
         invalid_gmail_msgid_issues = invalid_journal_target_gmail_msgid_issues(
             journal_rows,
