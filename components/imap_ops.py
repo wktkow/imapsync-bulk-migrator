@@ -880,7 +880,7 @@ def _legacy_remote_has_message(
     restore_missing_flags: bool = False,
 ) -> bool:
     data = _imap_append_wire_bytes(data)
-    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=not restore_missing_flags)
     if status != "OK":
         return False
     message_id = _message_id_header(data)

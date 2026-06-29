@@ -3423,8 +3423,10 @@ class TestLegacyImportJournal:
                 self.append_count = 0
                 self.flags = {"\\Seen"}
                 self.store_calls: List[Tuple[bytes, str, str]] = []
+                self.select_readonly_values: List[bool] = []
 
             def select(self, mailbox: str, readonly: bool = False):
+                self.select_readonly_values.append(readonly)
                 return "OK", [b"1"]
 
             def subscribe(self, mailbox: str):
@@ -3444,6 +3446,8 @@ class TestLegacyImportJournal:
                 ), append_data)]
 
             def store(self, num: bytes, command: str, flags: str):
+                if self.select_readonly_values and self.select_readonly_values[-1]:
+                    return "NO", [b"mailbox selected read-only"]
                 self.store_calls.append((num, command, flags))
                 for flag in flags.strip("()").split():
                     self.flags.add(flag)
@@ -3472,6 +3476,8 @@ class TestLegacyImportJournal:
         )
 
         assert target.append_count == 0
+        assert target.select_readonly_values
+        assert not any(target.select_readonly_values)
         assert target.store_calls == [(b"1", "+FLAGS.SILENT", "(\\ANSWERED)")]
 
     def test_import_skips_committed_same_content_after_uid_renumber(self, tmp_path: Path) -> None:
