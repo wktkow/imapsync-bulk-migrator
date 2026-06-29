@@ -2703,9 +2703,17 @@ def load_import_journal(
     _raise_if_provider_path_symlink(path, "file")
     if not path.exists():
         return rows
-    lines = _read_provider_artifact_bytes(path, "file").splitlines()
+    raw = _read_provider_artifact_bytes(path, "file")
+    trailing_row_unterminated = bool(raw) and not raw.endswith(b"\n")
+    lines = raw.splitlines()
     needs_rewrite = False
     for line_no, raw_line in enumerate(lines, 1):
+        if trailing_row_unterminated and line_no == len(lines):
+            if repair_trailing:
+                logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
+                needs_rewrite = True
+                break
+            raise ValueError(f"{path}: journal row {line_no} is not newline-terminated")
         try:
             line = raw_line.decode("utf-8")
         except UnicodeDecodeError:

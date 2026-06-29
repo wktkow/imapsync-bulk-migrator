@@ -11866,6 +11866,57 @@ def test_load_import_journal_repairs_trailing_partial_utf8_row(tmp_path: Path) -
     ).encode("utf-8")
 
 
+def test_load_import_journal_repairs_valid_but_unterminated_trailing_row(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    valid = {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }
+    trailing = {
+        "canonical_id": "gmail-456",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    }
+    journal.write_text(
+        json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n"
+        + json.dumps(trailing, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    rows = load_import_journal(account_dir, account, repair_trailing=True)
+
+    assert rows == [valid]
+    assert journal.read_text(encoding="utf-8") == (
+        json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+
+
+def test_load_import_journal_rejects_valid_but_unterminated_row_without_repair(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    valid = {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }
+    original = json.dumps(valid, ensure_ascii=False, sort_keys=True)
+    journal.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="journal row 1 is not newline-terminated"):
+        load_import_journal(account_dir, account, repair_trailing=False)
+
+    assert journal.read_text(encoding="utf-8") == original
+
+
 def test_load_import_journal_rejects_non_trailing_invalid_utf8_row(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -11897,7 +11948,7 @@ def test_provider_audit_and_validation_do_not_repair_incomplete_trailing_journal
     _name, report = provider_validate_account(config, account, tmp_path)
 
     assert any("import journal load failed" in issue for issue in audit_issues)
-    assert any("Expecting value" in issue for issue in report["failed"])
+    assert any("journal row 2 is not newline-terminated" in issue for issue in report["failed"])
     assert journal.read_text() == original
 
 
