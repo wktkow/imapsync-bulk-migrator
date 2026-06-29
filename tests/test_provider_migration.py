@@ -9236,6 +9236,32 @@ def test_provider_import_audit_and_validation_require_manifest_integrity_metadat
         provider_import_account(config, account, tmp_path)
 
 
+def test_provider_audit_and_validation_report_malformed_manifest_with_committed_journal(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_mailbox_attributes"] = {"Archive": "\\Archive"}
+    _write_single_manifest_row(account_dir, row, refresh_binding=False)
+    (account_dir / f"import-{account.target_email}.journal.jsonl").write_text(json.dumps({
+        **provider_target_journal_binding(config, account),
+        "canonical_id": row["canonical_id"],
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "content_sha256": row["content_sha256"],
+        "rfc822_size": row["rfc822_size"],
+        CONTENT_BINDING_FIELD: row[CONTENT_BINDING_FIELD],
+    }) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert any("invalid source_mailbox_attributes" in issue for issue in audit_issues)
+    assert any("journal committed content_binding_sha256 does not match manifest" in issue for issue in audit_issues)
+
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    assert any("invalid source_mailbox_attributes" in issue for issue in report["failed"])
+    assert any("journal committed content_binding_sha256 does not match manifest" in issue for issue in report["failed"])
+
+
 def test_provider_import_audit_and_validation_reject_content_binding_mismatch(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]

@@ -165,9 +165,9 @@ def _provider_content_binding_sha256(row: Mapping[str, Any], *, normalize_mailbo
 
 def provider_content_binding_matches(row: Mapping[str, Any], actual: str) -> bool:
     actual_normalized = actual.lower()
-    if actual_normalized == provider_content_binding_sha256(row):
-        return True
     with contextlib.suppress(ValueError):
+        if actual_normalized == provider_content_binding_sha256(row):
+            return True
         if actual_normalized == provider_content_binding_sha256_legacy_mailbox_attribute_order(row):
             return True
         return actual_normalized in _provider_legacy_mailbox_attribute_order_binding_candidates(row)
