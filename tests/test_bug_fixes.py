@@ -15232,7 +15232,8 @@ class TestRound7ConfirmedBugs:
         assert stats["errors"] == 1
         assert main() == 1
 
-    def test_direct_import_allows_left_bracket_in_flag_keyword(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("flag", ["project[2024", "project}2024"])
+    def test_direct_import_allows_valid_atom_special_flag_keywords(self, tmp_path: Path, flag: str) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
@@ -15246,7 +15247,7 @@ class TestRound7ConfirmedBugs:
         )
         meta_path = eml.with_suffix(".json")
         meta = json.loads(meta_path.read_text())
-        meta["flags"] = "project[2024"
+        meta["flags"] = flag
         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
         meta_path.write_text(json.dumps(meta))
 
@@ -15281,4 +15282,4 @@ class TestRound7ConfirmedBugs:
             source_server=ServerConfig("imap.example.com"),
         )
 
-        assert target.appended_flags == ["(project[2024)"]
+        assert target.appended_flags == [f"({flag})"]
