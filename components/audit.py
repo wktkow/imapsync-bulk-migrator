@@ -29,7 +29,14 @@ from .imap_ops import (
     legacy_server_endpoint_digest,
     quote_mailbox_name,
 )
-from .utils import quote_imap_search_value, sanitize_for_path, sanitized_path_key
+from .utils import (
+    canonical_imap_mailbox_name,
+    canonical_mailbox_alias_key,
+    canonical_mailbox_path_key,
+    quote_imap_search_value,
+    sanitize_for_path,
+    sanitized_path_key,
+)
 
 
 def _stop_requested(stop_event: Optional[object]) -> bool:
@@ -567,15 +574,15 @@ def audit_account(
                 remote_mailbox_by_key: Dict[str, Tuple[str, str]] = {}
                 remote_mailbox_by_path: Dict[str, str] = {}
                 remote_attrs_by_path: Dict[str, Tuple[str, ...]] = {
-                    sanitize_for_path(name): attrs
+                    canonical_mailbox_path_key(name): attrs
                     for name, attrs in remote_entries
                 }
                 count_mismatched = set()
                 for mbox in remote_mailboxes:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
-                    path = sanitize_for_path(mbox)
-                    key = sanitized_path_key(mbox)
+                    path = canonical_mailbox_path_key(mbox)
+                    key = canonical_mailbox_alias_key(mbox)
                     if status != "OK":
                         count_mismatched.add(path)
                         issues.append(f"{account.email}:{path}: remote mailbox could not be selected: {mbox!r}")
@@ -587,7 +594,11 @@ def audit_account(
                         continue
                     num = len((data[0] or b"").split()) if data else 0
                     previous = remote_mailbox_by_key.get(key)
-                    if previous is not None and previous[0] != mbox:
+                    if (
+                        previous is not None
+                        and canonical_imap_mailbox_name(previous[0])
+                        != canonical_imap_mailbox_name(mbox)
+                    ):
                         count_mismatched.update({previous[1], path})
                         issues.append(
                             f"{account.email}:{key}: remote mailbox name collision after sanitizing: "
@@ -603,7 +614,7 @@ def audit_account(
                 local_folder_info: Dict[str, Tuple[str, int]] = {}
                 for folder_dir in folder_dirs:
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
-                    folder = folder_dir.name
+                    folder = canonical_mailbox_path_key(folder_dir.name)
                     if folder_dir.is_symlink():
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: mailbox path is a symlink")
@@ -650,7 +661,11 @@ def audit_account(
                             continue
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
-                    elif remote_mailbox is not None and remote_mailbox != local_mailbox:
+                    elif (
+                        remote_mailbox is not None
+                        and canonical_imap_mailbox_name(remote_mailbox)
+                        != canonical_imap_mailbox_name(local_mailbox)
+                    ):
                         count_mismatched.add(folder)
                         issues.append(
                             f"{account.email}:{folder}: remote mailbox name mismatch for sanitized path "
@@ -658,7 +673,7 @@ def audit_account(
                         )
                 for folder_name, rcount in remote_counts.items():
                     _raise_if_stopped(stop_event, f"legacy audit {account.email}")
-                    if not (account_dir / folder_name).exists():
+                    if folder_name not in local_folder_info:
                         attrs = remote_attrs_by_path.get(folder_name, ())
                         remote_mailbox = remote_mailbox_by_path.get(folder_name, folder_name)
                         if (

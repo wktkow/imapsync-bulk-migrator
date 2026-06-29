@@ -23,6 +23,18 @@ def sanitized_path_key(name: str) -> str:
     return sanitize_for_path(name).casefold()
 
 
+def canonical_imap_mailbox_name(name: str) -> str:
+    return "INBOX" if name.upper() == "INBOX" else name
+
+
+def canonical_mailbox_path_key(name: str) -> str:
+    return sanitize_for_path(canonical_imap_mailbox_name(name))
+
+
+def canonical_mailbox_alias_key(name: str) -> str:
+    return sanitized_path_key(canonical_imap_mailbox_name(name))
+
+
 _IMAP_ATOM_SPECIALS = set('(){ %*"\\]')
 
 

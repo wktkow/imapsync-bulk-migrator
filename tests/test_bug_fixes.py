@@ -4715,6 +4715,53 @@ class TestCliAndConfigHardening:
 
         assert rc == 4
 
+    def test_legacy_validate_treats_inbox_case_variants_as_same_mailbox(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        source_server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": source_server.host, "port": source_server.port, "ssl": source_server.ssl, "starttls": source_server.starttls},
+            "source_server": {"host": source_server.host, "port": source_server.port, "ssl": source_server.ssl, "starttls": source_server.starttls},
+            "accounts": [{"email": "a@example.com", "password": "secret"}],
+        }))
+        input_dir = tmp_path / "exported"
+        _write_legacy_empty_mailbox_fixture(
+            input_dir / "a@example.com" / "INBOX",
+            mailbox="INBOX",
+            source_server=source_server,
+        )
+
+        class InboxCaseRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Inbox"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[InboxCaseRemote]:
+            yield InboxCaseRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+
     def test_legacy_audit_rejects_remote_empty_folder_missing_locally(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account, ServerConfig
@@ -4761,6 +4808,40 @@ class TestCliAndConfigHardening:
             _email, issues = audit_account(account, tmp_path, ServerConfig(host="imap.example.com"), check_remote=True)
 
         assert any("Projects: missing locally but remote has 0 messages" in issue for issue in issues)
+
+    def test_legacy_audit_treats_inbox_case_variants_as_same_mailbox(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        source_server = ServerConfig(host="imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account(email="a@example.com", password="secret")
+        _write_legacy_empty_mailbox_fixture(
+            tmp_path / "a@example.com" / "INBOX",
+            mailbox="INBOX",
+            source_server=source_server,
+        )
+
+        class InboxCaseRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Inbox"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def uid(self, command: str, *args):
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[InboxCaseRemote]:
+            yield InboxCaseRemote()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(account, tmp_path, source_server, check_remote=True)
+
+        assert issues == []
 
     def test_legacy_resync_missing_does_not_replay_import(self, tmp_path: Path) -> None:
         from components.main import main

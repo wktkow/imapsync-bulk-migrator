@@ -42,7 +42,14 @@ from .provider_ops import (
     provider_validate_all,
     _raise_if_provider_path_symlink,
 )
-from .utils import check_environment, quote_imap_search_value, sanitize_for_path, sanitized_path_key
+from .utils import (
+    canonical_imap_mailbox_name,
+    canonical_mailbox_path_key,
+    check_environment,
+    quote_imap_search_value,
+    sanitize_for_path,
+    sanitized_path_key,
+)
 from .utils import check_free_space_for_path
 
 
@@ -1521,7 +1528,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
                         guard_account_dir()
-                        folder_key = folder_dir.name
+                        folder_key = canonical_mailbox_path_key(folder_dir.name)
                         local_mailboxes_by_key.setdefault(folder_key, default_mailbox)
                         if default_segments:
                             local_segments_by_key[folder_key] = default_segments
@@ -1590,10 +1597,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                             for key, mailbox in local_mailboxes_by_key.items()
                         }
-                        target_key_by_mailbox = {
-                            mailbox: key
-                            for key, mailbox in target_mailboxes_by_key.items()
-                        }
+                        target_key_by_mailbox = {}
+                        for key, mailbox in target_mailboxes_by_key.items():
+                            target_key_by_mailbox[mailbox] = key
+                            target_key_by_mailbox.setdefault(canonical_imap_mailbox_name(mailbox), key)
                         target_collision_keys: Dict[str, Tuple[str, str]] = {}
                         for key, target_mailbox in target_mailboxes_by_key.items():
                             alias = sanitized_path_key(target_mailbox)
@@ -1611,7 +1618,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             if not _should_skip_legacy_source_view(name, attrs, mailbox_entries)
                         ]
                         remote_attrs_by_key = {
-                            sanitize_for_path(name): attrs
+                            canonical_mailbox_path_key(name): attrs
                             for name, attrs in mailbox_entries
                         }
                         for mailbox in mailboxes:
@@ -1623,10 +1630,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if status != "OK":
                                     raise RuntimeError(f"search failed: {mailbox}")
                                 num = len((data[0] or b"").split()) if data else 0
-                                key = target_key_by_mailbox.get(mailbox, sanitize_for_path(mailbox))
+                                key = target_key_by_mailbox.get(mailbox)
+                                if key is None:
+                                    key = target_key_by_mailbox.get(
+                                        canonical_imap_mailbox_name(mailbox),
+                                        canonical_mailbox_path_key(mailbox),
+                                    )
                                 alias_key = sanitized_path_key(key)
                                 expected_mailbox = target_mailboxes_by_key.get(key)
-                                if expected_mailbox is not None and mailbox != expected_mailbox:
+                                if (
+                                    expected_mailbox is not None
+                                    and canonical_imap_mailbox_name(mailbox)
+                                    != canonical_imap_mailbox_name(expected_mailbox)
+                                ):
                                     remote_counts[key] = num
                                     remote_mailboxes[key] = mailbox
                                     remote_name_mismatch_keys.add(key)
@@ -1638,7 +1654,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         ))
                                     continue
                                 previous = remote_mailboxes_by_alias_key.get(alias_key)
-                                if previous is not None and previous[0] != mailbox:
+                                if (
+                                    previous is not None
+                                    and canonical_imap_mailbox_name(previous[0])
+                                    != canonical_imap_mailbox_name(mailbox)
+                                ):
                                     previous_mailbox, previous_path = previous
                                     remote_counts[previous_path] = -1
                                     remote_counts[key] = -1
@@ -1655,7 +1675,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 remote_mailboxes[key] = mailbox
                                 remote_mailboxes_by_alias_key[alias_key] = (mailbox, key)
                             except Exception:
-                                key = sanitize_for_path(mailbox)
+                                key = canonical_mailbox_path_key(mailbox)
                                 remote_counts[key] = -1
                                 remote_mailboxes.setdefault(key, mailbox)
                         mismatched_folders = set()
