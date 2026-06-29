@@ -19,7 +19,13 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from .content_binding import CONTENT_BINDING_FIELD, provider_content_binding_issue, provider_content_binding_sha256
+from .content_binding import (
+    CONTENT_BINDING_FIELD,
+    normalize_provider_mailbox_attributes,
+    provider_content_binding_issue,
+    provider_content_binding_matches,
+    provider_content_binding_sha256,
+)
 from .executor import parallel_process_accounts
 from .imap_ops import _imap_append_wire_bytes, _valid_legacy_flag_token, _valid_legacy_internaldate
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
@@ -2327,7 +2333,7 @@ def committed_journal_manifest_content_issues(
             issues.append(f"journal committed content_sha256 does not match manifest: {label}")
         if type(journal_size) is not int or journal_size != manifest_row.get("rfc822_size"):
             issues.append(f"journal committed rfc822_size does not match manifest: {label}")
-        if not isinstance(journal_binding, str) or journal_binding != manifest_row.get(CONTENT_BINDING_FIELD):
+        if not isinstance(journal_binding, str) or not provider_content_binding_matches(manifest_row, journal_binding):
             issues.append(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest: {label}")
     return issues
 
@@ -2694,6 +2700,9 @@ def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:
 def _finalize_export_record(record: Dict[str, Any], folder_map: Dict[str, str]) -> None:
     record["source_mailboxes"] = sorted(str(value) for value in record.get("source_mailboxes", []))
     record["gmail_labels"] = sorted(str(value) for value in record.get("gmail_labels", []))
+    source_mailbox_attributes = record.get("source_mailbox_attributes")
+    if isinstance(source_mailbox_attributes, dict):
+        record["source_mailbox_attributes"] = normalize_provider_mailbox_attributes(source_mailbox_attributes)
     source_attributes = [
         attr
         for attrs in record.get("source_mailbox_attributes", {}).values()

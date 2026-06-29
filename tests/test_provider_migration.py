@@ -13,7 +13,11 @@ from unittest import mock
 
 import pytest
 
-from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
+from components.content_binding import (
+    CONTENT_BINDING_FIELD,
+    provider_content_binding_sha256,
+    provider_content_binding_sha256_legacy_mailbox_attribute_order,
+)
 from components.models import (
     AuthConfig,
     MigrationAccount,
@@ -29,6 +33,7 @@ from components.provider_ops import (
     _prune_provider_artifact_orphans,
     _safe_identity,
     build_xoauth2_payload,
+    committed_journal_manifest_content_issues,
     consume_target_match_num,
     committed_journal_target_mailbox_issues,
     effective_auth,
@@ -8969,6 +8974,54 @@ def test_provider_content_binding_rejects_malformed_route_map_shapes(field: str,
 
     with pytest.raises(ValueError, match=field):
         provider_content_binding_sha256(row)
+
+
+def test_provider_content_binding_ignores_mailbox_attribute_order() -> None:
+    first = _default_manifest_fixture_row()
+    first["source_mailbox_attributes"] = {"Sent": ["\\HasNoChildren", "\\Sent"]}
+    first[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(first)
+    second = dict(first)
+    second["source_mailbox_attributes"] = {"Sent": ["\\Sent", "\\HasNoChildren"]}
+    second[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(second)
+
+    assert first[CONTENT_BINDING_FIELD] == second[CONTENT_BINDING_FIELD]
+    assert (
+        provider_content_binding_sha256_legacy_mailbox_attribute_order(first)
+        != provider_content_binding_sha256_legacy_mailbox_attribute_order(second)
+    )
+
+
+def test_committed_journal_accepts_legacy_mailbox_attribute_order_binding() -> None:
+    config = _provider_config()
+    manifest_row = _default_manifest_fixture_row()
+    manifest_row["source_mailbox_attributes"] = {"Sent": ["\\HasNoChildren", "\\Sent"]}
+    manifest_row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(manifest_row)
+    legacy_order_row = dict(manifest_row)
+    legacy_order_row["source_mailbox_attributes"] = {"Sent": ["\\Sent", "\\HasNoChildren"]}
+    journal_row = _journal_fixture_for_manifest_row(config, manifest_row, {
+        "canonical_id": manifest_row["canonical_id"],
+        "target_mailbox": "Sent",
+        "status": "committed",
+    })
+    journal_row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256_legacy_mailbox_attribute_order(
+        legacy_order_row
+    )
+    assert journal_row[CONTENT_BINDING_FIELD] != manifest_row[CONTENT_BINDING_FIELD]
+
+    assert committed_journal_manifest_content_issues([journal_row], [manifest_row]) == []
+
+
+def test_provider_finalize_canonicalizes_mailbox_attributes() -> None:
+    from components.provider_ops import _finalize_export_record
+
+    row = _default_manifest_fixture_row()
+    row["source_mailboxes"] = ["Sent"]
+    row["gmail_labels"] = []
+    row["source_mailbox_attributes"] = {"Sent": ["\\Sent", "\\HasNoChildren", "\\sent"]}
+
+    _finalize_export_record(row, {})
+
+    assert row["source_mailbox_attributes"] == {"Sent": ["\\HasNoChildren", "\\Sent"]}
 
 
 @pytest.mark.parametrize("value", [["<m1@example.com>"], "bad\rvalue"])
