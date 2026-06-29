@@ -44,6 +44,7 @@ from components.provider_ops import (
     imap_connection,
     list_mailboxes,
     append_journal,
+    canonical_identity,
     load_import_journal,
     load_manifest,
     offline_journal_target_mailbox_issues,
@@ -66,6 +67,7 @@ from components.provider_ops import (
     provider_validate_all,
     quote_mailbox_name,
     RateLimiter,
+    require_merge_group_unique_manifest_identities,
     resolve_secret,
     resolve_primary_mailbox,
     resolve_target_mailbox,
@@ -2293,6 +2295,76 @@ def test_provider_safe_identity_hashes_truncated_names() -> None:
     assert len(_safe_identity(first)) == 180
     assert len(_safe_identity(second)) == 180
     assert _safe_identity(first) != _safe_identity(second)
+
+
+def test_provider_gmail_canonical_identity_scopes_source_for_merge() -> None:
+    body = b"Message-ID: <m1@example.com>\r\n\r\nhello"
+    parsed = {"gmail_msgid": "123", "rfc822_size": len(body)}
+
+    unscoped, _sha256, _message_id = canonical_identity(
+        parsed,
+        body,
+        source_account="First.Last@gmail.com",
+    )
+    scoped, _sha256, _message_id = canonical_identity(
+        parsed,
+        body,
+        source_account="First.Last@gmail.com",
+        scope_gmail_source=True,
+    )
+    same_gmail_source, _sha256, _message_id = canonical_identity(
+        parsed,
+        body,
+        source_account="firstlast@googlemail.com",
+        scope_gmail_source=True,
+    )
+    other_source, _sha256, _message_id = canonical_identity(
+        parsed,
+        body,
+        source_account="other@gmail.com",
+        scope_gmail_source=True,
+    )
+
+    assert unscoped == "gmail-123"
+    assert scoped.startswith("gmail-")
+    assert scoped.endswith("-123")
+    assert scoped != "gmail-123"
+    assert same_gmail_source == scoped
+    assert other_source != scoped
+
+
+def test_provider_merge_group_accepts_scoped_gmail_ids_for_different_sources(tmp_path: Path) -> None:
+    body = b"Message-ID: <m1@example.com>\r\n\r\nhello"
+    parsed = {"gmail_msgid": "123", "rfc822_size": len(body)}
+    first_id = canonical_identity(
+        parsed,
+        body,
+        source_account="first@gmail.com",
+        scope_gmail_source=True,
+    )[0]
+    second_id = canonical_identity(
+        parsed,
+        body,
+        source_account="second@gmail.com",
+        scope_gmail_source=True,
+    )[0]
+    first_account = MigrationAccount(source_email="first@gmail.com", target_email="target@gmail.com")
+    second_account = MigrationAccount(source_email="second@gmail.com", target_email="target@gmail.com")
+
+    require_merge_group_unique_manifest_identities(
+        [
+            (first_account, tmp_path / "first", [{"canonical_id": first_id}], []),
+            (second_account, tmp_path / "second", [{"canonical_id": second_id}], []),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="merge group canonical_id collision"):
+        require_merge_group_unique_manifest_identities(
+            [
+                (first_account, tmp_path / "first", [{"canonical_id": "gmail-123"}], []),
+                (second_account, tmp_path / "second", [{"canonical_id": "gmail-123"}], []),
+            ]
+        )
 
 
 def test_list_parser_accepts_literal_mailbox_names() -> None:

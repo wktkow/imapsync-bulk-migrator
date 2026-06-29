@@ -38,6 +38,11 @@ _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
 _HAS_DESCRIPTOR_RELATIVE_MKDIR = _HAS_DESCRIPTOR_RELATIVE_OPEN and os.mkdir in os.supports_dir_fd
 _PROVIDER_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
 _PROVIDER_UIDVALIDITY_MAX = 0xFFFFFFFF
+_GMAIL_IDENTITY_ENDPOINT = ProviderEndpoint(
+    provider="gmail",
+    host="imap.gmail.com",
+    auth=AuthConfig(method="xoauth2"),
+)
 
 
 @dataclass(frozen=True)
@@ -1066,6 +1071,19 @@ def _message_id_header(msg_bytes: bytes) -> str:
     return ""
 
 
+def gmail_canonical_identity(gmail_msgid: object, *, source_account: str = "", scope_source: bool = False) -> str:
+    msgid = str(gmail_msgid or "").strip()
+    if not msgid:
+        return ""
+    if not scope_source:
+        return f"gmail-{msgid}"
+    source_identity = auth_username_identity(_GMAIL_IDENTITY_ENDPOINT, source_account)
+    if not source_identity:
+        raise ValueError("source_account is required when scoping Gmail canonical identity")
+    source_digest = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()[:16]
+    return f"gmail-{source_digest}-{msgid}"
+
+
 def canonical_identity(
     parsed: Dict[str, Any],
     msg_bytes: bytes,
@@ -1076,11 +1094,16 @@ def canonical_identity(
     uid: Optional[int] = None,
     collapse_fallback: bool = False,
     use_gmail_msgid: bool = True,
+    scope_gmail_source: bool = False,
 ) -> Tuple[str, str, str]:
     sha256 = hashlib.sha256(msg_bytes).hexdigest()
     gmail_msgid = str(parsed.get("gmail_msgid") or "") if use_gmail_msgid else ""
     if gmail_msgid:
-        return f"gmail-{gmail_msgid}", sha256, _message_id_header(msg_bytes)
+        return (
+            gmail_canonical_identity(gmail_msgid, source_account=source_account, scope_source=scope_gmail_source),
+            sha256,
+            _message_id_header(msg_bytes),
+        )
     size = int(parsed.get("rfc822_size") or len(msg_bytes))
     message_id = _message_id_header(msg_bytes)
     if collapse_fallback or not mailbox or uid is None:
@@ -2916,6 +2939,7 @@ def provider_export_account(
     if not preserve_complete_state_until_ready:
         write_in_progress_state()
     limiter = limiter or RateLimiter(config.limits.throttle.max_bytes_per_second)
+    scope_gmail_source_identity = provider_account_merge_enabled(config)
 
     def update_membership(identity: str, mailbox: MailboxInfo, uid: int, uidvalidity: str, parsed: Dict[str, Any]) -> None:
         record = messages[identity]
@@ -3117,7 +3141,11 @@ def provider_export_account(
                     raise RuntimeError(f"metadata fetch failed in {mailbox.name} for UID {uid}: {meta_data}")
                 pre_parsed = parse_provider_fetch_response(meta_data or [])
                 identity_hint = (
-                    f"gmail-{pre_parsed.get('gmail_msgid')}"
+                    gmail_canonical_identity(
+                        pre_parsed.get("gmail_msgid"),
+                        source_account=account.source_email,
+                        scope_source=scope_gmail_source_identity,
+                    )
                     if use_gmail_metadata and pre_parsed.get("gmail_msgid")
                     else ""
                 )
@@ -3184,6 +3212,7 @@ def provider_export_account(
                     uid=uid,
                     collapse_fallback=config.source.provider == "gmail",
                     use_gmail_msgid=use_gmail_metadata,
+                    scope_gmail_source=scope_gmail_source_identity,
                 )
                 size = int(parsed.get("rfc822_size") or len(msg_bytes))
                 content_identity = (size, sha256)
