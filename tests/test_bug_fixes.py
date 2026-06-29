@@ -1210,7 +1210,8 @@ class TestLegacyListParsing:
 
         assert list_all_mailboxes(fake_imap) == ["Föld & Team"]
 
-    def test_export_skips_generic_all_and_covered_flagged_views(self, tmp_path: Path) -> None:
+    def test_export_merges_covered_flagged_view_when_generic_all_exists(self, tmp_path: Path) -> None:
+        from components.content_binding import legacy_content_binding_issue
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
 
@@ -1239,8 +1240,9 @@ class TestLegacyListParsing:
                 if command == "search":
                     return "OK", [b"1"]
                 if command == "fetch":
+                    flags = "\\Seen \\Flagged" if self.selected_mailbox == "Flagged" else "\\Seen"
                     return "OK", [(
-                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        f'1 (UID 1 FLAGS ({flags}) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
                         body,
                     )]
                 raise AssertionError(command)
@@ -1264,7 +1266,7 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
+        assert _unique_ordered(source.selected) == ["INBOX", "All Mail", "Flagged"]
         assert state["mailboxes"] == [
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
             {
@@ -1275,8 +1277,19 @@ class TestLegacyListParsing:
                 "source_attributes": ["\\HasNoChildren", "\\All"],
                 "uidvalidity": "123",
             },
+            {
+                "mailbox": "Flagged",
+                "path": "Flagged",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\Flagged"],
+                "uidvalidity": "123",
+            },
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
+        inbox_meta = json.loads((account_dir / "INBOX" / "u0000000001.json").read_text())
+        assert inbox_meta["flags"] == "\\Seen \\Flagged"
+        assert legacy_content_binding_issue(inbox_meta) is None
         all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
         assert all_marker == {
             "mailbox": "All Mail",
@@ -1286,7 +1299,15 @@ class TestLegacyListParsing:
             "uidvalidity": "123",
         }
         assert not list((account_dir / "All_Mail").glob("u*.eml"))
-        assert not (account_dir / "Flagged").exists()
+        flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
+        assert flagged_marker == {
+            "mailbox": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
+            "uidvalidity": "123",
+        }
+        assert not list((account_dir / "Flagged").glob("u*.eml"))
 
     def test_export_keeps_generic_all_archived_only_messages_with_inbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -2346,13 +2367,24 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert _unique_ordered(source.selected) == ["All Mail"]
+        assert _unique_ordered(source.selected) == ["All Mail", "Flagged"]
         assert state["mailboxes"] == [
             {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2, "uidvalidity": "123"},
+            {
+                "mailbox": "Flagged",
+                "path": "Flagged",
+                "message_count": 0,
+                "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\Flagged"],
+                "uidvalidity": "123",
+            },
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == flagged_body
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == archived_body
-        assert not (account_dir / "Flagged").exists()
+        flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
+        assert flagged_marker["covered_by_regular_content"] is True
+        assert flagged_marker["source_attributes"] == ["\\HasNoChildren", "\\Flagged"]
+        assert not list((account_dir / "Flagged").glob("u*.eml"))
 
     def test_export_requests_special_use_attrs_before_filtering_all_view(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account

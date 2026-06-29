@@ -626,11 +626,6 @@ def _should_skip_legacy_source_view(
     attributes: Tuple[str, ...],
     mailboxes: List[Tuple[str, Tuple[str, ...]]],
 ) -> bool:
-    if _is_legacy_flagged_source_view(attributes):
-        return any(
-            candidate_name != name and _is_legacy_all_source_view(candidate_attrs)
-            for candidate_name, candidate_attrs in mailboxes
-        )
     return False
 
 
@@ -1318,7 +1313,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     exported_regular_content: Counter[Tuple[int, str]] = Counter()
-    regular_metadata_paths_by_content: Dict[Tuple[int, str], List[Tuple[Path, str]]] = {}
+    mergeable_metadata_paths_by_content: Dict[Tuple[int, str], List[Tuple[Path, str]]] = {}
 
     def write_legacy_message(
         folder_dir: Path,
@@ -1362,9 +1357,9 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         flags: str,
         internaldate: str,
     ) -> bool:
-        metadata_entries = regular_metadata_paths_by_content.get(content_identity, [])
+        metadata_entries = mergeable_metadata_paths_by_content.get(content_identity, [])
         if match_index < 0 or match_index >= len(metadata_entries):
-            raise RuntimeError("covered virtual message has no matching regular metadata")
+            raise RuntimeError("covered virtual message has no matching mergeable metadata")
         virtual_internaldate = _normalized_legacy_internaldate(internaldate)
         if not virtual_internaldate:
             return False
@@ -1499,9 +1494,14 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         content_identity = (len(msg_bytes), digest)
                         if virtual_source:
                             seen_virtual_content[content_identity] += 1
+                            covered_content_count = exported_regular_content[content_identity]
+                            if flagged_virtual_source:
+                                covered_content_count = len(
+                                    mergeable_metadata_paths_by_content.get(content_identity, [])
+                                )
                             if content_identity in ambiguous_virtual_content:
                                 pass
-                            elif seen_virtual_content[content_identity] <= exported_regular_content[content_identity]:
+                            elif seen_virtual_content[content_identity] <= covered_content_count:
                                 if flagged_virtual_source:
                                     covered = merge_covered_virtual_flags(
                                         content_identity,
@@ -1543,7 +1543,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                                     (int(uid), msg_bytes, flags or "", internaldate or "", digest)
                                 )
                                 continue
-                            elif exported_regular_content[content_identity]:
+                            elif covered_content_count:
                                 ambiguous_virtual_content.add(content_identity)
                                 for pending_uid, pending_bytes, pending_flags, pending_date, pending_digest in (
                                     pending_virtual_content.pop(content_identity, [])
@@ -1573,8 +1573,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             digest,
                         )
                         written_stems.add(written_stem)
-                        if not virtual_source:
-                            regular_metadata_paths_by_content.setdefault(content_identity, []).append(
+                        if not flagged_virtual_source:
+                            mergeable_metadata_paths_by_content.setdefault(content_identity, []).append(
                                 (folder_dir / f"{written_stem}.json", internaldate or "")
                             )
                 _remove_stale_export_files(folder_dir, written_stems)
