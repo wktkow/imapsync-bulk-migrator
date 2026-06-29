@@ -12930,7 +12930,7 @@ class TestRound7ConfirmedBugs:
         assert target.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
 
-    def test_legacy_append_journal_does_not_chmod_replaced_symlink_target(
+    def test_legacy_append_journal_rejects_replaced_symlink_target(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -12966,17 +12966,61 @@ class TestRound7ConfirmedBugs:
 
         monkeypatch.setattr(imap_ops.os, "fdopen", racing_fdopen)
 
-        imap_ops._append_legacy_import_journal(account_dir, {
-            "key": "k",
-            "status": "pending",
-            "target": "imap://target",
-            "mailbox": "INBOX",
-            "path": "INBOX/u0000000001.eml",
-            "timestamp": "0",
-        })
+        with pytest.raises(RuntimeError, match="legacy import journal changed during append"):
+            imap_ops._append_legacy_import_journal(account_dir, {
+                "key": "k",
+                "status": "pending",
+                "target": "imap://target",
+                "mailbox": "INBOX",
+                "path": "INBOX/u0000000001.eml",
+                "timestamp": "0",
+            })
 
         assert journal.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
+
+    def test_legacy_append_journal_rejects_visible_path_replaced_after_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        journal = account_dir / "import.journal.jsonl"
+        old_journal = account_dir / "old-import.journal.jsonl"
+        real_fdopen = imap_ops.os.fdopen
+
+        def racing_fdopen(*args, **kwargs):
+            file_cm = real_fdopen(*args, **kwargs)
+
+            class RacingFile:
+                def __enter__(self):
+                    return file_cm.__enter__()
+
+                def __exit__(self, exc_type, exc, tb):
+                    result = file_cm.__exit__(exc_type, exc, tb)
+                    journal.rename(old_journal)
+                    journal.write_text("replacement\n", encoding="utf-8")
+                    return result
+
+            return RacingFile()
+
+        monkeypatch.setattr(imap_ops.os, "fdopen", racing_fdopen)
+
+        with pytest.raises(RuntimeError, match="legacy import journal changed during append"):
+            imap_ops._append_legacy_import_journal(account_dir, {
+                "key": "k",
+                "status": "pending",
+                "target": "imap://target",
+                "mailbox": "INBOX",
+                "path": "INBOX/u0000000001.eml",
+                "timestamp": "0",
+            })
+
+        assert journal.read_text(encoding="utf-8") == "replacement\n"
+        assert '"key": "k"' in old_journal.read_text(encoding="utf-8")
 
     def test_legacy_ensure_private_dir_rejects_symlink_inserted_during_mkdir(
         self,

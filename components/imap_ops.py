@@ -1063,6 +1063,7 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
+    fd = -1
     try:
         fd = os.open(name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
     except OSError as exc:
@@ -1078,17 +1079,30 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
             raise RuntimeError(f"refusing to use non-regular legacy import journal: {path}")
         _raise_if_hard_linked_private_file_fd(fd, path, "legacy import journal")
         _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
-    except Exception:
-        os.close(fd)
-        raise
+        file_obj = os.fdopen(fd, "a", encoding="utf-8")
+        fd = -1
+        with file_obj as f:
+            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+            json.dump(row, f, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+        try:
+            visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"legacy import journal changed during append: {path}") from exc
+        if (
+            visible_stat.st_dev != stat_result.st_dev
+            or visible_stat.st_ino != stat_result.st_ino
+            or stat.S_ISLNK(visible_stat.st_mode)
+            or not stat.S_ISREG(visible_stat.st_mode)
+        ):
+            raise RuntimeError(f"legacy import journal changed during append: {path}")
     finally:
+        if fd >= 0:
+            os.close(fd)
         os.close(parent_fd)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
-        json.dump(row, f, ensure_ascii=False, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
 
 
 def _fetch_response_uid(meta_str: str) -> Optional[int]:
