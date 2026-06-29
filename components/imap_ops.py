@@ -1053,7 +1053,43 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     exported_regular_content: Counter[Tuple[int, str]] = Counter()
-    exported_virtual_content: Counter[Tuple[int, str]] = Counter()
+
+    def write_legacy_message(
+        folder_dir: Path,
+        mailbox: str,
+        uid: int,
+        msg_bytes: bytes,
+        flags: str,
+        internaldate: str,
+        uidvalidity: Optional[str],
+        digest: str,
+    ) -> str:
+        base = f"u{int(uid):010d}"
+        eml_path = folder_dir / f"{base}.eml"
+        meta_path = folder_dir / f"{base}.json"
+        _secure_atomic_write_bytes(eml_path, msg_bytes)
+        meta = {
+            "account": account.email,
+            "mailbox": mailbox,
+            "uid": int(uid),
+            "flags": flags or "",
+            "internaldate": internaldate or "",
+            "rfc822_size": len(msg_bytes),
+            "content_sha256": digest,
+        }
+        if uidvalidity:
+            meta["uidvalidity"] = uidvalidity
+        source_segments = _legacy_mailbox_path_segments(
+            mailbox,
+            mailbox_delimiter_by_name.get(mailbox, ""),
+        )
+        if len(source_segments) > 1:
+            meta["source_delimiter"] = mailbox_delimiter_by_name.get(mailbox, "")
+            meta["source_path_segments"] = list(source_segments)
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        _secure_atomic_json(meta_path, meta)
+        return base
+
     with imap_connection(server, account) as imap:
         mailbox_details = _list_selectable_mailbox_details(imap)
         mailbox_entries = [(entry.name, entry.attributes) for entry in mailbox_details]
@@ -1131,6 +1167,9 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
 
                 ensure_private_dir(folder_dir)
                 written_stems: set[str] = set()
+                pending_virtual_content: Dict[Tuple[int, str], List[Tuple[int, bytes, str, str, str]]] = {}
+                seen_virtual_content: Counter[Tuple[int, str]] = Counter()
+                ambiguous_virtual_content: set[Tuple[int, str]] = set()
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
@@ -1149,38 +1188,45 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         digest = hashlib.sha256(msg_bytes).hexdigest()
                         content_identity = (len(msg_bytes), digest)
                         if virtual_source:
-                            if exported_virtual_content[content_identity] < exported_regular_content[content_identity]:
-                                exported_virtual_content[content_identity] += 1
+                            seen_virtual_content[content_identity] += 1
+                            if content_identity in ambiguous_virtual_content:
+                                pass
+                            elif seen_virtual_content[content_identity] <= exported_regular_content[content_identity]:
+                                pending_virtual_content.setdefault(content_identity, []).append(
+                                    (int(uid), msg_bytes, flags or "", internaldate or "", digest)
+                                )
                                 continue
-                            exported_virtual_content[content_identity] += 1
+                            elif exported_regular_content[content_identity]:
+                                ambiguous_virtual_content.add(content_identity)
+                                for pending_uid, pending_bytes, pending_flags, pending_date, pending_digest in (
+                                    pending_virtual_content.pop(content_identity, [])
+                                ):
+                                    written_stems.add(
+                                        write_legacy_message(
+                                            folder_dir,
+                                            mailbox,
+                                            pending_uid,
+                                            pending_bytes,
+                                            pending_flags,
+                                            pending_date,
+                                            uidvalidity,
+                                            pending_digest,
+                                        )
+                                    )
                         else:
                             exported_regular_content[content_identity] += 1
-                        # Zero-pad UID so lexicographic order matches numeric order
-                        base = f"u{int(uid):010d}"
-                        eml_path = folder_dir / f"{base}.eml"
-                        meta_path = folder_dir / f"{base}.json"
-                        _secure_atomic_write_bytes(eml_path, msg_bytes)
-                        meta = {
-                            "account": account.email,
-                            "mailbox": mailbox,
-                            "uid": int(uid),
-                            "flags": flags or "",
-                            "internaldate": internaldate or "",
-                            "rfc822_size": len(msg_bytes),
-                            "content_sha256": digest,
-                        }
-                        if uidvalidity:
-                            meta["uidvalidity"] = uidvalidity
-                        source_segments = _legacy_mailbox_path_segments(
-                            mailbox,
-                            mailbox_delimiter_by_name.get(mailbox, ""),
+                        written_stems.add(
+                            write_legacy_message(
+                                folder_dir,
+                                mailbox,
+                                int(uid),
+                                msg_bytes,
+                                flags or "",
+                                internaldate or "",
+                                uidvalidity,
+                                digest,
+                            )
                         )
-                        if len(source_segments) > 1:
-                            meta["source_delimiter"] = mailbox_delimiter_by_name.get(mailbox, "")
-                            meta["source_path_segments"] = list(source_segments)
-                        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
-                        _secure_atomic_json(meta_path, meta)
-                        written_stems.add(base)
                 _remove_stale_export_files(folder_dir, written_stems)
                 if written_stems or not virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")

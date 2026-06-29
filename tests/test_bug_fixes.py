@@ -2280,8 +2280,9 @@ class TestLegacyListParsing:
         state = json.loads((account_dir / "export-state.json").read_text())
         assert state["mailboxes"] == [
             {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2, "uidvalidity": "123"},
         ]
+        assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == body
 
         with mock.patch("components.audit.imap_connection", fake_connection):
@@ -2294,6 +2295,74 @@ class TestLegacyListParsing:
             )
 
         assert ok, issues
+
+    def test_export_preserves_ambiguous_duplicate_virtual_metadata(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-ambiguous-duplicate-virtual@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class AmbiguousDuplicateAllRemote:
+            response = _stable_uidvalidity_response
+
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    flags = "\\Seen \\ArchivedOnly" if self.selected == "All Mail" and uid == "1" else "\\Seen"
+                    internaldate = (
+                        "01-Jan-2024 00:00:00 +0000"
+                        if self.selected == "All Mail" and uid == "1"
+                        else "02-Jan-2024 00:00:00 +0000"
+                    )
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS ({flags}) INTERNALDATE "{internaldate}")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        server = ServerConfig("imap.example.com")
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[AmbiguousDuplicateAllRemote]:
+            yield AmbiguousDuplicateAllRemote()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2, "uidvalidity": "123"},
+        ]
+        all_dir = account_dir / "All_Mail"
+        assert (all_dir / "u0000000001.eml").read_bytes() == body
+        assert (all_dir / "u0000000002.eml").read_bytes() == body
+        archived_meta = json.loads((all_dir / "u0000000001.json").read_text())
+        covered_meta = json.loads((all_dir / "u0000000002.json").read_text())
+        assert archived_meta["flags"] == "\\Seen \\ArchivedOnly"
+        assert archived_meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert covered_meta["flags"] == "\\Seen"
+        assert covered_meta["internaldate"] == "02-Jan-2024 00:00:00 +0000"
 
     def test_validate_accepts_extra_duplicate_virtual_message_export(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
