@@ -1311,7 +1311,7 @@ def latest_committed_journal_rows(
     target_provider: str = "imap",
     target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    return {
+    latest = {
         key: row
         for key, row in latest_journal_rows(
             rows,
@@ -1319,6 +1319,38 @@ def latest_committed_journal_rows(
             target_mailboxes=target_mailboxes,
         ).items()
         if row.get("status") == "committed"
+    }
+    if (target_provider or "imap").lower() != "gmail":
+        return latest
+
+    row_positions = {id(row): index for index, row in enumerate(rows)}
+    latest_by_msgid: Dict[Tuple[str, str], Tuple[Tuple[str, str], Dict[str, Any]]] = {}
+    for key, row in latest.items():
+        identity = key[0]
+        target_gmail_msgid = row.get("target_gmail_msgid")
+        if not identity or not is_valid_gmail_msgid(target_gmail_msgid):
+            continue
+        msgid_key = (identity, str(target_gmail_msgid))
+        previous = latest_by_msgid.get(msgid_key)
+        if previous is None or row_positions.get(id(row), -1) > row_positions.get(id(previous[1]), -1):
+            latest_by_msgid[msgid_key] = (key, row)
+    if not latest_by_msgid:
+        return latest
+
+    retained_msgid_keys = {key for key, _row in latest_by_msgid.values()}
+    superseded_keys = {
+        key
+        for key, row in latest.items()
+        if is_valid_gmail_msgid(row.get("target_gmail_msgid"))
+        and (key[0], str(row.get("target_gmail_msgid"))) in latest_by_msgid
+        and key not in retained_msgid_keys
+    }
+    if not superseded_keys:
+        return latest
+    return {
+        key: row
+        for key, row in latest.items()
+        if key not in superseded_keys
     }
 
 

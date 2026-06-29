@@ -8537,6 +8537,62 @@ def test_provider_journal_content_check_ignores_superseded_gmail_alias_commit(tm
     assert online_report["ok"], online_report
 
 
+def test_provider_journal_content_check_ignores_superseded_localized_gmail_msgid_commit(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@example.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_provider"] = "gmail"
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Sent"
+    row["gmail_labels"] = ["\\Sent"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    stale = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[Gmail]/Sent Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+        "content_sha256": "0" * 64,
+        "rfc822_size": 1,
+        CONTENT_BINDING_FIELD: "0" * 64,
+    })
+    current = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "Gesendet",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(
+        json.dumps(stale) + "\n" + json.dumps(current) + "\n"
+    )
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, offline_report = provider_validate_account(config, account, tmp_path, check_target=False)
+
+    assert not any("journal committed content_sha256 does not match manifest" in issue for issue in audit_issues)
+    assert not any("journal committed rfc822_size does not match manifest" in issue for issue in audit_issues)
+    assert not any(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest" in issue for issue in audit_issues)
+    assert offline_report["ok"], offline_report
+
+
 @pytest.mark.parametrize(
     ("mutations", "needle"),
     [
