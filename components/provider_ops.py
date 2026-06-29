@@ -3520,6 +3520,13 @@ def append_target_internaldate_failure(
         )
 
 
+def _target_internaldate_matches_row(imap: imaplib.IMAP4, num: bytes, row: Dict[str, Any]) -> bool:
+    expected_internaldate = _normalized_provider_internaldate(row.get("internaldate"))
+    if not expected_internaldate:
+        return True
+    return target_message_internaldate(imap, num) == expected_internaldate
+
+
 def restore_imap_flags(
     imap: imaplib.IMAP4,
     target_mailbox: str,
@@ -4020,6 +4027,7 @@ def consume_target_match_num(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+    require_internaldate_match: bool = False,
 ) -> Optional[bytes]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
@@ -4031,6 +4039,8 @@ def consume_target_match_num(
         expected_content_identities=expected_content_identities,
     ):
         if num not in used:
+            if require_internaldate_match and not _target_internaldate_matches_row(imap, num, manifest_row):
+                continue
             if used_gmail_msgids is not None:
                 gmail_msgid = _target_gmail_msgid(imap, num)
                 if gmail_msgid and gmail_msgid in used_gmail_msgids:
@@ -4052,6 +4062,7 @@ def consume_target_gmail_msgid_match_num(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+    require_internaldate_match: bool = False,
 ) -> Optional[bytes]:
     if not target_gmail_msgid:
         return None
@@ -4068,6 +4079,8 @@ def consume_target_gmail_msgid_match_num(
             continue
         gmail_msgid = _target_gmail_msgid(imap, num)
         if gmail_msgid != target_gmail_msgid:
+            continue
+        if require_internaldate_match and not _target_internaldate_matches_row(imap, num, manifest_row):
             continue
         if used_gmail_msgids is not None:
             if gmail_msgid in used_gmail_msgids:
@@ -4087,6 +4100,7 @@ def consume_target_gmail_match_in_mailboxes(
     target_gmail_msgid: str = "",
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+    require_internaldate_match: bool = False,
 ) -> Optional[Tuple[str, bytes, str]]:
     for mailbox in mailboxes:
         mailbox_key = _target_mailbox_lookup_key(mailbox, "gmail")
@@ -4102,6 +4116,8 @@ def consume_target_gmail_match_in_mailboxes(
                 continue
             gmail_msgid = _target_gmail_msgid(imap, num)
             if target_gmail_msgid and gmail_msgid != target_gmail_msgid:
+                continue
+            if require_internaldate_match and not _target_internaldate_matches_row(imap, num, manifest_row):
                 continue
             if used_gmail_msgids is not None:
                 if gmail_msgid and gmail_msgid in used_gmail_msgids:
@@ -4122,6 +4138,7 @@ def consume_target_match(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+    require_internaldate_match: bool = False,
 ) -> bool:
     return consume_target_match_num(
         imap,
@@ -4131,6 +4148,7 @@ def consume_target_match(
         create_if_missing=create_if_missing,
         used_gmail_msgids=used_gmail_msgids,
         expected_content_identities=expected_content_identities,
+        require_internaldate_match=require_internaldate_match,
     ) is not None
 
 
@@ -4432,6 +4450,7 @@ def enforce_empty_target(
                     used,
                     create_if_missing=False,
                     expected_content_identities=expected_content_identities,
+                    require_internaldate_match=True,
                 )
                 if matched is not None:
                     verified += 1
@@ -4443,6 +4462,7 @@ def enforce_empty_target(
                 used,
                 create_if_missing=False,
                 expected_content_identities=expected_content_identities,
+                require_internaldate_match=True,
             ):
                 verified += 1
         if count > verified:
@@ -4724,6 +4744,7 @@ def require_merge_group_journals_remote_complete(
                     target_gmail_msgid=target_gmail_msgid,
                     used_gmail_msgids=row_used_gmail_msgids,
                     expected_content_identities=expected_content_identities,
+                    require_internaldate_match=True,
                 )
                 if matched is not None:
                     continue
@@ -4741,6 +4762,7 @@ def require_merge_group_journals_remote_complete(
                     row_used_by_mailbox,
                     create_if_missing=False,
                     expected_content_identities=expected_content_identities,
+                    require_internaldate_match=True,
                 )
                 if matched_num is not None:
                     continue
@@ -5062,6 +5084,7 @@ def provider_import_account(
                         target_gmail_msgid=journal_target_gmail_msgid,
                         used_gmail_msgids=used_target_gmail_msgids,
                         expected_content_identities=expected_content_identities,
+                        require_internaldate_match=True,
                     )
                     if committed_match is None:
                         committed_num = None
@@ -5076,6 +5099,7 @@ def provider_import_account(
                         create_if_missing=False,
                         used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
                         expected_content_identities=expected_content_identities,
+                        require_internaldate_match=True,
                     )
                 if committed_num is None and config.target.provider == "gmail" and journal_target_gmail_msgid:
                     raise RuntimeError(
@@ -5127,6 +5151,7 @@ def provider_import_account(
                         used_target_nums,
                         used_gmail_msgids=used_target_gmail_msgids,
                         expected_content_identities=expected_content_identities,
+                        require_internaldate_match=True,
                     )
                     if matched is not None:
                         matched_mailbox, matched_num, matched_gmail_msgid = matched
@@ -5137,6 +5162,7 @@ def provider_import_account(
                         row,
                         used_target_nums,
                         expected_content_identities=expected_content_identities,
+                        require_internaldate_match=True,
                     )
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
@@ -5220,6 +5246,7 @@ def provider_import_account(
                 create_if_missing=False,
                 used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
                 expected_content_identities=expected_content_identities,
+                require_internaldate_match=True,
             )
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")

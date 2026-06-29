@@ -6309,6 +6309,8 @@ def test_provider_import_resume_uses_journaled_gmail_target_msgid(tmp_path: Path
                 return "OK", [num + b" (X-GM-MSGID " + gmail_msgid + b")"]
             if "X-GM-LABELS" in query:
                 return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS (\\Inbox))"]
+            if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
+                return "OK", [num + b' (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
             return "OK", [(num + b" (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
 
     config = ProviderMigrationConfig(
@@ -7015,6 +7017,8 @@ def test_provider_import_empty_mode_allows_restored_secondary_system_view_on_rer
                 return "OK", [b"99 (X-GM-MSGID 9001)"]
             if "X-GM-LABELS" in query:
                 return "OK", [b"99 (FLAGS (\\Seen) X-GM-LABELS (\\Sent \\Inbox))"]
+            if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
+                return "OK", [b'99 (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
             return "OK", [(b"99 (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
 
     fake = MultiViewGmailTarget()
@@ -7674,6 +7678,63 @@ def test_provider_import_empty_mode_resumes_with_journaled_target_messages(tmp_p
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_merge_reappends_existing_wrong_target_internaldate(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    fake = StoredMessageTarget({"Archive": [body]})
+    fake.internaldates_by_mailbox["Archive"] = ["02-Jan-2024 00:00:00 +0000"]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.internaldates_by_mailbox["Archive"] == [
+        "02-Jan-2024 00:00:00 +0000",
+        "01-Jan-2024 00:00:00 +0000",
+    ]
+    journal_rows = [
+        json.loads(line)
+        for line in (account_dir / "import-target@icloud.com.journal.jsonl").read_text().splitlines()
+    ]
+    assert any(row.get("action") == "appended" for row in journal_rows)
+    assert not any(row.get("action") == "existing" for row in journal_rows)
+
+
+def test_provider_import_merge_reappends_committed_wrong_target_internaldate(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+    })) + "\n")
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    fake = StoredMessageTarget({"Archive": [body]})
+    fake.internaldates_by_mailbox["Archive"] = ["02-Jan-2024 00:00:00 +0000"]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.internaldates_by_mailbox["Archive"] == [
+        "02-Jan-2024 00:00:00 +0000",
+        "01-Jan-2024 00:00:00 +0000",
+    ]
 
 
 def test_provider_import_empty_mode_permits_journaled_generic_all_view(tmp_path: Path) -> None:
@@ -10638,6 +10699,8 @@ def test_provider_import_rejects_ambiguous_missing_journaled_gmail_target_msgid(
                 return "OK", [num + b" (X-GM-MSGID " + gmail_msgid + b")"]
             if "X-GM-LABELS" in query:
                 return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS (\\Inbox))"]
+            if "INTERNALDATE" in query and "BODY" not in query and "RFC822" not in query:
+                return "OK", [num + b' (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
             return "OK", [(num + b" (RFC822.SIZE 36 BODY[] {36}", b"Message-ID: <m1@example.com>\r\n\r\nbody")]
 
     config = ProviderMigrationConfig(
