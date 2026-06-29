@@ -2717,13 +2717,53 @@ def load_import_journal(
 def append_journal(account_dir: Path, account: MigrationAccount, row: Dict[str, Any]) -> None:
     path = _journal_path(account_dir, account)
     ensure_private_dir(path.parent)
-    fd = _open_provider_private_file(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
-        json.dump(row, f, ensure_ascii=False, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
+    parent_fd, name, parent_path = _open_provider_parent_dir(path, "file")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = -1
+    try:
+        try:
+            fd = os.open(name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked provider file: {path}") from exc
+            if exc.errno == errno.ENXIO:
+                raise RuntimeError(f"refusing to use non-regular provider file: {path}") from exc
+            raise
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise RuntimeError(f"refusing to use non-regular provider file: {path}")
+        if getattr(stat_result, "st_nlink", 1) > 1:
+            raise RuntimeError(f"refusing to use hard-linked provider file: {path}")
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+        file_obj = os.fdopen(fd, "a", encoding="utf-8")
+        fd = -1
+        with file_obj as f:
+            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+            json.dump(row, f, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+        try:
+            visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"provider import journal changed during append: {path}") from exc
+        if (
+            visible_stat.st_dev != stat_result.st_dev
+            or visible_stat.st_ino != stat_result.st_ino
+            or stat.S_ISLNK(visible_stat.st_mode)
+            or not stat.S_ISREG(visible_stat.st_mode)
+            or getattr(visible_stat, "st_nlink", 1) > 1
+        ):
+            raise RuntimeError(f"provider import journal changed during append: {path}")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:

@@ -274,7 +274,7 @@ def test_provider_atomic_writers_do_not_chmod_replaced_symlink_target(
     assert victim.stat().st_mode & 0o777 == original_mode
 
 
-def test_provider_append_journal_does_not_chmod_replaced_symlink_target(
+def test_provider_append_journal_rejects_replaced_symlink_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -310,10 +310,49 @@ def test_provider_append_journal_does_not_chmod_replaced_symlink_target(
 
     monkeypatch.setattr(provider_ops.os, "fdopen", racing_fdopen)
 
-    provider_ops.append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+    with pytest.raises(RuntimeError, match="provider import journal changed during append"):
+        provider_ops.append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
 
     assert journal.is_symlink()
     assert victim.stat().st_mode & 0o777 == original_mode
+
+
+def test_provider_append_journal_rejects_visible_path_replaced_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+    journal = account_dir / "import-target@example.com.journal.jsonl"
+    old_journal = account_dir / "old-import-target@example.com.journal.jsonl"
+    real_fdopen = provider_ops.os.fdopen
+
+    def racing_fdopen(*args, **kwargs):
+        file_cm = real_fdopen(*args, **kwargs)
+
+        class RacingFile:
+            def __enter__(self):
+                return file_cm.__enter__()
+
+            def __exit__(self, exc_type, exc, tb):
+                result = file_cm.__exit__(exc_type, exc, tb)
+                journal.rename(old_journal)
+                journal.write_text("", encoding="utf-8")
+                return result
+
+        return RacingFile()
+
+    monkeypatch.setattr(provider_ops.os, "fdopen", racing_fdopen)
+
+    with pytest.raises(RuntimeError, match="provider import journal changed during append"):
+        provider_ops.append_journal(account_dir, account, {"status": "pending", "canonical_id": "id"})
+
+    assert journal.read_text(encoding="utf-8") == ""
+    assert '"canonical_id": "id"' in old_journal.read_text(encoding="utf-8")
+    assert load_import_journal(account_dir, account) == []
 
 
 @pytest.mark.parametrize("rel_path", ["messages/gmail-123.eml", "metadata/gmail-123.json"])
