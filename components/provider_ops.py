@@ -1269,14 +1269,9 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            try:
-                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
-                _fsync_provider_directory_fd(parent_fd, parent_path, "file")
-                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
-            except Exception:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=parent_fd)
-                raise
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            _fsync_provider_directory_fd(parent_fd, parent_path, "file")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_name, dir_fd=parent_fd)
@@ -1314,14 +1309,9 @@ def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            try:
-                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
-                _fsync_provider_directory_fd(parent_fd, parent_path, "file")
-                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
-            except Exception:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=parent_fd)
-                raise
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            _fsync_provider_directory_fd(parent_fd, parent_path, "file")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_name, dir_fd=parent_fd)

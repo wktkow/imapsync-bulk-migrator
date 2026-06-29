@@ -319,6 +319,37 @@ def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
     assert fsync_targets == ["file", "dir"]
 
 
+@pytest.mark.parametrize("writer_name", ["bytes", "jsonl"])
+def test_provider_atomic_writers_preserve_visible_target_after_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    target = account_dir / ("message.eml" if writer_name == "bytes" else "manifest.jsonl")
+    target.write_bytes(b"old\n")
+
+    def fail_directory_fsync(*_args, **_kwargs) -> None:
+        raise RuntimeError("simulated directory fsync failure")
+
+    monkeypatch.setattr(provider_ops, "_fsync_provider_directory_fd", fail_directory_fsync)
+
+    with pytest.raises(RuntimeError, match="simulated directory fsync failure"):
+        if writer_name == "bytes":
+            provider_ops._atomic_bytes(target, b"new\n")
+        else:
+            provider_ops._write_jsonl(target, [{"canonical_id": "id"}])
+
+    assert target.exists()
+    if writer_name == "bytes":
+        assert target.read_bytes() == b"new\n"
+    else:
+        assert target.read_text(encoding="utf-8") == '{"canonical_id": "id"}\n'
+
+
 def test_provider_append_journal_rejects_replaced_symlink_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
