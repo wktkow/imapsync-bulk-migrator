@@ -4974,6 +4974,13 @@ def provider_import_account(
                             desired_target_mailbox=target_mailbox,
                         )
                         restore_gmail_starred_flag(imap, committed_mailbox, row, target_num=committed_num)
+                        restore_imap_flags(
+                            imap,
+                            committed_mailbox,
+                            row,
+                            target_num=committed_num,
+                            target_provider=config.target.provider,
+                        )
                     else:
                         restore_imap_flags(
                             imap,
@@ -5019,6 +5026,13 @@ def provider_import_account(
                         desired_target_mailbox=target_mailbox,
                     )
                     restore_gmail_starred_flag(imap, matched_mailbox, row, target_num=matched_num)
+                    restore_imap_flags(
+                        imap,
+                        matched_mailbox,
+                        row,
+                        target_num=matched_num,
+                        target_provider=config.target.provider,
+                    )
                 else:
                     restore_imap_flags(
                         imap,

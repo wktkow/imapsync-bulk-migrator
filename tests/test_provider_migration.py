@@ -4492,7 +4492,7 @@ class FakeGmailTargetImap(FakeTargetImap):
             for label in tokens:
                 if label not in self.gmail_labels:
                     self.gmail_labels.append(label)
-        elif command == "+FLAGS":
+        elif command in {"+FLAGS", "+FLAGS.SILENT"}:
             current = [flag for flag in self.gmail_flags.split() if flag]
             for flag in tokens:
                 if flag not in current:
@@ -5010,6 +5010,65 @@ def test_provider_import_merge_mode_restores_supported_imap_keywords_on_existing
     assert fake.stored_flags == [(b"99", "+FLAGS.SILENT", "(\\Seen $Forwarded NonJunk)")]
     journal = load_import_journal(account_dir, account)
     assert journal[-1]["action"] == "existing"
+
+
+def test_provider_import_to_gmail_restores_imap_flags_on_reused_messages(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="source@example.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="merge"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["flags"] = "\\Seen \\Answered"
+    row["gmail_labels"] = ["\\Inbox"]
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="INBOX",
+        messages_by_mailbox={"INBOX": 1},
+        gmail_labels=["\\Inbox"],
+        gmail_flags="\\Seen",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert fake.appended == []
+    assert (b"99", "+FLAGS.SILENT", "(\\Seen \\Answered)") in fake.stored_labels
+    assert report["ok"], report
+    journal = load_import_journal(account_dir, account)
+    assert journal[-1]["action"] == "existing"
+    assert journal[-1]["target_gmail_msgid"] == "9001"
+
+    fake.gmail_flags = "\\Seen"
+    fake.stored_labels.clear()
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert (b"99", "+FLAGS.SILENT", "(\\Seen \\Answered)") in fake.stored_labels
+    assert report["ok"], report
 
 
 def test_provider_validation_rejects_missing_supported_imap_keyword(tmp_path: Path) -> None:
@@ -6190,7 +6249,10 @@ def test_provider_import_resume_uses_journaled_gmail_target_msgid(tmp_path: Path
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
-    assert fake.stored_labels == [(b"2", "+X-GM-LABELS", '("Project A")')]
+    assert fake.stored_labels == [
+        (b"2", "+X-GM-LABELS", '("Project A")'),
+        (b"2", "+FLAGS.SILENT", "(\\Seen)"),
+    ]
 
 
 def test_provider_import_merge_fails_closed_when_journaled_gmail_msgid_missing(tmp_path: Path) -> None:
