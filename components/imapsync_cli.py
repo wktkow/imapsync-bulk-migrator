@@ -8,6 +8,14 @@ from typing import Optional, Tuple
 from .utils import ensure_imapsync_available
 
 
+def _fd_passfile_path(fd: int) -> str:
+    for template in ("/proc/self/fd/{fd}", "/dev/fd/{fd}"):
+        candidate = template.format(fd=fd)
+        if os.path.exists(candidate):
+            return candidate
+    raise RuntimeError("platform does not expose inherited file descriptors as passfile paths")
+
+
 def run_imapsync_justconnect(
     host: str,
     port: int,
@@ -26,13 +34,13 @@ def run_imapsync_justconnect(
     """
     resolved_imapsync = ensure_imapsync_available()
     imapsync_bin = resolved_imapsync if isinstance(resolved_imapsync, str) and resolved_imapsync else "imapsync"
-    passfile_path = ""
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="imapsync-pass-", delete=False) as passfile:
-            passfile.write(password)
-            passfile.write("\n")
-            passfile_path = passfile.name
-        os.chmod(passfile_path, 0o600)
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as passfile:
+        passfile.write(password)
+        passfile.write("\n")
+        passfile.flush()
+        passfile.seek(0)
+        passfile_fd = passfile.fileno()
+        passfile_path = _fd_passfile_path(passfile_fd)
         args = [
             imapsync_bin,
             "--justconnect",
@@ -52,35 +60,44 @@ def run_imapsync_justconnect(
             args.extend(["--nossl1", "--notls1"])
 
         logging.debug("Running imapsync justconnect: %s", " ".join(args))
-        if stop_event is None:
-            res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, text=True, timeout=timeout_sec + 10)
-            ok = res.returncode == 0
-            return ok, res.stdout
+        try:
+            if stop_event is None:
+                res = subprocess.run(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    text=True,
+                    timeout=timeout_sec + 10,
+                    pass_fds=(passfile_fd,),
+                )
+                ok = res.returncode == 0
+                return ok, res.stdout
 
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        deadline = time.monotonic() + timeout_sec + 10
-        while True:
-            try:
-                out, _stderr = proc.communicate(timeout=0.2)
-                return proc.returncode == 0, out
-            except subprocess.TimeoutExpired:
-                if getattr(stop_event, "is_set", lambda: False)():
-                    proc.terminate()
-                    try:
-                        out, _stderr = proc.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                pass_fds=(passfile_fd,),
+            )
+            deadline = time.monotonic() + timeout_sec + 10
+            while True:
+                try:
+                    out, _stderr = proc.communicate(timeout=0.2)
+                    return proc.returncode == 0, out
+                except subprocess.TimeoutExpired:
+                    if getattr(stop_event, "is_set", lambda: False)():
+                        proc.terminate()
+                        try:
+                            out, _stderr = proc.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            out, _stderr = proc.communicate()
+                        return False, "stop requested\n" + (out or "")
+                    if time.monotonic() >= deadline:
                         proc.kill()
                         out, _stderr = proc.communicate()
-                    return False, "stop requested\n" + (out or "")
-                if time.monotonic() >= deadline:
-                    proc.kill()
-                    out, _stderr = proc.communicate()
-                    return False, "timeout\n" + (out or "")
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    finally:
-        if passfile_path:
-            try:
-                os.unlink(passfile_path)
-            except FileNotFoundError:
-                pass
+                        return False, "timeout\n" + (out or "")
+        except subprocess.TimeoutExpired:
+            return False, "timeout"

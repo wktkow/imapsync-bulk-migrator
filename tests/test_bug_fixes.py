@@ -8859,11 +8859,17 @@ class TestImapsyncPasswordHandling:
         from components.imapsync_cli import run_imapsync_justconnect
 
         captured_args: List[List[str]] = []
+        captured_kwargs: List[dict] = []
 
-        def fake_run(args, **_kwargs):
+        def fake_run(args, **kwargs):
             captured_args.append(list(args))
-            if args[0] == "imapsync" and "--version" in args:
+            captured_kwargs.append(dict(kwargs))
+            if "--version" in args:
                 return subprocess.CompletedProcess(args, 0, "", "")
+            passfile_path = args[args.index("--passfile1") + 1]
+            assert passfile_path.startswith(("/proc/self/fd/", "/dev/fd/"))
+            with open(passfile_path, encoding="utf-8") as f:
+                assert f.read() == "super-secret\n"
             return subprocess.CompletedProcess(args, 0, "ok", "")
 
         with mock.patch("components.utils.shutil.which", return_value="/usr/bin/imapsync"):
@@ -8883,6 +8889,43 @@ class TestImapsyncPasswordHandling:
         assert "--passfile1" in imapsync_args
         assert "--password1" not in imapsync_args
         assert "super-secret" not in imapsync_args
+        assert "imapsync-pass-" not in imapsync_args[imapsync_args.index("--passfile1") + 1]
+        assert captured_kwargs[-1]["pass_fds"]
+
+    def test_justconnect_does_not_create_named_password_tempfile(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import components.imapsync_cli as imapsync_cli
+        from components.imapsync_cli import run_imapsync_justconnect
+
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setattr(imapsync_cli.tempfile, "tempdir", str(tmp_path))
+
+        def fake_run(args, **_kwargs):
+            if "--version" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            passfile_path = args[args.index("--passfile1") + 1]
+            assert "imapsync-pass-" not in passfile_path
+            with open(passfile_path, encoding="utf-8") as f:
+                assert f.read() == "super-secret\n"
+            return subprocess.CompletedProcess(args, 0, "ok", "")
+
+        with mock.patch("components.utils.shutil.which", return_value="/usr/bin/imapsync"), \
+            mock.patch("components.utils.subprocess.run", side_effect=fake_run), \
+            mock.patch("components.imapsync_cli.subprocess.run", side_effect=fake_run):
+            ok, _out = run_imapsync_justconnect(
+                host="imap.example.com",
+                port=993,
+                ssl_enabled=True,
+                starttls=False,
+                user="user@example.com",
+                password="super-secret",
+            )
+
+        assert ok
+        assert list(tmp_path.glob("imapsync-pass-*")) == []
 
     def test_justconnect_executes_validated_imapsync_binary(self) -> None:
         from components.imapsync_cli import run_imapsync_justconnect
