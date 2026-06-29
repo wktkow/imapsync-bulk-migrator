@@ -922,6 +922,38 @@ class TestLegacyExportCompleteness:
             with pytest.raises(RuntimeError, match="no message bytes"):
                 export_account(account, server, tmp_path, ignore_errors=False)
 
+    def test_export_accepts_zero_byte_message_literal(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+
+        fake_imap = mock.MagicMock()
+        fake_imap.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"'])
+        fake_imap.select.return_value = ("OK", [b"1"])
+        fake_imap.response.return_value = ("OK", [b"123"])
+        fake_imap.uid.side_effect = [
+            ("OK", [b"1"]),
+            ("OK", [(
+                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {0}',
+                b"",
+            )]),
+            ("OK", [b"1"]),
+        ]
+
+        with mock.patch("components.imap_ops.imap_connection") as mock_conn:
+            mock_conn.return_value.__enter__ = mock.MagicMock(return_value=fake_imap)
+            mock_conn.return_value.__exit__ = mock.MagicMock(return_value=False)
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / "user@example.com"
+        eml_path = account_dir / "INBOX" / "u0000000001.eml"
+        meta = json.loads(eml_path.with_suffix(".json").read_text())
+        assert eml_path.read_bytes() == b""
+        assert meta["rfc822_size"] == 0
+        assert meta["content_sha256"] == hashlib.sha256(b"").hexdigest()
+
     def test_export_ignore_errors_continues_but_raises_aggregate(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
@@ -3055,28 +3087,64 @@ class TestLegacyImportJournal:
         assert fake_imap.append_count == 1
         assert fake_imap.stored == [imaplib.MapCRLF.sub(imaplib.CRLF, data)]
 
-    def test_import_rejects_empty_message_before_append(self, tmp_path: Path) -> None:
-        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+    def test_import_accepts_bound_empty_message(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
 
         folder = tmp_path / "user@example.com" / "INBOX"
-        eml = _write_legacy_message_fixture(folder, data=b"")
-        meta_path = eml.with_suffix(".json")
-        meta = json.loads(meta_path.read_text())
-        meta["rfc822_size"] = 0
-        meta["content_sha256"] = hashlib.sha256(b"").hexdigest()
-        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
-        meta_path.write_text(json.dumps(meta))
+        _write_legacy_message_fixture(folder, data=b"")
 
-        with pytest.raises(RuntimeError, match="invalid rfc822_size metadata"):
-            import_account(
-                Account("user@example.com", "secret"),
-                ServerConfig("imap.example.com"),
-                tmp_path,
-                ignore_errors=False,
-                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
-            )
+        class EmptyAppendImap:
+            def __init__(self) -> None:
+                self.appended: List[bytes] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"0"]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.appended.append(payload)
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        target = EmptyAppendImap()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[EmptyAppendImap]:
+            yield target
+
+        import_account(
+            Account("user@example.com", "secret"),
+            ServerConfig("imap.example.com"),
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
+
+        assert target.appended == [b""]
+
+    def test_audit_accepts_bound_empty_message(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account
+
+        folder = tmp_path / "user@example.com" / "INBOX"
+        _write_legacy_message_fixture(folder, data=b"")
+
+        _email, issues = audit_account(
+            Account("user@example.com", "secret"),
+            tmp_path,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+            expected_source_server=self._source_server(),
+        )
+
+        assert issues == []
 
     def test_import_rejects_empty_message_without_integrity_metadata_before_append(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
@@ -9601,6 +9669,26 @@ class TestRound4ConfirmedBugs:
 
         assert analysis is None
         assert error == "empty file"
+
+    def test_verify_export_accepts_bound_legacy_zero_byte_message(self, tmp_path: Path) -> None:
+        from verify_export import analyze_message
+
+        eml_path = tmp_path / "empty.eml"
+        json_path = tmp_path / "empty.json"
+        eml_path.write_bytes(b"")
+        json_path.write_text(json.dumps(_legacy_integrity_metadata(
+            b"",
+            mailbox="INBOX",
+            uid=1,
+            flags="",
+            internaldate="",
+        )))
+
+        analysis, error = analyze_message(eml_path, json_path)
+
+        assert error is None
+        assert analysis is not None
+        assert analysis["size_bytes"] == 0
 
     @pytest.mark.parametrize(
         ("marker_text", "needle"),

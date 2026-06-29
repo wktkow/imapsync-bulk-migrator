@@ -15,7 +15,7 @@ from email.parser import BytesParser
 from email.policy import default as default_policy
 import re
 
-from components.content_binding import legacy_content_binding_issue, provider_content_binding_issue
+from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue, provider_content_binding_issue
 from components.imap_ops import (
     _legacy_hierarchy_metadata,
     _legacy_uidvalidity_metadata,
@@ -309,8 +309,6 @@ def analyze_message(
             return None, 'message file is a symlink'
         # Read the email
         msg_bytes = _read_artifact_no_links(eml_path, "message file")
-        if not msg_bytes and content_binding != "provider":
-            return None, 'empty file'
         
         # Check for multiple messages concatenated (look for multiple RFC822 headers).
         # Only count headers in the top-level header block (before the first blank line)
@@ -356,8 +354,7 @@ def analyze_message(
             integrity_errors.append('missing content_sha256 metadata')
         expected_size = metadata.get('rfc822_size')
         if expected_size is not None:
-            min_size = 0 if content_binding == "provider" else 1
-            if type(expected_size) is not int or expected_size < min_size:
+            if type(expected_size) is not int or expected_size < 0:
                 integrity_errors.append('invalid rfc822_size metadata')
             elif len(msg_bytes) != expected_size:
                 integrity_errors.append(f'rfc822_size mismatch (metadata={expected_size} actual={len(msg_bytes)})')
@@ -369,6 +366,9 @@ def analyze_message(
             binding_issue = legacy_content_binding_issue(metadata, required=require_metadata)
         if binding_issue:
             integrity_errors.append(binding_issue)
+        has_integrity_metadata = any(key in metadata for key in ('content_sha256', 'rfc822_size', CONTENT_BINDING_FIELD))
+        if not msg_bytes and content_binding != "provider" and not has_integrity_metadata:
+            integrity_errors.append('empty file')
         if content_binding == "legacy" and expected_account is not None:
             account_meta = metadata.get('account')
             if not isinstance(account_meta, str) or not account_meta.strip():

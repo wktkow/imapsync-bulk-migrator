@@ -881,7 +881,7 @@ def _parse_fetch_response_for_uid(
             body = part[1]
             meta_str = meta.decode(errors="ignore") if isinstance(meta, (bytes, bytearray)) else ""
             response_uid = _fetch_response_uid(meta_str)
-            if body and isinstance(body, (bytes, bytearray)):
+            if isinstance(body, (bytes, bytearray)):
                 if response_uid is None:
                     raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
                 if response_uid != expected_uid:
@@ -1191,7 +1191,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
                         msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))
-                        if not msg_bytes:
+                        if msg_bytes is None:
                             raise RuntimeError(f"fetch returned no message bytes in {mailbox} for UID {uid}")
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
@@ -1293,7 +1293,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
 
 def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object]) -> Tuple[Optional[int], Optional[str]]:
     expected_size_raw = meta.get("rfc822_size")
-    if type(expected_size_raw) is not int or expected_size_raw <= 0:
+    if type(expected_size_raw) is not int or expected_size_raw < 0:
         raise RuntimeError(f"{meta_path}: invalid rfc822_size metadata")
     expected_size = expected_size_raw
     expected_hash_raw = meta.get("content_sha256")
@@ -1309,8 +1309,6 @@ def _validate_legacy_sidecar_integrity(meta_path: Path, meta: Dict[str, object])
 
 
 def _require_legacy_payload_integrity(eml_path: Path, data: bytes, expected_size: Optional[int], expected_hash: Optional[str]) -> None:
-    if not data:
-        raise RuntimeError(f"{eml_path}: empty message file")
     if expected_size is not None and len(data) != expected_size:
         raise RuntimeError(f"{eml_path}: rfc822_size mismatch (metadata={expected_size} actual={len(data)})")
     if expected_hash is not None:

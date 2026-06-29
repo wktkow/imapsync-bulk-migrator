@@ -362,7 +362,6 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     except Exception as exc:
         return [f"{eml_path}: failed to read: {exc}"]
     if not data:
-        issues.append(f"{eml_path}: empty file")
         return issues
     try:
         msg = BytesParser(policy=compat32_policy).parsebytes(data)
