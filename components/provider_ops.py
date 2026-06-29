@@ -5396,24 +5396,27 @@ def provider_validate_account(
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
     report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
-    if not check_target:
-        report["failed"].extend(
-            offline_journal_target_mailbox_issues(
+
+    pending_resolution_checked = False
+
+    def append_unresolved_pending_failures(
+        target_mailboxes: Optional[List[MailboxInfo]] = None,
+    ) -> None:
+        nonlocal pending_resolution_checked
+        pending_resolution_checked = True
+        if allow_unresolved_pending:
+            return
+        committed_journal_keys = set(
+            latest_committed_journal_rows(
                 journal_rows,
-                manifest_rows,
                 target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
             )
         )
-    committed_journal_keys = set(
-        latest_committed_journal_rows(
-            journal_rows,
-            target_provider=config.target.provider,
-        )
-    )
-    if not allow_unresolved_pending:
         for key, row in latest_journal_rows(
             journal_rows,
             target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
         ).items():
             _raise_if_stopped(stop_event, f"provider validate {account.email}")
             if row.get("status") != "pending":
@@ -5424,6 +5427,16 @@ def provider_validate_account(
                 report["failed"].append(
                     f"journal pending identity has no committed resolution: {identity or '<missing>'} in {target_mailbox or '<missing>'}"
                 )
+
+    if not check_target:
+        report["failed"].extend(
+            offline_journal_target_mailbox_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=config.target.provider,
+            )
+        )
+        append_unresolved_pending_failures()
 
     identity_issues, manifest_id_counts = manifest_identity_issues(manifest_rows)
     for issue in identity_issues:
@@ -5558,6 +5571,7 @@ def provider_validate_account(
                 )
                 if config.target.provider == "gmail":
                     report["failed"].extend(gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes))
+                append_unresolved_pending_failures(target_mailboxes=target_mailboxes)
                 expected_target_by_id = {
                     identity: target_mailbox_by_identity[identity]
                     for identity, row in by_id.items()
@@ -5813,6 +5827,8 @@ def provider_validate_account(
         except Exception as exc:
             if _stop_requested(stop_event):
                 raise
+            if not pending_resolution_checked:
+                append_unresolved_pending_failures()
             committed_by_id, _target_by_id, failures = evaluate_journal()
             report["failed"].extend(failures)
             apply_counts(committed_by_id)
