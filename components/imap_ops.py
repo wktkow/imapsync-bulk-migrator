@@ -1361,20 +1361,23 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         match_index: int,
         flags: str,
         internaldate: str,
-    ) -> None:
-        if not _legacy_target_flag_set(flags):
-            return
+    ) -> bool:
         metadata_entries = regular_metadata_paths_by_content.get(content_identity, [])
         if match_index < 0 or match_index >= len(metadata_entries):
             raise RuntimeError("covered virtual message has no matching regular metadata")
         virtual_internaldate = _normalized_legacy_internaldate(internaldate)
+        if not virtual_internaldate:
+            return False
         same_date_paths = [
             path
             for path, regular_internaldate in metadata_entries
-            if virtual_internaldate
-            and _normalized_legacy_internaldate(regular_internaldate) == virtual_internaldate
+            if _normalized_legacy_internaldate(regular_internaldate) == virtual_internaldate
         ]
-        meta_path = same_date_paths[0] if len(same_date_paths) == 1 else metadata_entries[match_index][0]
+        if len(same_date_paths) != 1:
+            return False
+        meta_path = same_date_paths[0]
+        if not _legacy_target_flag_set(flags):
+            return True
         meta = json.loads(
             _read_file_no_symlink(
                 meta_path,
@@ -1386,10 +1389,11 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             raise RuntimeError(f"{meta_path}: message metadata is not an object")
         merged_flags = _merge_legacy_flag_strings(str(meta.get("flags") or ""), flags)
         if merged_flags == str(meta.get("flags") or ""):
-            return
+            return True
         meta["flags"] = merged_flags
         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
         _secure_atomic_json(meta_path, meta)
+        return True
 
     with imap_connection(server, account) as imap:
         mailbox_details = _list_selectable_mailbox_details(imap)
@@ -1499,12 +1503,42 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                                 pass
                             elif seen_virtual_content[content_identity] <= exported_regular_content[content_identity]:
                                 if flagged_virtual_source:
-                                    merge_covered_virtual_flags(
+                                    covered = merge_covered_virtual_flags(
                                         content_identity,
                                         seen_virtual_content[content_identity] - 1,
                                         flags or "",
                                         internaldate or "",
                                     )
+                                    if not covered:
+                                        ambiguous_virtual_content.add(content_identity)
+                                        for pending_uid, pending_bytes, pending_flags, pending_date, pending_digest in (
+                                            pending_virtual_content.pop(content_identity, [])
+                                        ):
+                                            written_stems.add(
+                                                write_legacy_message(
+                                                    folder_dir,
+                                                    mailbox,
+                                                    pending_uid,
+                                                    pending_bytes,
+                                                    pending_flags,
+                                                    pending_date,
+                                                    uidvalidity,
+                                                    pending_digest,
+                                                )
+                                            )
+                                        written_stems.add(
+                                            write_legacy_message(
+                                                folder_dir,
+                                                mailbox,
+                                                int(uid),
+                                                msg_bytes,
+                                                flags or "",
+                                                internaldate or "",
+                                                uidvalidity,
+                                                digest,
+                                            )
+                                        )
+                                        continue
                                 pending_virtual_content.setdefault(content_identity, []).append(
                                     (int(uid), msg_bytes, flags or "", internaldate or "", digest)
                                 )
