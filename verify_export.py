@@ -18,6 +18,9 @@ import re
 from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue, provider_content_binding_issue
 from components.imap_ops import (
     _legacy_hierarchy_metadata,
+    _legacy_source_attributes_key,
+    _legacy_source_attributes_metadata,
+    _legacy_trusted_covered_by_regular_content,
     _legacy_uidvalidity_metadata,
     _legacy_validate_path_segments,
     _valid_legacy_flag_token,
@@ -495,6 +498,11 @@ def analyze_mailbox_marker(marker_path, folder_name, eml_count):
     if not isinstance(marker, dict):
         return [f"{folder_name}: mailbox marker json is not an object"]
     issues = []
+    if marker.get("covered_by_regular_content") is True:
+        try:
+            _legacy_trusted_covered_by_regular_content(marker, f"{folder_name}: mailbox marker")
+        except RuntimeError as exc:
+            issues.append(str(exc))
     mailbox = marker.get('mailbox')
     if not isinstance(mailbox, str) or not mailbox.strip():
         issues.append(f"{folder_name}: mailbox marker missing mailbox")
@@ -592,6 +600,20 @@ def analyze_export_state(account_path, folder_counts):
             except RuntimeError as exc:
                 issues.append(str(exc))
                 state_uidvalidity = ""
+            state_covered = False
+            state_source_attributes = ()
+            if entry.get("covered_by_regular_content") is True:
+                try:
+                    state_covered = _legacy_trusted_covered_by_regular_content(
+                        entry,
+                        f"export-state mailbox {mailbox!r}",
+                    )
+                    state_source_attributes = _legacy_source_attributes_metadata(
+                        entry,
+                        f"export-state mailbox {mailbox!r}",
+                    )
+                except RuntimeError as exc:
+                    issues.append(str(exc))
             marker_path = account_path / path / ".mailbox.json"
             if marker_path.exists() and not marker_path.is_symlink():
                 try:
@@ -600,6 +622,31 @@ def analyze_export_state(account_path, folder_counts):
                     marker = None
                 else:
                     if isinstance(marker, dict) and marker.get("mailbox") == mailbox:
+                        marker_covered = False
+                        marker_source_attributes = ()
+                        if marker.get("covered_by_regular_content") is True:
+                            try:
+                                marker_covered = _legacy_trusted_covered_by_regular_content(
+                                    marker,
+                                    f"{path}: mailbox marker",
+                                )
+                                marker_source_attributes = _legacy_source_attributes_metadata(
+                                    marker,
+                                    f"{path}: mailbox marker",
+                                )
+                            except RuntimeError as exc:
+                                issues.append(str(exc))
+                        if marker_covered != state_covered:
+                            issues.append(
+                                f"export-state mailbox {mailbox!r} covered_by_regular_content mismatch with mailbox marker"
+                            )
+                        elif marker_covered and (
+                            _legacy_source_attributes_key(marker_source_attributes)
+                            != _legacy_source_attributes_key(state_source_attributes)
+                        ):
+                            issues.append(
+                                f"export-state mailbox {mailbox!r} source_attributes mismatch with mailbox marker"
+                            )
                         try:
                             marker_hierarchy = _legacy_hierarchy_metadata(
                                 marker,

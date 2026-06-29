@@ -33,6 +33,7 @@ from .imap_ops import (
     _open_legacy_dir,
     _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
+    _legacy_trusted_covered_by_regular_content,
     archive_legacy_import_journal_for_reset,
     export_account,
     import_account,
@@ -1577,7 +1578,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                             mailbox,
                             str(marker_path),
                         )
-                        return mailbox, hierarchy, bool(isinstance(raw, dict) and raw.get("covered_by_regular_content") is True)
+                        covered = (
+                            _legacy_trusted_covered_by_regular_content(raw, str(marker_path))
+                            if isinstance(raw, dict)
+                            else False
+                        )
+                        return mailbox, hierarchy, covered
 
                     folder_dirs: List[Path] = []
                     for child_name in sorted(os.listdir(account_dir_fd)):

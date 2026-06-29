@@ -384,6 +384,7 @@ def _legacy_mailbox_metadata(
     delimiter: str,
     uidvalidity: str = "",
     covered_by_regular_content: bool = False,
+    source_attributes: Tuple[str, ...] = (),
 ) -> Dict[str, object]:
     payload: Dict[str, object] = {
         "mailbox": mailbox,
@@ -391,6 +392,8 @@ def _legacy_mailbox_metadata(
     }
     if covered_by_regular_content:
         payload["covered_by_regular_content"] = True
+    if source_attributes:
+        payload["source_attributes"] = list(source_attributes)
     if uidvalidity:
         payload["uidvalidity"] = uidvalidity
     segments = _legacy_mailbox_path_segments(mailbox, delimiter)
@@ -407,6 +410,7 @@ def _legacy_export_state_mailbox_metadata(
     delimiter: str,
     uidvalidity: str = "",
     covered_by_regular_content: bool = False,
+    source_attributes: Tuple[str, ...] = (),
 ) -> Dict[str, object]:
     payload = _legacy_mailbox_metadata(
         mailbox,
@@ -414,6 +418,7 @@ def _legacy_export_state_mailbox_metadata(
         delimiter,
         uidvalidity,
         covered_by_regular_content,
+        source_attributes,
     )
     payload["path"] = path
     return payload
@@ -592,6 +597,28 @@ def _is_legacy_all_source_view(attributes: Tuple[str, ...]) -> bool:
 def _is_legacy_flagged_source_view(attributes: Tuple[str, ...]) -> bool:
     attr_lowers = {attr.lower() for attr in attributes}
     return "\\flagged" in attr_lowers
+
+
+def _legacy_source_attributes_metadata(meta: Mapping[str, object], label: str) -> Tuple[str, ...]:
+    raw = meta.get("source_attributes")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
+        raise RuntimeError(f"{label}: invalid source_attributes")
+    return tuple(raw)
+
+
+def _legacy_source_attributes_key(attributes: Tuple[str, ...]) -> frozenset[str]:
+    return frozenset(attr.lower() for attr in attributes)
+
+
+def _legacy_trusted_covered_by_regular_content(meta: Mapping[str, object], label: str) -> bool:
+    if meta.get("covered_by_regular_content") is not True:
+        return False
+    attributes = _legacy_source_attributes_metadata(meta, label)
+    if _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes):
+        return True
+    raise RuntimeError(f"{label}: covered_by_regular_content requires source_attributes with \\All or \\Flagged")
 
 
 def _should_skip_legacy_source_view(
@@ -1520,6 +1547,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 covered_virtual_source = virtual_source and bool(uids) and not written_stems
                 if written_stems or not virtual_source or covered_virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
+                    covered_source_attributes = attrs if covered_virtual_source else ()
                     verify_legacy_mailbox_uid_set_stable(
                         imap,
                         mailbox,
@@ -1535,6 +1563,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             delimiter,
                             uidvalidity,
                             covered_virtual_source,
+                            covered_source_attributes,
                         ),
                     )
                     export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
@@ -1544,6 +1573,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         delimiter,
                         uidvalidity,
                         covered_virtual_source,
+                        covered_source_attributes,
                     ))
             except Exception as exc:
                 logging.exception("[export] %s: mailbox %s failed: %s", account.email, mailbox, exc)
@@ -1808,7 +1838,7 @@ def import_account(
                 marker_mailbox_present = True
             else:
                 raise RuntimeError(f"{marker}: mailbox marker is not an object")
-            if marker_meta.get("covered_by_regular_content") is not True:
+            if not _legacy_trusted_covered_by_regular_content(marker_meta, str(marker)):
                 per_folder.setdefault(mailbox_meta, [])
         default_mailbox = mailbox_meta
         for eml_path in eml_paths:

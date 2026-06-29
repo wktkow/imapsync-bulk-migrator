@@ -1272,6 +1272,7 @@ class TestLegacyListParsing:
                 "path": "All_Mail",
                 "message_count": 0,
                 "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\All"],
                 "uidvalidity": "123",
             },
         ]
@@ -1281,6 +1282,7 @@ class TestLegacyListParsing:
             "mailbox": "All Mail",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\All"],
             "uidvalidity": "123",
         }
         assert not list((account_dir / "All_Mail").glob("u*.eml"))
@@ -1474,12 +1476,14 @@ class TestLegacyListParsing:
                 "path": "All_Mail",
                 "message_count": 0,
                 "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\All"],
                 "uidvalidity": "123",
             },
         ]
         assert (account_dir / "Projects" / "u0000000001.eml").read_bytes() == body
         all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
         assert all_marker["covered_by_regular_content"] is True
+        assert all_marker["source_attributes"] == ["\\HasNoChildren", "\\All"]
         assert all_marker["message_count"] == 0
 
     def test_export_keeps_generic_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
@@ -1603,6 +1607,7 @@ class TestLegacyListParsing:
                 "path": "Flagged",
                 "message_count": 0,
                 "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\Flagged"],
                 "uidvalidity": "123",
             },
         ]
@@ -1615,6 +1620,7 @@ class TestLegacyListParsing:
             "mailbox": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
             "uidvalidity": "123",
         }
         assert not list((account_dir / "Flagged").glob("u*.eml"))
@@ -1688,6 +1694,7 @@ class TestLegacyListParsing:
         assert legacy_content_binding_issue(second_meta) is None
         flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
         assert flagged_marker["covered_by_regular_content"] is True
+        assert flagged_marker["source_attributes"] == ["\\HasNoChildren", "\\Flagged"]
         assert not list((account_dir / "Flagged").glob("u*.eml"))
 
     def test_export_keeps_generic_all_when_it_is_only_source_mailbox(self, tmp_path: Path) -> None:
@@ -2343,11 +2350,13 @@ class TestLegacyListParsing:
                 "path": "All_Mail",
                 "message_count": 0,
                 "covered_by_regular_content": True,
+                "source_attributes": ["\\HasNoChildren", "\\All"],
                 "uidvalidity": "123",
             },
         ]
         all_marker = json.loads((account_dir / "All_Mail" / ".mailbox.json").read_text())
         assert all_marker["covered_by_regular_content"] is True
+        assert all_marker["source_attributes"] == ["\\HasNoChildren", "\\All"]
 
     def test_remote_audit_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
         from components.audit import audit_export
@@ -3749,6 +3758,7 @@ class TestLegacyImportJournal:
             "mailbox": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
         }))
         state_path = account_dir / "export-state.json"
         state = json.loads(state_path.read_text())
@@ -3757,6 +3767,7 @@ class TestLegacyImportJournal:
             "path": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
         })
         state_path.write_text(json.dumps(state))
 
@@ -13199,6 +13210,7 @@ class TestRound7ConfirmedBugs:
             "mailbox": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
         }))
 
         class FlaggedTarget:
@@ -13266,6 +13278,7 @@ class TestRound7ConfirmedBugs:
             "mailbox": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
         }))
         state_path = account_dir / "export-state.json"
         state = json.loads(state_path.read_text())
@@ -13274,6 +13287,7 @@ class TestRound7ConfirmedBugs:
             "path": "Flagged",
             "message_count": 0,
             "covered_by_regular_content": True,
+            "source_attributes": ["\\HasNoChildren", "\\Flagged"],
         })
         state_path.write_text(json.dumps(state))
         config_path = tmp_path / "validate.config.json"
@@ -13319,6 +13333,131 @@ class TestRound7ConfirmedBugs:
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
+    def test_legacy_audit_rejects_unproven_covered_marker(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        root = tmp_path / "exported"
+        account_dir = root / "user@example.com"
+        _write_legacy_empty_mailbox_fixture(
+            account_dir / "Archive",
+            mailbox="Archive",
+            source_server=server,
+        )
+        forged = account_dir / "Projects"
+        forged.mkdir()
+        (forged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"].append({
+            "mailbox": "Projects",
+            "path": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        })
+        state_path.write_text(json.dumps(state))
+
+        _email, issues = audit_account(
+            Account("user@example.com", "secret"),
+            root,
+            server=None,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert any("covered_by_regular_content requires source_attributes" in issue for issue in issues)
+
+    def test_legacy_import_rejects_unproven_covered_marker(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account_dir = tmp_path / "user@example.com"
+        _write_legacy_empty_mailbox_fixture(
+            account_dir / "Archive",
+            mailbox="Archive",
+            source_server=server,
+        )
+        forged = account_dir / "Projects"
+        forged.mkdir()
+        (forged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"].append({
+            "mailbox": "Projects",
+            "path": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        })
+        state_path.write_text(json.dumps(state))
+
+        with pytest.raises(RuntimeError, match="covered_by_regular_content requires source_attributes"):
+            import_account(
+                Account("user@example.com", "secret"),
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: pytest.fail("invalid covered marker should reject before IMAP"),
+            )
+
+    def test_legacy_validate_rejects_unproven_covered_marker(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        input_root = tmp_path / "exported"
+        account_dir = input_root / "user@example.com"
+        _write_legacy_empty_mailbox_fixture(
+            account_dir / "Archive",
+            mailbox="Archive",
+            source_server=server,
+        )
+        forged = account_dir / "Projects"
+        forged.mkdir()
+        (forged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"].append({
+            "mailbox": "Projects",
+            "path": "Projects",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        })
+        state_path.write_text(json.dumps(state))
+        config_path = tmp_path / "validate.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"):
             rc = main([
                 "--mode", "validate",
                 "--config", str(config_path),

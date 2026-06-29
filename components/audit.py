@@ -20,6 +20,9 @@ from .imap_ops import (
     _legacy_symlink_component,
     _legacy_hierarchy_metadata,
     _legacy_missing_target_flags,
+    _legacy_source_attributes_key,
+    _legacy_source_attributes_metadata,
+    _legacy_trusted_covered_by_regular_content,
     _normalized_legacy_internaldate,
     _legacy_uidvalidity_metadata,
     _list_selectable_mailbox_entries,
@@ -352,6 +355,20 @@ def _legacy_export_state_issues(
         except RuntimeError as exc:
             issues.append(str(exc))
             state_uidvalidity = ""
+        state_covered = False
+        state_source_attributes: Tuple[str, ...] = ()
+        if raw.get("covered_by_regular_content") is True:
+            try:
+                state_covered = _legacy_trusted_covered_by_regular_content(
+                    raw,
+                    f"{account.email}: export-state mailbox {mailbox!r}",
+                )
+                state_source_attributes = _legacy_source_attributes_metadata(
+                    raw,
+                    f"{account.email}: export-state mailbox {mailbox!r}",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
         collision_key = sanitized_path_key(mailbox)
         previous_mailbox = state_mailbox_by_path.get(collision_key)
         if previous_mailbox is not None:
@@ -375,6 +392,31 @@ def _legacy_export_state_issues(
                 issues.append(f"{account.email}:{path}: failed to parse mailbox marker for export-state comparison: {exc}")
             else:
                 if isinstance(marker, dict) and marker.get("mailbox") == mailbox:
+                    marker_covered = False
+                    marker_source_attributes: Tuple[str, ...] = ()
+                    if marker.get("covered_by_regular_content") is True:
+                        try:
+                            marker_covered = _legacy_trusted_covered_by_regular_content(
+                                marker,
+                                f"{account.email}:{path}: mailbox marker",
+                            )
+                            marker_source_attributes = _legacy_source_attributes_metadata(
+                                marker,
+                                f"{account.email}:{path}: mailbox marker",
+                            )
+                        except RuntimeError as exc:
+                            issues.append(str(exc))
+                    if marker_covered != state_covered:
+                        issues.append(
+                            f"{account.email}:{path}: mailbox marker covered_by_regular_content mismatch with export-state"
+                        )
+                    elif marker_covered and (
+                        _legacy_source_attributes_key(marker_source_attributes)
+                        != _legacy_source_attributes_key(state_source_attributes)
+                    ):
+                        issues.append(
+                            f"{account.email}:{path}: mailbox marker source_attributes mismatch with export-state"
+                        )
                     try:
                         marker_hierarchy = _legacy_hierarchy_metadata(
                             marker,
@@ -535,6 +577,15 @@ def audit_account(
                     issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
                 else:
                     marker_mailbox = mailbox_name
+                    if marker.get("covered_by_regular_content") is True:
+                        try:
+                            _legacy_trusted_covered_by_regular_content(
+                                marker,
+                                f"{account.email}:{folder}: mailbox marker",
+                            )
+                        except RuntimeError as exc:
+                            issues.append(str(exc))
+                            remote_safe = False
                     try:
                         marker_hierarchy = _legacy_hierarchy_metadata(
                             marker,
