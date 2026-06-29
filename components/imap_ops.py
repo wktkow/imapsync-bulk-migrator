@@ -1879,6 +1879,8 @@ def import_account(
                             account.email,
                             eml_path,
                         )
+                        if committed_content_remaining[content_identity] > 0:
+                            committed_content_remaining[content_identity] -= 1
                     elif committed_content_remaining[content_identity] > 0:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
                         if _legacy_remote_has_message(

@@ -3297,6 +3297,80 @@ class TestLegacyImportJournal:
 
         assert target.append_count == 2
 
+    def test_import_stale_committed_duplicate_does_not_cover_next_message(self, tmp_path: Path) -> None:
+        from components.imap_ops import (
+            _imap_append_wire_bytes,
+            _legacy_import_key,
+            _legacy_import_target_id,
+            import_account,
+        )
+        from components.models import Account, ServerConfig
+
+        account = Account(email="user@example.com", password="pass")
+        source_server = self._source_server()
+        target_server = ServerConfig(host="target.example.com", port=993, ssl=True)
+        account_dir = tmp_path / account.email
+        folder = account_dir / "INBOX"
+        data = b"Message-ID: <stale-duplicate@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        eml1 = _write_legacy_message_fixture(folder, uid=1, data=data, source_server=source_server)
+        _write_legacy_message_fixture(folder, uid=2, data=data, source_server=source_server)
+        append_data = _imap_append_wire_bytes(data)
+        import_key = _legacy_import_key(account_dir, eml1, "INBOX", append_data)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": import_key,
+            "status": "committed",
+            "target": _legacy_import_target_id(target_server, account),
+            "mailbox": "INBOX",
+            "path": eml1.relative_to(account_dir).as_posix(),
+            "rfc822_size": str(len(append_data)),
+            "content_sha256": hashlib.sha256(append_data).hexdigest(),
+            "timestamp": "0",
+        }) + "\n")
+
+        class Target:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.stored: List[bytes] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [str(len(self.stored)).encode("ascii")]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                nums = b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))
+                return "OK", [nums]
+
+            def fetch(self, num: bytes, query: str):
+                body = self.stored[int(num) - 1]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.append_count += 1
+                self.stored.append(payload)
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        target = Target()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[Target]:
+            yield target
+
+        import_account(
+            account,
+            target_server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=source_server,
+        )
+
+        assert target.append_count == 2
+
     def test_import_rerun_skips_lf_only_message_after_imaplib_normalization(self, tmp_path: Path) -> None:
         import imaplib
 
