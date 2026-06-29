@@ -1062,9 +1062,16 @@ def _load_legacy_import_journal_with_stat(
         if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
             return rows, None
         raise
+    trailing_row_unterminated = bool(raw) and not raw.endswith(b"\n")
     lines = raw.splitlines()
     needs_rewrite = False
     for line_no, raw_line in enumerate(lines, 1):
+        if trailing_row_unterminated and line_no == len(lines):
+            if repair_trailing:
+                logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
+                needs_rewrite = True
+                break
+            raise RuntimeError(f"import journal row {line_no} is not newline-terminated: {path}")
         try:
             line = raw_line.decode("utf-8")
         except UnicodeDecodeError:

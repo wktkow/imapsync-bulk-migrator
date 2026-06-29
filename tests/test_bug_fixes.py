@@ -6377,6 +6377,57 @@ class TestCliAndConfigHardening:
             json.dumps(valid, ensure_ascii=False, sort_keys=True) + "\n"
         ).encode("utf-8")
 
+    def test_legacy_import_repairs_valid_but_unterminated_trailing_journal_row(self, tmp_path: Path) -> None:
+        from components.imap_ops import _load_legacy_import_journal
+
+        account_dir = tmp_path / "a@example.com"
+        account_dir.mkdir()
+        committed = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "status": "committed",
+            "mailbox": "INBOX",
+        }
+        trailing = {
+            "key": "c" * 64,
+            "target": "d" * 64,
+            "status": "pending",
+            "mailbox": "INBOX",
+        }
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_text(
+            json.dumps(committed, ensure_ascii=False, sort_keys=True) + "\n"
+            + json.dumps(trailing, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        rows = _load_legacy_import_journal(account_dir, repair_trailing=True)
+
+        assert rows == [committed]
+        assert journal.read_text(encoding="utf-8") == (
+            json.dumps(committed, ensure_ascii=False, sort_keys=True) + "\n"
+        )
+
+    def test_legacy_import_rejects_valid_but_unterminated_journal_without_repair(self, tmp_path: Path) -> None:
+        from components.imap_ops import _load_legacy_import_journal
+
+        account_dir = tmp_path / "a@example.com"
+        account_dir.mkdir()
+        row = {
+            "key": "a" * 64,
+            "target": "b" * 64,
+            "status": "committed",
+            "mailbox": "INBOX",
+        }
+        journal = account_dir / "import.journal.jsonl"
+        original = json.dumps(row, ensure_ascii=False, sort_keys=True)
+        journal.write_text(original, encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="import journal row 1 is not newline-terminated"):
+            _load_legacy_import_journal(account_dir, repair_trailing=False)
+
+        assert journal.read_text(encoding="utf-8") == original
+
     def test_legacy_import_rejects_non_trailing_invalid_utf8_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import _load_legacy_import_journal
 
