@@ -15,6 +15,8 @@ import pytest
 
 from components.content_binding import (
     CONTENT_BINDING_FIELD,
+    provider_content_binding_issue,
+    provider_content_binding_matches,
     provider_content_binding_sha256,
     provider_content_binding_sha256_legacy_mailbox_attribute_order,
 )
@@ -9285,6 +9287,14 @@ def test_provider_content_binding_ignores_mailbox_attribute_order() -> None:
         provider_content_binding_sha256_legacy_mailbox_attribute_order(first)
         != provider_content_binding_sha256_legacy_mailbox_attribute_order(second)
     )
+
+
+def test_provider_content_binding_accepts_uppercase_equivalent_digest() -> None:
+    row = _default_manifest_fixture_row()
+    row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row).upper()
+
+    assert provider_content_binding_issue(row) is None
+    assert provider_content_binding_matches(row, row[CONTENT_BINDING_FIELD])
 
 
 def test_committed_journal_accepts_legacy_mailbox_attribute_order_binding() -> None:

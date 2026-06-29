@@ -164,12 +164,13 @@ def _provider_content_binding_sha256(row: Mapping[str, Any], *, normalize_mailbo
 
 
 def provider_content_binding_matches(row: Mapping[str, Any], actual: str) -> bool:
-    if actual == provider_content_binding_sha256(row):
+    actual_normalized = actual.lower()
+    if actual_normalized == provider_content_binding_sha256(row):
         return True
     with contextlib.suppress(ValueError):
-        if actual == provider_content_binding_sha256_legacy_mailbox_attribute_order(row):
+        if actual_normalized == provider_content_binding_sha256_legacy_mailbox_attribute_order(row):
             return True
-        return actual in _provider_legacy_mailbox_attribute_order_binding_candidates(row)
+        return actual_normalized in _provider_legacy_mailbox_attribute_order_binding_candidates(row)
     return False
 
 
@@ -243,6 +244,7 @@ def provider_content_binding_issue(row: Mapping[str, Any], *, required: bool = T
         return None
     if not isinstance(actual, str) or not _HEX_SHA256.fullmatch(actual):
         return f"invalid {CONTENT_BINDING_FIELD}"
-    if actual != expected and not provider_content_binding_matches(row, actual):
+    actual_normalized = actual.lower()
+    if actual_normalized != expected and not provider_content_binding_matches(row, actual_normalized):
         return f"{CONTENT_BINDING_FIELD} mismatch"
     return None
