@@ -3069,6 +3069,96 @@ class TestLegacyImportJournal:
 
         assert fake_imap.append_count == 1
 
+    def test_import_rerun_restores_missing_committed_flags(self, tmp_path: Path) -> None:
+        from components.imap_ops import (
+            _imap_append_wire_bytes,
+            _legacy_import_key,
+            _legacy_import_target_id,
+            import_account,
+        )
+        from components.models import Account, ServerConfig
+
+        account = Account(email="user@example.com", password="pass")
+        source_server = self._source_server()
+        target_server = ServerConfig(host="target.example.com", port=993, ssl=True)
+        account_dir = tmp_path / account.email
+        folder = account_dir / "INBOX"
+        data = b"Message-ID: <flag-restore@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=data,
+            flags="\\Seen \\Answered",
+            source_server=source_server,
+        )
+        append_data = _imap_append_wire_bytes(data)
+        import_key = _legacy_import_key(account_dir, eml, "INBOX", append_data)
+        (account_dir / "import.journal.jsonl").write_text(json.dumps({
+            "key": import_key,
+            "status": "committed",
+            "target": _legacy_import_target_id(target_server, account),
+            "mailbox": "INBOX",
+            "path": eml.relative_to(account_dir).as_posix(),
+            "rfc822_size": str(len(append_data)),
+            "content_sha256": hashlib.sha256(append_data).hexdigest(),
+            "timestamp": "0",
+        }) + "\n")
+
+        class MissingFlagTarget:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.flags = {"\\Seen"}
+                self.store_calls: List[Tuple[bytes, str, str]] = []
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def subscribe(self, mailbox: str):
+                return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                flags = " ".join(sorted(self.flags))
+                if query == "(FLAGS)":
+                    return "OK", [f"1 (FLAGS ({flags}))".encode("ascii")]
+                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (%s) BODY[] {%d}" % (
+                    len(append_data),
+                    flags.encode("ascii"),
+                    len(append_data),
+                ), append_data)]
+
+            def store(self, num: bytes, command: str, flags: str):
+                self.store_calls.append((num, command, flags))
+                for flag in flags.strip("()").split():
+                    self.flags.add(flag)
+                return "OK", [b""]
+
+            def append(self, mailbox: str, flags: str, date_time: str, payload: bytes):
+                self.append_count += 1
+                return "OK", [b""]
+
+            def logout(self):
+                return "OK", []
+
+        target = MissingFlagTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[MissingFlagTarget]:
+            yield target
+
+        import_account(
+            account,
+            target_server,
+            tmp_path,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=source_server,
+        )
+
+        assert target.append_count == 0
+        assert target.store_calls == [(b"1", "+FLAGS.SILENT", "(\\ANSWERED)")]
+
     def test_import_skips_committed_same_content_after_uid_renumber(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig

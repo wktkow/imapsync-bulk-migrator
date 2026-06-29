@@ -647,6 +647,11 @@ def _legacy_missing_target_flags(expected_flags: Optional[str], actual_flags: Op
     return sorted(expected - actual, key=str.upper)
 
 
+def _legacy_flags_arg_from_tokens(tokens: Iterable[str]) -> str:
+    flags = [flag for flag in tokens if flag and flag.strip()]
+    return "(" + " ".join(flags) + ")" if flags else ""
+
+
 def _fetch_legacy_flags_for_uid(imap: imaplib.IMAP4, mailbox: str, uid: int) -> str:
     status, data = imap.uid("fetch", str(uid), "(FLAGS)")
     if status != "OK":
@@ -762,7 +767,15 @@ def _message_id_header(data: bytes) -> str:
     return ""
 
 
-def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, used_nums: set[bytes]) -> bool:
+def _legacy_remote_has_message(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    data: bytes,
+    used_nums: set[bytes],
+    expected_flags: str = "",
+    *,
+    restore_missing_flags: bool = False,
+) -> bool:
     data = _imap_append_wire_bytes(data)
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
@@ -779,14 +792,37 @@ def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, u
     for num in search_data[0].split():
         if num in used_nums:
             continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS BODY.PEEK[])")
         if status != "OK":
             continue
+        fetched_parts = list(fetched or [])
         for part in fetched or []:
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             body = bytes(part[1])
             if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
+                missing_flags = _legacy_missing_target_flags(
+                    expected_flags,
+                    _legacy_flags_from_fetch_response(fetched_parts),
+                )
+                if missing_flags:
+                    if not restore_missing_flags:
+                        continue
+                    flags_arg = _legacy_flags_arg_from_tokens(missing_flags)
+                    status, response = imap.store(num, "+FLAGS.SILENT", flags_arg)
+                    if status != "OK":
+                        raise RuntimeError(f"failed to restore legacy flags in {mailbox}: {response}")
+                    status, refetched = imap.fetch(num, "(FLAGS)")
+                    if status != "OK":
+                        raise RuntimeError(f"failed to verify restored legacy flags in {mailbox}: {refetched}")
+                    remaining = _legacy_missing_target_flags(
+                        expected_flags,
+                        _legacy_flags_from_fetch_response(list(refetched or [])),
+                    )
+                    if remaining:
+                        raise RuntimeError(
+                            f"remote flags missing after restore in {mailbox}: " + ", ".join(remaining)
+                        )
                 used_nums.add(num)
                 return True
     return False
@@ -1826,7 +1862,14 @@ def import_account(
                         )
                     if committed_key_present:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
-                        if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
+                        if _legacy_remote_has_message(
+                            imap,
+                            mailbox,
+                            data,
+                            used_remote_nums,
+                            flags,
+                            restore_missing_flags=True,
+                        ):
                             if committed_content_remaining[content_identity] > 0:
                                 committed_content_remaining[content_identity] -= 1
                             logging.info("[import] %s: skipping verified committed %s", account.email, eml_path)
@@ -1838,7 +1881,14 @@ def import_account(
                         )
                     elif committed_content_remaining[content_identity] > 0:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
-                        if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
+                        if _legacy_remote_has_message(
+                            imap,
+                            mailbox,
+                            data,
+                            used_remote_nums,
+                            flags,
+                            restore_missing_flags=True,
+                        ):
                             committed_content_remaining[content_identity] -= 1
                             logging.info("[import] %s: skipping verified committed content %s", account.email, eml_path)
                             continue
