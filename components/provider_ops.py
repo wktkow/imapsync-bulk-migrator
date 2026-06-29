@@ -5480,7 +5480,7 @@ def provider_import_account(
                         target_gmail_msgid=journal_target_gmail_msgid,
                         used_gmail_msgids=used_target_gmail_msgids,
                         expected_content_identities=expected_content_identities,
-                        require_internaldate_match=True,
+                        require_internaldate_match=False,
                     )
                     if committed_match is None:
                         committed_num = None
@@ -5495,7 +5495,7 @@ def provider_import_account(
                         create_if_missing=False,
                         used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
                         expected_content_identities=expected_content_identities,
-                        require_internaldate_match=True,
+                        require_internaldate_match=False,
                     )
                 if committed_num is None and config.target.provider == "gmail" and journal_target_gmail_msgid:
                     raise RuntimeError(
@@ -5547,7 +5547,7 @@ def provider_import_account(
                         used_target_nums,
                         used_gmail_msgids=used_target_gmail_msgids,
                         expected_content_identities=expected_content_identities,
-                        require_internaldate_match=True,
+                        require_internaldate_match=False,
                     )
                     if matched is not None:
                         matched_mailbox, matched_num, matched_gmail_msgid = matched
@@ -5558,7 +5558,7 @@ def provider_import_account(
                         row,
                         used_target_nums,
                         expected_content_identities=expected_content_identities,
-                        require_internaldate_match=True,
+                        require_internaldate_match=False,
                     )
             if matched_num is not None:
                 subscribe_mailbox(imap, target_mailbox)
@@ -5642,7 +5642,7 @@ def provider_import_account(
                 create_if_missing=False,
                 used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
                 expected_content_identities=expected_content_identities,
-                require_internaldate_match=True,
+                require_internaldate_match=False,
             )
             if appended_num is None:
                 raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")

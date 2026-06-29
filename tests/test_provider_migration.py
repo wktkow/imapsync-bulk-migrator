@@ -5636,6 +5636,32 @@ def test_provider_import_merge_mode_restores_supported_imap_keywords_on_existing
     assert journal[-1]["action"] == "existing"
 
 
+def test_provider_import_merge_reuses_content_match_when_internaldate_differs(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    body = (account_dir / row["eml_path"]).read_bytes()
+    _write_provider_export_state(account_dir)
+    fake = FakeTargetImap(
+        has_existing=True,
+        existing_body=body,
+        existing_internaldate="02-Jan-2024 00:00:00 +0000",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    journal = load_import_journal(account_dir, account)
+    assert journal[-1]["status"] == "committed"
+    assert journal[-1]["action"] == "existing"
+
+
 def test_provider_import_to_gmail_restores_imap_flags_on_reused_messages(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -8260,7 +8286,7 @@ def test_provider_import_empty_mode_resumes_with_journaled_target_messages(tmp_p
     assert fake.appended == ["Archive"]
 
 
-def test_provider_import_merge_reappends_existing_wrong_target_internaldate(tmp_path: Path) -> None:
+def test_provider_import_merge_reuses_existing_wrong_target_internaldate(tmp_path: Path) -> None:
     config = _provider_config(target_mode="merge")
     account = config.accounts[0]
     account_dir = _write_manifest_fixture(tmp_path)
@@ -8275,20 +8301,17 @@ def test_provider_import_merge_reappends_existing_wrong_target_internaldate(tmp_
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, account, tmp_path)
 
-    assert fake.appended == ["Archive"]
-    assert fake.internaldates_by_mailbox["Archive"] == [
-        "02-Jan-2024 00:00:00 +0000",
-        "01-Jan-2024 00:00:00 +0000",
-    ]
+    assert fake.appended == []
+    assert fake.internaldates_by_mailbox["Archive"] == ["02-Jan-2024 00:00:00 +0000"]
     journal_rows = [
         json.loads(line)
         for line in (account_dir / "import-target@icloud.com.journal.jsonl").read_text().splitlines()
     ]
-    assert any(row.get("action") == "appended" for row in journal_rows)
-    assert not any(row.get("action") == "existing" for row in journal_rows)
+    assert any(row.get("action") == "existing" for row in journal_rows)
+    assert not any(row.get("action") == "appended" for row in journal_rows)
 
 
-def test_provider_import_merge_reappends_committed_wrong_target_internaldate(tmp_path: Path) -> None:
+def test_provider_import_merge_reuses_committed_wrong_target_internaldate(tmp_path: Path) -> None:
     config = _provider_config(target_mode="merge")
     account = config.accounts[0]
     account_dir = _write_manifest_fixture(tmp_path)
@@ -8310,11 +8333,14 @@ def test_provider_import_merge_reappends_committed_wrong_target_internaldate(tmp
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, account, tmp_path)
 
-    assert fake.appended == ["Archive"]
-    assert fake.internaldates_by_mailbox["Archive"] == [
-        "02-Jan-2024 00:00:00 +0000",
-        "01-Jan-2024 00:00:00 +0000",
+    assert fake.appended == []
+    assert fake.internaldates_by_mailbox["Archive"] == ["02-Jan-2024 00:00:00 +0000"]
+    journal_rows = [
+        json.loads(line)
+        for line in (account_dir / "import-target@icloud.com.journal.jsonl").read_text().splitlines()
     ]
+    assert len(journal_rows) == 1
+    assert journal_rows[0]["status"] == "committed"
 
 
 def test_provider_import_empty_mode_permits_journaled_generic_all_view(tmp_path: Path) -> None:
