@@ -9192,6 +9192,54 @@ def test_provider_validation_rejects_extra_matching_generic_target_copy_in_merge
     assert report["duplicates"] == [{"canonical_id": "gmail-123", "count": 2, "source": "target"}]
 
 
+def test_provider_validation_allows_append_normalized_duplicate_source_rows(tmp_path: Path) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    _remove_default_manifest_fixture_artifacts(account_dir)
+    lf_body = b"Message-ID: <same-line-ending@example.com>\n\nbody\n"
+    crlf_body = imaplib.MapCRLF.sub(imaplib.CRLF, lf_body)
+    base = _default_manifest_fixture_row()
+    rows = []
+    for canonical_id, body in (("lf-row", lf_body), ("crlf-row", crlf_body)):
+        row = dict(base)
+        row.update({
+            "canonical_id": canonical_id,
+            "message_id_header": "<same-line-ending@example.com>",
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+            "eml_path": f"messages/{canonical_id}.eml",
+            "metadata_path": f"metadata/{canonical_id}.json",
+        })
+        row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row)
+        (account_dir / row["eml_path"]).write_bytes(body)
+        (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+        rows.append(row)
+    (account_dir / "manifest.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    _write_provider_export_state(account_dir, canonical_messages=2)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text("".join(
+        json.dumps(_journal_fixture_for_manifest_row(config, row, {
+            "canonical_id": row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "committed",
+        })) + "\n"
+        for row in rows
+    ))
+    fake = StoredMessageTarget({"Archive": [crlf_body, crlf_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert report["ok"], report
+    assert report["duplicates"] == []
+    assert report["remote_missing"] == []
+
+
 def test_provider_validation_rejects_single_gmail_message_for_two_physical_source_rows(tmp_path: Path) -> None:
     class OneGmailMessageInTwoLabels(FakeGmailTargetImap):
         def __init__(self, body: bytes) -> None:

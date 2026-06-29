@@ -3708,6 +3708,45 @@ def target_matching_message_nums(
     return matches
 
 
+def target_message_content_identity(
+    imap: imaplib.IMAP4,
+    num: bytes,
+) -> Optional[Tuple[int, str]]:
+    status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+    if status != "OK":
+        return None
+    for part in fetched or []:
+        if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray)):
+            body = bytes(part[1])
+            return (len(body), hashlib.sha256(body).hexdigest())
+    return None
+
+
+def _max_expected_content_identity_matches(
+    target_content_identities: List[Tuple[int, str]],
+    expected_identity_sets: List[set[Tuple[int, str]]],
+) -> int:
+    assigned_targets_by_expected: Dict[int, int] = {}
+
+    def assign(target_index: int, seen_expected: set[int]) -> bool:
+        target_identity = target_content_identities[target_index]
+        for expected_index, expected_identities in enumerate(expected_identity_sets):
+            if expected_index in seen_expected or target_identity not in expected_identities:
+                continue
+            seen_expected.add(expected_index)
+            previous_target = assigned_targets_by_expected.get(expected_index)
+            if previous_target is None or assign(previous_target, seen_expected):
+                assigned_targets_by_expected[expected_index] = target_index
+                return True
+        return False
+
+    matched = 0
+    for target_index in range(len(target_content_identities)):
+        if assign(target_index, set()):
+            matched += 1
+    return matched
+
+
 def target_has_message(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -5511,6 +5550,7 @@ def provider_validate_account(
                         report["failed"].append(f"remote target validation failed: {exc}")
                 if not report["missing"]:
                     used_target_nums: Dict[str, set[bytes]] = {}
+                    target_content_identity_cache: Dict[Tuple[str, bytes], Optional[Tuple[int, str]]] = {}
                     used_target_gmail_msgids: set[str] = set()
                     effective_committed_rows = latest_committed_journal_rows(
                         journal_rows,
@@ -5629,16 +5669,36 @@ def provider_validate_account(
                                 expected_content_identities=expected_content_identities,
                             )
                             current_content_identities = _expected_content_identities(row, expected_content_identities)
-                            expected_occurrences = sum(
-                                1
-                                for other_identity, other_row in by_id.items()
-                                if target_by_id.get(other_identity) == target_mailbox
-                                and _expected_content_identities(
+                            expected_identity_sets = [
+                                _expected_content_identities(
                                     other_row,
                                     expected_content_identities_by_id.get(other_identity),
                                 )
-                                == current_content_identities
-                            )
+                                for other_identity, other_row in by_id.items()
+                                if target_by_id.get(other_identity) == target_mailbox
+                            ]
+                            matching_content_identities: List[Tuple[int, str]] = []
+                            for matching_num in matching_nums:
+                                cache_key = (target_mailbox, matching_num)
+                                if cache_key not in target_content_identity_cache:
+                                    target_content_identity_cache[cache_key] = target_message_content_identity(
+                                        imap,
+                                        matching_num,
+                                    )
+                                target_content_identity = target_content_identity_cache[cache_key]
+                                if target_content_identity is not None:
+                                    matching_content_identities.append(target_content_identity)
+                            if len(matching_content_identities) == len(matching_nums):
+                                expected_occurrences = _max_expected_content_identity_matches(
+                                    matching_content_identities,
+                                    expected_identity_sets,
+                                )
+                            else:
+                                expected_occurrences = sum(
+                                    1
+                                    for expected_identities in expected_identity_sets
+                                    if expected_identities & current_content_identities
+                                )
                             if len(matching_nums) > max(expected_occurrences, 1):
                                 report["duplicates"].append({
                                     "canonical_id": identity,
