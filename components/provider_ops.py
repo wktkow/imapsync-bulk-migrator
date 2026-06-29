@@ -946,6 +946,14 @@ def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
 _MAX_GMAIL_UINT64 = (1 << 64) - 1
 
 
+def _provider_fetch_response_uids(meta_str: str) -> List[int]:
+    uids: List[int] = []
+    for match in re.finditer(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE):
+        with contextlib.suppress(ValueError):
+            uids.append(int(match.group(1)))
+    return uids
+
+
 def _valid_gmail_uint64(value: Optional[str]) -> str:
     if not value or not value.isdecimal():
         return ""
@@ -958,40 +966,85 @@ def _valid_gmail_uint64(value: Optional[str]) -> str:
     return value
 
 
-def parse_provider_fetch_response(fetch_response: Iterable[Any]) -> Dict[str, Any]:
+def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid: Optional[int] = None) -> Dict[str, Any]:
+    expected_uid_int = int(expected_uid) if expected_uid is not None else None
     msg_bytes: Optional[bytes] = None
     meta_chunks: List[str] = []
     literal_labels: List[str] = []
     label_literal_context = False
+    label_literal_matches_expected = True
+    active_matches_expected: Optional[bool] = None
+    seen_expected_uid = expected_uid_int is None
+
+    def classify_meta(meta_text: str, *, is_body: bool = False) -> bool:
+        nonlocal active_matches_expected, seen_expected_uid
+        if expected_uid_int is None:
+            return True
+        uids = _provider_fetch_response_uids(meta_text)
+        if uids:
+            unique_uids = set(uids)
+            if expected_uid_int in unique_uids:
+                if len(unique_uids) > 1:
+                    raise RuntimeError(f"fetch response mixed UID metadata for UID {expected_uid_int}")
+                seen_expected_uid = True
+                active_matches_expected = True
+                return True
+            active_matches_expected = False
+            return False
+        if is_body:
+            raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
+        return bool(active_matches_expected and label_literal_context)
+
     for part in fetch_response:
         if isinstance(part, tuple) and len(part) == 2:
             meta, body = part
             meta_text = ""
             if isinstance(meta, (bytes, bytearray)):
                 meta_text = bytes(meta).decode(errors="ignore")
+            body_is_message = (
+                isinstance(body, (bytes, bytearray))
+                and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
+            )
+            matches_expected = classify_meta(meta_text, is_body=bool(body_is_message))
+            if meta_text and matches_expected:
                 meta_chunks.append(meta_text)
-                if re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE):
-                    label_literal_context = True
+            if re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE):
+                label_literal_context = True
+                label_literal_matches_expected = matches_expected
             is_label_literal = bool(
                 re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE)
                 or (label_literal_context and re.fullmatch(r"\s*\{\d+\}\s*", meta_text))
             )
-            if (
-                isinstance(body, (bytes, bytearray))
-                and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
-            ):
+            if body_is_message:
+                if not matches_expected:
+                    uids = _provider_fetch_response_uids(meta_text)
+                    if uids:
+                        raise RuntimeError(f"fetch returned message bytes for unexpected UID {uids[0]}")
+                    raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
                 if msg_bytes is not None:
                     raise RuntimeError("fetch returned multiple message bodies for one UID")
                 msg_bytes = bytes(body)
-            elif isinstance(body, (bytes, bytearray)) and body and is_label_literal:
+            elif (
+                matches_expected
+                and label_literal_matches_expected
+                and isinstance(body, (bytes, bytearray))
+                and body
+                and is_label_literal
+            ):
                 label = decode_imap_utf7(bytes(body).decode("ascii", errors="ignore").strip())
                 if label:
                     literal_labels.append(label)
         elif isinstance(part, (bytes, bytearray)):
             meta_text = bytes(part).decode(errors="ignore")
-            meta_chunks.append(meta_text)
+            matches_expected = classify_meta(meta_text)
+            if matches_expected:
+                meta_chunks.append(meta_text)
             if label_literal_context and ")" in meta_text:
                 label_literal_context = False
+                label_literal_matches_expected = True
+                active_matches_expected = None
+    if not seen_expected_uid and expected_uid_int is not None:
+        raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
     meta_str = " ".join(meta_chunks)
 
     def group(pattern: str) -> Optional[str]:
@@ -3112,7 +3165,7 @@ def provider_export_account(
             )
             if status != "OK":
                 raise RuntimeError(f"failed final metadata fetch in {mailbox_name} for UID {uid}: {data}")
-            parsed = parse_provider_fetch_response(data or [])
+            parsed = parse_provider_fetch_response(data or [], expected_uid=int(uid))
             expected = expected_by_uid[int(uid)]
             if _provider_export_flag_set(parsed.get("flags")) != _provider_export_flag_set(expected.get("flags")):
                 raise RuntimeError(f"FLAGS changed during export of {mailbox_name} for UID {uid}")
@@ -3259,7 +3312,7 @@ def provider_export_account(
                 )
                 if status != "OK":
                     raise RuntimeError(f"metadata fetch failed in {mailbox.name} for UID {uid}: {meta_data}")
-                pre_parsed = parse_provider_fetch_response(meta_data or [])
+                pre_parsed = parse_provider_fetch_response(meta_data or [], expected_uid=int(uid))
                 identity_hint = (
                     gmail_canonical_identity(
                         pre_parsed.get("gmail_msgid"),
@@ -3310,7 +3363,7 @@ def provider_export_account(
                 )
                 if status != "OK":
                     raise RuntimeError(f"fetch failed in {mailbox.name} for UID {uid}: {data}")
-                parsed = parse_provider_fetch_response(data or [])
+                parsed = parse_provider_fetch_response(data or [], expected_uid=int(uid))
                 for key, value in pre_parsed.items():
                     if key != "message_bytes" and not parsed.get(key):
                         parsed[key] = value
@@ -6514,7 +6567,11 @@ def provider_preflight(
                         if not re.search(r"\bRFC822\.SIZE\s+\d+\b", raw_fetch_text, flags=re.IGNORECASE):
                             account_issues.append(f"metadata fetch missing RFC822.SIZE in {mailbox.name} for UID {uid}")
                             continue
-                        parsed = parse_provider_fetch_response(data or [])
+                        try:
+                            parsed = parse_provider_fetch_response(data or [], expected_uid=int(uid))
+                        except Exception as exc:
+                            account_issues.append(f"metadata fetch parse failed in {mailbox.name} for UID {uid}: {exc}")
+                            continue
                         if gmail_extensions and not parsed.get("gmail_msgid"):
                             account_issues.append(f"metadata fetch missing X-GM-MSGID in {mailbox.name} for UID {uid}")
                             continue

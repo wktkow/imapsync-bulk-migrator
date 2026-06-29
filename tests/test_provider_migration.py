@@ -2452,6 +2452,28 @@ def test_list_and_gmail_fetch_parsers() -> None:
             b")",
         ])
 
+    requested_body = b"Message-ID: <requested@example.com>\r\n\r\nbody"
+    uid_bound = parse_provider_fetch_response([
+        b'99 (UID 99 RFC822.SIZE 999 FLAGS (\\Deleted) INTERNALDATE "02-Jan-2024 00:00:00 +0000" '
+        b'X-GM-MSGID 999 X-GM-THRID 999 X-GM-LABELS ("Wrong"))',
+        (
+            b'42 (UID 42 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+            b'X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS ("Project A" \\Inbox) BODY[] {42}',
+            requested_body,
+        ),
+    ], expected_uid=42)
+    assert uid_bound["message_bytes"] == requested_body
+    assert uid_bound["flags"] == "\\Seen"
+    assert uid_bound["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert uid_bound["rfc822_size"] == 42
+    assert uid_bound["gmail_msgid"] == "123"
+    assert uid_bound["gmail_labels"] == ["Project A", "\\Inbox"]
+
+    with pytest.raises(RuntimeError, match="unexpected UID 99"):
+        parse_provider_fetch_response([
+            (b'99 (UID 99 RFC822.SIZE 5 BODY[] {5}', b"wrong"),
+        ], expected_uid=42)
+
 
 def test_provider_safe_identity_hashes_truncated_names() -> None:
     first = "gmail-" + ("1" * 174) + "2"
@@ -2957,6 +2979,39 @@ class FakeSourceImap:
         return "OK", []
 
 
+class FakeGmailUnsolicitedFetchSourceImap(FakeSourceImap):
+    body = b"Message-ID: <requested@example.com>\r\n\r\nbody"
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+        ]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            if self.selected == "[Gmail]/All Mail":
+                return "OK", [b""]
+            return "OK", [b"42"]
+        if command == "fetch":
+            query = args[-1]
+            other = (
+                b'99 (UID 99 RFC822.SIZE 999 FLAGS (\\Deleted) '
+                b'INTERNALDATE "02-Jan-2024 00:00:00 +0000" '
+                b'X-GM-MSGID 999 X-GM-THRID 999 X-GM-LABELS ("Wrong"))'
+            )
+            requested = (
+                b'42 (UID 42 RFC822.SIZE 43 FLAGS (\\Seen) '
+                b'INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                b'X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS ("Project A" \\Inbox))'
+            )
+            if "BODY.PEEK[]" not in query:
+                return "OK", [other, requested]
+            self.body_fetches += 1
+            return "OK", [other, (requested[:-1] + b" BODY[] {43}", self.body), b")"]
+        raise AssertionError(command)
+
+
 class FakeGmailSourceNoExtensions(FakeSourceImap):
     def capability(self):
         return "OK", [b"IMAP4rev1"]
@@ -3395,6 +3450,30 @@ def test_provider_export_dedupes_gmail_labels(tmp_path: Path) -> None:
     assert state["canonical_messages"] == 1
     assert state["manifest_sha256"] == provider_manifest_digest(manifest)
     assert fake.body_fetches == 1
+
+
+def test_provider_export_binds_fetch_metadata_to_requested_uid(tmp_path: Path) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    fake = FakeGmailUnsolicitedFetchSourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGmailUnsolicitedFetchSourceImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    assert len(manifest) == 1
+    row = manifest[0]
+    assert row["canonical_id"] == "gmail-123"
+    assert row["flags"] == "\\Seen"
+    assert row["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert row["rfc822_size"] == 43
+    assert row["gmail_labels"] == ["Project A", "\\Inbox"]
+    assert row["content_sha256"] == hashlib.sha256(FakeGmailUnsolicitedFetchSourceImap.body).hexdigest()
 
 
 def test_rate_limiter_stop_event_aborts_throttled_wait() -> None:
