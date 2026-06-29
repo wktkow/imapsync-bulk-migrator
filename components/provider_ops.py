@@ -2014,12 +2014,16 @@ def _target_mailbox_matches_expected(
     expected_target: str,
     *,
     target_provider: str,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> bool:
     if target_mailbox == expected_target:
         return True
     if (target_provider or "").lower() == "gmail":
-        expected_key = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
-        target_key = _gmail_target_system_key(target_mailbox)
+        expected_key = (
+            _gmail_target_system_key(expected_target, target_mailboxes)
+            or _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
+        )
+        target_key = _gmail_target_system_key(target_mailbox, target_mailboxes)
         if expected_key and target_key:
             return expected_key == target_key
     return False
@@ -2072,6 +2076,7 @@ def committed_journal_target_mailbox_issues(
     expected_target_by_id: Dict[str, str],
     *,
     target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
 ) -> List[str]:
@@ -2089,6 +2094,7 @@ def committed_journal_target_mailbox_issues(
             target_mailbox,
             expected_target,
             target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
         ):
             if (
                 defer_generic_special_use
@@ -2114,6 +2120,7 @@ def pending_journal_target_mailbox_issues(
     expected_target_by_id: Dict[str, str],
     *,
     target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
 ) -> List[str]:
@@ -2133,6 +2140,7 @@ def pending_journal_target_mailbox_issues(
             target_mailbox,
             expected_target,
             target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
         ):
             if (
                 defer_generic_special_use
@@ -2315,10 +2323,15 @@ def duplicate_journal_target_gmail_msgid_issues(
     rows: List[Dict[str, Any]],
     *,
     manifest_ids: Optional[set[str]] = None,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> List[str]:
     by_msgid: Dict[str, set[str]] = {}
     by_identity: Dict[str, set[str]] = {}
-    latest_rows = latest_committed_journal_rows(rows)
+    latest_rows = latest_committed_journal_rows(
+        rows,
+        target_provider="gmail",
+        target_mailboxes=target_mailboxes,
+    )
     for (identity, _target_mailbox), row in latest_rows.items():
         if manifest_ids is not None and identity not in manifest_ids:
             continue
@@ -2356,9 +2369,14 @@ def missing_journal_target_gmail_msgid_issues(
     rows: List[Dict[str, Any]],
     *,
     manifest_ids: set[str],
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> List[str]:
     issues: List[str] = []
-    for (identity, target_mailbox), row in latest_committed_journal_rows(rows).items():
+    for (identity, target_mailbox), row in latest_committed_journal_rows(
+        rows,
+        target_provider="gmail",
+        target_mailboxes=target_mailboxes,
+    ).items():
         if identity not in manifest_ids:
             continue
         if row.get("target_gmail_msgid"):
@@ -2379,6 +2397,7 @@ def repair_missing_journal_target_gmail_msgids(
     target_mailbox_by_identity: Dict[str, str],
     target_binding: Dict[str, Any],
     expected_content_identities_by_id: Optional[Dict[str, set[Tuple[int, str]]]] = None,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> List[Dict[str, Any]]:
     manifest_by_id = {
         str(row.get("canonical_id") or ""): row
@@ -2391,17 +2410,23 @@ def repair_missing_journal_target_gmail_msgids(
         if not identity or identity not in manifest_by_id or journal_row.get("target_gmail_msgid"):
             continue
         expected_target_mailbox = target_mailbox_by_identity.get(identity)
-        if expected_target_mailbox and target_mailbox != expected_target_mailbox:
+        if expected_target_mailbox and not _target_mailbox_matches_expected(
+            target_mailbox,
+            expected_target_mailbox,
+            target_provider="gmail",
+            target_mailboxes=target_mailboxes,
+        ):
             issues.append(
                 f"journal committed Gmail target row missing target_gmail_msgid and is in wrong target mailbox: "
                 f"{identity} expected {expected_target_mailbox!r} got {target_mailbox!r}"
             )
             continue
+        search_mailbox = expected_target_mailbox or target_mailbox
         manifest_row = manifest_by_id[identity]
         matches: Dict[str, bytes] = {}
         for num in target_matching_message_nums(
             imap,
-            target_mailbox,
+            search_mailbox,
             manifest_row,
             create_if_missing=False,
             expected_content_identities=(
@@ -2416,19 +2441,19 @@ def repair_missing_journal_target_gmail_msgids(
         if not matches:
             issues.append(
                 f"journal committed Gmail target row missing target_gmail_msgid and target message was not found: "
-                f"{identity} in {target_mailbox or '<missing>'}"
+                f"{identity} in {search_mailbox or '<missing>'}"
             )
             continue
         if len(matches) > 1:
             issues.append(
                 f"journal committed Gmail target row missing target_gmail_msgid and matched multiple target Gmail messages: "
-                f"{identity} in {target_mailbox}: " + ", ".join(sorted(matches))
+                f"{identity} in {search_mailbox}: " + ", ".join(sorted(matches))
             )
             continue
         target_gmail_msgid = next(iter(matches))
         repaired = _journal_row(
             manifest_row,
-            target_mailbox,
+            search_mailbox,
             "committed",
             "verified",
             target_binding=target_binding,
@@ -2445,10 +2470,15 @@ def duplicate_journal_target_gmail_msgid_entries(
     rows: List[Dict[str, Any]],
     *,
     manifest_ids: set[str],
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> List[Dict[str, Any]]:
     by_msgid: Dict[str, set[str]] = {}
     by_identity: Dict[str, set[str]] = {}
-    latest_rows = latest_committed_journal_rows(rows)
+    latest_rows = latest_committed_journal_rows(
+        rows,
+        target_provider="gmail",
+        target_mailboxes=target_mailboxes,
+    )
     for (identity, _target_mailbox), row in latest_rows.items():
         if identity not in manifest_ids:
             continue
@@ -4684,6 +4714,7 @@ def provider_import_account(
             journal_rows,
             target_mailbox_by_identity,
             target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
         )
         if committed_target_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(committed_target_issues))
@@ -4691,6 +4722,7 @@ def provider_import_account(
             journal_rows,
             target_mailbox_by_identity,
             target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
         )
         if pending_target_issues:
             raise RuntimeError("invalid import journal: " + "; ".join(pending_target_issues))
@@ -4710,18 +4742,21 @@ def provider_import_account(
                 target_mailbox_by_identity,
                 target_binding,
                 expected_content_identities_by_id,
+                target_mailboxes=target_mailboxes,
             )
             repaired_journal_issues = []
             repaired_journal_issues.extend(
                 missing_journal_target_gmail_msgid_issues(
                     journal_rows,
                     manifest_ids=manifest_ids,
+                    target_mailboxes=target_mailboxes,
                 )
             )
             repaired_journal_issues.extend(
                 duplicate_journal_target_gmail_msgid_issues(
                     journal_rows,
                     manifest_ids=manifest_ids,
+                    target_mailboxes=target_mailboxes,
                 )
             )
             if repaired_journal_issues:
@@ -5463,6 +5498,7 @@ def provider_validate_account(
                 target_mailbox,
                 expected_target,
                 target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
             ):
                 failures.append(
                     f"journal committed identity in wrong target mailbox: {identity} "
@@ -5530,6 +5566,21 @@ def provider_validate_account(
                     expected_target_by_id,
                     target_mailboxes=target_mailboxes,
                 )
+                if config.target.provider == "gmail":
+                    journal_gmail_msgid_missing = (
+                        missing_journal_target_gmail_msgid_issues(
+                            journal_rows,
+                            manifest_ids=manifest_ids,
+                            target_mailboxes=target_mailboxes,
+                        )
+                        if not allow_missing_gmail_target_msgid
+                        else []
+                    )
+                    journal_gmail_msgid_duplicates = duplicate_journal_target_gmail_msgid_entries(
+                        journal_rows,
+                        manifest_ids=manifest_ids,
+                        target_mailboxes=target_mailboxes,
+                    )
                 report["failed"].extend(failures)
                 apply_counts(committed_by_id)
                 if config.target.provider == "gmail":
