@@ -694,6 +694,10 @@ def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: by
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
+def _legacy_import_content_identity(mailbox: str, data: bytes) -> Tuple[str, int, str]:
+    return mailbox, len(data), hashlib.sha256(data).hexdigest()
+
+
 def _imap_append_wire_bytes(data: bytes) -> bytes:
     return imaplib.MapCRLF.sub(imaplib.CRLF, data)
 
@@ -735,12 +739,19 @@ def _legacy_remote_has_message(imap: imaplib.IMAP4, mailbox: str, data: bytes, u
     return False
 
 
-def _latest_legacy_status_by_key(rows: List[Dict[str, str]], target_id: str) -> Dict[str, str]:
-    latest: Dict[str, str] = {}
+def _latest_legacy_rows_by_key(rows: List[Dict[str, str]], target_id: str) -> Dict[str, Dict[str, str]]:
+    latest: Dict[str, Dict[str, str]] = {}
     for row in rows:
         key = row.get("key", "")
         if key and row.get("target") == target_id:
-            latest[key] = row.get("status", "")
+            latest[key] = row
+    return latest
+
+
+def _latest_legacy_status_by_key(rows: List[Dict[str, str]], target_id: str) -> Dict[str, str]:
+    latest: Dict[str, str] = {}
+    for key, row in _latest_legacy_rows_by_key(rows, target_id).items():
+        latest[key] = row.get("status", "")
     return latest
 
 
@@ -758,6 +769,38 @@ def _unresolved_legacy_pending_keys(rows: List[Dict[str, str]], target_id: str) 
         for key, status in _latest_legacy_status_by_key(rows, target_id).items()
         if status == "pending"
     }
+
+
+def _legacy_journal_content_identity(row: Mapping[str, str]) -> Optional[Tuple[str, int, str]]:
+    mailbox = row.get("mailbox", "")
+    if not mailbox:
+        return None
+    size_raw = row.get("rfc822_size", "")
+    try:
+        size = int(size_raw)
+    except (TypeError, ValueError):
+        return None
+    if size < 0:
+        return None
+    digest = row.get("content_sha256", "").lower()
+    if not _SHA256_HEX_RE.fullmatch(digest):
+        return None
+    return mailbox, size, digest
+
+
+def _legacy_journal_content_counts(
+    rows: List[Dict[str, str]],
+    target_id: str,
+    status: str,
+) -> Counter[Tuple[str, int, str]]:
+    counts: Counter[Tuple[str, int, str]] = Counter()
+    for row in _latest_legacy_rows_by_key(rows, target_id).values():
+        if row.get("status") != status:
+            continue
+        identity = _legacy_journal_content_identity(row)
+        if identity is not None:
+            counts[identity] += 1
+    return counts
 
 
 def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = True) -> List[Dict[str, str]]:
@@ -1405,6 +1448,8 @@ def import_account(
     journal_rows = _load_legacy_import_journal(account_dir)
     committed_keys = _latest_legacy_committed_keys(journal_rows, target_id)
     pending_keys = _unresolved_legacy_pending_keys(journal_rows, target_id)
+    committed_content_remaining = _legacy_journal_content_counts(journal_rows, target_id, "committed")
+    pending_content_remaining = _legacy_journal_content_counts(journal_rows, target_id, "pending")
 
     def _completed_zero_message_export(
         staged_marker_paths: set[str],
@@ -1708,11 +1753,19 @@ def import_account(
                         date_time = _imaplib.Time2Internaldate(time.time())
                     import_key = _legacy_import_key(account_dir, eml_path, mailbox, append_data)
                     legacy_raw_key = _legacy_import_key(account_dir, eml_path, mailbox, data)
+                    content_identity = _legacy_import_content_identity(mailbox, append_data)
                     committed_key_present = import_key in committed_keys or legacy_raw_key in committed_keys
                     pending_key_present = import_key in pending_keys or legacy_raw_key in pending_keys
+                    if pending_key_present or pending_content_remaining[content_identity] > 0:
+                        raise RuntimeError(
+                            f"legacy import journal has pending append for {eml_path}; "
+                            "target state is uncertain, inspect the mailbox before retrying"
+                        )
                     if committed_key_present:
                         used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
                         if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
+                            if committed_content_remaining[content_identity] > 0:
+                                committed_content_remaining[content_identity] -= 1
                             logging.info("[import] %s: skipping verified committed %s", account.email, eml_path)
                             continue
                         logging.warning(
@@ -1720,10 +1773,16 @@ def import_account(
                             account.email,
                             eml_path,
                         )
-                    if pending_key_present:
-                        raise RuntimeError(
-                            f"legacy import journal has pending append for {eml_path}; "
-                            "target state is uncertain, inspect the mailbox before retrying"
+                    elif committed_content_remaining[content_identity] > 0:
+                        used_remote_nums = used_remote_nums_by_folder.setdefault(mailbox, set())
+                        if _legacy_remote_has_message(imap, mailbox, data, used_remote_nums):
+                            committed_content_remaining[content_identity] -= 1
+                            logging.info("[import] %s: skipping verified committed content %s", account.email, eml_path)
+                            continue
+                        logging.warning(
+                            "[import] %s: committed content journal row is stale for %s; re-appending",
+                            account.email,
+                            eml_path,
                         )
                     rel_path = eml_path.relative_to(account_dir).as_posix()
                     _append_legacy_import_journal(account_dir, {
@@ -1732,6 +1791,8 @@ def import_account(
                         "target": target_id,
                         "mailbox": mailbox,
                         "path": rel_path,
+                        "rfc822_size": str(len(append_data)),
+                        "content_sha256": hashlib.sha256(append_data).hexdigest(),
                         "timestamp": str(int(time.time())),
                     })
                     try:
@@ -1748,9 +1809,12 @@ def import_account(
                             "target": target_id,
                             "mailbox": mailbox,
                             "path": rel_path,
+                            "rfc822_size": str(len(append_data)),
+                            "content_sha256": hashlib.sha256(append_data).hexdigest(),
                             "timestamp": str(int(time.time())),
                         })
                         pending_keys.discard(import_key)
+                        pending_keys.discard(legacy_raw_key)
                         raise RuntimeError(f"append failed for {eml_path}")
                     _append_legacy_import_journal(account_dir, {
                         "key": import_key,
@@ -1758,9 +1822,12 @@ def import_account(
                         "target": target_id,
                         "mailbox": mailbox,
                         "path": rel_path,
+                        "rfc822_size": str(len(append_data)),
+                        "content_sha256": hashlib.sha256(append_data).hexdigest(),
                         "timestamp": str(int(time.time())),
                     })
                     pending_keys.discard(import_key)
+                    pending_keys.discard(legacy_raw_key)
                     committed_keys.add(import_key)
             except _LegacyAppendOutcomeUncertain as exc:
                 logging.exception("[import] %s: mailbox %s failed: %s", account.email, mailbox, exc)
