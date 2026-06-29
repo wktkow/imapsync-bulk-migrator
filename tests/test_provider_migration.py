@@ -2840,6 +2840,16 @@ def test_generic_target_folder_resolution_preserves_lowercase_special_like_physi
     assert translated_target_mailboxes_for_rows([row], mailboxes, target_provider="imap") == {"physical-1": "sent"}
 
 
+def test_generic_target_folder_resolution_prefers_special_use_over_same_name_ordinary_mailbox() -> None:
+    mailboxes = [
+        MailboxInfo(name="Sent", delimiter="/", attributes=("\\HasNoChildren",)),
+        MailboxInfo(name="Sent Items", delimiter="/", attributes=("\\HasNoChildren", "\\Sent")),
+    ]
+
+    assert resolve_target_mailbox("Sent", mailboxes, target_provider="imap") == "Sent Items"
+    assert resolve_target_mailbox("Sent", mailboxes, target_provider="icloud") == "Sent Items"
+
+
 def test_translated_target_mailboxes_allows_case_distinct_generic_targets() -> None:
     mailboxes = [
         MailboxInfo(name="Project", delimiter="/", attributes=("\\HasNoChildren",)),

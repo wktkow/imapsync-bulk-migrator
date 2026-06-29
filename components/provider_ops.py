@@ -3651,22 +3651,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
     provider = (target_provider or "imap").lower()
     by_name = _target_mailboxes_by_name(mailboxes, target_provider=provider)
     desired_name = str(desired)
-    desired_lower = desired_name.lower()
     desired_key = _target_mailbox_lookup_key(desired, provider)
-    gmail_special_desired = {
-        "archive",
-        "sent",
-        "drafts",
-        "deleted messages",
-        "trash",
-        "junk",
-        "spam",
-        "important",
-        "starred",
-        "flagged",
-    }
-    if desired_key in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
-        return by_name[desired_key].name
     special_key_by_name = {
         "Sent": "sent",
         "Drafts": "drafts",
@@ -3680,6 +3665,8 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         "Flagged": "starred",
     }
     special_key = special_key_by_name.get(desired_name)
+    if desired_key in by_name and not special_key:
+        return by_name[desired_key].name
     attr_map = {
         "sent": ("\\Sent",),
         "drafts": ("\\Drafts",),
