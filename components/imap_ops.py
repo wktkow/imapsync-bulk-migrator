@@ -8,6 +8,7 @@ import re
 import ssl
 import stat
 import time
+from collections import Counter
 from contextlib import AbstractContextManager
 from email.parser import BytesParser
 from email.policy import default as default_policy
@@ -955,8 +956,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     )
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
-    exported_regular_content: set[Tuple[int, str]] = set()
-    exported_virtual_content: set[Tuple[int, str]] = set()
+    exported_regular_content: Counter[Tuple[int, str]] = Counter()
+    exported_virtual_content: Counter[Tuple[int, str]] = Counter()
     with imap_connection(server, account) as imap:
         mailbox_details = _list_selectable_mailbox_details(imap)
         mailbox_entries = [(entry.name, entry.attributes) for entry in mailbox_details]
@@ -1042,11 +1043,12 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         digest = hashlib.sha256(msg_bytes).hexdigest()
                         content_identity = (len(msg_bytes), digest)
                         if virtual_source:
-                            if content_identity in exported_regular_content or content_identity in exported_virtual_content:
+                            if exported_virtual_content[content_identity] < exported_regular_content[content_identity]:
+                                exported_virtual_content[content_identity] += 1
                                 continue
-                            exported_virtual_content.add(content_identity)
+                            exported_virtual_content[content_identity] += 1
                         else:
-                            exported_regular_content.add(content_identity)
+                            exported_regular_content[content_identity] += 1
                         # Zero-pad UID so lexicographic order matches numeric order
                         base = f"u{int(uid):010d}"
                         eml_path = folder_dir / f"{base}.eml"

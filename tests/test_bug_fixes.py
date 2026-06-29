@@ -1338,6 +1338,69 @@ class TestLegacyListParsing:
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
 
+    def test_export_keeps_identical_generic_all_only_messages_distinct(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-all-only-duplicate@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class DuplicateAllOnlySource:
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren \\All) "/" "All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = DuplicateAllOnlySource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DuplicateAllOnlySource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert source.selected == ["All Mail"]
+        assert state["mailboxes"] == [
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2},
+        ]
+        assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
+        assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == body
+        metadata_uids = {
+            json.loads(path.read_text())["uid"]
+            for path in sorted((account_dir / "All_Mail").glob("u*.json"))
+        }
+        assert metadata_uids == {1, 2}
+
     def test_export_uses_generic_all_instead_of_flagged_when_no_concrete_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
@@ -1715,7 +1778,7 @@ class TestLegacyListParsing:
 
         assert rc == 0
 
-    def test_remote_audit_rejects_duplicate_virtual_messages_covered_by_one_local_copy(self, tmp_path: Path) -> None:
+    def test_remote_audit_accepts_extra_duplicate_virtual_message_export(self, tmp_path: Path) -> None:
         from components.audit import audit_export
         from components.imap_ops import export_account
         from components.models import Account, Config, ServerConfig
@@ -1771,6 +1834,14 @@ class TestLegacyListParsing:
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
             export_account(account, server, tmp_path, ignore_errors=False)
 
+        account_dir = tmp_path / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert state["mailboxes"] == [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+        ]
+        assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == body
+
         with mock.patch("components.audit.imap_connection", fake_connection):
             ok, issues = audit_export(
                 tmp_path,
@@ -1780,10 +1851,9 @@ class TestLegacyListParsing:
                 require_integrity_metadata=True,
             )
 
-        assert not ok
-        assert any("All_Mail: missing locally but remote has 2 messages" in issue for issue in issues)
+        assert ok, issues
 
-    def test_validate_rejects_duplicate_virtual_messages_covered_by_one_local_copy(self, tmp_path: Path) -> None:
+    def test_validate_accepts_extra_duplicate_virtual_message_export(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.main import main
         from components.models import Account, ServerConfig
@@ -1857,7 +1927,7 @@ class TestLegacyListParsing:
                 "--no-connectivity-test",
             ])
 
-        assert rc == 4
+        assert rc == 0
 
     def test_import_translates_legacy_source_hierarchy_delimiter(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account, import_account
