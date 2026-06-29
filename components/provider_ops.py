@@ -637,14 +637,6 @@ def _is_icloud_vip_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
     return provider_key == "icloud" and mailbox.name.lower() == "vip"
 
 
-def _covers_non_gmail_flagged_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
-    if is_noselect(mailbox) or _is_icloud_vip_mailbox(provider_key, mailbox):
-        return False
-    if _is_non_gmail_flagged_mailbox(provider_key, mailbox):
-        return False
-    return True
-
-
 def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: List[MailboxInfo]) -> bool:
     provider_key = provider.lower()
     if is_noselect(mailbox):
@@ -653,11 +645,6 @@ def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: L
         return True
     if provider_key == "gmail":
         return False
-    if _is_non_gmail_flagged_mailbox(provider_key, mailbox):
-        for candidate in mailboxes:
-            if candidate is not mailbox and _covers_non_gmail_flagged_mailbox(provider_key, candidate):
-                return True
-        return False
     if _is_non_gmail_all_mailbox(provider_key, mailbox):
         return False
     return False
@@ -665,10 +652,16 @@ def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: L
 
 def _source_mailbox_scan_order(provider_key: str, mailboxes: List[MailboxInfo]) -> List[MailboxInfo]:
     indexed = list(enumerate(mailboxes))
-    indexed.sort(key=lambda item: (
-        1 if _is_non_gmail_all_mailbox(provider_key, item[1]) else 0,
-        item[0],
-    ))
+    indexed.sort(
+        key=lambda item: (
+            2
+            if _is_non_gmail_flagged_mailbox(provider_key, item[1])
+            else 1
+            if _is_non_gmail_all_mailbox(provider_key, item[1])
+            else 0,
+            item[0],
+        )
+    )
     return [mailbox for _idx, mailbox in indexed]
 
 
@@ -2774,9 +2767,19 @@ def _manifest_path(account_dir: Path, row: Dict[str, Any], key: str) -> Path:
 
 
 def _finalize_export_record(record: Dict[str, Any], folder_map: Dict[str, str]) -> None:
-    record["source_mailboxes"] = sorted(str(value) for value in record.get("source_mailboxes", []))
-    record["gmail_labels"] = sorted(str(value) for value in record.get("gmail_labels", []))
     source_mailbox_attributes = record.get("source_mailbox_attributes")
+
+    def source_mailbox_sort_key(value: object) -> Tuple[int, str]:
+        name = str(value)
+        attrs = source_mailbox_attributes.get(name, []) if isinstance(source_mailbox_attributes, dict) else []
+        attr_lowers = {str(attr).lower() for attr in attrs if str(attr)}
+        return (1 if "\\flagged" in attr_lowers else 0, name)
+
+    record["source_mailboxes"] = sorted(
+        (str(value) for value in record.get("source_mailboxes", [])),
+        key=source_mailbox_sort_key,
+    )
+    record["gmail_labels"] = sorted(str(value) for value in record.get("gmail_labels", []))
     if isinstance(source_mailbox_attributes, dict):
         record["source_mailbox_attributes"] = normalize_provider_mailbox_attributes(source_mailbox_attributes)
     source_attributes = [
@@ -2826,6 +2829,21 @@ def _provider_export_flag_set(flags: object) -> set[str]:
     }
 
 
+def _merge_provider_export_flag_strings(existing_flags: object, additional_flags: object) -> str:
+    merged: List[str] = []
+    seen: set[str] = set()
+    for flags in (existing_flags, additional_flags):
+        for token in str(flags or "").split():
+            if not token or token.upper() == "\\RECENT":
+                continue
+            canonical = token.upper() if token.startswith("\\") else token
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            merged.append(token)
+    return " ".join(merged)
+
+
 def _provider_export_gmail_label_set(labels: object) -> set[str]:
     if not isinstance(labels, list):
         return set()
@@ -2856,6 +2874,7 @@ def provider_export_account(
     previous_rows_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
+    mergeable_provider_records_by_content: Dict[Tuple[int, str], List[Tuple[str, str]]] = {}
     scanned_uidvalidity_by_mailbox: Dict[str, str] = {}
     exported_delivery_by_mailbox_uid: Dict[str, Dict[int, Dict[str, Any]]] = {}
     if manifest_path.exists():
@@ -2970,6 +2989,45 @@ def provider_export_account(
             for identity in sorted(active_identities)
             if identity in messages
         }
+
+    def remember_provider_mergeable_record(identity: str, content_identity: Tuple[int, str]) -> None:
+        record = messages.get(identity)
+        if not record:
+            return
+        entries = mergeable_provider_records_by_content.setdefault(content_identity, [])
+        if any(existing_identity == identity for existing_identity, _internaldate in entries):
+            return
+        entries.append((identity, str(record.get("internaldate") or "")))
+
+    def merge_covered_provider_flagged_flags(
+        content_identity: Tuple[int, str],
+        flags: str,
+        internaldate: str,
+        mailbox: MailboxInfo,
+        uid: int,
+        uidvalidity: str,
+        parsed: Dict[str, Any],
+    ) -> bool:
+        flagged_internaldate = _normalized_provider_internaldate(internaldate)
+        if not flagged_internaldate:
+            return False
+        same_date_identities = [
+            identity
+            for identity, candidate_internaldate in mergeable_provider_records_by_content.get(content_identity, [])
+            if _normalized_provider_internaldate(candidate_internaldate) == flagged_internaldate
+        ]
+        if len(same_date_identities) != 1:
+            return False
+        target_identity = same_date_identities[0]
+        record = messages[target_identity]
+        merged_flags = _merge_provider_export_flag_strings(record.get("flags"), flags)
+        if merged_flags != str(record.get("flags") or ""):
+            record["flags"] = merged_flags
+        update_membership(target_identity, mailbox, uid, uidvalidity, parsed)
+        persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+        previous_rows_by_identity[target_identity] = dict(messages[target_identity])
+        trusted_payload_identities.add(target_identity)
+        return True
 
     def record_export_delivery_snapshot(mailbox_name: str, uid: int, parsed: Dict[str, Any]) -> None:
         exported_delivery_by_mailbox_uid.setdefault(mailbox_name, {})[int(uid)] = {
@@ -3228,11 +3286,23 @@ def provider_export_account(
                             (identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
                         )
                         continue
+                if non_gmail_flagged_source and merge_covered_provider_flagged_flags(
+                    content_identity,
+                    str(parsed.get("flags") or ""),
+                    str(parsed.get("internaldate") or ""),
+                    mailbox,
+                    uid,
+                    uidvalidity,
+                    parsed,
+                ):
+                    continue
                 persist_fetched_message(identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
                 if provider_key != "gmail" and not non_gmail_all_source and not non_gmail_flagged_source:
                     ordinary_content_remaining_for_all[content_identity] = (
                         ordinary_content_remaining_for_all.get(content_identity, 0) + 1
                     )
+                if not non_gmail_flagged_source:
+                    remember_provider_mergeable_record(identity, content_identity)
             for content_identity, pending_messages in pending_all_messages_by_content.items():
                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                 if len(pending_messages) <= remaining_ordinary:
@@ -3258,6 +3328,7 @@ def provider_export_account(
                         pending_uid,
                         pending_uidvalidity,
                     )
+                    remember_provider_mergeable_record(identity, content_identity)
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")

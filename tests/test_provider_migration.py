@@ -3889,7 +3889,7 @@ def test_provider_export_binds_non_gmail_physical_identity_to_source_account(tmp
     assert ids_by_source["a@example.com"] != ids_by_source["b@example.com"]
 
 
-def test_provider_export_skips_generic_virtual_views_when_physical_mailbox_exists(tmp_path: Path) -> None:
+def test_provider_export_merges_generic_flagged_view_when_physical_mailbox_exists(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
             provider="imap",
@@ -3916,7 +3916,7 @@ def test_provider_export_skips_generic_virtual_views_when_physical_mailbox_exist
     account_dir = tmp_path / "source@example.com"
     manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
     assert len(manifest) == 1
-    assert manifest[0]["source_mailboxes"] == ["INBOX"]
+    assert manifest[0]["source_mailboxes"] == ["INBOX", "Flagged"]
     assert manifest[0]["primary_mailbox"] == "INBOX"
     assert all(row["canonical_id"].startswith("physical-") for row in manifest)
 
@@ -3994,8 +3994,86 @@ def test_provider_export_requests_special_use_attrs_before_filtering_generic_all
     account_dir = tmp_path / "source@example.com"
     manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
     assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
-    assert [row["source_mailboxes"] for row in manifest] == [["INBOX"]]
+    assert [row["source_mailboxes"] for row in manifest] == [["INBOX", "Flagged"]]
+    assert manifest[0]["primary_mailbox"] == "INBOX"
     assert not any(row["primary_mailbox"] in {"All Mail", "Flagged"} for row in manifest)
+
+
+def test_provider_export_merges_covered_generic_flagged_flags_with_generic_all_present(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    body = b"Message-ID: <provider-covered-flagged@example.com>\r\n\r\nbody"
+
+    class GenericArchiveAllFlaggedSource:
+        selected = ""
+        selected_mailboxes: List[str] = []
+
+        def capability(self):
+            return "OK", [b"IMAP4rev1"]
+
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "Archive"',
+                b'(\\HasNoChildren \\All) "/" "All Mail"',
+                b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+            ]
+
+        def select(self, mailbox: str, readonly: bool = False):
+            self.selected = mailbox.strip('"')
+            self.selected_mailboxes.append(self.selected)
+            return "OK", [b"1"]
+
+        def response(self, name: str):
+            return "OK", [b"123"]
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                return "OK", [b"1"]
+            if command == "fetch":
+                query = args[-1]
+                flags = "\\Seen \\Flagged" if self.selected == "Flagged" else "\\Seen"
+                meta = f'1 (UID 1 RFC822.SIZE {len(body)} FLAGS ({flags}) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii")
+                if "BODY.PEEK[]" not in query:
+                    return "OK", [meta]
+                return "OK", [(meta + f" BODY[] {{{len(body)}}}".encode("ascii"), body)]
+            raise AssertionError(command)
+
+        def logout(self):
+            return "OK", []
+
+    source = GenericArchiveAllFlaggedSource()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[GenericArchiveAllFlaggedSource]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+
+    assert list(dict.fromkeys(source.selected_mailboxes)) == ["Archive", "All Mail", "Flagged"]
+    assert len(manifest) == 1
+    row = manifest[0]
+    assert row["source_mailboxes"] == ["Archive", "Flagged"]
+    assert row["primary_mailbox"] == "Archive"
+    assert row["flags"] == "\\Seen \\Flagged"
+    assert provider_content_binding_issue(row) is None
+    assert (account_dir / row["eml_path"]).read_bytes() == body
 
 
 def test_provider_export_scans_generic_all_view_when_it_is_only_source_mailbox(tmp_path: Path) -> None:
@@ -4171,10 +4249,12 @@ def test_provider_export_scans_generic_all_when_only_flagged_view_is_alternative
         (account_dir / row["eml_path"]).read_bytes()
         for row in manifest
     ]
+    rows_by_message_id = {row["message_id_header"]: row for row in manifest}
     assert len(manifest) == 2
     assert {row["message_id_header"] for row in manifest} == {"<flagged@example.com>", "<unflagged@example.com>"}
-    assert all(row["source_mailboxes"] == ["All Mail"] for row in manifest)
-    assert set(source.fetch_queries_by_mailbox) == {"All Mail"}
+    assert rows_by_message_id["<flagged@example.com>"]["source_mailboxes"] == ["All Mail", "Flagged"]
+    assert rows_by_message_id["<unflagged@example.com>"]["source_mailboxes"] == ["All Mail"]
+    assert set(source.fetch_queries_by_mailbox) == {"All Mail", "Flagged"}
     assert any(b"<unflagged@example.com>" in payload for payload in payloads)
 
 
