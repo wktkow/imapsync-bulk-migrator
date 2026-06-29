@@ -51,22 +51,26 @@ def quote_imap_search_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def parse_imap_uid_token(token: object, *, label: str = "UID token") -> int:
+    try:
+        value = token.decode("ascii") if isinstance(token, bytes) else str(token)
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"invalid UID token in {label}: {token!r}") from exc
+    if not _IMAP_UID_TOKEN_RE.fullmatch(value):
+        raise RuntimeError(f"invalid UID token in {label}: {token!r}")
+    uid = int(value)
+    if uid > IMAP_UID_MAX:
+        raise RuntimeError(f"UID out of range in {label}: {token!r}")
+    return uid
+
+
 def parse_imap_uid_search_data(data: Any, *, label: str = "UID SEARCH response") -> list[int]:
     """Parse a SEARCH response that must contain only RFC-valid IMAP UIDs."""
     uids: list[int] = []
     if not data or not data[0]:
         return uids
     for token in data[0].split():
-        try:
-            value = token.decode("ascii") if isinstance(token, bytes) else str(token)
-        except UnicodeDecodeError as exc:
-            raise RuntimeError(f"invalid UID token in {label}: {token!r}") from exc
-        if not _IMAP_UID_TOKEN_RE.fullmatch(value):
-            raise RuntimeError(f"invalid UID token in {label}: {token!r}")
-        uid = int(value)
-        if uid > IMAP_UID_MAX:
-            raise RuntimeError(f"UID out of range in {label}: {token!r}")
-        uids.append(uid)
+        uids.append(parse_imap_uid_token(token, label=label))
     return sorted(uids)
 
 

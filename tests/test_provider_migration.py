@@ -2500,6 +2500,12 @@ def test_list_and_gmail_fetch_parsers() -> None:
             (b'99 (UID 99 RFC822.SIZE 5 BODY[] {5}', b"wrong"),
         ], expected_uid=42)
 
+    for uid_token in ("00042", "0", "4294967296"):
+        with pytest.raises(RuntimeError, match="UID"):
+            parse_provider_fetch_response([
+                (f"1 (UID {uid_token} RFC822.SIZE 5 BODY[] {{5}}".encode("ascii"), b"hello"),
+            ], expected_uid=42)
+
 
 def test_provider_safe_identity_hashes_truncated_names() -> None:
     first = "gmail-" + ("1" * 174) + "2"

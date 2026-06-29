@@ -936,6 +936,20 @@ class TestLegacyExportCompleteness:
         assert flags == "\\Seen"
         assert internaldate == "01-Jan-2024 00:00:00 +0000"
 
+    @pytest.mark.parametrize("uid_token", ["00042", "0", "4294967296"])
+    def test_fetch_parser_rejects_invalid_uid_metadata(self, uid_token: str) -> None:
+        from components.imap_ops import _parse_fetch_response_for_uid
+
+        body = b"Message-ID: <invalid-fetch-uid@example.com>\r\n\r\nbody"
+
+        with pytest.raises(RuntimeError, match="UID"):
+            _parse_fetch_response_for_uid(
+                [
+                    (f"1 (UID {uid_token} FLAGS (\\Seen) BODY[] {{50}}".encode("ascii"), body),
+                ],
+                42,
+            )
+
     def test_fetch_parser_ignores_later_metadata_for_other_uid(self) -> None:
         from components.imap_ops import _parse_fetch_response_for_uid
 

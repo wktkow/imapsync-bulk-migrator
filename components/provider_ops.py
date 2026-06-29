@@ -34,6 +34,7 @@ from .utils import (
     decode_imap_utf7,
     encode_imap_utf7,
     parse_imap_uid_search_data,
+    parse_imap_uid_token,
     quote_imap_search_value,
     sanitize_for_path,
 )
@@ -972,8 +973,7 @@ _MAX_GMAIL_UINT64 = (1 << 64) - 1
 def _provider_fetch_response_uids(meta_str: str) -> List[int]:
     uids: List[int] = []
     for match in re.finditer(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE):
-        with contextlib.suppress(ValueError):
-            uids.append(int(match.group(1)))
+        uids.append(parse_imap_uid_token(match.group(1), label="FETCH UID response"))
     return uids
 
 

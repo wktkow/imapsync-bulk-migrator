@@ -1,6 +1,6 @@
 import pytest
 
-from components.utils import parse_imap_uid_search_data, sanitize_for_path
+from components.utils import parse_imap_uid_search_data, parse_imap_uid_token, sanitize_for_path
 
 
 @pytest.mark.parametrize(
@@ -26,3 +26,13 @@ def test_parse_imap_uid_search_data_rejects_invalid_tokens(payload: bytes) -> No
     with pytest.raises(RuntimeError, match="UID"):
         parse_imap_uid_search_data([payload])
 
+
+@pytest.mark.parametrize("token", ["1", "42", "4294967295"])
+def test_parse_imap_uid_token_accepts_valid_uid(token: str) -> None:
+    assert parse_imap_uid_token(token) == int(token)
+
+
+@pytest.mark.parametrize("token", ["0", "00042", "4294967296", "2:4", "bad"])
+def test_parse_imap_uid_token_rejects_invalid_uid(token: str) -> None:
+    with pytest.raises(RuntimeError, match="UID"):
+        parse_imap_uid_token(token)
