@@ -30,6 +30,7 @@ from components.provider_ops import (
     _safe_identity,
     build_xoauth2_payload,
     consume_target_match_num,
+    committed_journal_target_mailbox_issues,
     effective_auth,
     fetch_all_uids_and_uidvalidity,
     gmail_labels_for_restore,
@@ -8650,6 +8651,31 @@ def test_provider_journal_content_check_ignores_superseded_localized_gmail_msgid
     assert not any("journal committed rfc822_size does not match manifest" in issue for issue in audit_issues)
     assert not any(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest" in issue for issue in audit_issues)
     assert offline_report["ok"], offline_report
+
+
+def test_committed_journal_target_mailbox_uses_gmail_msgid_latest_row() -> None:
+    rows = [
+        {
+            "canonical_id": "gmail-123",
+            "target_mailbox": "BadLabel",
+            "target_account": "target@gmail.com",
+            "target_gmail_msgid": "9001",
+            "status": "committed",
+        },
+        {
+            "canonical_id": "gmail-123",
+            "target_mailbox": "INBOX",
+            "target_account": "target@gmail.com",
+            "target_gmail_msgid": "9001",
+            "status": "committed",
+        },
+    ]
+
+    assert committed_journal_target_mailbox_issues(
+        rows,
+        {"gmail-123": "INBOX"},
+        target_provider="gmail",
+    ) == []
 
 
 @pytest.mark.parametrize(

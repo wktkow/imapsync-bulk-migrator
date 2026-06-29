@@ -2115,7 +2115,11 @@ def committed_journal_target_mailbox_issues(
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
-    for row in latest_committed_journal_rows(rows).values():
+    for row in latest_committed_journal_rows(
+        rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    ).values():
         identity = str(row.get("canonical_id") or "")
         if not identity:
             continue
