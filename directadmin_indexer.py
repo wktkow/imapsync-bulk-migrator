@@ -298,6 +298,13 @@ def _raise_if_indexer_parent_replaced(parent_path: Path, parent_fd: int, label: 
         raise RuntimeError(f"refusing to use replaced indexer {label} directory: {parent_path}")
 
 
+def _fsync_indexer_directory_fd(dir_fd: int, path: Path, label: str) -> None:
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise RuntimeError(f"unable to fsync indexer {label} directory for durability: {path}") from exc
+
+
 def _indexer_dir_open_flags() -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -394,6 +401,8 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(name, dir_fd=parent_fd)
                     raise
+                _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
+                _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
             else:
                 try:
                     os.link(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -407,6 +416,8 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                     raise
                 os.unlink(tmp_name, dir_fd=parent_fd)
                 tmp_name = ""
+                _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
+                _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
         except Exception:
             if tmp_name:
                 with contextlib.suppress(FileNotFoundError):

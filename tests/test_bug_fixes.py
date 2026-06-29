@@ -7344,6 +7344,33 @@ class TestDirectAdminIndexerHardening:
         assert json.loads(out.read_text())["accounts"][0]["password"] == "secret"
 
     @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_json_fsyncs_parent_directory_after_publish(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        overwrite: bool,
+    ) -> None:
+        import directadmin_indexer
+        from directadmin_indexer import write_json
+
+        out = tmp_path / "export.pass.config.json"
+        if overwrite:
+            out.write_text("{}")
+        fsync_targets: List[str] = []
+        real_fsync = directadmin_indexer.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            mode = directadmin_indexer.os.fstat(fd).st_mode
+            fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+            real_fsync(fd)
+
+        monkeypatch.setattr(directadmin_indexer.os, "fsync", recording_fsync)
+
+        write_json({"accounts": []}, str(out), overwrite=overwrite)
+
+        assert fsync_targets == ["file", "dir"]
+
+    @pytest.mark.parametrize("overwrite", [False, True])
     def test_write_json_does_not_chmod_replaced_symlink_target(
         self,
         tmp_path: Path,
