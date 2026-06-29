@@ -775,6 +775,15 @@ def _imap_append_wire_bytes(data: bytes) -> bytes:
     return imaplib.MapCRLF.sub(imaplib.CRLF, data)
 
 
+def _normalized_legacy_internaldate(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized.startswith('"') and normalized.endswith('"'):
+        normalized = normalized[1:-1]
+    return normalized
+
+
 def _message_id_header(data: bytes) -> str:
     with contextlib.suppress(Exception):
         msg = BytesParser(policy=default_policy).parsebytes(data)
@@ -1210,7 +1219,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     exported_regular_content: Counter[Tuple[int, str]] = Counter()
-    regular_metadata_paths_by_content: Dict[Tuple[int, str], List[Path]] = {}
+    regular_metadata_paths_by_content: Dict[Tuple[int, str], List[Tuple[Path, str]]] = {}
 
     def write_legacy_message(
         folder_dir: Path,
@@ -1248,13 +1257,25 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         _secure_atomic_json(meta_path, meta)
         return base
 
-    def merge_covered_virtual_flags(content_identity: Tuple[int, str], match_index: int, flags: str) -> None:
+    def merge_covered_virtual_flags(
+        content_identity: Tuple[int, str],
+        match_index: int,
+        flags: str,
+        internaldate: str,
+    ) -> None:
         if not _legacy_target_flag_set(flags):
             return
-        metadata_paths = regular_metadata_paths_by_content.get(content_identity, [])
-        if match_index < 0 or match_index >= len(metadata_paths):
+        metadata_entries = regular_metadata_paths_by_content.get(content_identity, [])
+        if match_index < 0 or match_index >= len(metadata_entries):
             raise RuntimeError("covered virtual message has no matching regular metadata")
-        meta_path = metadata_paths[match_index]
+        virtual_internaldate = _normalized_legacy_internaldate(internaldate)
+        same_date_paths = [
+            path
+            for path, regular_internaldate in metadata_entries
+            if virtual_internaldate
+            and _normalized_legacy_internaldate(regular_internaldate) == virtual_internaldate
+        ]
+        meta_path = same_date_paths[0] if len(same_date_paths) == 1 else metadata_entries[match_index][0]
         meta = json.loads(
             _read_file_no_symlink(
                 meta_path,
@@ -1383,6 +1404,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                                         content_identity,
                                         seen_virtual_content[content_identity] - 1,
                                         flags or "",
+                                        internaldate or "",
                                     )
                                 pending_virtual_content.setdefault(content_identity, []).append(
                                     (int(uid), msg_bytes, flags or "", internaldate or "", digest)
@@ -1420,7 +1442,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         written_stems.add(written_stem)
                         if not virtual_source:
                             regular_metadata_paths_by_content.setdefault(content_identity, []).append(
-                                folder_dir / f"{written_stem}.json"
+                                (folder_dir / f"{written_stem}.json", internaldate or "")
                             )
                 _remove_stale_export_files(folder_dir, written_stems)
                 covered_virtual_source = virtual_source and bool(uids) and not written_stems

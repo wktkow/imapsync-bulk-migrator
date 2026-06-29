@@ -1540,6 +1540,77 @@ class TestLegacyListParsing:
         }
         assert not list((account_dir / "Flagged").glob("u*.eml"))
 
+    def test_export_merges_covered_flagged_view_by_internaldate_for_identical_duplicates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from components.content_binding import legacy_content_binding_issue
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-identical-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
+
+        class DuplicateCoveredFlaggedSource:
+            response = _stable_uidvalidity_response
+
+            def __init__(self) -> None:
+                self.selected: List[str] = []
+                self.selected_mailbox = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "Archive"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected_mailbox = mailbox.strip('"').replace(r"\"", '"')
+                self.selected.append(self.selected_mailbox)
+                return "OK", [b"2" if self.selected_mailbox == "Archive" else b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1 2" if self.selected_mailbox == "Archive" else b"2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    internaldate = "02-Jan-2024 00:00:00 +0000" if uid == "2" else "01-Jan-2024 00:00:00 +0000"
+                    flags = "\\Seen \\Flagged" if self.selected_mailbox == "Flagged" else "\\Seen"
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS ({flags}) INTERNALDATE "{internaldate}")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        source = DuplicateCoveredFlaggedSource()
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[DuplicateCoveredFlaggedSource]:
+            yield source
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(
+                Account("user@example.com", "secret"),
+                ServerConfig("imap.example.com"),
+                tmp_path,
+                ignore_errors=False,
+            )
+
+        account_dir = tmp_path / "user@example.com"
+        first_meta = json.loads((account_dir / "Archive" / "u0000000001.json").read_text())
+        second_meta = json.loads((account_dir / "Archive" / "u0000000002.json").read_text())
+        assert first_meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert second_meta["internaldate"] == "02-Jan-2024 00:00:00 +0000"
+        assert first_meta["flags"] == "\\Seen"
+        assert second_meta["flags"] == "\\Seen \\Flagged"
+        assert legacy_content_binding_issue(first_meta) is None
+        assert legacy_content_binding_issue(second_meta) is None
+        flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
+        assert flagged_marker["covered_by_regular_content"] is True
+        assert not list((account_dir / "Flagged").glob("u*.eml"))
+
     def test_export_keeps_generic_all_when_it_is_only_source_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
