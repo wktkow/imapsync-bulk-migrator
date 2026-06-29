@@ -4887,7 +4887,7 @@ class TestLegacyImportJournal:
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
-            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
+            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()) as reset_mock, \
             mock.patch("components.main.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
             mock.patch("components.main.import_account") as import_mock:
             rc = main([
@@ -4907,6 +4907,51 @@ class TestLegacyImportJournal:
             ])
 
         assert rc == 4
+        reset_mock.assert_not_called()
+        import_mock.assert_not_called()
+
+    def test_cpanel_reset_archive_failure_returns_error_before_reset(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="imap.example.com", port=993, ssl=True)
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value=set()) as reset_mock, \
+            mock.patch("components.main.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(in_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-cpanel",
+                "--reset",
+                "--reset-confirm", "imap.example.com",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "admin",
+                "--cpanel-password", "secret",
+            ])
+
+        assert rc == 4
+        reset_mock.assert_not_called()
         import_mock.assert_not_called()
 
 
