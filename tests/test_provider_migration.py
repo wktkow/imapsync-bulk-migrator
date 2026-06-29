@@ -8062,6 +8062,76 @@ def test_provider_import_repairs_gmail_alias_msgid_from_localized_sent_target(tm
     assert report["remote_missing"] == []
 
 
+def test_provider_import_does_not_repair_superseded_localized_gmail_alias_row(tmp_path: Path) -> None:
+    class LocalizedSentTarget(FakeGmailTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "Gesendet"',
+            ]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _mark_manifest_source_provider(row, "imap")
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Sent"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    stale = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[Gmail]/Sent Mail",
+        "status": "committed",
+    })
+    current = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "Gesendet",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(
+        json.dumps(stale) + "\n" + json.dumps(current) + "\n"
+    )
+    fake = LocalizedSentTarget(
+        has_existing=True,
+        existing_mailbox="Gesendet",
+        messages_by_mailbox={"Gesendet": 1},
+        gmail_labels=["\\Sent"],
+        gmail_msgid="9001",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[LocalizedSentTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        provider_import_account(config, account, tmp_path)
+
+    journal = load_import_journal(account_dir, account)
+    assert fake.appended == []
+    assert len(journal) == 2
+    assert all(row.get("action") != "verified" for row in journal)
+
+
 def test_provider_import_empty_mode_permits_journaled_gmail_starred_view(tmp_path: Path) -> None:
     class StarredGmailTarget(FakeGmailTargetImap):
         def __init__(self, **kwargs) -> None:

@@ -2495,9 +2495,14 @@ def repair_missing_journal_target_gmail_msgids(
     }
     repaired_rows = list(rows)
     issues: List[str] = []
-    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(repaired_rows).items():
+    for (identity, _target_mailbox_key), journal_row in latest_committed_journal_rows(
+        repaired_rows,
+        target_provider="gmail",
+        target_mailboxes=target_mailboxes,
+    ).items():
         if not identity or identity not in manifest_by_id or journal_row.get("target_gmail_msgid"):
             continue
+        target_mailbox = str(journal_row.get("target_mailbox") or "")
         expected_target_mailbox = target_mailbox_by_identity.get(identity)
         if expected_target_mailbox and not _target_mailbox_matches_expected(
             target_mailbox,
