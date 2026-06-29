@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import json
@@ -30,7 +31,9 @@ from .imap_ops import (
     _legacy_missing_target_flags,
     _normalized_legacy_internaldate,
     ensure_private_dir as ensure_legacy_private_dir,
+    _fsync_legacy_directory_fd,
     _open_legacy_dir,
+    _open_legacy_parent_dir,
     _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
     _legacy_trusted_covered_by_regular_content,
@@ -170,17 +173,46 @@ def _ensure_cpanel_client_dependency() -> None:
 
 
 def _write_secure_json_file(path: Path, payload: Dict) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    parent_fd, name, parent_path = _open_legacy_parent_dir(path, "secure config file")
+    fd = -1
+    created = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    except Exception:
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
         try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        raise
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            try:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+            except RuntimeError as replaced_exc:
+                raise replaced_exc from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked secure config file: {path}") from exc
+            raise
+        created = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+            _fsync_legacy_directory_fd(parent_fd, parent_path, "secure config file")
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+        except Exception:
+            if created:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=parent_fd)
+            raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _message_id_header(data: bytes) -> str:

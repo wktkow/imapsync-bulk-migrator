@@ -519,6 +519,82 @@ class TestBug7ImportConfigPlaceholder:
         assert result["accounts"][0]["email"] == "a@example.com"
         assert import_path.stat().st_mode & 0o777 == 0o600
 
+    def test_generated_config_rejects_symlinked_parent(self, tmp_path: Path) -> None:
+        from components.main import _write_secure_json_file
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        requested = tmp_path / "requested"
+        try:
+            requested.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        with pytest.raises(RuntimeError, match="symlinked secure config file"):
+            _write_secure_json_file(requested / "import.pass.config.json", {"password": "secret"})
+
+        assert not (outside / "import.pass.config.json").exists()
+
+    def test_generated_config_rejects_replaced_parent_before_publish(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import components.main as main_module
+
+        parent = tmp_path / "requested"
+        parent.mkdir()
+        backup = tmp_path / "requested.old"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = parent / "import.pass.config.json"
+        real_open = main_module.os.open
+        real_rename = main_module.os.rename
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path == "import.pass.config.json" and not swapped:
+                swapped = True
+                real_rename(parent, backup)
+                try:
+                    parent.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(main_module.os, "open", racing_open)
+
+        with pytest.raises(RuntimeError, match="replaced secure config file directory"):
+            main_module._write_secure_json_file(target, {"password": "secret"})
+
+        assert swapped
+        assert parent.is_symlink()
+        assert not (outside / "import.pass.config.json").exists()
+        assert not (backup / "import.pass.config.json").exists()
+
+    def test_generated_config_fsyncs_file_and_parent_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import components.main as main_module
+
+        target = tmp_path / "import.pass.config.json"
+        fsync_targets: List[str] = []
+        real_fsync = main_module.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            mode = main_module.os.fstat(fd).st_mode
+            fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+            real_fsync(fd)
+
+        monkeypatch.setattr(main_module.os, "fsync", recording_fsync)
+
+        main_module._write_secure_json_file(target, {"password": "secret"})
+
+        assert fsync_targets == ["file", "dir"]
+
 
 # ---------------------------------------------------------------------------
 # BUG #1 — executor stop_on_error must drain and log ALL errors
