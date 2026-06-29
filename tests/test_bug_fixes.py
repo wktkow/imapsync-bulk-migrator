@@ -6926,25 +6926,35 @@ class TestDirectAdminIndexerHardening:
 
         if overwrite:
             out.write_text("{}")
-            real_replace = directadmin_indexer.os.replace
+            real_rename = directadmin_indexer.os.rename
 
-            def racing_replace(src: str, dst: str) -> None:
-                real_replace(src, dst)
-                Path(dst).unlink()
+            def racing_rename(src: str, dst: str, *args, **kwargs) -> None:
+                real_rename(src, dst, *args, **kwargs)
+                dst_dir_fd = kwargs.get("dst_dir_fd")
                 try:
-                    Path(dst).symlink_to(victim)
+                    if dst_dir_fd is None:
+                        Path(dst).unlink()
+                        Path(dst).symlink_to(victim)
+                    else:
+                        os.unlink(dst, dir_fd=dst_dir_fd)
+                        os.symlink(victim, dst, dir_fd=dst_dir_fd)
                 except (OSError, NotImplementedError) as exc:
                     pytest.skip(f"symlink creation unavailable: {exc}")
 
-            monkeypatch.setattr(directadmin_indexer.os, "replace", racing_replace)
+            monkeypatch.setattr(directadmin_indexer.os, "rename", racing_rename)
         else:
             real_link = directadmin_indexer.os.link
 
-            def racing_link(src: str, dst: str) -> None:
-                real_link(src, dst)
-                Path(dst).unlink()
+            def racing_link(src: str, dst: str, *args, **kwargs) -> None:
+                real_link(src, dst, *args, **kwargs)
+                dst_dir_fd = kwargs.get("dst_dir_fd")
                 try:
-                    Path(dst).symlink_to(victim)
+                    if dst_dir_fd is None:
+                        Path(dst).unlink()
+                        Path(dst).symlink_to(victim)
+                    else:
+                        os.unlink(dst, dir_fd=dst_dir_fd)
+                        os.symlink(victim, dst, dir_fd=dst_dir_fd)
                 except (OSError, NotImplementedError) as exc:
                     pytest.skip(f"symlink creation unavailable: {exc}")
 
@@ -6954,6 +6964,83 @@ class TestDirectAdminIndexerHardening:
 
         assert out.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
+
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_json_rejects_symlinked_output_parent(self, tmp_path: Path, overwrite: bool) -> None:
+        from directadmin_indexer import write_json
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        requested = tmp_path / "requested"
+        try:
+            requested.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        out = requested / "export.pass.config.json"
+
+        with pytest.raises(RuntimeError, match="symlinked indexer output directory"):
+            write_json({"accounts": [{"email": "a@example.com", "password": "secret"}]}, str(out), overwrite=overwrite)
+
+        assert not (outside / "export.pass.config.json").exists()
+
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_json_refuses_replaced_output_parent_before_publish(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        overwrite: bool,
+    ) -> None:
+        import directadmin_indexer
+
+        parent = tmp_path / "requested"
+        parent.mkdir()
+        backup = tmp_path / "requested.old"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        out = parent / "export.pass.config.json"
+        if overwrite:
+            out.write_text("{}")
+
+        real_rename = directadmin_indexer.os.rename
+        real_link = directadmin_indexer.os.link
+        swapped = False
+
+        def swap_parent_once() -> None:
+            nonlocal swapped
+            if swapped:
+                return
+            swapped = True
+            real_rename(parent, backup)
+            try:
+                parent.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlink creation unavailable: {exc}")
+
+        if overwrite:
+            def racing_rename(src: str, dst: str, *args, **kwargs) -> None:
+                swap_parent_once()
+                real_rename(src, dst, *args, **kwargs)
+
+            monkeypatch.setattr(directadmin_indexer.os, "rename", racing_rename)
+        else:
+            def racing_link(src: str, dst: str, *args, **kwargs) -> None:
+                swap_parent_once()
+                real_link(src, dst, *args, **kwargs)
+
+            monkeypatch.setattr(directadmin_indexer.os, "link", racing_link)
+
+        with pytest.raises(RuntimeError, match="replaced indexer output directory"):
+            directadmin_indexer.write_json(
+                {"accounts": [{"email": "a@example.com", "password": "secret"}]},
+                str(out),
+                overwrite=overwrite,
+            )
+
+        assert swapped
+        assert parent.is_symlink()
+        assert not (outside / "export.pass.config.json").exists()
+        assert not (backup / "export.pass.config.json").exists()
 
     def test_indexer_list_pop_accounts_raises_on_api_error(self) -> None:
         from directadmin_indexer import DirectAdminClient
@@ -14039,9 +14126,15 @@ class TestRound7ConfirmedBugs:
         out = tmp_path / "export.pass.config.json"
         real_link = directadmin_indexer.os.link
 
-        def racing_link(src: str, dst: str) -> None:
-            Path(dst).write_text("raced\n")
-            real_link(src, dst)
+        def racing_link(src: str, dst: str, *args, **kwargs) -> None:
+            dst_dir_fd = kwargs.get("dst_dir_fd")
+            if dst_dir_fd is None:
+                Path(dst).write_text("raced\n")
+            else:
+                fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dst_dir_fd)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("raced\n")
+            real_link(src, dst, *args, **kwargs)
 
         monkeypatch.setattr(directadmin_indexer.os, "link", racing_link)
 

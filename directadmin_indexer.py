@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
+import stat
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +42,14 @@ class ServerSettings:
     port: int = 993
     ssl: bool = True
     starttls: bool = False
+
+
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+_HAS_DESCRIPTOR_RELATIVE_OUTPUT = all(
+    fn in os.supports_dir_fd
+    for fn in (os.link, os.mkdir, os.open, os.rename, os.unlink)
+)
 
 
 class DirectAdminClient:
@@ -255,32 +266,154 @@ def build_config(server: ServerSettings, emails: List[str], default_password: st
     }
 
 
+def _indexer_normalized_absolute_path(path: Path) -> Path:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    parts: List[str] = []
+    for part in absolute.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return Path(absolute.anchor).joinpath(*parts)
+
+
+def _indexer_parent_matches_fd(parent_path: Path, parent_fd: int) -> bool:
+    try:
+        current = os.stat(parent_path, follow_symlinks=False)
+    except OSError:
+        return False
+    pinned = os.fstat(parent_fd)
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and current.st_dev == pinned.st_dev
+        and current.st_ino == pinned.st_ino
+    )
+
+
+def _raise_if_indexer_parent_replaced(parent_path: Path, parent_fd: int, label: str) -> None:
+    if not _indexer_parent_matches_fd(parent_path, parent_fd):
+        raise RuntimeError(f"refusing to use replaced indexer {label} directory: {parent_path}")
+
+
+def _indexer_dir_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_or_create_indexer_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
+    if not _HAS_DESCRIPTOR_RELATIVE_OUTPUT:
+        raise RuntimeError("platform does not support descriptor-relative indexer output access")
+    absolute = _indexer_normalized_absolute_path(path)
+    name = absolute.name
+    if not name or name in {".", ".."}:
+        raise RuntimeError(f"refusing to use invalid indexer {label} path: {path}")
+    parent_path = absolute.parent
+    flags = _indexer_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:-1]:
+            try:
+                os.mkdir(part, PRIVATE_DIR_MODE, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                if exc.errno != errno.EEXIST:
+                    raise
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    with contextlib.suppress(OSError):
+                        component_stat = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISLNK(component_stat.st_mode):
+                            raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                    raise RuntimeError(f"indexer {label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"indexer {label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+            current = current / part
+        _raise_if_indexer_parent_replaced(parent_path, fd, label)
+        return fd, name, parent_path
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    parent_fd, name, parent_path = _open_or_create_indexer_parent_dir(out, "output")
+    tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     try:
-        os.fchmod(fd, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            fd = os.open(tmp_name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise RuntimeError(f"refusing to use unsafe indexer temporary file: {out.with_name(tmp_name)}") from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked indexer temporary file: {out.with_name(tmp_name)}") from exc
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.write("\n")
-        if overwrite:
-            os.replace(str(tmp), str(out))
-        else:
-            try:
-                os.link(str(tmp), str(out))
-            except FileExistsError as exc:
-                raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
-            tmp.unlink()
-    except Exception:
+            f.flush()
+            os.fsync(f.fileno())
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+            if overwrite:
+                os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                tmp_name = ""
+                try:
+                    _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+                except Exception:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(name, dir_fd=parent_fd)
+                    raise
+            else:
+                try:
+                    os.link(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                except FileExistsError as exc:
+                    raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
+                try:
+                    _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+                except Exception:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(name, dir_fd=parent_fd)
+                    raise
+                os.unlink(tmp_name, dir_fd=parent_fd)
+                tmp_name = ""
+        except Exception:
+            if tmp_name:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+            raise
+    finally:
+        os.close(parent_fd)
 
 
 def read_secret_file(path: str, *, label: str) -> str:
