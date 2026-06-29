@@ -838,6 +838,53 @@ class TestLegacyExportCompleteness:
         eml = account_dir / "INBOX" / "u0000000001.eml"
         assert not eml.exists() or eml.read_bytes() != first + second
 
+    def test_export_ignores_unsolicited_fetch_metadata_for_other_uid(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        body = b"Message-ID: <bound-fetch@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class UnsolicitedMetadataFetchImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"42"]
+                if command == "fetch":
+                    return "OK", [
+                        (
+                            b'42 (UID 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                            body,
+                        ),
+                        b'99 (UID 99 FLAGS (\\Deleted) INTERNALDATE "02-Jan-2024 00:00:00 +0000")',
+                    ]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[UnsolicitedMetadataFetchImap]:
+            yield UnsolicitedMetadataFetchImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        meta = json.loads((tmp_path / "user@example.com" / "INBOX" / "u0000000042.json").read_text())
+        assert meta["flags"] == "\\Seen"
+        assert meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert meta["uid"] == 42
+        assert meta["uidvalidity"] == "123"
+
     def test_export_raises_when_fetch_has_no_message_bytes(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig

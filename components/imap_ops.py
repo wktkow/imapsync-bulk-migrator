@@ -811,7 +811,19 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
         os.fsync(f.fileno())
 
 
-def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+def _fetch_response_uid(meta_str: str) -> Optional[int]:
+    match = re.search(r"\bUID\s+(\d+)\b", meta_str)
+    if match is None:
+        return None
+    with contextlib.suppress(ValueError):
+        return int(match.group(1))
+    return None
+
+
+def _parse_fetch_response_for_uid(
+    fetch_response: List[object],
+    expected_uid: int,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Parse a FETCH response into payload bytes and metadata.
 
     Returns (msg_bytes, flags, internaldate). Any of them can be None.
@@ -826,10 +838,19 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
         if isinstance(part, tuple) and len(part) == 2:
             meta = part[0]
             body = part[1]
+            meta_str = meta.decode(errors="ignore") if isinstance(meta, (bytes, bytearray)) else ""
+            response_uid = _fetch_response_uid(meta_str)
             if body and isinstance(body, (bytes, bytearray)):
+                if response_uid is None:
+                    raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
+                if response_uid != expected_uid:
+                    if joinable:
+                        raise RuntimeError("fetch returned multiple message bodies for one UID")
+                    raise RuntimeError(f"fetch returned message bytes for unexpected UID {response_uid}")
                 joinable.append(bytes(body))
             if meta and isinstance(meta, (bytes, bytearray)):
-                meta_str = meta.decode(errors="ignore")
+                if response_uid != expected_uid:
+                    continue
                 m_flags = re.search(r"FLAGS \((.*?)\)", meta_str)
                 if m_flags:
                     flags = m_flags.group(1)
@@ -838,6 +859,9 @@ def _parse_fetch_response_for_uid(fetch_response: List[bytes]) -> Tuple[Optional
                     internaldate = m_int.group(1)
         elif isinstance(part, (bytes, bytearray)):
             meta_str = part.decode(errors="ignore")
+            response_uid = _fetch_response_uid(meta_str)
+            if response_uid != expected_uid:
+                continue
             m_flags = re.search(r"FLAGS \((.*?)\)", meta_str)
             if m_flags:
                 flags = m_flags.group(1)
@@ -1080,7 +1104,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         status, data = imap.uid("fetch", str(uid), "(BODY.PEEK[] FLAGS INTERNALDATE)")
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
-                        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []))
+                        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))
                         if not msg_bytes:
                             raise RuntimeError(f"fetch returned no message bytes in {mailbox} for UID {uid}")
                         with contextlib.suppress(Exception):
