@@ -1500,10 +1500,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
                         return
 
-                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, Tuple[str, ...]]]:
+                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, Tuple[str, ...]], bool]:
                         marker_path = folder_dir / ".mailbox.json"
                         if not marker_path.exists():
-                            return folder_dir.name, ("", ())
+                            return folder_dir.name, ("", ()), False
                         try:
                             marker_bytes = _read_file_no_symlink(
                                 marker_path,
@@ -1515,13 +1515,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                             raise RuntimeError(f"{marker_path}: failed to parse mailbox marker: {exc}") from exc
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
                         if not isinstance(mailbox, str) or not mailbox:
-                            return folder_dir.name, ()
+                            return folder_dir.name, ("", ()), False
                         hierarchy = _legacy_hierarchy_metadata(
                             raw if isinstance(raw, dict) else {},
                             mailbox,
                             str(marker_path),
                         )
-                        return mailbox, hierarchy
+                        return mailbox, hierarchy, bool(isinstance(raw, dict) and raw.get("covered_by_regular_content") is True)
 
                     folder_dirs: List[Path] = []
                     for child_name in sorted(os.listdir(account_dir_fd)):
@@ -1544,10 +1544,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     local_segments_by_key: Dict[str, Tuple[str, ...]] = {}
                     for folder_dir in folder_dirs:
                         guard_account_dir()
-                        default_mailbox, default_hierarchy = marker_info(folder_dir)
+                        default_mailbox, default_hierarchy, covered_by_regular_content = marker_info(folder_dir)
                         guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
                         guard_account_dir()
+                        if covered_by_regular_content and not eml_paths:
+                            continue
                         folder_key = canonical_mailbox_path_key(folder_dir.name)
                         local_mailboxes_by_key.setdefault(folder_key, default_mailbox)
                         if default_hierarchy[1]:

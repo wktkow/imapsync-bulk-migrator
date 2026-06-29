@@ -3320,6 +3320,7 @@ class TestLegacyImportJournal:
 
     def test_import_skips_covered_virtual_marker_only_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
+        from components.main import main
         from components.models import Account, ServerConfig
 
         server = ServerConfig("imap.example.com")
@@ -3354,6 +3355,7 @@ class TestLegacyImportJournal:
                 self.selected: List[str] = []
                 self.subscribed: List[str] = []
                 self.appended: List[str] = []
+                self.payloads_by_mailbox: dict[str, List[bytes]] = {}
 
             def _normalize(self, mailbox: str) -> str:
                 return mailbox.strip('"').replace(r"\"", '"')
@@ -3363,7 +3365,10 @@ class TestLegacyImportJournal:
                 if selected == "Flagged":
                     raise AssertionError("covered virtual mailbox should not be selected")
                 self.selected.append(selected)
-                return "OK", [b"0"]
+                return "OK", [str(len(self.payloads_by_mailbox.get(selected, []))).encode("ascii")]
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "Archive"']
 
             def subscribe(self, mailbox: str):
                 selected = self._normalize(mailbox)
@@ -3377,7 +3382,23 @@ class TestLegacyImportJournal:
                 if selected == "Flagged":
                     raise AssertionError("covered virtual mailbox should not receive appends")
                 self.appended.append(selected)
+                self.payloads_by_mailbox.setdefault(selected, []).append(bytes(payload))
                 return "OK", [b""]
+
+            def search(self, charset, *criteria):
+                payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
+                if criteria == ("ALL",):
+                    return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, len(payloads) + 1))]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<covered-virtual-import@example.com>" and payloads:
+                        return "OK", [b"1"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
+                payload = payloads[int(num) - 1]
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(payload), len(payload)), payload)]
 
             def logout(self):
                 return "OK", []
@@ -3400,6 +3421,29 @@ class TestLegacyImportJournal:
         assert target.selected == ["Archive"]
         assert target.subscribed == ["Archive"]
         assert target.appended == ["Archive"]
+
+        config_path = tmp_path / "config.json"
+        server_json = {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False}
+        config_path.write_text(json.dumps({
+            "server": server_json,
+            "source_server": server_json,
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        target.selected.clear()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_factory):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+        assert "Flagged" not in target.selected
 
     def test_import_recognizes_existing_raw_committed_key_for_lf_only_message(self, tmp_path: Path) -> None:
         import imaplib
