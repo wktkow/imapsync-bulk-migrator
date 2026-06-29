@@ -2111,6 +2111,7 @@ def committed_journal_target_mailbox_issues(
     target_mailboxes: Optional[List[MailboxInfo]] = None,
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
+    defer_unknown_hierarchy_delimiter_ids: Optional[set[str]] = None,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -2128,6 +2129,8 @@ def committed_journal_target_mailbox_issues(
             target_provider=target_provider,
             target_mailboxes=target_mailboxes,
         ):
+            if defer_unknown_hierarchy_delimiter_ids and identity in defer_unknown_hierarchy_delimiter_ids:
+                continue
             if (
                 defer_generic_special_use
                 and provider in {"imap", "icloud"}
@@ -2155,6 +2158,7 @@ def pending_journal_target_mailbox_issues(
     target_mailboxes: Optional[List[MailboxInfo]] = None,
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
+    defer_unknown_hierarchy_delimiter_ids: Optional[set[str]] = None,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -2174,6 +2178,8 @@ def pending_journal_target_mailbox_issues(
             target_provider=target_provider,
             target_mailboxes=target_mailboxes,
         ):
+            if defer_unknown_hierarchy_delimiter_ids and identity in defer_unknown_hierarchy_delimiter_ids:
+                continue
             if (
                 defer_generic_special_use
                 and provider in {"imap", "icloud"}
@@ -2227,6 +2233,25 @@ def offline_target_mailboxes_for_rows(
     return expected
 
 
+def offline_hierarchy_delimiter_dependent_ids(rows: List[Dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for row in rows:
+        identity = str(row.get("canonical_id") or "")
+        if not identity:
+            continue
+        desired = str(row.get("primary_mailbox") or "Archive")
+        source_paths = row.get("source_mailbox_paths")
+        if not isinstance(source_paths, dict):
+            continue
+        raw_segments = source_paths.get(desired)
+        if not isinstance(raw_segments, list):
+            continue
+        segments = [str(segment) for segment in raw_segments if str(segment)]
+        if len(segments) > 1:
+            ids.add(identity)
+    return ids
+
+
 def offline_journal_target_mailbox_issues(
     journal_rows: List[Dict[str, Any]],
     manifest_rows: List[Dict[str, Any]],
@@ -2234,12 +2259,14 @@ def offline_journal_target_mailbox_issues(
     target_provider: str,
 ) -> List[str]:
     expected = offline_target_mailboxes_for_rows(manifest_rows, target_provider=target_provider)
+    hierarchy_delimiter_dependent_ids = offline_hierarchy_delimiter_dependent_ids(manifest_rows)
     issues = committed_journal_target_mailbox_issues(
         journal_rows,
         expected,
         target_provider=target_provider,
         defer_generic_special_use=True,
         defer_gmail_special_use=True,
+        defer_unknown_hierarchy_delimiter_ids=hierarchy_delimiter_dependent_ids,
     )
     issues.extend(
         pending_journal_target_mailbox_issues(
@@ -2248,6 +2275,7 @@ def offline_journal_target_mailbox_issues(
             target_provider=target_provider,
             defer_generic_special_use=True,
             defer_gmail_special_use=True,
+            defer_unknown_hierarchy_delimiter_ids=hierarchy_delimiter_dependent_ids,
         )
     )
     return issues

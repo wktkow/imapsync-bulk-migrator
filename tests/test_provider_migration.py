@@ -2584,6 +2584,31 @@ def test_offline_journal_target_mailbox_rejects_generic_custom_folder_mismatch()
     assert any("wrong target mailbox" in issue for issue in issues)
 
 
+@pytest.mark.parametrize("status", ["committed", "pending"])
+def test_offline_journal_target_mailbox_defers_custom_hierarchy_without_live_delimiter(status: str) -> None:
+    manifest_rows = [
+        {
+            "canonical_id": "custom-folder",
+            "primary_mailbox": "Projects/2024",
+            "source_mailbox_paths": {"Projects/2024": ["Projects", "2024"]},
+        }
+    ]
+    journal_rows = [
+        {
+            "canonical_id": "custom-folder",
+            "target_mailbox": "Projects.2024",
+            "target_account": "target@example.com",
+            "status": status,
+        }
+    ]
+
+    assert offline_journal_target_mailbox_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider="imap",
+    ) == []
+
+
 def test_custom_folder_translation_uses_target_delimiter_and_preserves_flat_targets() -> None:
     row = {
         "source_mailbox_paths": {
@@ -8313,6 +8338,40 @@ def test_provider_offline_validation_defers_generic_special_use_target_mailbox(t
         "canonical_id": "gmail-123",
         "target_account": account.target_email,
         "target_mailbox": "Papierkorb",
+        "status": "committed",
+    })) + "\n")
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, report = provider_validate_account(config, account, tmp_path, check_target=False)
+    cli_issues = _provider_cli_staged_validation_issues(tmp_path, config, mode="import")
+
+    assert not any("wrong target mailbox" in issue for issue in audit_issues)
+    assert report["ok"], report
+    assert not any("wrong target mailbox" in issue for issue in cli_issues)
+
+
+def test_provider_offline_validation_defers_custom_hierarchy_until_live_delimiter(tmp_path: Path) -> None:
+    from components.main import _provider_cli_staged_validation_issues
+
+    config = _generic_target_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["target_account"] = account.target_email
+    row["primary_mailbox"] = "Projects/2024"
+    row["source_mailboxes"] = ["Projects/2024"]
+    row["source_mailbox_delimiters"] = {"Projects/2024": "/"}
+    row["source_mailbox_paths"] = {"Projects/2024": ["Projects", "2024"]}
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(
+        account_dir,
+        target=account.target_email,
+        target_endpoint=ProviderEndpoint(provider="imap", host="mail.target.example.com"),
+    )
+    (account_dir / "import-target@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Projects.2024",
         "status": "committed",
     })) + "\n")
 
