@@ -4481,6 +4481,46 @@ class TestCliAndConfigHardening:
         assert victim.read_text(encoding="utf-8") == "outside\n"
         assert victim.stat().st_mode & 0o777 == 0o644
 
+    def test_setup_logging_rejects_log_directory_swap_before_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components.main import setup_logging
+
+        log_dir = tmp_path / "logs"
+        outside = tmp_path / "outside"
+        log_dir.mkdir()
+        outside.mkdir()
+        monkeypatch.setattr("components.main._utc_log_timestamp", lambda: "20240101-000000")
+
+        real_open = os.open
+        swapped = False
+
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if (
+                isinstance(path, str)
+                and path.startswith("run-20240101-000000")
+                and dir_fd is not None
+                and not swapped
+            ):
+                swapped = True
+                try:
+                    log_dir.rmdir()
+                    log_dir.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink race setup unavailable: {exc}")
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", racing_open)
+
+        with pytest.raises(RuntimeError, match="replaced log directory"):
+            setup_logging(log_dir)
+
+        assert swapped
+        assert not any(outside.iterdir())
+
     def test_setup_logging_uses_utc_timestamps_for_z_suffix(self, tmp_path: Path) -> None:
         import logging
         import time

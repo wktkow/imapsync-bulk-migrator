@@ -24,6 +24,8 @@ from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
 from .imap_ops import (
+    _open_legacy_dir,
+    _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
     archive_legacy_import_journal_for_reset,
     export_account,
@@ -318,21 +320,39 @@ def setup_logging(log_directory: Path) -> Path:
         flags |= os.O_NOFOLLOW
     log_file: Optional[Path] = None
     log_fd: Optional[int] = None
-    for attempt in range(100):
-        suffix = "" if attempt == 0 else f"-{attempt}"
-        candidate = log_directory / f"run-{timestamp}{suffix}.log"
-        try:
-            log_fd = os.open(candidate, flags, 0o600)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.EMLINK} or candidate.is_symlink():
-                raise RuntimeError(f"refusing to use symlinked log file: {candidate}") from exc
-            raise
-        log_file = candidate
-        break
-    if log_file is None or log_fd is None:
-        raise RuntimeError(f"could not create a unique log file in {log_directory}")
+    log_dir_fd: Optional[int] = None
+    try:
+        log_dir_fd, log_dir_path = _open_legacy_dir(log_directory, "log directory")
+        for attempt in range(100):
+            suffix = "" if attempt == 0 else f"-{attempt}"
+            name = f"run-{timestamp}{suffix}.log"
+            candidate = log_directory / name
+            try:
+                _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                opened_fd = os.open(name, flags, 0o600, dir_fd=log_dir_fd)
+                try:
+                    _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                except Exception:
+                    os.close(opened_fd)
+                    raise
+                log_fd = opened_fd
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                try:
+                    _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                except RuntimeError as replaced_exc:
+                    raise replaced_exc from exc
+                if exc.errno in {errno.ELOOP, errno.EMLINK} or candidate.is_symlink():
+                    raise RuntimeError(f"refusing to use symlinked log file: {candidate}") from exc
+                raise
+            log_file = candidate
+            break
+        if log_file is None or log_fd is None:
+            raise RuntimeError(f"could not create a unique log file in {log_directory}")
+    finally:
+        if log_dir_fd is not None:
+            os.close(log_dir_fd)
     os.fchmod(log_fd, 0o600)
     fh = logging.StreamHandler(os.fdopen(log_fd, "a", encoding="utf-8"))
     fh.setFormatter(formatter)
