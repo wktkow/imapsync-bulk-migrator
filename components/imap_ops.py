@@ -25,6 +25,7 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
+_HAS_DESCRIPTOR_RELATIVE_MKDIR = _HAS_DESCRIPTOR_RELATIVE_OPEN and os.mkdir in os.supports_dir_fd
 LEGACY_ACCOUNT_RESERVED_PATHS = frozenset({"export-state.json", "import.journal.jsonl", "manifest.jsonl"})
 _LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGACY_ACCOUNT_RESERVED_PATHS)
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
@@ -55,13 +56,8 @@ def quote_mailbox_name(mailbox: str) -> str:
     return f'"{escaped}"'
 
 
-def ensure_private_dir(path: Path) -> None:
-    if _legacy_symlink_component(path) is not None:
-        raise RuntimeError(f"refusing to use symlinked directory: {path}")
-    path.mkdir(parents=True, exist_ok=True)
-    if _legacy_symlink_component(path) is not None:
-        raise RuntimeError(f"refusing to use symlinked directory: {path}")
-    dir_fd, dir_path = _open_legacy_dir(path, "directory")
+def ensure_private_dir(path: Path, *, label: str = "directory") -> None:
+    dir_fd, dir_path = _open_or_create_legacy_dir(path, label)
     try:
         _raise_if_legacy_parent_replaced(dir_path, dir_fd, "directory")
         with contextlib.suppress(Exception):
@@ -139,6 +135,53 @@ def _legacy_dir_open_flags() -> int:
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     return flags
+
+
+def _open_or_create_legacy_dir(path: Path, label: str) -> Tuple[int, Path]:
+    if not _HAS_DESCRIPTOR_RELATIVE_MKDIR:
+        raise RuntimeError("platform does not support descriptor-relative legacy directory creation")
+    absolute = _legacy_normalized_absolute_path(path)
+    flags = _legacy_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                os.mkdir(part, PRIVATE_DIR_MODE, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
+                if exc.errno != errno.EEXIST:
+                    raise
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    with contextlib.suppress(OSError):
+                        component_stat = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISLNK(component_stat.st_mode):
+                            raise RuntimeError(f"refusing to use symlinked {label}: {path}") from exc
+                    raise RuntimeError(f"{label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"{label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+            current = current / part
+        _raise_if_legacy_parent_replaced(absolute, fd, label)
+        return fd, absolute
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _open_legacy_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:

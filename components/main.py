@@ -29,6 +29,7 @@ from .imap_ops import (
     _legacy_internaldate_from_fetch_response,
     _legacy_missing_target_flags,
     _normalized_legacy_internaldate,
+    ensure_private_dir as ensure_legacy_private_dir,
     _open_legacy_dir,
     _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
@@ -353,11 +354,7 @@ def _legacy_remote_mailbox_content_covered(
 
 def setup_logging(log_directory: Path) -> Path:
     """Initialize root logger with file + stdout handlers and return log path."""
-    if _legacy_symlink_component(log_directory) is not None:
-        raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
-    log_directory.mkdir(parents=True, exist_ok=True)
-    if _legacy_symlink_component(log_directory) is not None:
-        raise RuntimeError(f"refusing to use symlinked log directory: {log_directory}")
+    ensure_legacy_private_dir(log_directory, label="log directory")
     import logging
     import sys
     import time
@@ -1228,7 +1225,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 4
             if args.mode == "export":
                 out_root = Path(args.output_dir)
-                out_root.mkdir(parents=True, exist_ok=True)
                 if out_root not in free_space_checked_paths:
                     check_free_space_for_path(out_root, min_free_gb)
                 provider_export_all(
@@ -1323,7 +1319,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             if out_root.is_symlink():
                 logging.error("Output directory is a symlink: %s", out_root)
                 return 2
-            out_root.mkdir(parents=True, exist_ok=True)
             # Ensure destination filesystem has enough free space
             if out_root not in free_space_checked_paths:
                 check_free_space_for_path(out_root, min_free_gb)

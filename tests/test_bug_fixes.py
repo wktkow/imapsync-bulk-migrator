@@ -12611,81 +12611,108 @@ class TestRound7ConfirmedBugs:
         assert journal.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
 
-    def test_legacy_ensure_private_dir_does_not_chmod_replaced_symlink_target(
+    def test_legacy_ensure_private_dir_rejects_symlink_inserted_during_mkdir(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from components import imap_ops
 
-        target_dir = tmp_path / "user@example.com"
-        target_dir.mkdir()
-        victim = tmp_path / "outside-legacy-dir"
-        victim.mkdir()
-        victim.chmod(0o755)
-        original_mode = victim.stat().st_mode & 0o777
-        checked_dir = tmp_path / "checked-legacy-dir"
-        real_component = imap_ops._legacy_symlink_component
-        checks = 0
+        base = tmp_path / "base"
+        outside = tmp_path / "outside-legacy-dir"
+        base.mkdir()
+        outside.mkdir()
+        target_dir = base / "account" / "INBOX"
+        real_mkdir = imap_ops.os.mkdir
+        swapped = False
 
-        def racing_component(path: Path):
-            nonlocal checks
-            result = real_component(path)
-            if Path(path) == target_dir:
-                checks += 1
-                if checks == 2 and result is None:
-                    target_dir.rename(checked_dir)
-                    try:
-                        target_dir.symlink_to(victim, target_is_directory=True)
-                    except (OSError, NotImplementedError) as exc:
-                        pytest.skip(f"symlink creation unavailable: {exc}")
-            return result
+        def racing_mkdir(path, mode=0o777, *args, **kwargs):
+            nonlocal swapped
+            if path == "account" and kwargs.get("dir_fd") is not None and not swapped:
+                try:
+                    (base / "account").symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return real_mkdir(path, mode, *args, **kwargs)
 
-        monkeypatch.setattr(imap_ops, "_legacy_symlink_component", racing_component)
+        monkeypatch.setattr(imap_ops.os, "mkdir", racing_mkdir)
 
         with pytest.raises(RuntimeError, match="symlinked directory|replaced directory"):
             imap_ops.ensure_private_dir(target_dir)
 
-        assert target_dir.is_symlink()
-        assert victim.stat().st_mode & 0o777 == original_mode
+        assert swapped
+        assert (base / "account").is_symlink()
+        assert not (outside / "INBOX").exists()
 
-    def test_provider_ensure_private_dir_does_not_chmod_replaced_symlink_target(
+    def test_provider_ensure_private_dir_rejects_symlink_inserted_during_mkdir(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from components import provider_ops
 
-        target_dir = tmp_path / "source@example.com"
-        target_dir.mkdir()
-        victim = tmp_path / "outside-provider-dir"
-        victim.mkdir()
-        victim.chmod(0o755)
-        original_mode = victim.stat().st_mode & 0o777
-        checked_dir = tmp_path / "checked-provider-dir"
-        real_component = provider_ops._provider_symlink_component
-        checks = 0
+        base = tmp_path / "base"
+        outside = tmp_path / "outside-provider-dir"
+        base.mkdir()
+        outside.mkdir()
+        target_dir = base / "account" / "messages"
+        real_mkdir = provider_ops.os.mkdir
+        swapped = False
 
-        def racing_component(path: Path):
-            nonlocal checks
-            result = real_component(path)
-            if Path(path) == target_dir:
-                checks += 1
-                if checks == 2 and result is None:
-                    target_dir.rename(checked_dir)
-                    try:
-                        target_dir.symlink_to(victim, target_is_directory=True)
-                    except (OSError, NotImplementedError) as exc:
-                        pytest.skip(f"symlink creation unavailable: {exc}")
-            return result
+        def racing_mkdir(path, mode=0o777, *args, **kwargs):
+            nonlocal swapped
+            if path == "account" and kwargs.get("dir_fd") is not None and not swapped:
+                try:
+                    (base / "account").symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return real_mkdir(path, mode, *args, **kwargs)
 
-        monkeypatch.setattr(provider_ops, "_provider_symlink_component", racing_component)
+        monkeypatch.setattr(provider_ops.os, "mkdir", racing_mkdir)
 
         with pytest.raises(RuntimeError, match="symlinked provider directory|replaced provider directory"):
             provider_ops.ensure_private_dir(target_dir)
 
-        assert target_dir.is_symlink()
-        assert victim.stat().st_mode & 0o777 == original_mode
+        assert swapped
+        assert (base / "account").is_symlink()
+        assert not (outside / "messages").exists()
+
+    def test_setup_logging_rejects_symlink_inserted_during_mkdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+        from components.main import setup_logging
+
+        base = tmp_path / "base"
+        outside = tmp_path / "outside-log-dir"
+        base.mkdir()
+        outside.mkdir()
+        log_dir = base / "logs" / "run"
+        real_mkdir = imap_ops.os.mkdir
+        swapped = False
+
+        def racing_mkdir(path, mode=0o777, *args, **kwargs):
+            nonlocal swapped
+            if path == "logs" and kwargs.get("dir_fd") is not None and not swapped:
+                try:
+                    (base / "logs").symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError) as exc:
+                    pytest.skip(f"symlink creation unavailable: {exc}")
+                swapped = True
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(imap_ops.os, "mkdir", racing_mkdir)
+
+        with pytest.raises(RuntimeError, match="symlinked log directory|replaced log directory"):
+            setup_logging(log_dir)
+
+        assert swapped
+        assert (base / "logs").is_symlink()
+        assert not (outside / "run").exists()
 
     def test_legacy_import_rejects_hard_linked_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account

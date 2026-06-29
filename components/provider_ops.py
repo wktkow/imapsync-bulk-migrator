@@ -35,6 +35,7 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
+_HAS_DESCRIPTOR_RELATIVE_MKDIR = _HAS_DESCRIPTOR_RELATIVE_OPEN and os.mkdir in os.supports_dir_fd
 _PROVIDER_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
 _PROVIDER_UIDVALIDITY_MAX = 0xFFFFFFFF
 
@@ -120,10 +121,7 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
 
 
 def ensure_private_dir(path: Path) -> None:
-    _raise_if_provider_path_symlink(path, "directory")
-    path.mkdir(parents=True, exist_ok=True)
-    _raise_if_provider_path_symlink(path, "directory")
-    dir_fd, dir_path = _open_provider_dir(path, "directory")
+    dir_fd, dir_path = _open_or_create_provider_dir(path, "directory")
     try:
         stat_result = os.fstat(dir_fd)
         if not stat.S_ISDIR(stat_result.st_mode):
@@ -197,6 +195,53 @@ def _provider_dir_open_flags() -> int:
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     return flags
+
+
+def _open_or_create_provider_dir(path: Path, label: str) -> Tuple[int, Path]:
+    if not _HAS_DESCRIPTOR_RELATIVE_MKDIR:
+        raise RuntimeError("platform does not support descriptor-relative provider directory creation")
+    absolute = _provider_normalized_absolute_path(path)
+    flags = _provider_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                os.mkdir(part, PRIVATE_DIR_MODE, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked provider {label}: {path}") from exc
+                if exc.errno != errno.EEXIST:
+                    raise
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked provider {label}: {path}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    with contextlib.suppress(OSError):
+                        component_stat = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISLNK(component_stat.st_mode):
+                            raise RuntimeError(f"refusing to use symlinked provider {label}: {path}") from exc
+                    raise RuntimeError(f"provider {label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"provider {label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+            current = current / part
+        _raise_if_provider_parent_replaced(absolute, fd, label)
+        return fd, absolute
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _open_provider_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
@@ -3239,9 +3284,11 @@ def provider_export_all(
     stop_event: Optional[object] = None,
 ) -> None:
     max_workers = _require_max_workers(max_workers)
-    _raise_if_provider_path_symlink(out_root, "export root")
-    out_root.mkdir(parents=True, exist_ok=True)
-    _raise_if_provider_path_symlink(out_root, "export root")
+    root_fd, root_path = _open_or_create_provider_dir(out_root, "export root")
+    try:
+        _raise_if_provider_parent_replaced(root_path, root_fd, "export root")
+    finally:
+        os.close(root_fd)
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
