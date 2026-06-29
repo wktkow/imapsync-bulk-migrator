@@ -121,6 +121,7 @@ class TestUidSearchNoNone:
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"3"])
+        fake_imap.response.return_value = ("OK", [b"123"])
         fake_imap.uid.return_value = ("OK", [b"1 2 3"])
 
         result = fetch_all_uids(fake_imap, "INBOX")

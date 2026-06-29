@@ -55,6 +55,14 @@ def _mkfifo_or_skip(path: Path) -> None:
         pytest.skip(f"FIFO creation unavailable: {exc}")
 
 
+def _stable_uidvalidity_response(*_args, **_kwargs):
+    return "OK", [b"123"]
+
+
+def _unique_ordered(values: List[str]) -> List[str]:
+    return list(dict.fromkeys(values))
+
+
 def _write_legacy_message_fixture(
     folder: Path,
     *,
@@ -724,6 +732,7 @@ class TestBug2NoDoubleSelect:
         fake_imap = mock.MagicMock()
         fake_imap.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"'])
         fake_imap.select.return_value = ("OK", [b"0"])
+        fake_imap.response.return_value = ("OK", [b"123"])
         fake_imap.uid.side_effect = [
             ("OK", [b""]),  # uid search → no messages
         ]
@@ -739,7 +748,7 @@ class TestBug2NoDoubleSelect:
         assert len(select_calls) == 1, f"Expected 1 select call for INBOX, got {len(select_calls)}"
         state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
         assert state["complete"] is True
-        assert state["mailboxes"] == [{"mailbox": "INBOX", "message_count": 0, "path": "INBOX"}]
+        assert state["mailboxes"] == [{"mailbox": "INBOX", "message_count": 0, "path": "INBOX", "uidvalidity": "123"}]
 
     def test_export_writes_private_source_bound_staging_artifacts(self, tmp_path: Path) -> None:
         from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest, export_account
@@ -750,6 +759,8 @@ class TestBug2NoDoubleSelect:
         data = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
 
         class SingleMessageExportImap:
+            response = _stable_uidvalidity_response
+
             def list(self):
                 return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
 
@@ -804,6 +815,8 @@ class TestLegacyExportCompleteness:
         second = b"Message-ID: <two@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ntwo"
 
         class MultiBodyFetchImap:
+            response = _stable_uidvalidity_response
+
             def list(self):
                 return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
 
@@ -895,6 +908,7 @@ class TestLegacyExportCompleteness:
         fake_imap = mock.MagicMock()
         fake_imap.list.return_value = ("OK", [b'(\\HasNoChildren) "/" "INBOX"'])
         fake_imap.select.return_value = ("OK", [b"1"])
+        fake_imap.response.return_value = ("OK", [b"123"])
         fake_imap.uid.side_effect = [
             ("OK", [b"1"]),
             ("OK", [b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")']),
@@ -915,6 +929,8 @@ class TestLegacyExportCompleteness:
         account = Account(email="user@example.com", password="pass")
 
         class PartialExportImap:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -964,6 +980,8 @@ class TestLegacyExportCompleteness:
         account = Account(email="user@example.com", password="pass")
 
         class SuccessfulExportImap:
+            response = _stable_uidvalidity_response
+
             selected = "INBOX"
 
             def list(self):
@@ -1039,6 +1057,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class SpecialUseSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1084,9 +1104,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX", "All Mail"]
+        assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == body
         assert not (account_dir / "All_Mail").exists()
@@ -1100,6 +1120,8 @@ class TestLegacyListParsing:
         archived_body = b"Message-ID: <legacy-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
 
         class InboxAndAllSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1146,10 +1168,10 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX", "All Mail"]
+        assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == inbox_body
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == archived_body
@@ -1162,6 +1184,8 @@ class TestLegacyListParsing:
         flagged_body = b"Message-ID: <legacy-flagged-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
 
         class InboxAndFlaggedSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1207,10 +1231,10 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["INBOX", "Flagged"]
+        assert _unique_ordered(source.selected) == ["INBOX", "Flagged"]
         assert state["mailboxes"] == [
-            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
-            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "INBOX" / "u0000000001.eml").read_bytes() == inbox_body
         assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
@@ -1222,6 +1246,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-project@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class ProjectAndAllSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1266,9 +1292,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["Projects", "All Mail"]
+        assert _unique_ordered(source.selected) == ["Projects", "All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "Projects", "path": "Projects", "message_count": 1},
+            {"mailbox": "Projects", "path": "Projects", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "Projects" / "u0000000001.eml").read_bytes() == body
         assert not (account_dir / "All_Mail").exists()
@@ -1280,6 +1306,8 @@ class TestLegacyListParsing:
         flagged_body = b"Message-ID: <legacy-flagged@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nflagged"
 
         class FlaggedOnlySource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1323,9 +1351,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["Flagged"]
+        assert _unique_ordered(source.selected) == ["Flagged"]
         assert state["mailboxes"] == [
-            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1},
+            {"mailbox": "Flagged", "path": "Flagged", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
 
@@ -1336,6 +1364,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-all-only@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class AllOnlySource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1379,9 +1409,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["All Mail"]
+        assert _unique_ordered(source.selected) == ["All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
 
@@ -1392,6 +1422,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-all-only-duplicate@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
 
         class DuplicateAllOnlySource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1436,9 +1468,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["All Mail"]
+        assert _unique_ordered(source.selected) == ["All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2, "uidvalidity": "123"},
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == body
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == body
@@ -1501,6 +1533,45 @@ class TestLegacyListParsing:
         assert marker["uidvalidity"] == "123"
         assert metadata["uidvalidity"] == "123"
         assert state["mailboxes"][0]["uidvalidity"] == "123"
+
+    def test_export_fails_without_legacy_uidvalidity(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-missing-uidvalidity@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class MissingUIDValiditySource:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [None]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[MissingUIDValiditySource]:
+            yield MissingUIDValiditySource()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="did not provide valid UIDVALIDITY"):
+                export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+        assert not (tmp_path / "user@example.com" / "INBOX" / "u0000000001.eml").exists()
 
     def test_export_fails_when_legacy_uidvalidity_changes(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -1612,6 +1683,8 @@ class TestLegacyListParsing:
         archived_body = b"Message-ID: <legacy-all-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
 
         class AllAndFlaggedSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected: List[str] = []
                 self.selected_mailbox = ""
@@ -1660,9 +1733,9 @@ class TestLegacyListParsing:
 
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
-        assert source.selected == ["All Mail"]
+        assert _unique_ordered(source.selected) == ["All Mail"]
         assert state["mailboxes"] == [
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 2, "uidvalidity": "123"},
         ]
         assert (account_dir / "All_Mail" / "u0000000001.eml").read_bytes() == flagged_body
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == archived_body
@@ -1675,6 +1748,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-special-use-return@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class SpecialUseReturnSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.list_calls: List[tuple] = []
                 self.selected: List[str] = []
@@ -1728,8 +1803,8 @@ class TestLegacyListParsing:
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
         assert source.list_calls == [('""', '"*" RETURN (SPECIAL-USE)')]
-        assert source.selected == ["INBOX", "All Mail"]
-        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1}]
+        assert _unique_ordered(source.selected) == ["INBOX", "All Mail"]
+        assert state["mailboxes"] == [{"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"}]
         assert not (account_dir / "All_Mail").exists()
 
     def test_remote_audit_uses_legacy_export_scope_mailboxes(self, tmp_path: Path) -> None:
@@ -1740,6 +1815,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-audit-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class SpecialUseRemote:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected_mailbox = ""
 
@@ -1808,6 +1885,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-validate-special-use@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
         class SpecialUseRemote:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected_mailbox = ""
 
@@ -1888,6 +1967,8 @@ class TestLegacyListParsing:
         archived_body = b"Message-ID: <legacy-audit-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
 
         class InboxAndAllRemote:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected_mailbox = ""
 
@@ -1946,8 +2027,8 @@ class TestLegacyListParsing:
         account_dir = export_root / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
         assert state["mailboxes"] == [
-            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1, "uidvalidity": "123"},
         ]
 
         with mock.patch("components.audit.imap_connection", fake_connection):
@@ -1989,6 +2070,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-duplicate-virtual@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
 
         class DuplicateAllRemote:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -2040,8 +2123,8 @@ class TestLegacyListParsing:
         account_dir = tmp_path / "user@example.com"
         state = json.loads((account_dir / "export-state.json").read_text())
         assert state["mailboxes"] == [
-            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
-            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1},
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1, "uidvalidity": "123"},
+            {"mailbox": "All Mail", "path": "All_Mail", "message_count": 1, "uidvalidity": "123"},
         ]
         assert (account_dir / "All_Mail" / "u0000000002.eml").read_bytes() == body
 
@@ -2064,6 +2147,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-validate-duplicate-virtual@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsame"
 
         class DuplicateAllRemote:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -2139,6 +2224,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-nested@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nnested"
 
         class SlashSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -2221,6 +2308,7 @@ class TestLegacyListParsing:
             "path": "Projects_2024",
             "source_delimiter": "/",
             "source_path_segments": ["Projects", "2024"],
+            "uidvalidity": "123",
         }]
 
         with mock.patch("components.imap_ops.imap_connection", target_connection):
@@ -2244,6 +2332,8 @@ class TestLegacyListParsing:
         body = b"Message-ID: <legacy-validate-nested@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nnested"
 
         class SlashSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -2334,6 +2424,8 @@ class TestLegacyListParsing:
         archived_body = b"Message-ID: <translated-all-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
 
         class SlashAllSource:
+            response = _stable_uidvalidity_response
+
             def __init__(self) -> None:
                 self.selected = ""
 
@@ -7308,6 +7400,8 @@ class TestRound1ConfirmedBugs:
         from components.models import Account, ServerConfig
 
         class DotDotMailboxImap:
+            response = _stable_uidvalidity_response
+
             def list(self):
                 return "OK", [b'(\\HasNoChildren) "/" ".."']
 
@@ -7555,6 +7649,8 @@ print("ok")
         from components.models import Account, ServerConfig
 
         class UidExportImap:
+            response = _stable_uidvalidity_response
+
             def __init__(self, uids: List[int]) -> None:
                 self.uids = uids
 
@@ -7599,6 +7695,8 @@ print("ok")
         from components.models import Account, Config, ServerConfig
 
         class MailboxExportImap:
+            response = _stable_uidvalidity_response
+
             def __init__(self, mailboxes: List[str]) -> None:
                 self.mailboxes = mailboxes
                 self.selected = ""
