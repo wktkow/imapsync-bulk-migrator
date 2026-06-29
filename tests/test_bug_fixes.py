@@ -2079,7 +2079,12 @@ class TestLegacyListParsing:
         assert metadata["uidvalidity"] == "123"
         assert state["mailboxes"][0]["uidvalidity"] == "123"
 
-    def test_export_fails_without_legacy_uidvalidity(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("uidvalidity_response", ([None], [b""], [b"0"], [b"not-a-number"], [b"4294967296"]))
+    def test_export_fails_without_valid_legacy_uidvalidity(
+        self,
+        tmp_path: Path,
+        uidvalidity_response: List[Optional[bytes]],
+    ) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
 
@@ -2093,7 +2098,7 @@ class TestLegacyListParsing:
                 return "OK", [b"1"]
 
             def response(self, name: str):
-                return "OK", [None]
+                return "OK", uidvalidity_response
 
             def uid(self, command: str, *args):
                 if command == "search":
@@ -2117,6 +2122,12 @@ class TestLegacyListParsing:
                 export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
 
         assert not (tmp_path / "user@example.com" / "INBOX" / "u0000000001.eml").exists()
+
+    def test_legacy_uidvalidity_metadata_rejects_out_of_range_value(self) -> None:
+        from components.imap_ops import _legacy_uidvalidity_metadata
+
+        with pytest.raises(RuntimeError, match="invalid uidvalidity metadata"):
+            _legacy_uidvalidity_metadata({"uidvalidity": "4294967296"}, "message metadata")
 
     def test_export_fails_when_legacy_uidvalidity_changes(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account

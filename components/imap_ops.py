@@ -31,6 +31,7 @@ _LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGAC
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _LEGACY_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
+_LEGACY_UIDVALIDITY_MAX = 0xFFFFFFFF
 _IMAP_INTERNALDATE_RE = re.compile(
     r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
@@ -468,9 +469,13 @@ def _legacy_uidvalidity_metadata(record: Mapping[str, object], label: str) -> st
     value = record.get("uidvalidity")
     if value in (None, ""):
         return ""
-    if not isinstance(value, str) or not _LEGACY_UIDVALIDITY_RE.fullmatch(value):
+    if not isinstance(value, str) or not _valid_legacy_uidvalidity(value):
         raise RuntimeError(f"{label}: invalid uidvalidity metadata")
     return value
+
+
+def _valid_legacy_uidvalidity(value: str) -> bool:
+    return bool(_LEGACY_UIDVALIDITY_RE.fullmatch(value) and int(value) <= _LEGACY_UIDVALIDITY_MAX)
 
 
 def selected_uidvalidity(imap: imaplib.IMAP4) -> str:
@@ -479,7 +484,7 @@ def selected_uidvalidity(imap: imaplib.IMAP4) -> str:
         if data and data[0]:
             value = data[0].decode(errors="ignore") if isinstance(data[0], bytes) else str(data[0])
             value = value.strip()
-            if _LEGACY_UIDVALIDITY_RE.fullmatch(value):
+            if _valid_legacy_uidvalidity(value):
                 return value
     return ""
 
