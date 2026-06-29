@@ -24,6 +24,7 @@ from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
 from .imap_ops import (
+    _is_legacy_flagged_source_view,
     _legacy_flags_from_fetch_response,
     _legacy_internaldate_from_fetch_response,
     _legacy_missing_target_flags,
@@ -262,18 +263,33 @@ def _legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
     return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
 
 
+_LegacyCoverageSlot = Tuple[Set[Tuple[int, str]], str, str]
+
+
 def _legacy_identity_variant_slots_cover(
-    remote_slots: List[Set[Tuple[int, str]]],
-    local_slots: List[Set[Tuple[int, str]]],
+    remote_slots: List[_LegacyCoverageSlot],
+    local_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
 ) -> bool:
     if len(remote_slots) > len(local_slots):
         return False
     edges: List[List[int]] = []
-    for remote_identities in remote_slots:
+    for remote_identities, remote_flags, remote_internaldate in remote_slots:
+        if required_flags and _legacy_missing_target_flags(required_flags, remote_flags):
+            return False
         matches = [
             idx
-            for idx, local_identities in enumerate(local_slots)
+            for idx, (local_identities, local_flags, local_internaldate) in enumerate(local_slots)
             if remote_identities & local_identities
+            and not (required_flags and _legacy_missing_target_flags(required_flags, local_flags))
+            and not (
+                required_flags
+                and _normalized_legacy_internaldate(remote_internaldate)
+                and _normalized_legacy_internaldate(local_internaldate)
+                and _normalized_legacy_internaldate(remote_internaldate)
+                != _normalized_legacy_internaldate(local_internaldate)
+            )
         ]
         if not matches:
             return False
@@ -297,7 +313,13 @@ def _legacy_identity_variant_slots_cover(
     return True
 
 
-def _legacy_remote_mailbox_content_covered(imap, mailbox: str, local_identity_slots: List[Set[Tuple[int, str]]]) -> bool:
+def _legacy_remote_mailbox_content_covered(
+    imap,
+    mailbox: str,
+    local_identity_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
+) -> bool:
     from .imap_ops import quote_mailbox_name
 
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
@@ -307,20 +329,26 @@ def _legacy_remote_mailbox_content_covered(imap, mailbox: str, local_identity_sl
     if status != "OK":
         return False
     nums = search_data[0].split() if search_data and search_data[0] else []
-    remote_slots: List[Set[Tuple[int, str]]] = []
+    remote_slots: List[_LegacyCoverageSlot] = []
+    fetch_query = "(RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])" if required_flags else "(RFC822.SIZE BODY.PEEK[])"
     for num in nums:
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+        status, fetched = imap.fetch(num, fetch_query)
         if status != "OK":
             return False
+        fetched_parts = list(fetched or [])
         remote_identities: Set[Tuple[int, str]] = set()
-        for part in fetched or []:
+        for part in fetched_parts:
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
             remote_identities.update(_legacy_content_identity_variants(bytes(part[1])))
         if not remote_identities:
             return False
-        remote_slots.append(remote_identities)
-    return _legacy_identity_variant_slots_cover(remote_slots, local_identity_slots)
+        remote_slots.append((
+            remote_identities,
+            _legacy_flags_from_fetch_response(fetched_parts) or "",
+            _legacy_internaldate_from_fetch_response(fetched_parts) or "",
+        ))
+    return _legacy_identity_variant_slots_cover(remote_slots, local_identity_slots, required_flags=required_flags)
 
 
 def setup_logging(log_directory: Path) -> Path:
@@ -1499,7 +1527,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
                     local_messages: Dict[str, List[Tuple[str, bytes, str, str]]] = {}
-                    local_content_identity_slots: List[Set[Tuple[int, str]]] = []
+                    local_content_identity_slots: List[_LegacyCoverageSlot] = []
                     if not account_dir.exists():
                         with mismatches_lock:
                             validation_errors.append((email, f"account directory missing: {account_dir}"))
@@ -1639,7 +1667,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                             )
                             guard_account_dir()
                             _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
-                            local_content_identity_slots.append(_legacy_content_identity_variants(message_bytes))
+                            local_content_identity_slots.append((
+                                _legacy_content_identity_variants(message_bytes),
+                                expected_flags,
+                                _expected_internaldate or "",
+                            ))
                             local_messages.setdefault(folder_key, []).append((
                                 eml_path.relative_to(account_dir).as_posix(),
                                 message_bytes,
@@ -1764,6 +1796,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         imap,
                                         remote_mailbox,
                                         local_content_identity_slots,
+                                        required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
                                     )
                                 ):
                                     continue
@@ -1781,6 +1814,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         imap,
                                         remote_mailbox,
                                         local_content_identity_slots,
+                                        required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
                                     )
                                 ):
                                     continue

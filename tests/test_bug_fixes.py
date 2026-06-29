@@ -13077,6 +13077,154 @@ class TestRound7ConfirmedBugs:
 
         assert any("remote INTERNALDATE mismatch" in issue for issue in issues)
 
+    def test_legacy_audit_rejects_covered_flagged_without_local_flag(self, tmp_path: Path) -> None:
+        from components.audit import audit_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        root = tmp_path / "exported"
+        account_dir = root / "user@example.com"
+        archive = account_dir / "Archive"
+        data = b"Message-ID: <covered-flag-loss@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(archive, mailbox="Archive", data=data, flags="\\Seen", source_server=server)
+        flagged = account_dir / "Flagged"
+        flagged.mkdir()
+        (flagged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+
+        class FlaggedTarget:
+            selected = "Archive"
+
+            def list(self, *_args):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "Archive"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                flags = b"\\Seen \\Flagged" if self.selected == "Flagged" else b"\\Seen"
+                return "OK", [(
+                    b"1 (RFC822.SIZE "
+                    + str(len(data)).encode("ascii")
+                    + b" FLAGS ("
+                    + flags
+                    + b') INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {'
+                    + str(len(data)).encode("ascii")
+                    + b"}",
+                    data,
+                )]
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[FlaggedTarget]:
+            yield FlaggedTarget()
+
+        with mock.patch("components.audit.imap_connection", fake_connection):
+            _email, issues = audit_account(
+                Account("user@example.com", "secret"),
+                root,
+                server=server,
+                check_remote=True,
+                require_integrity_metadata=True,
+            )
+
+        assert any("Flagged: local=0 remote=1 mismatch" in issue for issue in issues)
+
+    def test_legacy_validate_rejects_covered_flagged_without_local_flag(self, tmp_path: Path) -> None:
+        from components.main import main
+        from components.models import ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        input_root = tmp_path / "exported"
+        account_dir = input_root / "user@example.com"
+        archive = account_dir / "Archive"
+        data = b"Message-ID: <covered-flag-validate@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        _write_legacy_message_fixture(archive, mailbox="Archive", data=data, flags="\\Seen", source_server=server)
+        flagged = account_dir / "Flagged"
+        flagged.mkdir()
+        (flagged / ".mailbox.json").write_text(json.dumps({
+            "mailbox": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        }))
+        state_path = account_dir / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"].append({
+            "mailbox": "Flagged",
+            "path": "Flagged",
+            "message_count": 0,
+            "covered_by_regular_content": True,
+        })
+        state_path.write_text(json.dumps(state))
+        config_path = tmp_path / "validate.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "source_server": {"host": server.host, "port": server.port, "ssl": server.ssl, "starttls": server.starttls},
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+
+        class FlaggedTarget:
+            selected = "Archive"
+
+            def list(self, *_args):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "Archive"',
+                    b'(\\HasNoChildren \\Flagged) "/" "Flagged"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"')
+                return "OK", [b"1"]
+
+            def search(self, charset, *criteria):
+                return "OK", [b"1"]
+
+            def fetch(self, num: bytes, query: str):
+                flags = b"\\Seen \\Flagged" if self.selected == "Flagged" else b"\\Seen"
+                return "OK", [(
+                    b"1 (RFC822.SIZE "
+                    + str(len(data)).encode("ascii")
+                    + b" FLAGS ("
+                    + flags
+                    + b') INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {'
+                    + str(len(data)).encode("ascii")
+                    + b"}",
+                    data,
+                )]
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[FlaggedTarget]:
+            yield FlaggedTarget()
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.imap_ops.imap_connection", fake_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 4
+
     @pytest.mark.parametrize(
         ("artifact", "needle"),
         [
