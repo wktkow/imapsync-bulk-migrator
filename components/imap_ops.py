@@ -1977,6 +1977,7 @@ def import_account(
         login_ok = True
     except Exception as first_exc:
         if provision_context is not None:
+            _raise_if_stopped(stop_event, f"legacy import {account.email}")
             client, quota_mb, provision_label = provision_context
             try:
                 if "@" in account.email:
@@ -1986,9 +1987,12 @@ def import_account(
                 # Create mailbox then retry login
                 client.create_pop_account(domain, local, account.password, quota_mb=quota_mb)  # type: ignore[attr-defined]
                 logging.info("[%s][lazy] Created mailbox: %s, retrying login", provision_label, account.email)
+                _raise_if_stopped(stop_event, f"legacy import {account.email}")
                 _try_login_only()
                 login_ok = True
             except Exception as retry_exc:
+                if _stop_requested(stop_event):
+                    raise retry_exc
                 # Propagate original login failure, preserving retry context
                 raise first_exc from retry_exc
         else:

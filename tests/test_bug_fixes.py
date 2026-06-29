@@ -7598,6 +7598,58 @@ class TestCPanelProvisioning:
             {"email": "a@example.com", "domain": "example.com"},
         )
 
+    def test_lazy_panel_provisioning_stops_before_create_after_failed_login(self, tmp_path: Path) -> None:
+        from components.imap_ops import import_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig("imap.example.com", port=993, ssl=True, starttls=False)
+        account = Account("user@example.com", "secret")
+        _write_legacy_empty_mailbox_fixture(
+            tmp_path / account.email / "Archive",
+            mailbox="Archive",
+            source_server=server,
+        )
+        stop_event = threading.Event()
+
+        class FailingLogin:
+            def __enter__(self):
+                stop_event.set()
+                raise RuntimeError("login failed after stop")
+
+            def __exit__(self, *_args):
+                return False
+
+        class PanelClient:
+            def __init__(self) -> None:
+                self.created: List[Tuple[str, str, str, int]] = []
+
+            def create_pop_account(
+                self,
+                domain: str,
+                local_part: str,
+                password: str,
+                quota_mb: int = 0,
+                *,
+                allow_existing: bool = True,
+            ) -> None:
+                self.created.append((domain, local_part, password, quota_mb))
+
+        client = PanelClient()
+
+        with pytest.raises(RuntimeError, match="stop requested"):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: FailingLogin(),
+                stop_event=stop_event,
+                provision_context=(client, 512, "cpanel"),
+                source_server=server,
+            )
+
+        assert client.created == []
+
     def test_cpanel_reset_does_not_create_after_delete_failure(self) -> None:
         from components.cpanel_ensure import reset_accounts_cpanel
         from components.models import Account, Config, ServerConfig
