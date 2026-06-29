@@ -968,6 +968,7 @@ def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
 
 
 _MAX_GMAIL_UINT64 = (1 << 64) - 1
+_PROVIDER_FETCH_RESPONSE_START_RE = re.compile(r"^\s*\d+\s+\(")
 
 
 def _provider_fetch_response_uids(meta_str: str) -> List[int]:
@@ -998,6 +999,29 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
     label_literal_matches_expected = True
     active_matches_expected: Optional[bool] = None
     seen_expected_uid = expected_uid_int is None
+    pending_body: Optional[bytes] = None
+    pending_body_meta_chunks: List[str] = []
+
+    def finalize_pending_body() -> None:
+        nonlocal msg_bytes, pending_body, pending_body_meta_chunks
+        if pending_body is None:
+            return
+        meta_text = " ".join(pending_body_meta_chunks)
+        uids = _provider_fetch_response_uids(meta_text)
+        if expected_uid_int is not None:
+            unique_uids = set(uids)
+            if expected_uid_int not in unique_uids:
+                if uids:
+                    raise RuntimeError(f"fetch returned message bytes for unexpected UID {uids[0]}")
+                raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
+            if len(unique_uids) > 1:
+                raise RuntimeError(f"fetch response mixed UID metadata for UID {expected_uid_int}")
+        if msg_bytes is not None:
+            raise RuntimeError("fetch returned multiple message bodies for one UID")
+        msg_bytes = pending_body
+        meta_chunks.extend(pending_body_meta_chunks)
+        pending_body = None
+        pending_body_meta_chunks = []
 
     def classify_meta(meta_text: str, *, is_body: bool = False) -> bool:
         nonlocal active_matches_expected, seen_expected_uid
@@ -1020,6 +1044,7 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
 
     for part in fetch_response:
         if isinstance(part, tuple) and len(part) == 2:
+            finalize_pending_body()
             meta, body = part
             meta_text = ""
             if isinstance(meta, (bytes, bytearray)):
@@ -1028,6 +1053,10 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
                 isinstance(body, (bytes, bytearray))
                 and re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE)
             )
+            if body_is_message and expected_uid_int is not None and not _provider_fetch_response_uids(meta_text):
+                pending_body = bytes(body)
+                pending_body_meta_chunks = [meta_text] if meta_text else []
+                continue
             matches_expected = classify_meta(meta_text, is_body=bool(body_is_message))
             if meta_text and matches_expected:
                 meta_chunks.append(meta_text)
@@ -1059,6 +1088,20 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
                     literal_labels.append(label)
         elif isinstance(part, (bytes, bytearray)):
             meta_text = bytes(part).decode(errors="ignore")
+            if pending_body is not None:
+                if _PROVIDER_FETCH_RESPONSE_START_RE.match(meta_text):
+                    finalize_pending_body()
+                else:
+                    pending_body_meta_chunks.append(meta_text)
+                    if _provider_fetch_response_uids(meta_text):
+                        final_meta = " ".join(pending_body_meta_chunks)
+                        matches_expected = classify_meta(final_meta, is_body=True)
+                        if not matches_expected:
+                            uids = _provider_fetch_response_uids(final_meta)
+                            if uids:
+                                raise RuntimeError(f"fetch returned message bytes for unexpected UID {uids[0]}")
+                            raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
+                    continue
             matches_expected = classify_meta(meta_text)
             if matches_expected:
                 meta_chunks.append(meta_text)
@@ -1066,6 +1109,7 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
                 label_literal_context = False
                 label_literal_matches_expected = True
                 active_matches_expected = None
+    finalize_pending_body()
     if not seen_expected_uid and expected_uid_int is not None:
         raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
     meta_str = " ".join(meta_chunks)
