@@ -2818,6 +2818,10 @@ def provider_export_account(
     account_dir = account_export_dir(out_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     _raise_if_provider_path_symlink(account_dir / "export-state.json", "file")
+    if account_dir.exists():
+        mixed_layout_issues = provider_mixed_legacy_layout_issues(account_dir)
+        if mixed_layout_issues:
+            raise RuntimeError("; ".join(mixed_layout_issues))
     messages: Dict[str, Dict[str, Any]] = {}
     manifest_path = account_dir / "manifest.jsonl"
     preserve_complete_state_until_ready = False

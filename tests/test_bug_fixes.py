@@ -11452,6 +11452,37 @@ class TestRound7ConfirmedBugs:
             with pytest.raises(RuntimeError, match="symlinked provider account directory"):
                 provider_export_account(config, account, out_root)
 
+    def test_provider_export_rejects_legacy_layout_before_state_rewrite(self, tmp_path: Path) -> None:
+        from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
+        from components.provider_ops import provider_export_account
+
+        source = ProviderEndpoint(
+            provider="imap",
+            host="source.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="secret"),
+        )
+        target = ProviderEndpoint(
+            provider="imap",
+            host="target.example.com",
+            auth=AuthConfig(method="password", username="target@example.com", password="secret"),
+        )
+        account = MigrationAccount(source_email="source@example.com", target_email="target@example.com")
+        config = ProviderMigrationConfig(source=source, target=target, accounts=[account])
+        account_dir = tmp_path / "exported" / "source@example.com"
+        legacy_folder = account_dir / "Archive"
+        legacy_folder.mkdir(parents=True)
+        (legacy_folder / ".mailbox.json").write_text(json.dumps({"mailbox": "Archive", "message_count": 0}))
+        state_path = account_dir / "export-state.json"
+        legacy_state = {"schema_version": 1, "account": account.source_email, "complete": True, "mailboxes": []}
+        state_path.write_text(json.dumps(legacy_state))
+
+        with mock.patch("components.provider_ops.imap_connection", side_effect=AssertionError("source should not be contacted")):
+            with pytest.raises(RuntimeError, match="legacy mailbox directory present"):
+                provider_export_account(config, account, tmp_path / "exported")
+
+        assert json.loads(state_path.read_text()) == legacy_state
+        assert not (account_dir / "manifest.jsonl").exists()
+
     def test_provider_export_rejects_symlinked_resume_state_before_source_contact(self, tmp_path: Path) -> None:
         from components.content_binding import CONTENT_BINDING_FIELD, provider_content_binding_sha256
         from components.models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig
