@@ -578,12 +578,7 @@ def fetch_all_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     return uids
 
 
-def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[List[int], str]:
-    """Select a mailbox and return all message UIDs plus the selected UIDVALIDITY."""
-    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
-    if status != "OK":
-        raise RuntimeError(f"Failed to select mailbox {mailbox}")
-    uidvalidity = require_selected_uidvalidity(imap, mailbox)
+def _search_selected_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"Failed to search UIDs in {mailbox}")
@@ -594,9 +589,38 @@ def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[L
                 uids.append(int(tok))
             except ValueError:
                 continue
-    # Ensure stable ascending order
     uids.sort()
+    return uids
+
+
+def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[List[int], str]:
+    """Select a mailbox and return all message UIDs plus the selected UIDVALIDITY."""
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        raise RuntimeError(f"Failed to select mailbox {mailbox}")
+    uidvalidity = require_selected_uidvalidity(imap, mailbox)
+    uids = _search_selected_uids(imap, mailbox)
     return uids, uidvalidity
+
+
+def verify_legacy_mailbox_uid_set_stable(
+    imap: imaplib.IMAP4,
+    mailbox: str,
+    initial_uids: List[int],
+    uidvalidity: str,
+) -> None:
+    status, response = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        raise RuntimeError(f"Failed to reselect mailbox {mailbox} after export: {response}")
+    final_uidvalidity = require_selected_uidvalidity(imap, mailbox)
+    if final_uidvalidity != uidvalidity:
+        raise RuntimeError(
+            f"UIDVALIDITY changed during export of {mailbox}: "
+            f"{uidvalidity} -> {final_uidvalidity}"
+        )
+    final_uids = _search_selected_uids(imap, mailbox)
+    if final_uids != initial_uids:
+        raise RuntimeError(f"UID set changed during export of {mailbox}")
 
 
 def _legacy_import_journal_path(account_dir: Path) -> Path:
@@ -1088,6 +1112,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 if not uids:
                     if virtual_source and not export_scope_only_virtual:
                         continue
+                    verify_legacy_mailbox_uid_set_stable(imap, mailbox, uids, uidvalidity)
                     ensure_private_dir(folder_dir)
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
                     _secure_atomic_json(
@@ -1159,15 +1184,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 _remove_stale_export_files(folder_dir, written_stems)
                 if written_stems or not virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
-                    status, response = imap.select(quote_mailbox_name(mailbox), readonly=True)
-                    if status != "OK":
-                        raise RuntimeError(f"Failed to reselect mailbox {mailbox} after export: {response}")
-                    final_uidvalidity = require_selected_uidvalidity(imap, mailbox)
-                    if final_uidvalidity != uidvalidity:
-                        raise RuntimeError(
-                            f"UIDVALIDITY changed during export of {mailbox}: "
-                            f"{uidvalidity} -> {final_uidvalidity}"
-                        )
+                    verify_legacy_mailbox_uid_set_stable(imap, mailbox, uids, uidvalidity)
                     _secure_atomic_json(
                         folder_dir / ".mailbox.json",
                         _legacy_mailbox_metadata(mailbox, len(written_stems), delimiter, uidvalidity),

@@ -720,7 +720,7 @@ class TestBug12SignalThreadGuard:
 
 
 class TestBug2NoDoubleSelect:
-    """export_account should call select exactly once per mailbox (inside fetch_all_uids)."""
+    """export_account should avoid redundant selects beyond required stability checks."""
 
     def test_select_called_once_per_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -735,6 +735,7 @@ class TestBug2NoDoubleSelect:
         fake_imap.response.return_value = ("OK", [b"123"])
         fake_imap.uid.side_effect = [
             ("OK", [b""]),  # uid search → no messages
+            ("OK", [b""]),  # final stability search
         ]
 
         with mock.patch("components.imap_ops.imap_connection") as mock_conn:
@@ -743,9 +744,9 @@ class TestBug2NoDoubleSelect:
 
             export_account(account, server, tmp_path, ignore_errors=False)
 
-        # select should be called exactly once for "INBOX" (by fetch_all_uids)
+        # select is used for initial discovery and the final stability check.
         select_calls = [c for c in fake_imap.select.call_args_list if c[0][0] == "INBOX"]
-        assert len(select_calls) == 1, f"Expected 1 select call for INBOX, got {len(select_calls)}"
+        assert len(select_calls) == 2, f"Expected 2 select calls for INBOX, got {len(select_calls)}"
         state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
         assert state["complete"] is True
         assert state["mailboxes"] == [{"mailbox": "INBOX", "message_count": 0, "path": "INBOX", "uidvalidity": "123"}]
@@ -1723,6 +1724,51 @@ class TestLegacyListParsing:
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
             with pytest.raises(RuntimeError, match="UIDVALIDITY changed during export of INBOX"):
                 export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+    def test_export_fails_when_legacy_uid_set_changes(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-uid-set-changed@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class ChangingUIDSetSource:
+            def __init__(self) -> None:
+                self.search_count = 0
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1" if self.search_count == 0 else b"2"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    self.search_count += 1
+                    return "OK", [b"1" if self.search_count == 1 else b"1 2"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[ChangingUIDSetSource]:
+            yield ChangingUIDSetSource()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match="UID set changed during export of INBOX"):
+                export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+        state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
+        assert state["complete"] is False
+        assert not (tmp_path / "user@example.com" / "INBOX" / ".mailbox.json").exists()
 
     def test_audit_import_and_verify_reject_legacy_uidvalidity_mismatch(self, tmp_path: Path) -> None:
         from components.audit import audit_account
