@@ -2224,6 +2224,9 @@ def offline_journal_target_mailbox_issues(
 def committed_journal_manifest_content_issues(
     rows: List[Dict[str, Any]],
     manifest_rows: List[Dict[str, Any]],
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
 ) -> List[str]:
     manifest_by_id = {
         str(row.get("canonical_id") or ""): row
@@ -2231,7 +2234,11 @@ def committed_journal_manifest_content_issues(
         if row.get("canonical_id")
     }
     issues: List[str] = []
-    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(rows).items():
+    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(
+        rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    ).items():
         manifest_row = manifest_by_id.get(identity)
         label = f"{identity} in {target_mailbox or '<missing>'}"
         if manifest_row is None:
@@ -4355,7 +4362,11 @@ def _validated_group_stage(
             f"invalid import journal for merge source {account.source_email}: "
             + "; ".join(journal_target_issues)
         )
-    journal_content_issues = committed_journal_manifest_content_issues(journal_rows, manifest_rows)
+    journal_content_issues = committed_journal_manifest_content_issues(
+        journal_rows,
+        manifest_rows,
+        target_provider=config.target.provider,
+    )
     if journal_content_issues:
         raise RuntimeError(
             f"invalid import journal for merge source {account.source_email}: "
@@ -4645,10 +4656,15 @@ def provider_import_account(
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
     if journal_target_issues:
         raise RuntimeError("invalid import journal: " + "; ".join(journal_target_issues))
-    journal_content_issues = committed_journal_manifest_content_issues(journal_rows, manifest_rows)
-    if journal_content_issues:
-        raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
     manifest_ids = {str(row.get("canonical_id") or "") for row in manifest_rows if row.get("canonical_id")}
+    if config.target.provider != "gmail":
+        journal_content_issues = committed_journal_manifest_content_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+        )
+        if journal_content_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
     if config.target.provider == "gmail":
         invalid_gmail_msgid_issues = invalid_journal_target_gmail_msgid_issues(
             journal_rows,
@@ -4687,6 +4703,14 @@ def provider_import_account(
                     "IMAP server did not advertise X-GM-EXT-1"
                 )
         target_mailboxes = list_mailboxes(imap)
+        journal_content_issues = committed_journal_manifest_content_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
+        )
+        if journal_content_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
         pending = {
             key
             for key, row in latest_journal_rows(
@@ -5142,7 +5166,13 @@ def provider_audit_account(
     else:
         issues.extend(journal_row_issues(journal_rows, account))
         issues.extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
-        issues.extend(committed_journal_manifest_content_issues(journal_rows, rows))
+        issues.extend(
+            committed_journal_manifest_content_issues(
+                journal_rows,
+                rows,
+                target_provider=config.target.provider,
+            )
+        )
         issues.extend(
             offline_journal_target_mailbox_issues(
                 journal_rows,
@@ -5395,7 +5425,22 @@ def provider_validate_account(
     journal_issues = journal_row_issues(journal_rows, account)
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
-    report["failed"].extend(committed_journal_manifest_content_issues(journal_rows, manifest_rows))
+
+    journal_content_checked = False
+
+    def append_journal_content_failures(
+        target_mailboxes: Optional[List[MailboxInfo]] = None,
+    ) -> None:
+        nonlocal journal_content_checked
+        journal_content_checked = True
+        report["failed"].extend(
+            committed_journal_manifest_content_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
+        )
 
     pending_resolution_checked = False
 
@@ -5429,6 +5474,7 @@ def provider_validate_account(
                 )
 
     if not check_target:
+        append_journal_content_failures()
         report["failed"].extend(
             offline_journal_target_mailbox_issues(
                 journal_rows,
@@ -5555,6 +5601,7 @@ def provider_validate_account(
                         raise RuntimeError("target Gmail IMAP server did not advertise X-GM-EXT-1")
                 target_mailboxes = list_mailboxes(imap)
                 _raise_if_stopped(stop_event, f"provider validate {account.email}")
+                append_journal_content_failures(target_mailboxes=target_mailboxes)
                 if merge_group_stages is not None:
                     require_merge_group_target_translation_safe(
                         merge_group_stages,
@@ -5827,6 +5874,8 @@ def provider_validate_account(
         except Exception as exc:
             if _stop_requested(stop_event):
                 raise
+            if not journal_content_checked:
+                append_journal_content_failures()
             if not pending_resolution_checked:
                 append_unresolved_pending_failures()
             committed_by_id, _target_by_id, failures = evaluate_journal()
@@ -5834,6 +5883,8 @@ def provider_validate_account(
             apply_counts(committed_by_id)
             report["failed"].append(f"remote target validation failed: {exc}")
     else:
+        if not journal_content_checked:
+            append_journal_content_failures()
         committed_by_id, _target_by_id, failures = evaluate_journal()
         report["failed"].extend(failures)
         apply_counts(committed_by_id)

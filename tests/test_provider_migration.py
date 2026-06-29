@@ -8471,6 +8471,72 @@ def test_provider_audit_and_offline_validate_reject_stale_journal_content(tmp_pa
     assert any("journal committed content_sha256 does not match manifest" in issue for issue in report["failed"])
 
 
+def test_provider_journal_content_check_ignores_superseded_gmail_alias_commit(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    _mark_manifest_source_provider(row, "imap")
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Sent"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    stale = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[Gmail]/Sent Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+        "content_sha256": "0" * 64,
+        "rfc822_size": 1,
+        CONTENT_BINDING_FIELD: "0" * 64,
+    })
+    current = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@gmail.com",
+        "target_mailbox": "[GoogleMail]/Sent Mail",
+        "status": "committed",
+        "target_gmail_msgid": "9001",
+    })
+    (account_dir / "import-target@gmail.com.journal.jsonl").write_text(
+        json.dumps(stale) + "\n" + json.dumps(current) + "\n"
+    )
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_mailbox="[Gmail]/Sent Mail",
+        messages_by_mailbox={"[Gmail]/Sent Mail": 1},
+        gmail_labels=["\\Sent"],
+        gmail_msgid="9001",
+    )
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    _name, offline_report = provider_validate_account(config, account, tmp_path, check_target=False)
+    with mock.patch("components.provider_ops.imap_connection", lambda *_args, **_kwargs: contextlib.nullcontext(fake)):
+        provider_import_account(config, account, tmp_path)
+        _name, online_report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not any("journal committed content_sha256 does not match manifest" in issue for issue in audit_issues)
+    assert not any("journal committed content_sha256 does not match manifest" in issue for issue in offline_report["failed"])
+    assert not any("journal committed content_sha256 does not match manifest" in issue for issue in online_report["failed"])
+    assert fake.appended == []
+    assert offline_report["ok"], offline_report
+    assert online_report["ok"], online_report
+
+
 @pytest.mark.parametrize(
     ("mutations", "needle"),
     [
