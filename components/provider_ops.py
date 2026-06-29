@@ -29,6 +29,8 @@ from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
+_PROVIDER_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
+_PROVIDER_UIDVALIDITY_MAX = 0xFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -972,8 +974,18 @@ def selected_uidvalidity(imap: imaplib.IMAP4) -> str:
     with contextlib.suppress(Exception):
         _typ, data = imap.response("UIDVALIDITY")
         if data and data[0]:
-            return data[0].decode(errors="ignore") if isinstance(data[0], bytes) else str(data[0])
+            value = data[0].decode(errors="ignore") if isinstance(data[0], bytes) else str(data[0])
+            value = value.strip()
+            if _PROVIDER_UIDVALIDITY_RE.fullmatch(value) and int(value) <= _PROVIDER_UIDVALIDITY_MAX:
+                return value
     return ""
+
+
+def require_selected_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> str:
+    uidvalidity = selected_uidvalidity(imap)
+    if not uidvalidity:
+        raise RuntimeError(f"Selected mailbox {mailbox} did not provide valid UIDVALIDITY")
+    return uidvalidity
 
 
 def _parse_uid_search_data(data: Any) -> List[int]:
@@ -989,7 +1001,7 @@ def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[L
     status, response = select_mailbox(imap, mailbox, readonly=True)
     if status != "OK":
         raise RuntimeError(f"failed to select mailbox {mailbox}: {response}")
-    uidvalidity = selected_uidvalidity(imap)
+    uidvalidity = require_selected_uidvalidity(imap, mailbox)
     status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"failed to search UIDs in {mailbox}")
@@ -2968,10 +2980,9 @@ def provider_export_account(
                 continue
             _raise_if_stopped(stop_event, f"provider export {account.source_email}")
             uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox.name)
-            if uidvalidity:
-                scanned_uidvalidity_by_mailbox[mailbox.name] = uidvalidity
+            scanned_uidvalidity_by_mailbox[mailbox.name] = uidvalidity
             previous_uidvalidities = previous_uidvalidities_by_mailbox.get(mailbox.name, set())
-            if previous_uidvalidities and uidvalidity and uidvalidity not in previous_uidvalidities:
+            if previous_uidvalidities and uidvalidity not in previous_uidvalidities:
                 raise RuntimeError(
                     f"UIDVALIDITY changed since previous export for {mailbox.name}: "
                     f"previous={sorted(previous_uidvalidities)} current={uidvalidity}; "
@@ -3103,8 +3114,8 @@ def provider_export_account(
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")
-            final_uidvalidity = selected_uidvalidity(imap)
-            if uidvalidity and final_uidvalidity and final_uidvalidity != uidvalidity:
+            final_uidvalidity = require_selected_uidvalidity(imap, mailbox.name)
+            if final_uidvalidity != uidvalidity:
                 raise RuntimeError(
                     f"UIDVALIDITY changed during export of {mailbox.name}: "
                     f"{uidvalidity} -> {final_uidvalidity}; restart this mailbox"

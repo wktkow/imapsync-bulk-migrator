@@ -4045,6 +4045,39 @@ def test_provider_uid_search_uses_rfc_valid_signature() -> None:
     assert fake.search_args == ("ALL",)
 
 
+@pytest.mark.parametrize("uidvalidity_response", ([None], [b""], [b"0"], [b"not-a-number"], [b"4294967296"]))
+def test_provider_uid_search_requires_valid_uidvalidity(uidvalidity_response: List[Optional[bytes]]) -> None:
+    class InvalidUidvalidityImap(FakeSourceImap):
+        def response(self, name: str):
+            return "OK", uidvalidity_response
+
+    with pytest.raises(RuntimeError, match="valid UIDVALIDITY"):
+        fetch_all_uids_and_uidvalidity(InvalidUidvalidityImap(), "INBOX")
+
+
+@pytest.mark.parametrize("uidvalidity_response", ([None], [b"not-a-number"]))
+def test_provider_export_requires_uidvalidity_before_manifest(
+    tmp_path: Path,
+    uidvalidity_response: List[Optional[bytes]],
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+
+    class InvalidUidvaliditySource(FakeSourceImap):
+        def response(self, name: str):
+            return "OK", uidvalidity_response
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[InvalidUidvaliditySource]:
+        yield InvalidUidvaliditySource()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        with pytest.raises(RuntimeError, match="valid UIDVALIDITY"):
+            provider_export_account(config, account, tmp_path)
+
+    assert not (tmp_path / account.source_email / "manifest.jsonl").exists()
+
+
 class FakeSourceNoBodyImap(FakeSourceImap):
     def uid(self, command: str, *args):
         if command == "search":
