@@ -1078,6 +1078,14 @@ def _fetch_response_uid(meta_str: str) -> Optional[int]:
     return None
 
 
+def _fetch_response_uids(meta_str: str) -> List[int]:
+    uids: List[int] = []
+    for match in re.finditer(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE):
+        with contextlib.suppress(ValueError):
+            uids.append(int(match.group(1)))
+    return uids
+
+
 def _parse_fetch_response_for_uid(
     fetch_response: List[object],
     expected_uid: int,
@@ -1091,7 +1099,9 @@ def _parse_fetch_response_for_uid(
     msg_bytes: Optional[bytes] = None
     flags: Optional[str] = None
     internaldate: Optional[str] = None
-    joinable: List[bytes] = []
+    body_parts: List[bytes] = []
+    body_meta_chunks: List[str] = []
+    active_body_meta_chunks: Optional[List[str]] = None
     for part in fetch_response:
         if isinstance(part, tuple) and len(part) == 2:
             meta = part[0]
@@ -1099,37 +1109,38 @@ def _parse_fetch_response_for_uid(
             meta_str = meta.decode(errors="ignore") if isinstance(meta, (bytes, bytearray)) else ""
             response_uid = _fetch_response_uid(meta_str)
             if isinstance(body, (bytes, bytearray)):
-                if response_uid is None:
-                    raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
                 if response_uid != expected_uid:
-                    if joinable:
+                    if body_parts:
                         raise RuntimeError("fetch returned multiple message bodies for one UID")
-                    raise RuntimeError(f"fetch returned message bytes for unexpected UID {response_uid}")
-                joinable.append(bytes(body))
-            if meta and isinstance(meta, (bytes, bytearray)):
-                if response_uid != expected_uid:
-                    continue
-                m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
-                if m_flags:
-                    flags = m_flags.group(1)
-                m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
-                if m_int:
-                    internaldate = m_int.group(1)
+                    if response_uid is not None:
+                        raise RuntimeError(f"fetch returned message bytes for unexpected UID {response_uid}")
+                if body_parts:
+                    raise RuntimeError("fetch returned multiple message bodies for one UID")
+                body_parts.append(bytes(body))
+                body_meta_chunks = [meta_str] if meta_str else []
+                active_body_meta_chunks = body_meta_chunks
+            else:
+                active_body_meta_chunks = None
         elif isinstance(part, (bytes, bytearray)):
             meta_str = part.decode(errors="ignore")
-            response_uid = _fetch_response_uid(meta_str)
-            if response_uid != expected_uid:
-                continue
-            m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
-            if m_flags:
-                flags = m_flags.group(1)
-            m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
-            if m_int:
-                internaldate = m_int.group(1)
-    if len(joinable) > 1:
+            if active_body_meta_chunks is not None:
+                active_body_meta_chunks.append(meta_str)
+    if len(body_parts) > 1:
         raise RuntimeError("fetch returned multiple message bodies for one UID")
-    if joinable:
-        msg_bytes = joinable[0]
+    if body_parts:
+        msg_bytes = body_parts[0]
+        meta_str = " ".join(body_meta_chunks)
+        response_uids = _fetch_response_uids(meta_str)
+        if expected_uid not in response_uids:
+            if response_uids:
+                raise RuntimeError(f"fetch returned message bytes for unexpected UID {response_uids[0]}")
+            raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
+        m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
+        if m_flags:
+            flags = m_flags.group(1)
+        m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
+        if m_int:
+            internaldate = m_int.group(1)
     return msg_bytes, flags, internaldate
 
 
@@ -1442,7 +1453,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                     batch = uids[i : i + batch_size]
                     for uid in batch:
                         _raise_if_stopped(stop_event, f"legacy export {account.email}")
-                        status, data = imap.uid("fetch", str(uid), "(BODY.PEEK[] FLAGS INTERNALDATE)")
+                        status, data = imap.uid("fetch", str(uid), "(UID FLAGS INTERNALDATE BODY.PEEK[])")
                         if status != "OK":
                             raise RuntimeError(f"fetch failed in {mailbox} for UID {uid}")
                         msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))

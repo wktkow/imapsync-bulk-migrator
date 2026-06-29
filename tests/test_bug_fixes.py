@@ -807,6 +807,40 @@ class TestBug2NoDoubleSelect:
 class TestLegacyExportCompleteness:
     """A searched UID must not disappear silently when FETCH lacks a message literal."""
 
+    def test_fetch_parser_reads_flags_and_date_from_literal_trailer(self) -> None:
+        from components.imap_ops import _parse_fetch_response_for_uid
+
+        body = b"Message-ID: <split-fetch@example.com>\r\n\r\nbody"
+
+        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(
+            [
+                (b"1 (UID 7 BODY[] {45}", body),
+                b' FLAGS (\\Seen \\Flagged) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+            ],
+            7,
+        )
+
+        assert msg_bytes == body
+        assert flags == "\\Seen \\Flagged"
+        assert internaldate == "01-Jan-2024 00:00:00 +0000"
+
+    def test_fetch_parser_accepts_uid_from_literal_trailer(self) -> None:
+        from components.imap_ops import _parse_fetch_response_for_uid
+
+        body = b"Message-ID: <trailing-uid@example.com>\r\n\r\nbody"
+
+        msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(
+            [
+                (b"1 (BODY[] {45}", body),
+                b' UID 7 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+            ],
+            7,
+        )
+
+        assert msg_bytes == body
+        assert flags == "\\Seen"
+        assert internaldate == "01-Jan-2024 00:00:00 +0000"
+
     def test_export_rejects_multiple_fetch_message_bodies_for_one_uid(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
@@ -898,6 +932,51 @@ class TestLegacyExportCompleteness:
         assert meta["flags"] == "\\Seen"
         assert meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
         assert meta["uid"] == 42
+
+    def test_export_preserves_metadata_from_fetch_literal_trailer(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        body = b"Message-ID: <split-export@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class SplitLiteralFetchImap:
+            response = _stable_uidvalidity_response
+
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"7"]
+                if command == "fetch":
+                    query = str(args[-1])
+                    if "BODY.PEEK[]" in query:
+                        return "OK", [
+                            (b"1 (UID 7 BODY[] {64}", body),
+                            b' FLAGS (\\Seen \\Flagged) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        ]
+                    return "OK", [b"1 (UID 7 FLAGS (\\Seen \\Flagged))"]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[SplitLiteralFetchImap]:
+            yield SplitLiteralFetchImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        meta = json.loads((tmp_path / "user@example.com" / "INBOX" / "u0000000007.json").read_text())
+        assert meta["flags"] == "\\Seen \\Flagged"
+        assert meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert meta["uid"] == 7
         assert meta["uidvalidity"] == "123"
 
     def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
