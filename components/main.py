@@ -1617,6 +1617,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             for name, attrs in mailbox_entries
                             if not _should_skip_legacy_source_view(name, attrs, mailbox_entries)
                         ]
+                        remote_attrs_by_mailbox = {name: attrs for name, attrs in mailbox_entries}
                         remote_attrs_by_key = {
                             canonical_mailbox_path_key(name): attrs
                             for name, attrs in mailbox_entries
@@ -1636,6 +1637,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         canonical_imap_mailbox_name(mailbox),
                                         canonical_mailbox_path_key(mailbox),
                                     )
+                                remote_attrs_by_key[key] = remote_attrs_by_mailbox.get(mailbox, ())
                                 alias_key = sanitized_path_key(key)
                                 expected_mailbox = target_mailboxes_by_key.get(key)
                                 if (

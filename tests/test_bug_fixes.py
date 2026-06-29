@@ -2052,6 +2052,119 @@ class TestLegacyListParsing:
 
         assert rc == 0
 
+    def test_validate_uses_translated_all_attrs_for_virtual_coverage(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        inbox_body = b"Message-ID: <translated-all-inbox@example.com>\r\nFrom: a\r\nTo: b\r\n\r\ninbox"
+        archived_body = b"Message-ID: <translated-all-archived@example.com>\r\nFrom: a\r\nTo: b\r\n\r\narchived"
+
+        class SlashAllSource:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" "INBOX"',
+                    b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = str(args[0])
+                    body = inbox_body if uid == "1" else archived_body
+                    return "OK", [(
+                        f'{uid} (UID {uid} FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'.encode("ascii"),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        class DotAllTarget:
+            def __init__(self) -> None:
+                self.selected = ""
+
+            def list(self, *args):
+                return "OK", [
+                    b'(\\HasNoChildren) "." "INBOX"',
+                    b'(\\HasNoChildren \\All) "." "[Gmail].All Mail"',
+                ]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.selected = mailbox.strip('"').replace(r"\"", '"')
+                return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def search(self, charset, *criteria):
+                if criteria == ("ALL",):
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if len(criteria) == 3 and criteria[:2] == ("HEADER", "Message-ID"):
+                    wanted = str(criteria[2]).strip('"')
+                    if wanted == "<translated-all-inbox@example.com>":
+                        return "OK", [b"1"]
+                    if wanted == "<translated-all-archived@example.com>" and self.selected == "[Gmail].All Mail":
+                        return "OK", [b"2"]
+                return "OK", [b""]
+
+            def fetch(self, num: bytes, query: str):
+                body = inbox_body if int(num) == 1 else archived_body
+                return "OK", [(b"1 (RFC822.SIZE %d BODY[] {%d}" % (len(body), len(body)), body)]
+
+            def logout(self):
+                return "OK", []
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("source.example.com")
+
+        @contextlib.contextmanager
+        def source_connection(*_args, **_kwargs) -> Iterator[SlashAllSource]:
+            yield SlashAllSource()
+
+        with mock.patch("components.imap_ops.imap_connection", source_connection):
+            export_account(account, source_server, tmp_path / "exported", ignore_errors=False)
+
+        account_dir = tmp_path / "exported" / "user@example.com"
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert {
+            (row["mailbox"], row["path"], row["message_count"])
+            for row in state["mailboxes"]
+        } == {
+            ("INBOX", "INBOX", 1),
+            ("[Gmail]/All Mail", "_Gmail__All_Mail", 1),
+        }
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "target.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "source.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+
+        @contextlib.contextmanager
+        def target_connection(*_args, **_kwargs) -> Iterator[DotAllTarget]:
+            yield DotAllTarget()
+
+        with mock.patch("components.imap_ops.imap_connection", target_connection):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(tmp_path / "exported"),
+                "--log-dir", str(tmp_path / "logs"),
+                "--max-workers", "1",
+                "--min-free-gb", "0",
+                "--no-connectivity-test",
+            ])
+
+        assert rc == 0
+
 
 class TestLegacyImportJournal:
     """Legacy import should not blindly duplicate committed local messages on rerun."""
