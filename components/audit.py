@@ -16,6 +16,7 @@ from .imap_ops import (
     _is_legacy_all_source_view,
     _is_legacy_flagged_source_view,
     _legacy_symlink_component,
+    _legacy_hierarchy_metadata,
     _list_selectable_mailbox_entries,
     _read_file_no_symlink,
     _require_legacy_payload_integrity,
@@ -274,14 +275,14 @@ def _legacy_export_state_issues(
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
         try:
-            _legacy_validate_path_segments(
-                raw.get("source_path_segments"),
+            state_hierarchy = _legacy_hierarchy_metadata(
+                raw,
                 mailbox,
-                raw.get("source_delimiter"),
                 f"{account.email}: export-state mailbox {mailbox!r}",
             )
         except RuntimeError as exc:
             issues.append(str(exc))
+            state_hierarchy = ("", ())
         collision_key = sanitized_path_key(mailbox)
         previous_mailbox = state_mailbox_by_path.get(collision_key)
         if previous_mailbox is not None:
@@ -297,6 +298,27 @@ def _legacy_export_state_issues(
         if folder_dir is None:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} missing staged folder {path}")
             continue
+        marker_path = folder_dir / ".mailbox.json"
+        if marker_path.exists() and not marker_path.is_symlink():
+            try:
+                marker = json.loads(_read_staged_artifact(marker_path, "legacy mailbox marker").decode("utf-8"))
+            except Exception as exc:
+                issues.append(f"{account.email}:{path}: failed to parse mailbox marker for export-state comparison: {exc}")
+            else:
+                if isinstance(marker, dict) and marker.get("mailbox") == mailbox:
+                    try:
+                        marker_hierarchy = _legacy_hierarchy_metadata(
+                            marker,
+                            mailbox,
+                            f"{account.email}:{path}: mailbox marker",
+                        )
+                    except RuntimeError as exc:
+                        issues.append(str(exc))
+                    else:
+                        if marker_hierarchy != state_hierarchy:
+                            issues.append(
+                                f"{account.email}:{path}: mailbox marker source_path_segments mismatch with export-state"
+                            )
         eml_count = len(list(folder_dir.glob("*.eml")))
         if eml_count != message_count:
             issues.append(
@@ -410,6 +432,7 @@ def audit_account(
         mailbox_marker = folder_dir / ".mailbox.json"
         mailbox_marker_present = mailbox_marker.exists() or mailbox_marker.is_symlink()
         marker_mailbox: Optional[str] = None
+        marker_hierarchy: Tuple[str, Tuple[str, ...]] = ("", ())
         if not emls and not mailbox_marker.exists():
             issues.append(f"{account.email}:{folder}: no .eml files found")
         if mailbox_marker.is_symlink():
@@ -431,10 +454,9 @@ def audit_account(
                 else:
                     marker_mailbox = mailbox_name
                     try:
-                        _legacy_validate_path_segments(
-                            marker.get("source_path_segments"),
+                        marker_hierarchy = _legacy_hierarchy_metadata(
+                            marker,
                             marker_mailbox,
-                            marker.get("source_delimiter"),
                             f"{account.email}:{folder}: mailbox marker",
                         )
                     except RuntimeError as exc:
@@ -506,14 +528,20 @@ def audit_account(
                 )
             if isinstance(mailbox_meta, str) and mailbox_meta.strip():
                 try:
-                    _legacy_validate_path_segments(
-                        meta.get("source_path_segments"),
+                    message_hierarchy = _legacy_hierarchy_metadata(
+                        meta,
                         mailbox_meta,
-                        meta.get("source_delimiter"),
                         f"{account.email}:{folder}:{eml_path.name}",
                     )
                 except RuntimeError as exc:
                     issues.append(str(exc))
+                    message_hierarchy = ("", ())
+                else:
+                    if marker_mailbox is not None and message_hierarchy != marker_hierarchy:
+                        issues.append(
+                            f"{account.email}:{folder}:{eml_path.name}: "
+                            "source_path_segments mismatch with mailbox marker"
+                        )
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
                 uid_meta = meta.get("uid")

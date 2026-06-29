@@ -12,7 +12,7 @@ from contextlib import AbstractContextManager
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
 import imaplib
 
@@ -353,6 +353,8 @@ def _legacy_export_state_mailbox_metadata(mailbox: str, path: str, message_count
 
 def _legacy_validate_path_segments(value: object, mailbox: str, delimiter: object, label: str) -> Tuple[str, ...]:
     if value is None:
+        if delimiter not in (None, ""):
+            raise RuntimeError(f"{label}: source_delimiter without source_path_segments")
         return ()
     if not isinstance(value, list) or not value:
         raise RuntimeError(f"{label}: invalid source_path_segments")
@@ -363,11 +365,30 @@ def _legacy_validate_path_segments(value: object, mailbox: str, delimiter: objec
         segments.append(segment)
     if delimiter is not None and not isinstance(delimiter, str):
         raise RuntimeError(f"{label}: invalid source_delimiter")
+    if len(segments) > 1 and (not isinstance(delimiter, str) or not delimiter):
+        raise RuntimeError(f"{label}: invalid source_delimiter")
     if isinstance(delimiter, str) and delimiter and delimiter.join(segments) != mailbox:
         raise RuntimeError(f"{label}: source_path_segments mismatch")
-    if (not delimiter) and len(segments) == 1 and segments[0] != mailbox:
+    if (not delimiter) and segments[0] != mailbox:
         raise RuntimeError(f"{label}: source_path_segments mismatch")
     return tuple(segments)
+
+
+def _legacy_hierarchy_metadata(
+    record: Mapping[str, object],
+    mailbox: str,
+    label: str,
+) -> Tuple[str, Tuple[str, ...]]:
+    segments = _legacy_validate_path_segments(
+        record.get("source_path_segments"),
+        mailbox,
+        record.get("source_delimiter"),
+        label,
+    )
+    if not segments:
+        return "", ()
+    delimiter = record.get("source_delimiter")
+    return (delimiter if isinstance(delimiter, str) else "", segments)
 
 
 def _legacy_target_mailbox_name(source_mailbox: str, source_path_segments: Tuple[str, ...], target_delimiter: str) -> str:
@@ -1267,7 +1288,7 @@ def import_account(
 
     # Build worklist before opening IMAP connection
     per_folder: Dict[str, List[Tuple[Path, str, Optional[str], Optional[int], Optional[str]]]] = {}
-    source_segments_by_mailbox: Dict[str, Tuple[str, ...]] = {}
+    source_hierarchy_by_mailbox: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
     staged_marker_paths: set[str] = set()
     staged_markers: Dict[str, Dict[str, object]] = {}
     folder_dirs: List[Path] = []
@@ -1314,14 +1335,9 @@ def import_account(
                     raise RuntimeError(f"{marker}: mailbox marker missing mailbox")
                 if sanitize_for_path(marker_mailbox) != folder_dir.name:
                     raise RuntimeError(f"{marker}: mailbox metadata mismatch (folder={folder_dir.name} meta={marker_mailbox})")
-                marker_segments = _legacy_validate_path_segments(
-                    marker_meta.get("source_path_segments"),
-                    marker_mailbox,
-                    marker_meta.get("source_delimiter"),
-                    str(marker),
-                )
-                if marker_segments:
-                    source_segments_by_mailbox[marker_mailbox] = marker_segments
+                marker_hierarchy = _legacy_hierarchy_metadata(marker_meta, marker_mailbox, str(marker))
+                if marker_hierarchy[1]:
+                    source_hierarchy_by_mailbox[marker_mailbox] = marker_hierarchy
                 mailbox_meta = marker_mailbox
                 marker_mailbox_present = True
             else:
@@ -1361,25 +1377,20 @@ def import_account(
                 raise RuntimeError(f"{meta_path}: missing mailbox metadata")
             if sanitize_for_path(mbox) != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (folder={folder_dir.name} meta={mbox})")
-            message_segments = _legacy_validate_path_segments(
-                meta.get("source_path_segments"),
-                mbox,
-                meta.get("source_delimiter"),
-                str(meta_path),
-            )
+            message_hierarchy = _legacy_hierarchy_metadata(meta, mbox, str(meta_path))
             if marker_mailbox_present:
                 if mbox != default_mailbox:
                     raise RuntimeError(f"{meta_path}: mailbox metadata mismatch (marker={default_mailbox} meta={mbox})")
-                marker_segments = source_segments_by_mailbox.get(default_mailbox, ())
-                if marker_segments and message_segments and message_segments != marker_segments:
+                marker_hierarchy = source_hierarchy_by_mailbox.get(default_mailbox, ("", ()))
+                if message_hierarchy != marker_hierarchy:
                     raise RuntimeError(f"{meta_path}: source_path_segments mismatch")
             elif mbox != folder_dir.name:
                 raise RuntimeError(f"{meta_path}: missing mailbox marker for original mailbox {mbox}")
-            if message_segments:
-                existing_segments = source_segments_by_mailbox.get(mbox)
-                if existing_segments is not None and existing_segments != message_segments:
+            if message_hierarchy[1]:
+                existing_hierarchy = source_hierarchy_by_mailbox.get(mbox)
+                if existing_hierarchy is not None and existing_hierarchy != message_hierarchy:
                     raise RuntimeError(f"{meta_path}: source_path_segments mismatch")
-                source_segments_by_mailbox[mbox] = message_segments
+                source_hierarchy_by_mailbox[mbox] = message_hierarchy
             data = _read_file_no_symlink(eml_path, "legacy message file", reject_hard_links=True)
             _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
             mailbox_meta = mbox
@@ -1456,7 +1467,7 @@ def import_account(
         target_mailbox_by_source = {
             source_mailbox: _legacy_target_mailbox_name(
                 source_mailbox,
-                source_segments_by_mailbox.get(source_mailbox, ()),
+                source_hierarchy_by_mailbox.get(source_mailbox, ("", ()))[1],
                 target_delimiter,
             )
             for source_mailbox in per_folder

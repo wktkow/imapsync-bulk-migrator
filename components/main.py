@@ -1427,6 +1427,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 try:
                     from .imap_ops import (
                         _legacy_import_target_id,
+                        _legacy_hierarchy_metadata,
                         _list_selectable_mailbox_entries,
                         _load_legacy_import_journal,
                         _open_legacy_dir,
@@ -1479,10 +1480,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
                         return
 
-                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, ...]]:
+                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, Tuple[str, ...]]]:
                         marker_path = folder_dir / ".mailbox.json"
                         if not marker_path.exists():
-                            return folder_dir.name, ()
+                            return folder_dir.name, ("", ())
                         try:
                             marker_bytes = _read_file_no_symlink(
                                 marker_path,
@@ -1495,13 +1496,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
                         if not isinstance(mailbox, str) or not mailbox:
                             return folder_dir.name, ()
-                        segments = _legacy_validate_path_segments(
-                            raw.get("source_path_segments") if isinstance(raw, dict) else None,
+                        hierarchy = _legacy_hierarchy_metadata(
+                            raw if isinstance(raw, dict) else {},
                             mailbox,
-                            raw.get("source_delimiter") if isinstance(raw, dict) else None,
                             str(marker_path),
                         )
-                        return mailbox, segments
+                        return mailbox, hierarchy
 
                     folder_dirs: List[Path] = []
                     for child_name in sorted(os.listdir(account_dir_fd)):
@@ -1524,14 +1524,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     local_segments_by_key: Dict[str, Tuple[str, ...]] = {}
                     for folder_dir in folder_dirs:
                         guard_account_dir()
-                        default_mailbox, default_segments = marker_info(folder_dir)
+                        default_mailbox, default_hierarchy = marker_info(folder_dir)
                         guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
                         guard_account_dir()
                         folder_key = canonical_mailbox_path_key(folder_dir.name)
                         local_mailboxes_by_key.setdefault(folder_key, default_mailbox)
-                        if default_segments:
-                            local_segments_by_key[folder_key] = default_segments
+                        if default_hierarchy[1]:
+                            local_segments_by_key[folder_key] = default_hierarchy[1]
                         if not eml_paths:
                             local_counts.setdefault(folder_key, 0)
                             local_messages.setdefault(folder_key, [])
@@ -1558,18 +1558,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                             metadata_mailbox = metadata.get("mailbox")
                             if isinstance(metadata_mailbox, str) and metadata_mailbox:
                                 mailbox = metadata_mailbox
-                            message_segments = _legacy_validate_path_segments(
-                                metadata.get("source_path_segments"),
+                            message_hierarchy = _legacy_hierarchy_metadata(
+                                metadata,
                                 mailbox,
-                                metadata.get("source_delimiter"),
                                 str(metadata_path),
                             )
+                            if message_hierarchy != default_hierarchy:
+                                raise RuntimeError(f"{metadata_path}: source_path_segments mismatch")
                             local_mailboxes_by_key.setdefault(folder_key, mailbox)
-                            if message_segments:
+                            if message_hierarchy[1]:
                                 existing_segments = local_segments_by_key.get(folder_key)
-                                if existing_segments is not None and existing_segments != message_segments:
+                                if existing_segments is not None and existing_segments != message_hierarchy[1]:
                                     raise RuntimeError(f"{metadata_path}: source_path_segments mismatch")
-                                local_segments_by_key[folder_key] = message_segments
+                                local_segments_by_key[folder_key] = message_hierarchy[1]
                             local_counts[folder_key] = local_counts.get(folder_key, 0) + 1
                             guard_account_dir()
                             message_bytes = _read_file_no_symlink(

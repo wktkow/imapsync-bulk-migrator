@@ -13346,6 +13346,82 @@ class TestRound7ConfirmedBugs:
                 imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
             )
 
+    def test_strict_audit_import_and_verify_reject_legacy_hierarchy_tamper(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from components.audit import audit_export
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.imap_ops import import_account
+        from components.models import Account, Config, ServerConfig
+        from verify_export import verify_account
+
+        server = ServerConfig("source.example.com")
+        account = Account("user@example.com", "secret")
+        folder = tmp_path / account.email / "Projects_2024"
+        eml = _write_legacy_message_fixture(
+            folder,
+            uid=1,
+            mailbox="Projects/2024",
+            data=b"Message-ID: <hierarchy-tamper@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
+            source_server=server,
+        )
+        marker = {
+            "mailbox": "Projects/2024",
+            "message_count": 1,
+            "source_delimiter": "/",
+            "source_path_segments": ["Projects", "2024"],
+        }
+        (folder / ".mailbox.json").write_text(json.dumps(marker))
+        meta_path = eml.with_suffix(".json")
+        meta = json.loads(meta_path.read_text())
+        meta["source_delimiter"] = "/"
+        meta["source_path_segments"] = ["Projects", "2024"]
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+        state_path = folder.parent / "export-state.json"
+        state = json.loads(state_path.read_text())
+        state["mailboxes"] = [{
+            "mailbox": "Projects/2024",
+            "path": "Projects_2024",
+            "message_count": 1,
+            "source_delimiter": "/",
+            "source_path_segments": ["Projects", "2024"],
+        }]
+        state_path.write_text(json.dumps(state))
+
+        tampered_hierarchy = {
+            "source_delimiter": "j",
+            "source_path_segments": ["Pro", "ects/2024"],
+        }
+        marker.update(tampered_hierarchy)
+        (folder / ".mailbox.json").write_text(json.dumps(marker))
+        meta.update(tampered_hierarchy)
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        meta_path.write_text(json.dumps(meta))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(server, [account], source_server=server),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any("source_path_segments mismatch with export-state" in issue for issue in issues)
+        with pytest.raises(RuntimeError, match="source_path_segments mismatch with export-state"):
+            import_account(
+                account,
+                ServerConfig("target.example.com"),
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=lambda *_args: (_ for _ in ()).throw(AssertionError("IMAP should not be opened")),
+                source_server=server,
+            )
+        stats = verify_account(folder.parent)
+        assert stats["errors"] >= 1
+
     def test_verify_export_rejects_invalid_legacy_delivery_metadata(
         self,
         tmp_path: Path,

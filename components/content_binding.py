@@ -57,6 +57,16 @@ def _add_optional_text_list(fields: Dict[str, Any], record: Mapping[str, Any], k
         fields[key] = list(value)
 
 
+def _add_optional_text_list_strict(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
+    if key not in record or record.get(key) is None:
+        return
+    value = record.get(key)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"invalid {key}")
+    if value:
+        fields[key] = list(value)
+
+
 def _add_optional_text_list_map(fields: Dict[str, Any], record: Mapping[str, Any], key: str) -> None:
     if key not in record or record.get(key) is None:
         return
@@ -85,6 +95,8 @@ def legacy_content_binding_sha256(meta: Mapping[str, Any]) -> str:
     _add_optional_text(fields, meta, "flags")
     _add_optional_text(fields, meta, "internaldate")
     _add_optional_text(fields, meta, "message_id_header")
+    _add_optional_text(fields, meta, "source_delimiter")
+    _add_optional_text_list_strict(fields, meta, "source_path_segments")
     return _content_binding_sha256("legacy-sidecar", fields)
 
 
