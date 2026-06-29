@@ -232,6 +232,13 @@ def _open_legacy_dir(path: Path, label: str) -> Tuple[int, Path]:
     return fd, dir_path
 
 
+def _fsync_legacy_directory_fd(dir_fd: int, path: Path, label: str) -> None:
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise RuntimeError(f"unable to fsync {label} directory for durability: {path}") from exc
+
+
 def _read_file_no_symlink(path: Path, label: str, *, reject_hard_links: bool = False) -> bytes:
     parent_fd, name, parent_path = _open_legacy_parent_dir(path, label)
     flags = os.O_RDONLY
@@ -296,6 +303,8 @@ def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             try:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
+                _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy file")
                 _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
             except Exception:
                 with contextlib.suppress(FileNotFoundError):
@@ -825,6 +834,8 @@ def archive_legacy_import_journal_for_reset(account_dir: Path) -> Optional[Path]
                 _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
                 os.rename(name, archive_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
+                _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy import journal")
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
                 return account_dir / archive_name
         raise RuntimeError(f"unable to archive import journal for reset: {path}")
     finally:
@@ -1112,6 +1123,8 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
             or not stat.S_ISREG(visible_stat.st_mode)
         ):
             raise RuntimeError(f"legacy import journal changed during append: {path}")
+        _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy import journal")
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import journal")
     finally:
         if fd >= 0:
             os.close(fd)

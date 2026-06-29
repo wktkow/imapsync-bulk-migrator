@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -12988,6 +12989,58 @@ class TestRound7ConfirmedBugs:
 
         assert target.is_symlink()
         assert victim.stat().st_mode & 0o777 == original_mode
+
+    def test_legacy_atomic_write_fsyncs_parent_directory_after_rename(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target = tmp_path / "user@example.com" / "export-state.json"
+        fsync_targets: List[str] = []
+        real_fsync = imap_ops.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            mode = imap_ops.os.fstat(fd).st_mode
+            fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", recording_fsync)
+
+        imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
+
+        assert fsync_targets == ["file", "dir"]
+
+    def test_legacy_append_journal_fsyncs_parent_directory_after_create(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        account_dir.mkdir()
+        fsync_targets: List[str] = []
+        real_fsync = imap_ops.os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            mode = imap_ops.os.fstat(fd).st_mode
+            fsync_targets.append("dir" if stat.S_ISDIR(mode) else "file")
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", recording_fsync)
+
+        imap_ops._append_legacy_import_journal(account_dir, {
+            "key": "k",
+            "status": "pending",
+            "target": "imap://target",
+            "mailbox": "INBOX",
+            "path": "INBOX/u0000000001.eml",
+            "timestamp": "0",
+        })
+
+        assert fsync_targets == ["file", "dir"]
 
     def test_legacy_append_journal_rejects_replaced_symlink_target(
         self,
