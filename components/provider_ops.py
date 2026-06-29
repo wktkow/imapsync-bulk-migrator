@@ -696,7 +696,19 @@ def translate_source_mailbox_for_target(
     *,
     target_provider: str,
 ) -> str:
-    special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important", "starred", "inbox"}
+    special_desired = {
+        "archive",
+        "sent",
+        "drafts",
+        "deleted messages",
+        "trash",
+        "junk",
+        "spam",
+        "important",
+        "starred",
+        "flagged",
+        "inbox",
+    }
     if desired.lower() in special_desired:
         return desired
     source_paths = row.get("source_mailbox_paths")
@@ -3549,7 +3561,18 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
     desired_name = str(desired)
     desired_lower = desired_name.lower()
     desired_key = _target_mailbox_lookup_key(desired, provider)
-    gmail_special_desired = {"archive", "sent", "drafts", "deleted messages", "trash", "junk", "spam", "important", "starred"}
+    gmail_special_desired = {
+        "archive",
+        "sent",
+        "drafts",
+        "deleted messages",
+        "trash",
+        "junk",
+        "spam",
+        "important",
+        "starred",
+        "flagged",
+    }
     if desired_key in by_name and not (provider == "gmail" and desired_lower in gmail_special_desired):
         return by_name[desired_key].name
     special_key_by_name = {
@@ -3562,6 +3585,7 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         "Archive": "archive",
         "Important": "important",
         "Starred": "starred",
+        "Flagged": "starred",
     }
     special_key = special_key_by_name.get(desired_name)
     attr_map = {
@@ -3910,6 +3934,7 @@ _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS = {
     "[googlemail]/important": "important",
     "\\important": "important",
     "starred": "starred",
+    "flagged": "starred",
     "[gmail]/starred": "starred",
     "[googlemail]/starred": "starred",
     "\\starred": "starred",

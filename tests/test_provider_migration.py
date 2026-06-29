@@ -2652,6 +2652,7 @@ def test_gmail_target_folder_resolution_uses_special_use_and_gmail_names() -> No
     assert resolve_target_mailbox("Junk", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Spam"
     assert resolve_target_mailbox("Important", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Important"
     assert resolve_target_mailbox("Starred", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Starred"
+    assert resolve_target_mailbox("Flagged", gmail_mailboxes, target_provider="gmail") == "[Gmail]/Starred"
 
 
 def test_gmail_target_system_mailbox_issues_require_important_and_starred() -> None:
@@ -2660,6 +2661,7 @@ def test_gmail_target_system_mailbox_issues_require_important_and_starred() -> N
     rows = [
         {"canonical_id": "important-message", "primary_mailbox": "Important"},
         {"canonical_id": "starred-message", "primary_mailbox": "Starred"},
+        {"canonical_id": "flagged-message", "primary_mailbox": "Flagged"},
     ]
     base_mailboxes = [
         MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),
@@ -6609,7 +6611,10 @@ def test_provider_import_to_gmail_requires_selectable_all_mail_before_append(tmp
     assert not (account_dir / "import-target@gmail.com.journal.jsonl").exists()
 
 
-@pytest.mark.parametrize(("primary_mailbox", "system_key"), [("Important", "important"), ("Starred", "starred")])
+@pytest.mark.parametrize(
+    ("primary_mailbox", "system_key"),
+    [("Important", "important"), ("Starred", "starred"), ("Flagged", "starred")],
+)
 def test_provider_import_to_gmail_requires_important_and_starred_system_mailboxes_before_append(
     tmp_path: Path,
     primary_mailbox: str,
@@ -6650,6 +6655,54 @@ def test_provider_import_to_gmail_requires_important_and_starred_system_mailboxe
 
     assert fake.appended == []
     assert not (account_dir / "import-target@gmail.com.journal.jsonl").exists()
+
+
+def test_provider_import_to_gmail_maps_flagged_primary_to_starred_system_mailbox(tmp_path: Path) -> None:
+    class StarredCapableGmailTarget(FakeGmailTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Flagged) "/" "[Gmail]/Starred"',
+            ]
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(method="xoauth2", username="target@gmail.com", password="gmail-token"),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@gmail.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_provider"] = "imap"
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "Flagged"
+    row["flags"] = "\\Seen \\Flagged"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    fake = StarredCapableGmailTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StarredCapableGmailTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["[Gmail]/Starred"]
+    assert "Flagged" not in fake.messages_by_mailbox
+    journal = load_import_journal(account_dir, account)
+    assert journal[-1]["target_mailbox"] == "[Gmail]/Starred"
 
 
 def test_provider_import_to_gmail_requires_target_visibility_attestation(tmp_path: Path) -> None:
