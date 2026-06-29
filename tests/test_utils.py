@@ -1,6 +1,6 @@
 import pytest
 
-from components.utils import sanitize_for_path
+from components.utils import parse_imap_uid_search_data, sanitize_for_path
 
 
 @pytest.mark.parametrize(
@@ -16,4 +16,13 @@ from components.utils import sanitize_for_path
 def test_sanitize_for_path_equivalence(source: str, expected: str) -> None:
     assert sanitize_for_path(source) == expected
 
+
+def test_parse_imap_uid_search_data_sorts_valid_uids() -> None:
+    assert parse_imap_uid_search_data([b"4294967295 2 1"]) == [1, 2, 4294967295]
+
+
+@pytest.mark.parametrize("payload", [b"0", b"4294967296", b"2:4", b"bad", b"01", b"\xff"])
+def test_parse_imap_uid_search_data_rejects_invalid_tokens(payload: bytes) -> None:
+    with pytest.raises(RuntimeError, match="UID"):
+        parse_imap_uid_search_data([payload])
 

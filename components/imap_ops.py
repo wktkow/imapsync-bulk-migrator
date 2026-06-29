@@ -19,7 +19,14 @@ import imaplib
 
 from .models import Account, ServerConfig
 from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue, legacy_content_binding_sha256
-from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path, sanitized_path_key
+from .utils import (
+    decode_imap_utf7,
+    encode_imap_utf7,
+    parse_imap_uid_search_data,
+    quote_imap_search_value,
+    sanitize_for_path,
+    sanitized_path_key,
+)
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -680,15 +687,7 @@ def _search_selected_uids(imap: imaplib.IMAP4, mailbox: str) -> List[int]:
     status, data = imap.uid("search", "ALL")
     if status != "OK":
         raise RuntimeError(f"Failed to search UIDs in {mailbox}")
-    uids: List[int] = []
-    if data and data[0]:
-        for tok in data[0].split():
-            try:
-                uids.append(int(tok))
-            except ValueError:
-                continue
-    uids.sort()
-    return uids
+    return parse_imap_uid_search_data(data, label=f"UID SEARCH response for {mailbox}")
 
 
 def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[List[int], str]:

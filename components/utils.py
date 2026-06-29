@@ -5,9 +5,12 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.@+-]+")
 IMAPSYNC_VERSION_TIMEOUT_SEC = 10
+IMAP_UID_MAX = 0xFFFFFFFF
+_IMAP_UID_TOKEN_RE = re.compile(r"[1-9][0-9]*")
 
 
 def sanitize_for_path(name: str) -> str:
@@ -46,6 +49,25 @@ def quote_imap_search_value(value: str) -> str:
         return value
     escaped = value.replace("\\", "\\\\").replace('"', r"\"")
     return f'"{escaped}"'
+
+
+def parse_imap_uid_search_data(data: Any, *, label: str = "UID SEARCH response") -> list[int]:
+    """Parse a SEARCH response that must contain only RFC-valid IMAP UIDs."""
+    uids: list[int] = []
+    if not data or not data[0]:
+        return uids
+    for token in data[0].split():
+        try:
+            value = token.decode("ascii") if isinstance(token, bytes) else str(token)
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"invalid UID token in {label}: {token!r}") from exc
+        if not _IMAP_UID_TOKEN_RE.fullmatch(value):
+            raise RuntimeError(f"invalid UID token in {label}: {token!r}")
+        uid = int(value)
+        if uid > IMAP_UID_MAX:
+            raise RuntimeError(f"UID out of range in {label}: {token!r}")
+        uids.append(uid)
+    return sorted(uids)
 
 
 def encode_imap_utf7(value: str) -> str:

@@ -29,7 +29,13 @@ from .content_binding import (
 from .executor import parallel_process_accounts
 from .imap_ops import _imap_append_wire_bytes, _valid_legacy_flag_token, _valid_legacy_internaldate
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
-from .utils import decode_imap_utf7, encode_imap_utf7, quote_imap_search_value, sanitize_for_path
+from .utils import (
+    decode_imap_utf7,
+    encode_imap_utf7,
+    parse_imap_uid_search_data,
+    quote_imap_search_value,
+    sanitize_for_path,
+)
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -1110,12 +1116,7 @@ def require_selected_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> str:
 
 
 def _parse_uid_search_data(data: Any) -> List[int]:
-    uids: List[int] = []
-    if data and data[0]:
-        for token in data[0].split():
-            with contextlib.suppress(ValueError):
-                uids.append(int(token))
-    return sorted(uids)
+    return parse_imap_uid_search_data(data)
 
 
 def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[List[int], str]:

@@ -800,6 +800,24 @@ class TestBug12SignalThreadGuard:
 class TestBug2NoDoubleSelect:
     """export_account should avoid redundant selects beyond required stability checks."""
 
+    @pytest.mark.parametrize("payload", [b"0 1", b"1 4294967296", b"1 bad", b"1 2:4", b"01"])
+    def test_legacy_uid_search_rejects_invalid_uid_tokens(self, payload: bytes) -> None:
+        from components.imap_ops import fetch_all_uids_and_uidvalidity
+
+        class InvalidUidSearchImap:
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                assert command == "search"
+                return "OK", [payload]
+
+        with pytest.raises(RuntimeError, match="UID"):
+            fetch_all_uids_and_uidvalidity(InvalidUidSearchImap(), "INBOX")
+
     def test_select_called_once_per_mailbox(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig

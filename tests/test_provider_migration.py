@@ -4530,6 +4530,18 @@ def test_provider_uid_search_uses_rfc_valid_signature() -> None:
     assert fake.search_args == ("ALL",)
 
 
+@pytest.mark.parametrize("payload", [b"0 1", b"1 4294967296", b"1 bad", b"1 2:4", b"01"])
+def test_provider_uid_search_rejects_invalid_uid_tokens(payload: bytes) -> None:
+    class InvalidUidSearchImap(FakeSourceImap):
+        def uid(self, command: str, *args):
+            if command == "search":
+                return "OK", [payload]
+            return super().uid(command, *args)
+
+    with pytest.raises(RuntimeError, match="UID"):
+        fetch_all_uids_and_uidvalidity(InvalidUidSearchImap(), "INBOX")
+
+
 @pytest.mark.parametrize("uidvalidity_response", ([None], [b""], [b"0"], [b"not-a-number"], [b"4294967296"]))
 def test_provider_uid_search_requires_valid_uidvalidity(uidvalidity_response: List[Optional[bytes]]) -> None:
     class InvalidUidvalidityImap(FakeSourceImap):
