@@ -613,11 +613,31 @@ def fetch_all_uids_and_uidvalidity(imap: imaplib.IMAP4, mailbox: str) -> Tuple[L
     return uids, uidvalidity
 
 
+def _canonical_legacy_flag_set(flags: Optional[str]) -> frozenset[str]:
+    normalized = []
+    for token in str(flags or "").split():
+        if not token:
+            continue
+        normalized.append(token.upper() if token.startswith("\\") else token)
+    return frozenset(normalized)
+
+
+def _fetch_legacy_flags_for_uid(imap: imaplib.IMAP4, mailbox: str, uid: int) -> str:
+    status, data = imap.uid("fetch", str(uid), "(FLAGS)")
+    if status != "OK":
+        raise RuntimeError(f"fetch flags failed in {mailbox} for UID {uid}")
+    _msg_bytes, flags, _internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))
+    if flags is None:
+        raise RuntimeError(f"fetch returned no flags in {mailbox} for UID {uid}")
+    return flags
+
+
 def verify_legacy_mailbox_uid_set_stable(
     imap: imaplib.IMAP4,
     mailbox: str,
     initial_uids: List[int],
     uidvalidity: str,
+    initial_flags_by_uid: Optional[Mapping[int, str]] = None,
 ) -> None:
     status, response = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
@@ -631,6 +651,14 @@ def verify_legacy_mailbox_uid_set_stable(
     final_uids = _search_selected_uids(imap, mailbox)
     if final_uids != initial_uids:
         raise RuntimeError(f"UID set changed during export of {mailbox}")
+    if initial_flags_by_uid is not None:
+        expected_uids = sorted(int(uid) for uid in initial_flags_by_uid)
+        if expected_uids != initial_uids:
+            raise RuntimeError(f"internal flag snapshot mismatch during export of {mailbox}")
+        for uid in initial_uids:
+            final_flags = _fetch_legacy_flags_for_uid(imap, mailbox, uid)
+            if _canonical_legacy_flag_set(final_flags) != _canonical_legacy_flag_set(initial_flags_by_uid[uid]):
+                raise RuntimeError(f"FLAGS changed during export of {mailbox} for UID {uid}")
 
 
 def _legacy_import_journal_path(account_dir: Path) -> Path:
@@ -1223,6 +1251,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 pending_virtual_content: Dict[Tuple[int, str], List[Tuple[int, bytes, str, str, str]]] = {}
                 seen_virtual_content: Counter[Tuple[int, str]] = Counter()
                 ambiguous_virtual_content: set[Tuple[int, str]] = set()
+                exported_flags_by_uid: Dict[int, str] = {}
 
                 batch_size = 200
                 for i in range(0, len(uids), batch_size):
@@ -1236,6 +1265,9 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                         msg_bytes, flags, internaldate = _parse_fetch_response_for_uid(list(data or []), int(uid))
                         if msg_bytes is None:
                             raise RuntimeError(f"fetch returned no message bytes in {mailbox} for UID {uid}")
+                        if flags is None:
+                            raise RuntimeError(f"fetch returned no flags in {mailbox} for UID {uid}")
+                        exported_flags_by_uid[int(uid)] = flags
                         with contextlib.suppress(Exception):
                             _ = BytesParser(policy=default_policy).parsebytes(msg_bytes)
                         digest = hashlib.sha256(msg_bytes).hexdigest()
@@ -1284,7 +1316,13 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 covered_virtual_source = virtual_source and bool(uids) and not written_stems
                 if written_stems or not virtual_source or covered_virtual_source:
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
-                    verify_legacy_mailbox_uid_set_stable(imap, mailbox, uids, uidvalidity)
+                    verify_legacy_mailbox_uid_set_stable(
+                        imap,
+                        mailbox,
+                        uids,
+                        uidvalidity,
+                        initial_flags_by_uid=exported_flags_by_uid,
+                    )
                     _secure_atomic_json(
                         folder_dir / ".mailbox.json",
                         _legacy_mailbox_metadata(

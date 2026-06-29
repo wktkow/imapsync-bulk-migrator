@@ -940,6 +940,7 @@ class TestLegacyExportCompleteness:
                 b"",
             )]),
             ("OK", [b"1"]),
+            ("OK", [b"1 (UID 1 FLAGS (\\Seen))"]),
         ]
 
         with mock.patch("components.imap_ops.imap_connection") as mock_conn:
@@ -1894,6 +1895,50 @@ class TestLegacyListParsing:
 
         with mock.patch("components.imap_ops.imap_connection", fake_connection):
             with pytest.raises(RuntimeError, match="UID set changed during export of INBOX"):
+                export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
+
+        state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
+        assert state["complete"] is False
+        assert not (tmp_path / "user@example.com" / "INBOX" / ".mailbox.json").exists()
+
+    def test_export_fails_when_legacy_flags_change(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        body = b"Message-ID: <legacy-flags-changed@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class ChangingFlagsSource:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    query = str(args[-1])
+                    if query == "(FLAGS)":
+                        return "OK", [b"1 (UID 1 FLAGS (\\Seen \\Answered))"]
+                    return "OK", [(
+                        b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[ChangingFlagsSource]:
+            yield ChangingFlagsSource()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            with pytest.raises(RuntimeError, match=r"FLAGS changed during export of INBOX for UID 1"):
                 export_account(Account("user@example.com", "secret"), ServerConfig("imap.example.com"), tmp_path, ignore_errors=False)
 
         state = json.loads((tmp_path / "user@example.com" / "export-state.json").read_text())
