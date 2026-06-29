@@ -900,6 +900,52 @@ class TestLegacyExportCompleteness:
         assert meta["uid"] == 42
         assert meta["uidvalidity"] == "123"
 
+    def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
+        from components.imap_ops import export_account
+        from components.models import Account, ServerConfig
+
+        server = ServerConfig(host="dummy", port=993, ssl=True)
+        account = Account(email="user@example.com", password="pass")
+        body = b"Message-ID: <lowercase-fetch@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        class LowercaseMetadataFetchImap:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                return "OK", [b"123"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    query = str(args[-1])
+                    if query == "(FLAGS)":
+                        return "OK", [b"1 (uid 1 flags (\\Seen))"]
+                    return "OK", [(
+                        b'1 (uid 1 flags (\\Seen) internaldate "01-Jan-2024 00:00:00 +0000")',
+                        body,
+                    )]
+                raise AssertionError(command)
+
+            def logout(self):
+                return "OK", []
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs) -> Iterator[LowercaseMetadataFetchImap]:
+            yield LowercaseMetadataFetchImap()
+
+        with mock.patch("components.imap_ops.imap_connection", fake_connection):
+            export_account(account, server, tmp_path, ignore_errors=False)
+
+        meta = json.loads((tmp_path / "user@example.com" / "INBOX" / "u0000000001.json").read_text())
+        assert meta["flags"] == "\\Seen"
+        assert meta["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert meta["uid"] == 1
+
     def test_export_raises_when_fetch_has_no_message_bytes(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig

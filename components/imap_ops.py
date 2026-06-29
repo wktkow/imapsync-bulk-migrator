@@ -985,7 +985,7 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
 
 
 def _fetch_response_uid(meta_str: str) -> Optional[int]:
-    match = re.search(r"\bUID\s+(\d+)\b", meta_str)
+    match = re.search(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE)
     if match is None:
         return None
     with contextlib.suppress(ValueError):
@@ -1024,10 +1024,10 @@ def _parse_fetch_response_for_uid(
             if meta and isinstance(meta, (bytes, bytearray)):
                 if response_uid != expected_uid:
                     continue
-                m_flags = re.search(r"FLAGS \((.*?)\)", meta_str)
+                m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
                 if m_flags:
                     flags = m_flags.group(1)
-                m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str)
+                m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
                 if m_int:
                     internaldate = m_int.group(1)
         elif isinstance(part, (bytes, bytearray)):
@@ -1035,10 +1035,10 @@ def _parse_fetch_response_for_uid(
             response_uid = _fetch_response_uid(meta_str)
             if response_uid != expected_uid:
                 continue
-            m_flags = re.search(r"FLAGS \((.*?)\)", meta_str)
+            m_flags = re.search(r"FLAGS \((.*?)\)", meta_str, flags=re.IGNORECASE)
             if m_flags:
                 flags = m_flags.group(1)
-            m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str)
+            m_int = re.search(r"INTERNALDATE \"([^\"]+)\"", meta_str, flags=re.IGNORECASE)
             if m_int:
                 internaldate = m_int.group(1)
     if len(joinable) > 1:
