@@ -647,6 +647,21 @@ def _legacy_missing_target_flags(expected_flags: Optional[str], actual_flags: Op
     return sorted(expected - actual, key=str.upper)
 
 
+def _merge_legacy_flag_strings(existing_flags: str, additional_flags: str) -> str:
+    merged: List[str] = []
+    seen: set[str] = set()
+    for flags in (existing_flags, additional_flags):
+        for token in str(flags or "").split():
+            if not token or token.upper() == "\\RECENT":
+                continue
+            canonical = next(iter(_canonical_legacy_flag_set(token)), token)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            merged.append(token)
+    return " ".join(merged)
+
+
 def _legacy_flags_arg_from_tokens(tokens: Iterable[str]) -> str:
     flags = [flag for flag in tokens if flag and flag.strip()]
     return "(" + " ".join(flags) + ")" if flags else ""
@@ -1195,6 +1210,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     mailbox_errors: List[str] = []
     export_state_mailboxes: List[Dict[str, object]] = []
     exported_regular_content: Counter[Tuple[int, str]] = Counter()
+    regular_metadata_paths_by_content: Dict[Tuple[int, str], List[Path]] = {}
 
     def write_legacy_message(
         folder_dir: Path,
@@ -1231,6 +1247,29 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
         _secure_atomic_json(meta_path, meta)
         return base
+
+    def merge_covered_virtual_flags(content_identity: Tuple[int, str], match_index: int, flags: str) -> None:
+        if not _legacy_target_flag_set(flags):
+            return
+        metadata_paths = regular_metadata_paths_by_content.get(content_identity, [])
+        if match_index < 0 or match_index >= len(metadata_paths):
+            raise RuntimeError("covered virtual message has no matching regular metadata")
+        meta_path = metadata_paths[match_index]
+        meta = json.loads(
+            _read_file_no_symlink(
+                meta_path,
+                "legacy message metadata",
+                reject_hard_links=True,
+            ).decode("utf-8")
+        )
+        if not isinstance(meta, dict):
+            raise RuntimeError(f"{meta_path}: message metadata is not an object")
+        merged_flags = _merge_legacy_flag_strings(str(meta.get("flags") or ""), flags)
+        if merged_flags == str(meta.get("flags") or ""):
+            return
+        meta["flags"] = merged_flags
+        meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        _secure_atomic_json(meta_path, meta)
 
     with imap_connection(server, account) as imap:
         mailbox_details = _list_selectable_mailbox_details(imap)
@@ -1283,7 +1322,8 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             _raise_if_stopped(stop_event, f"legacy export {account.email}")
             try:
                 attrs = mailbox_attrs_by_name.get(mailbox, ())
-                virtual_source = _is_legacy_all_source_view(attrs) or _is_legacy_flagged_source_view(attrs)
+                flagged_virtual_source = _is_legacy_flagged_source_view(attrs)
+                virtual_source = _is_legacy_all_source_view(attrs) or flagged_virtual_source
                 folder_dir = account_dir / sanitize_for_path(mailbox)
                 uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox)
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
@@ -1338,6 +1378,12 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                             if content_identity in ambiguous_virtual_content:
                                 pass
                             elif seen_virtual_content[content_identity] <= exported_regular_content[content_identity]:
+                                if flagged_virtual_source:
+                                    merge_covered_virtual_flags(
+                                        content_identity,
+                                        seen_virtual_content[content_identity] - 1,
+                                        flags or "",
+                                    )
                                 pending_virtual_content.setdefault(content_identity, []).append(
                                     (int(uid), msg_bytes, flags or "", internaldate or "", digest)
                                 )
@@ -1361,18 +1407,21 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                                     )
                         else:
                             exported_regular_content[content_identity] += 1
-                        written_stems.add(
-                            write_legacy_message(
-                                folder_dir,
-                                mailbox,
-                                int(uid),
-                                msg_bytes,
-                                flags or "",
-                                internaldate or "",
-                                uidvalidity,
-                                digest,
-                            )
+                        written_stem = write_legacy_message(
+                            folder_dir,
+                            mailbox,
+                            int(uid),
+                            msg_bytes,
+                            flags or "",
+                            internaldate or "",
+                            uidvalidity,
+                            digest,
                         )
+                        written_stems.add(written_stem)
+                        if not virtual_source:
+                            regular_metadata_paths_by_content.setdefault(content_identity, []).append(
+                                folder_dir / f"{written_stem}.json"
+                            )
                 _remove_stale_export_files(folder_dir, written_stems)
                 covered_virtual_source = virtual_source and bool(uids) and not written_stems
                 if written_stems or not virtual_source or covered_virtual_source:

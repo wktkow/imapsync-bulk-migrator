@@ -1462,6 +1462,7 @@ class TestLegacyListParsing:
         assert (account_dir / "Flagged" / "u0000000001.eml").read_bytes() == flagged_body
 
     def test_export_records_covered_generic_flagged_view(self, tmp_path: Path) -> None:
+        from components.content_binding import legacy_content_binding_issue
         from components.imap_ops import export_account
         from components.models import Account, ServerConfig
 
@@ -1527,6 +1528,9 @@ class TestLegacyListParsing:
             },
         ]
         assert (account_dir / "Archive" / "u0000000001.eml").read_bytes() == body
+        archive_meta = json.loads((account_dir / "Archive" / "u0000000001.json").read_text())
+        assert archive_meta["flags"] == "\\Seen \\Flagged"
+        assert legacy_content_binding_issue(archive_meta) is None
         flagged_marker = json.loads((account_dir / "Flagged" / ".mailbox.json").read_text())
         assert flagged_marker == {
             "mailbox": "Flagged",
