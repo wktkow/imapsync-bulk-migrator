@@ -2524,6 +2524,18 @@ def test_list_and_gmail_fetch_parsers() -> None:
     assert uid_bound["gmail_msgid"] == "123"
     assert uid_bound["gmail_labels"] == ["Project A", "\\Inbox"]
 
+    quoted_uid_label = parse_provider_fetch_response([
+        b'1 (UID 42 RFC822.SIZE 4 X-GM-MSGID 123 X-GM-LABELS ("UID 99" UID) FLAGS (\\Seen))',
+    ], expected_uid=42)
+    assert quoted_uid_label["gmail_msgid"] == "123"
+    assert quoted_uid_label["gmail_labels"] == ["UID 99", "UID"]
+    assert quoted_uid_label["flags"] == "\\Seen"
+
+    with pytest.raises(RuntimeError, match="did not include UID metadata"):
+        parse_provider_fetch_response([
+            b'1 (RFC822.SIZE 4 X-GM-LABELS ("UID 42") FLAGS (\\Seen))',
+        ], expected_uid=42)
+
     uid_after_literal = parse_provider_fetch_response([
         (b"1 (BODY[] {42}", requested_body),
         b' UID 42 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',
