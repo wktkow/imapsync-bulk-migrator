@@ -7236,7 +7236,10 @@ def provider_preflight(
                             if isinstance(raw, (bytes, bytearray)):
                                 raw_fetch_parts.append(bytes(raw).decode(errors="ignore"))
                         raw_fetch_text = " ".join(raw_fetch_parts)
-                        if not re.search(r"\bRFC822\.SIZE\s+\d+\b", raw_fetch_text, flags=re.IGNORECASE):
+                        if not _provider_fetch_number_after(
+                            _provider_fetch_meta_without_label_values(raw_fetch_text),
+                            "RFC822.SIZE",
+                        ):
                             account_issues.append(f"metadata fetch missing RFC822.SIZE in {mailbox.name} for UID {uid}")
                             continue
                         try:

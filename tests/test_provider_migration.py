@@ -12722,6 +12722,18 @@ class FakePreflightSourceMissingSize(FakePreflightSourceFailure):
         raise AssertionError(command)
 
 
+class FakePreflightSourceQuotedSizeLabel(FakePreflightSourceFailure):
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            return "OK", [
+                b'1 (UID 1 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                b'X-GM-MSGID 55 X-GM-LABELS ("RFC822.SIZE 123"))'
+            ]
+        raise AssertionError(command)
+
+
 class FakePreflightSourceMissingGmailMsgid(FakePreflightSourceFailure):
     def uid(self, command: str, *args):
         if command == "search":
@@ -12917,6 +12929,20 @@ def test_provider_preflight_reports_missing_metadata_size(tmp_path: Path) -> Non
     @contextlib.contextmanager
     def fake_connection(endpoint, *_args, **_kwargs):
         yield FakePreflightSourceMissingSize() if endpoint.provider == "gmail" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any("metadata fetch missing RFC822.SIZE" in issue for issue in issues)
+
+
+def test_provider_preflight_ignores_quoted_label_text_when_requiring_metadata_size(tmp_path: Path) -> None:
+    config = _provider_config()
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield FakePreflightSourceQuotedSizeLabel() if endpoint.provider == "gmail" else FakePreflightTarget()
 
     with mock.patch("components.provider_ops.imap_connection", fake_connection):
         ok, issues = provider_preflight(config, max_workers=1)
