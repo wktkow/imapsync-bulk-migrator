@@ -113,13 +113,13 @@ def _identity_variant_slots_cover(
     required_flags: str = "",
     require_all_local: bool = False,
 ) -> bool:
-    if local_slots and not remote_slots:
-        return False
     required_local_indexes = {
         idx
         for idx, (_local_identities, local_flags, _local_internaldate) in enumerate(local_slots)
         if not required_flags or not _legacy_missing_target_flags(required_flags, local_flags)
     }
+    if not remote_slots and (required_local_indexes if required_flags else local_slots):
+        return False
     if require_all_local and len(remote_slots) < len(required_local_indexes):
         return False
     if len(remote_slots) > len(local_slots):

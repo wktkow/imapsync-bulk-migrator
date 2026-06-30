@@ -14926,6 +14926,28 @@ class TestRound7ConfirmedBugs:
         assert not audit_module._identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
         assert not main_module._legacy_identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
 
+    def test_legacy_flagged_virtual_coverage_accepts_empty_remote_when_local_unflagged(self) -> None:
+        from components import audit as audit_module
+        from components import main as main_module
+
+        body = b"Message-ID: <empty-unflagged-virtual@example.com>\r\n\r\nbody"
+        unflagged_slot = ({(len(body), hashlib.sha256(body).hexdigest())}, "\\Seen", "")
+
+        assert audit_module._identity_variant_slots_cover([], [unflagged_slot], required_flags="\\Flagged")
+        assert main_module._legacy_identity_variant_slots_cover([], [unflagged_slot], required_flags="\\Flagged")
+        assert audit_module._identity_variant_slots_cover(
+            [],
+            [unflagged_slot],
+            required_flags="\\Flagged",
+            require_all_local=True,
+        )
+        assert main_module._legacy_identity_variant_slots_cover(
+            [],
+            [unflagged_slot],
+            required_flags="\\Flagged",
+            require_all_local=True,
+        )
+
     def test_legacy_virtual_coverage_requires_all_local_slots_when_local_is_larger(self) -> None:
         from components import audit as audit_module
         from components import main as main_module
