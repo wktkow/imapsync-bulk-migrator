@@ -1074,6 +1074,14 @@ def _message_id_header(data: bytes) -> str:
     return ""
 
 
+def _legacy_used_uid_key(uidvalidity: str, uid: int) -> bytes:
+    return f"{uidvalidity}:{uid}".encode("ascii")
+
+
+def _legacy_used_uid_namespace(imap: imaplib.IMAP4) -> str:
+    return selected_uidvalidity(imap) or "unknown"
+
+
 def _legacy_remote_has_message(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -1088,6 +1096,7 @@ def _legacy_remote_has_message(
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=not restore_missing_flags)
     if status != "OK":
         return False
+    uidvalidity = _legacy_used_uid_namespace(imap)
     message_id = _message_id_header(data)
     search_uids = _legacy_search_target_uids(imap, message_id, mailbox=mailbox)
     if not search_uids:
@@ -1096,7 +1105,8 @@ def _legacy_remote_has_message(
     expected_size = len(data)
     for uid in search_uids:
         uid_token = str(uid).encode("ascii")
-        if uid_token in used_nums:
+        used_key = _legacy_used_uid_key(uidvalidity, uid)
+        if used_key in used_nums or uid_token in used_nums:
             continue
         status, fetched = imap.uid("fetch", str(uid), "(UID RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
         if status != "OK":
@@ -1135,7 +1145,7 @@ def _legacy_remote_has_message(
                 raise RuntimeError(
                     f"remote flags missing after restore in {mailbox}: " + ", ".join(remaining)
                 )
-        used_nums.add(uid_token)
+        used_nums.add(used_key)
         return True
     return False
 

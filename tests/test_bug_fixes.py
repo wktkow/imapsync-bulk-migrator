@@ -1312,7 +1312,7 @@ class TestLegacyExportCompleteness:
             used: set[bytes] = set()
             assert remote_has_message(target, "INBOX", first, used)
             assert remote_has_message(target, "INBOX", second, used)
-            assert used == {b"101", b"202"}
+            assert used == {b"unknown:101", b"unknown:202"}
 
     def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -14750,6 +14750,54 @@ class TestRound7ConfirmedBugs:
 
         assert not audit_module._identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
         assert not main_module._legacy_identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
+
+    def test_legacy_target_used_uids_are_scoped_by_uidvalidity(self) -> None:
+        from components import audit as audit_module
+        from components import imap_ops
+        from components import main as main_module
+
+        data = b"Message-ID: <uidvalidity-reuse@example.com>\r\n\r\nbody"
+
+        class UidValidityReuseTarget:
+            def __init__(self) -> None:
+                self.uidvalidity = 100
+                self.fetches = 0
+
+            def select(self, mailbox: str, readonly: bool = False):
+                self.uidvalidity += 1
+                return "OK", [b"1"]
+
+            def response(self, name: str):
+                assert name == "UIDVALIDITY"
+                return "OK", [str(self.uidvalidity).encode("ascii")]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"2"]
+                if command == "fetch":
+                    self.fetches += 1
+                    return "OK", [(
+                        b"1 (UID 2 RFC822.SIZE "
+                        + str(len(data)).encode("ascii")
+                        + b' FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {'
+                        + str(len(data)).encode("ascii")
+                        + b"}",
+                        data,
+                    )]
+                raise AssertionError(command)
+
+        for checker in (
+            lambda imap, used: imap_ops._legacy_remote_has_message(imap, "Archive", data, used),
+            lambda imap, used: main_module._legacy_remote_has_message(imap, "Archive", data, used),
+            lambda imap, used: audit_module._remote_has_message(imap, "Archive", data, used),
+        ):
+            target = UidValidityReuseTarget()
+            used: set[bytes] = set()
+
+            assert checker(target, used)
+            assert checker(target, used)
+            assert target.fetches == 2
+            assert used == {b"101:2", b"102:2"}
 
     def test_legacy_audit_rejects_unproven_covered_marker(self, tmp_path: Path) -> None:
         from components.audit import audit_account

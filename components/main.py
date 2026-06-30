@@ -29,6 +29,8 @@ from .imap_ops import (
     _legacy_metadata_for_fetch_body_part,
     _legacy_missing_target_flags,
     _legacy_search_target_uids,
+    _legacy_used_uid_key,
+    _legacy_used_uid_namespace,
     _normalized_legacy_internaldate,
     _parse_fetch_response_for_uid,
     ensure_private_dir as ensure_legacy_private_dir,
@@ -238,6 +240,7 @@ def _legacy_remote_has_message(
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
+    uidvalidity = _legacy_used_uid_namespace(imap)
     message_id = _message_id_header(data)
     expected_hash = hashlib.sha256(data).hexdigest()
     expected_size = len(data)
@@ -249,7 +252,8 @@ def _legacy_remote_has_message(
     expected_date = _normalized_legacy_internaldate(expected_internaldate)
     for uid in search_uids:
         uid_token = str(uid).encode("ascii")
-        if used_nums is not None and uid_token in used_nums:
+        used_key = _legacy_used_uid_key(uidvalidity, uid)
+        if used_nums is not None and (used_key in used_nums or uid_token in used_nums):
             continue
         status, fetched = imap.uid("fetch", str(uid), "(UID RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
         if status != "OK":
@@ -267,7 +271,7 @@ def _legacy_remote_has_message(
             date_mismatches.append(actual_date or "<missing>")
             continue
         if used_nums is not None:
-            used_nums.add(uid_token)
+            used_nums.add(used_key)
         return True
     if flag_mismatches:
         missing = sorted({flag for flags in flag_mismatches for flag in flags}, key=str.upper)
