@@ -206,6 +206,15 @@ def _fsync_provider_directory_fd(dir_fd: int, path: Path, label: str) -> None:
         raise RuntimeError(f"unable to fsync provider {label} directory for durability: {path}") from exc
 
 
+def _unlink_provider_entry_and_fsync(parent_fd: int, name: str, parent_path: Path, label: str) -> bool:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    _fsync_provider_directory_fd(parent_fd, parent_path, label)
+    return True
+
+
 def _provider_dir_open_flags() -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -1478,8 +1487,7 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
             _fsync_provider_directory_fd(parent_fd, parent_path, "file")
             _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
         except Exception:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
+            _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
             raise
     finally:
         os.close(parent_fd)
@@ -1518,8 +1526,7 @@ def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             _fsync_provider_directory_fd(parent_fd, parent_path, "file")
             _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
         except Exception:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
+            _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
             raise
     finally:
         os.close(parent_fd)

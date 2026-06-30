@@ -252,6 +252,15 @@ def _fsync_legacy_directory_fd(dir_fd: int, path: Path, label: str) -> None:
         raise RuntimeError(f"unable to fsync {label} directory for durability: {path}") from exc
 
 
+def _unlink_legacy_entry_and_fsync(parent_fd: int, name: str, parent_path: Path, label: str) -> bool:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    _fsync_legacy_directory_fd(parent_fd, parent_path, label)
+    return True
+
+
 def _read_file_no_symlink_with_stat(
     path: Path,
     label: str,
@@ -333,8 +342,7 @@ def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
             _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy file")
             _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
         except Exception:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
+            _unlink_legacy_entry_and_fsync(parent_fd, tmp_name, parent_path, "legacy file")
             raise
     finally:
         os.close(parent_fd)

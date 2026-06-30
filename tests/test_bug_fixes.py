@@ -597,6 +597,33 @@ class TestBug7ImportConfigPlaceholder:
 
         assert fsync_targets == ["file", "dir"]
 
+    def test_generated_config_cleanup_fsyncs_parent_after_failed_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import components.main as main_module
+
+        target = tmp_path / "import.pass.config.json"
+        fsynced_dirs: List[int] = []
+        real_fsync = main_module.os.fsync
+
+        def fail_regular_file_fsync(fd: int) -> None:
+            mode = main_module.os.fstat(fd).st_mode
+            if stat.S_ISREG(mode):
+                raise OSError("simulated secure config fsync failure")
+            if stat.S_ISDIR(mode):
+                fsynced_dirs.append(main_module.os.fstat(fd).st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(main_module.os, "fsync", fail_regular_file_fsync)
+
+        with pytest.raises(OSError, match="simulated secure config fsync failure"):
+            main_module._write_secure_json_file(target, {"password": "secret"})
+
+        assert not target.exists()
+        assert tmp_path.stat().st_ino in fsynced_dirs
+
 
 # ---------------------------------------------------------------------------
 # BUG #1 — executor stop_on_error must drain and log ALL errors
@@ -13675,6 +13702,35 @@ class TestRound7ConfirmedBugs:
         imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
 
         assert fsync_targets == ["file", "dir"]
+
+    def test_legacy_atomic_write_cleanup_fsyncs_parent_after_failed_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        target = tmp_path / "user@example.com" / "export-state.json"
+        target.parent.mkdir()
+        fsynced_dirs: List[int] = []
+        real_fsync = imap_ops.os.fsync
+
+        def fail_regular_file_fsync(fd: int) -> None:
+            mode = imap_ops.os.fstat(fd).st_mode
+            if stat.S_ISREG(mode):
+                raise OSError("simulated legacy file fsync failure")
+            if stat.S_ISDIR(mode):
+                fsynced_dirs.append(imap_ops.os.fstat(fd).st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(imap_ops.os, "fsync", fail_regular_file_fsync)
+
+        with pytest.raises(OSError, match="simulated legacy file fsync failure"):
+            imap_ops._secure_atomic_write_bytes(target, b'{"complete": false}\n')
+
+        assert not target.exists()
+        assert list(target.parent.glob(".export-state.json.*.tmp")) == []
+        assert target.parent.stat().st_ino in fsynced_dirs
 
     def test_legacy_ensure_private_dir_fsyncs_parent_after_mkdir(
         self,

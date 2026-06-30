@@ -307,6 +307,15 @@ def _fsync_indexer_directory_fd(dir_fd: int, path: Path, label: str) -> None:
         raise RuntimeError(f"unable to fsync indexer {label} directory for durability: {path}") from exc
 
 
+def _unlink_indexer_entry_and_fsync(parent_fd: int, name: str, parent_path: Path, label: str) -> bool:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    _fsync_indexer_directory_fd(parent_fd, parent_path, label)
+    return True
+
+
 def _indexer_dir_open_flags() -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -406,8 +415,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                 try:
                     _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
                 except Exception:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(name, dir_fd=parent_fd)
+                    _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
                     raise
                 _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
                 _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
@@ -419,8 +427,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                 try:
                     _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
                 except Exception:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(name, dir_fd=parent_fd)
+                    _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
                     raise
                 os.unlink(tmp_name, dir_fd=parent_fd)
                 tmp_name = ""
@@ -428,14 +435,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                 _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
         except Exception:
             if tmp_name and created_tmp:
-                removed_tmp = False
-                try:
-                    os.unlink(tmp_name, dir_fd=parent_fd)
-                    removed_tmp = True
-                except FileNotFoundError:
-                    pass
-                if removed_tmp:
-                    _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
+                _unlink_indexer_entry_and_fsync(parent_fd, tmp_name, parent_path, "output")
             raise
     finally:
         os.close(parent_fd)

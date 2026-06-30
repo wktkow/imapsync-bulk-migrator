@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import errno
 import hashlib
 import json
@@ -39,6 +38,7 @@ from .imap_ops import (
     _raise_if_legacy_parent_replaced,
     _legacy_symlink_component,
     _legacy_trusted_covered_by_regular_content,
+    _unlink_legacy_entry_and_fsync,
     archive_legacy_import_journal_for_reset,
     export_account,
     import_account,
@@ -208,8 +208,7 @@ def _write_secure_json_file(path: Path, payload: Dict) -> None:
             _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
         except Exception:
             if created:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=parent_fd)
+                _unlink_legacy_entry_and_fsync(parent_fd, name, parent_path, "secure config file")
             raise
     finally:
         if fd >= 0:

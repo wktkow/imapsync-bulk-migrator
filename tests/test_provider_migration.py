@@ -346,6 +346,41 @@ def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
 
 
 @pytest.mark.parametrize("writer_name", ["bytes", "jsonl"])
+def test_provider_atomic_writer_cleanup_fsyncs_parent_after_failed_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    target = account_dir / ("message.eml" if writer_name == "bytes" else "manifest.jsonl")
+    fsynced_dirs: List[int] = []
+    real_fsync = provider_ops.os.fsync
+
+    def fail_regular_file_fsync(fd: int) -> None:
+        mode = provider_ops.os.fstat(fd).st_mode
+        if stat.S_ISREG(mode):
+            raise OSError("simulated provider file fsync failure")
+        if stat.S_ISDIR(mode):
+            fsynced_dirs.append(provider_ops.os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(provider_ops.os, "fsync", fail_regular_file_fsync)
+
+    with pytest.raises(OSError, match="simulated provider file fsync failure"):
+        if writer_name == "bytes":
+            provider_ops._atomic_bytes(target, b"message\n")
+        else:
+            provider_ops._write_jsonl(target, [{"canonical_id": "id"}])
+
+    assert not target.exists()
+    assert list(account_dir.glob(f".{target.name}.*.tmp")) == []
+    assert account_dir.stat().st_ino in fsynced_dirs
+
+
+@pytest.mark.parametrize("writer_name", ["bytes", "jsonl"])
 def test_provider_atomic_writers_preserve_visible_target_after_directory_fsync_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
