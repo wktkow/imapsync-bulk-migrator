@@ -2609,6 +2609,15 @@ def test_list_and_gmail_fetch_parsers() -> None:
             b'1 (RFC822.SIZE 4 X-GM-LABELS ("UID 42") FLAGS (\\Seen))',
         ], expected_uid=42)
 
+    literal_label_before_uid = parse_provider_fetch_response([
+        (b'1 (X-GM-MSGID 123 X-GM-LABELS ({9}', b"Project A"),
+        b' UID 42 RFC822.SIZE 4 FLAGS (\\Seen))',
+    ], expected_uid=42)
+    assert literal_label_before_uid["gmail_msgid"] == "123"
+    assert literal_label_before_uid["gmail_labels"] == ["Project A"]
+    assert literal_label_before_uid["flags"] == "\\Seen"
+    assert literal_label_before_uid["rfc822_size"] == 4
+
     uid_after_literal = parse_provider_fetch_response([
         (b"1 (BODY[] {42}", requested_body),
         b' UID 42 RFC822.SIZE 42 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000")',

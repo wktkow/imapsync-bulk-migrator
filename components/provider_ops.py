@@ -976,6 +976,15 @@ def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
     return ""
 
 
+def _trim_gmail_label_list_at_fetch_item(raw: str) -> str:
+    match = re.search(
+        r'(?i)(?:^|\s)(?:UID\s+\d+|RFC822\.SIZE\s+\d+|FLAGS\s+\(|INTERNALDATE\s+"|'
+        r"X-GM-(?:MSGID|THRID|LABELS)\s+|BODY(?:\.PEEK)?\[)",
+        raw,
+    )
+    return raw[: match.start()].rstrip() if match else raw
+
+
 _MAX_GMAIL_UINT64 = (1 << 64) - 1
 _PROVIDER_FETCH_RESPONSE_START_RE = re.compile(r"^\s*\d+\s+\(")
 
@@ -1077,6 +1086,57 @@ def _provider_fetch_response_uids(meta_str: str) -> List[int]:
     return uids
 
 
+def _provider_fetch_part_meta_text(part: Any) -> str:
+    meta = part[0] if isinstance(part, tuple) and part else part
+    if isinstance(meta, (bytes, bytearray)):
+        return bytes(meta).decode(errors="ignore")
+    return str(meta or "")
+
+
+def _provider_fetch_group_has_message_body(parts: List[Any]) -> bool:
+    for part in parts:
+        if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+            continue
+        meta_text = _provider_fetch_part_meta_text(part)
+        if re.search(r"(?:BODY(?:\.PEEK)?\[\]|(?<![\w.])RFC822(?![\w.]))", meta_text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _provider_fetch_response_for_uid(fetch_response: Iterable[Any], expected_uid: int) -> List[Any]:
+    selected: List[Any] = []
+    current: List[Any] = []
+
+    def finish_current() -> None:
+        nonlocal current
+        if not current:
+            return
+        uids: List[int] = []
+        for part in current:
+            uids.extend(_provider_fetch_response_uids(_provider_fetch_part_meta_text(part)))
+        if uids:
+            unique_uids = set(uids)
+            if expected_uid in unique_uids:
+                if len(unique_uids) > 1:
+                    raise RuntimeError(f"fetch response mixed UID metadata for UID {expected_uid}")
+                selected.extend(current)
+            elif _provider_fetch_group_has_message_body(current):
+                raise RuntimeError(f"fetch returned message bytes for unexpected UID {uids[0]}")
+        elif _provider_fetch_group_has_message_body(current):
+            raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
+        current = []
+
+    for part in fetch_response:
+        meta_text = _provider_fetch_part_meta_text(part)
+        if _PROVIDER_FETCH_RESPONSE_START_RE.match(meta_text):
+            finish_current()
+        current.append(part)
+    finish_current()
+    if not selected:
+        raise RuntimeError(f"fetch response for UID {expected_uid} did not include UID metadata")
+    return selected
+
+
 def _valid_gmail_uint64(value: Optional[str]) -> str:
     if not value or not value.isdecimal():
         return ""
@@ -1091,6 +1151,8 @@ def _valid_gmail_uint64(value: Optional[str]) -> str:
 
 def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid: Optional[int] = None) -> Dict[str, Any]:
     expected_uid_int = int(expected_uid) if expected_uid is not None else None
+    if expected_uid_int is not None:
+        return parse_provider_fetch_response(_provider_fetch_response_for_uid(fetch_response, expected_uid_int))
     msg_bytes: Optional[bytes] = None
     meta_chunks: List[str] = []
     literal_labels: List[str] = []
@@ -1219,6 +1281,8 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
 
     size_raw = group(r"RFC822\.SIZE\s+(\d+)")
     labels_raw = _extract_parenthesized_after(meta_str, "X-GM-LABELS")
+    if literal_labels and labels_raw:
+        labels_raw = _trim_gmail_label_list_at_fetch_item(labels_raw)
     labels = _parse_parenthesized_words(labels_raw or "", drop_literal_markers=True)
     for label in literal_labels:
         if label not in labels:
