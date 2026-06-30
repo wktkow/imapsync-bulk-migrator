@@ -14627,6 +14627,16 @@ class TestRound7ConfirmedBugs:
 
         assert rc == 4
 
+    def test_legacy_virtual_coverage_rejects_empty_remote_for_non_empty_local(self) -> None:
+        from components import audit as audit_module
+        from components import main as main_module
+
+        body = b"Message-ID: <empty-remote-virtual@example.com>\r\n\r\nbody"
+        local_slot = ({(len(body), hashlib.sha256(body).hexdigest())}, "\\Seen \\Flagged", "")
+
+        assert not audit_module._identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
+        assert not main_module._legacy_identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
+
     def test_legacy_audit_rejects_unproven_covered_marker(self, tmp_path: Path) -> None:
         from components.audit import audit_account
         from components.models import Account, ServerConfig

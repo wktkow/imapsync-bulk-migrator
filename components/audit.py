@@ -110,6 +110,8 @@ def _identity_variant_slots_cover(
     *,
     required_flags: str = "",
 ) -> bool:
+    if local_slots and not remote_slots:
+        return False
     if len(remote_slots) > len(local_slots):
         return False
     edges: List[List[int]] = []
