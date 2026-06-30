@@ -16051,6 +16051,78 @@ class TestRound7ConfirmedBugs:
         assert list(tmp_path.glob(".export.pass.config.json.*.tmp")) == []
         assert tmp_path.stat().st_ino in fsynced_dirs
 
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_indexer_write_json_removes_published_file_after_final_parent_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        overwrite: bool,
+    ) -> None:
+        import directadmin_indexer
+
+        parent = tmp_path / "requested"
+        parent.mkdir()
+        backup = tmp_path / "requested.old"
+        out = parent / "export.pass.config.json"
+        if overwrite:
+            out.write_text("{}\n")
+        real_fsync_dir = directadmin_indexer._fsync_indexer_directory_fd
+        real_rename = directadmin_indexer.os.rename
+        swapped = False
+
+        def racing_directory_fsync(dir_fd: int, path: Path, label: str) -> None:
+            nonlocal swapped
+            real_fsync_dir(dir_fd, path, label)
+            if path == parent and not swapped:
+                swapped = True
+                real_rename(parent, backup)
+                parent.mkdir()
+
+        monkeypatch.setattr(directadmin_indexer, "_fsync_indexer_directory_fd", racing_directory_fsync)
+
+        with pytest.raises(RuntimeError, match="replaced indexer output directory"):
+            directadmin_indexer.write_json(
+                {"accounts": [{"email": "a@example.com", "password": "SECRET"}]},
+                str(out),
+                overwrite=overwrite,
+            )
+
+        assert swapped
+        assert not out.exists()
+        assert not (backup / out.name).exists()
+        assert list(backup.glob(".export.pass.config.json.*.tmp")) == []
+
+    def test_indexer_write_json_removes_published_file_after_temp_unlink_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import directadmin_indexer
+
+        out = tmp_path / "export.pass.config.json"
+        real_unlink = directadmin_indexer.os.unlink
+        failed_temp_unlink = False
+
+        def fail_first_temp_unlink(path: str, *args, **kwargs) -> None:
+            nonlocal failed_temp_unlink
+            if str(path).startswith(".export.pass.config.json.") and not failed_temp_unlink:
+                failed_temp_unlink = True
+                raise OSError("simulated temp unlink failure")
+            real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(directadmin_indexer.os, "unlink", fail_first_temp_unlink)
+
+        with pytest.raises(OSError, match="simulated temp unlink failure"):
+            directadmin_indexer.write_json(
+                {"accounts": [{"email": "a@example.com", "password": "SECRET"}]},
+                str(out),
+                overwrite=False,
+            )
+
+        assert failed_temp_unlink
+        assert not out.exists()
+        assert list(tmp_path.glob(".export.pass.config.json.*.tmp")) == []
+
     def test_legacy_export_refuses_preexisting_temp_symlink(
         self,
         tmp_path: Path,

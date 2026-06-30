@@ -387,6 +387,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     parent_fd, name, parent_path = _open_or_create_indexer_parent_dir(out, "output")
     tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     created_tmp = False
+    published_name = False
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -412,6 +413,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
             if overwrite:
                 os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 tmp_name = ""
+                published_name = True
                 try:
                     _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
                 except Exception:
@@ -424,6 +426,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                     os.link(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 except FileExistsError as exc:
                     raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
+                published_name = True
                 try:
                     _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
                 except Exception:
@@ -433,7 +436,10 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                 tmp_name = ""
                 _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
                 _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+            published_name = False
         except Exception:
+            if published_name:
+                _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
             if tmp_name and created_tmp:
                 _unlink_indexer_entry_and_fsync(parent_fd, tmp_name, parent_path, "output")
             raise
