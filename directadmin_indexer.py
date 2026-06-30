@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
+import stat
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,11 +30,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import urllib.parse
 
+from components.secret_files import read_secret_file_no_links
+
 try:
     import requests
 except Exception:  # pragma: no cover
-    print("This script requires the 'requests' package. Install via: pip install -r requirements.txt", file=sys.stderr)
-    sys.exit(2)
+    requests = None  # type: ignore
 
 
 @dataclass
@@ -42,6 +46,14 @@ class ServerSettings:
     starttls: bool = False
 
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+_HAS_DESCRIPTOR_RELATIVE_OUTPUT = all(
+    fn in os.supports_dir_fd
+    for fn in (os.link, os.mkdir, os.open, os.rename, os.unlink)
+)
+
+
 class DirectAdminClient:
     """
     Minimal client for DirectAdmin-compatible API.
@@ -50,8 +62,10 @@ class DirectAdminClient:
     """
 
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout_sec: int = 20) -> None:
+        if requests is None:  # type: ignore
+            raise RuntimeError("DirectAdmin indexer requires the 'requests' package. Install via: pip install -r requirements.txt")
         self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
+        self.session = requests.Session()  # type: ignore[union-attr]
         self.session.auth = (username, password)
         self.session.verify = verify_ssl
         self.timeout_sec = timeout_sec
@@ -100,6 +114,7 @@ class DirectAdminClient:
         if json_obj is not None:
             # Newer DA returns {"list": ["example.com", ...]}
             if isinstance(json_obj, dict):
+                has_error = "error" in json_obj
                 err = str(json_obj.get("error", "0"))
                 if err not in {"0", "false", "False"}:
                     msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
@@ -109,7 +124,13 @@ class DirectAdminClient:
                 # Some variants nest under "domains"
                 if "domains" in json_obj and isinstance(json_obj["domains"], list):
                     return [str(d) for d in json_obj["domains"]]
+                if has_error:
+                    return []
+                raise RuntimeError("Unable to parse domains response from API")
+            elif isinstance(json_obj, list):
+                return [str(d) for d in json_obj]
         if kv is not None:
+            has_error = "error" in kv
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
                 msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
@@ -117,6 +138,8 @@ class DirectAdminClient:
             # Expect keys like list[]=domain
             items = kv.get("list[]") or kv.get("list")
             if items is None:
+                if has_error or not kv:
+                    return []
                 raise RuntimeError("Unable to parse domains response from API")
             return [str(d) for d in items]
         raise RuntimeError("Unable to parse domains response from API")
@@ -133,6 +156,7 @@ class DirectAdminClient:
             # {"list": ["user1", "user2"]}
             # {"users": ["user1", ...]}
             if isinstance(json_obj, dict):
+                has_error = "error" in json_obj
                 err = str(json_obj.get("error", "0"))
                 if err not in {"0", "false", "False"}:
                     msg = str(json_obj.get("text") or json_obj.get("message") or "DirectAdmin returned error")
@@ -141,13 +165,30 @@ class DirectAdminClient:
                     return [str(u) for u in json_obj["list"]]
                 if "users" in json_obj and isinstance(json_obj["users"], list):
                     return [str(u) for u in json_obj["users"]]
+                dynamic_values = []
+                for k, v in json_obj.items():
+                    if isinstance(k, str) and k.startswith("list"):
+                        if isinstance(v, list):
+                            dynamic_values.extend(v)
+                        else:
+                            dynamic_values.append(v)
+                if dynamic_values:
+                    return [str(u) for u in dynamic_values]
+                if has_error:
+                    return []
+                raise RuntimeError(f"Unable to parse POP account list response for {domain}")
+            elif isinstance(json_obj, list):
+                return [str(u) for u in json_obj]
         if kv is not None:
+            has_error = "error" in kv
             err = _kv_get_one(kv, "error") or "0"
             if err not in {"0", "false", "False"}:
                 msg = _kv_get_one(kv, "text") or _kv_get_one(kv, "message") or "DirectAdmin returned error"
                 raise RuntimeError(msg)
             items = kv.get("list[]") or kv.get("list") or kv.get("users[]") or kv.get("users")
             if items is None:
+                if has_error:
+                    return []
                 raise RuntimeError(f"Unable to parse POP account list response for {domain}")
             return [str(u) for u in items]
         # Some installs place names under index keys like list0=user
@@ -209,7 +250,7 @@ def prompt_select_from_list(options: List[str], title: str) -> List[int]:
             seen.add(i)
             deduped.append(i)
     if not deduped:
-        return list(range(len(options)))
+        return []
     return deduped
 
 
@@ -227,33 +268,187 @@ def build_config(server: ServerSettings, emails: List[str], default_password: st
     }
 
 
-def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
-    path_exists = os.path.exists(out_path)
-    if path_exists and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)")
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _indexer_normalized_absolute_path(path: Path) -> Path:
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    parts: List[str] = []
+    for part in absolute.parts[1:]:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return Path(absolute.anchor).joinpath(*parts)
+
+
+def _indexer_parent_matches_fd(parent_path: Path, parent_fd: int) -> bool:
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(str(tmp), str(out))
-        os.chmod(out, 0o600)
-    except Exception:
-        try:
+        current = os.stat(parent_path, follow_symlinks=False)
+    except OSError:
+        return False
+    pinned = os.fstat(parent_fd)
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and current.st_dev == pinned.st_dev
+        and current.st_ino == pinned.st_ino
+    )
+
+
+def _raise_if_indexer_parent_replaced(parent_path: Path, parent_fd: int, label: str) -> None:
+    if not _indexer_parent_matches_fd(parent_path, parent_fd):
+        raise RuntimeError(f"refusing to use replaced indexer {label} directory: {parent_path}")
+
+
+def _fsync_indexer_directory_fd(dir_fd: int, path: Path, label: str) -> None:
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise RuntimeError(f"unable to fsync indexer {label} directory for durability: {path}") from exc
+
+
+def _unlink_indexer_entry_and_fsync(parent_fd: int, name: str, parent_path: Path, label: str) -> bool:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False
+    _fsync_indexer_directory_fd(parent_fd, parent_path, label)
+    return True
+
+
+def _indexer_dir_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_or_create_indexer_parent_dir(path: Path, label: str) -> Tuple[int, str, Path]:
+    if not _HAS_DESCRIPTOR_RELATIVE_OUTPUT:
+        raise RuntimeError("platform does not support descriptor-relative indexer output access")
+    absolute = _indexer_normalized_absolute_path(path)
+    name = absolute.name
+    if not name or name in {".", ".."}:
+        raise RuntimeError(f"refusing to use invalid indexer {label} path: {path}")
+    parent_path = absolute.parent
+    flags = _indexer_dir_open_flags()
+    fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:-1]:
+            created = False
+            try:
+                os.mkdir(part, PRIVATE_DIR_MODE, dir_fd=fd)
+                created = True
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                if exc.errno != errno.EEXIST:
+                    raise
+            if created:
+                _fsync_indexer_directory_fd(fd, current, label)
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                if exc.errno == errno.ENOTDIR:
+                    with contextlib.suppress(OSError):
+                        component_stat = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISLNK(component_stat.st_mode):
+                            raise RuntimeError(f"refusing to use symlinked indexer {label} directory: {path}") from exc
+                    raise RuntimeError(f"indexer {label} path component is not a directory: {current / part}") from exc
+                raise
+            try:
+                stat_result = os.fstat(next_fd)
+                if not stat.S_ISDIR(stat_result.st_mode):
+                    raise RuntimeError(f"indexer {label} path component is not a directory: {current / part}")
+            except Exception:
+                os.close(next_fd)
+                raise
             os.close(fd)
-        except OSError:
-            pass
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
+            fd = next_fd
+            current = current / part
+        _raise_if_indexer_parent_replaced(parent_path, fd, label)
+        return fd, name, parent_path
+    except Exception:
+        os.close(fd)
         raise
 
 
+def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
+    out = Path(out_path)
+    parent_fd, name, parent_path = _open_or_create_indexer_parent_dir(out, "output")
+    tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
+    created_tmp = False
+    published_name = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            fd = os.open(tmp_name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise RuntimeError(f"refusing to use unsafe indexer temporary file: {out.with_name(tmp_name)}") from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked indexer temporary file: {out.with_name(tmp_name)}") from exc
+            raise
+        created_tmp = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            if overwrite:
+                os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                tmp_name = ""
+                published_name = True
+                try:
+                    _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+                except Exception:
+                    _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
+                    raise
+                _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
+                _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+            else:
+                try:
+                    os.link(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                except FileExistsError as exc:
+                    raise FileExistsError(f"Refusing to overwrite existing file: {out_path} (use --overwrite)") from exc
+                published_name = True
+                try:
+                    _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+                except Exception:
+                    _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
+                    raise
+                os.unlink(tmp_name, dir_fd=parent_fd)
+                tmp_name = ""
+                _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
+                _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
+            published_name = False
+        except Exception:
+            if published_name:
+                _unlink_indexer_entry_and_fsync(parent_fd, name, parent_path, "output")
+            if tmp_name and created_tmp:
+                _unlink_indexer_entry_and_fsync(parent_fd, tmp_name, parent_path, "output")
+            raise
+    finally:
+        os.close(parent_fd)
+
+
 def read_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").strip()
+    value = read_secret_file_no_links(path, label=label)
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value
@@ -277,8 +472,8 @@ def resolve_password(args: argparse.Namespace) -> str:
         return read_secret_file(str(args.password_file), label="DirectAdmin password file")
     if getattr(args, "password_env", None):
         env_name = str(args.password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"DirectAdmin password environment variable is unset or empty: {env_name}")
         return value
     print("Warning: --password can expose the secret via shell history/process arguments; prefer --password-file or --password-env", file=sys.stderr)
@@ -301,8 +496,8 @@ def resolve_default_password(args: argparse.Namespace) -> str:
         return read_secret_file(str(args.default_password_file), label="Default mailbox password file")
     if getattr(args, "default_password_env", None):
         env_name = str(args.default_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"Default mailbox password environment variable is unset or empty: {env_name}")
         return value
     if getattr(args, "default_password", None):
@@ -360,6 +555,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     selected_idx = prompt_select_from_list(domains, title="Available Domains")
+    if not selected_idx:
+        print("No valid domain selection provided.", file=sys.stderr)
+        return 2
     selected_domains = [domains[i] for i in selected_idx]
 
     all_emails: List[str] = []
@@ -367,17 +565,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             users = client.list_pop_accounts(domain)
         except Exception as exc:
-            print(f"Warning: failed to list accounts for {domain}: {exc}")
-            users = []
+            print(f"Failed to list accounts for {domain}: {exc}", file=sys.stderr)
+            return 2
         emails = [f"{u}@{domain}" for u in users]
         print(f"{domain}: {len(emails)} accounts")
         all_emails.extend(emails)
+    if not all_emails:
+        print("No email accounts found for the selected domain(s).")
+        return 0
 
     # Build config
     server = ServerSettings(
         host=args.imap_host,
         port=int(args.imap_port),
-        ssl=bool(args.imap_ssl),
+        ssl=bool(args.imap_ssl) and not bool(args.imap_starttls),
         starttls=bool(args.imap_starttls),
     )
     payload = build_config(server, all_emails, default_password=default_password)

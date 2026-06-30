@@ -5,14 +5,73 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.@+-]+")
+IMAPSYNC_VERSION_TIMEOUT_SEC = 10
+IMAP_UID_MAX = 0xFFFFFFFF
+_IMAP_UID_TOKEN_RE = re.compile(r"[1-9][0-9]*")
 
 
 def sanitize_for_path(name: str) -> str:
     name = name.strip().replace(os.sep, "_").replace("/", "_")
     name = SANITIZE_PATTERN.sub("_", name)
-    return name[:200] if len(name) > 200 else name
+    name = name[:200] if len(name) > 200 else name
+    if name in {"", ".", ".."}:
+        return "_"
+    return name
+
+
+def sanitized_path_key(name: str) -> str:
+    return sanitize_for_path(name).casefold()
+
+
+def canonical_imap_mailbox_name(name: str) -> str:
+    return "INBOX" if name.upper() == "INBOX" else name
+
+
+def canonical_mailbox_path_key(name: str) -> str:
+    return sanitize_for_path(canonical_imap_mailbox_name(name))
+
+
+def canonical_mailbox_alias_key(name: str) -> str:
+    return sanitized_path_key(canonical_imap_mailbox_name(name))
+
+
+_IMAP_ATOM_SPECIALS = set('(){ %*"\\]')
+
+
+def quote_imap_search_value(value: str) -> str:
+    """Return an IMAP search string safe for imaplib's raw argument joining."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError("IMAP search value contains control characters")
+    if value and not any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _IMAP_ATOM_SPECIALS for ch in value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
+
+
+def parse_imap_uid_token(token: object, *, label: str = "UID token") -> int:
+    try:
+        value = token.decode("ascii") if isinstance(token, bytes) else str(token)
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"invalid UID token in {label}: {token!r}") from exc
+    if not _IMAP_UID_TOKEN_RE.fullmatch(value):
+        raise RuntimeError(f"invalid UID token in {label}: {token!r}")
+    uid = int(value)
+    if uid > IMAP_UID_MAX:
+        raise RuntimeError(f"UID out of range in {label}: {token!r}")
+    return uid
+
+
+def parse_imap_uid_search_data(data: Any, *, label: str = "UID SEARCH response") -> list[int]:
+    """Parse a SEARCH response that must contain only RFC-valid IMAP UIDs."""
+    uids: list[int] = []
+    if not data or not data[0]:
+        return uids
+    for token in data[0].split():
+        uids.append(parse_imap_uid_token(token, label=label))
+    return sorted(uids)
 
 
 def encode_imap_utf7(value: str) -> str:
@@ -71,25 +130,31 @@ def decode_imap_utf7(value: str) -> str:
     return "".join(result)
 
 
-def ensure_imapsync_available() -> None:
+def ensure_imapsync_available() -> str:
     path = shutil.which("imapsync")
     if not path:
         raise RuntimeError(
             "The 'imapsync' binary is required but was not found in PATH. Install it and try again."
         )
-    subprocess.run([path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    try:
+        subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=IMAPSYNC_VERSION_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"The 'imapsync' binary did not respond to --version within {IMAPSYNC_VERSION_TIMEOUT_SEC} seconds."
+        ) from exc
+    return path
 
 
 def check_environment(min_free_gb: float = 1.0) -> None:
     if sys.version_info < (3, 9):
         raise RuntimeError("Python 3.9+ is required.")
-
-    total, used, free = shutil.disk_usage(Path.cwd())
-    free_gb = free / (1024 ** 3)
-    if free_gb < min_free_gb:
-        raise RuntimeError(
-            f"Insufficient free disk space: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
-        )
+    _ = min_free_gb
 
 
 def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
@@ -111,4 +176,3 @@ def check_free_space_for_path(target_path: Path, min_free_gb: float) -> None:
         raise RuntimeError(
             f"Insufficient free disk space at {probe}: {free_gb:.2f} GiB available, requires ≥ {min_free_gb:.2f} GiB"
         )
-

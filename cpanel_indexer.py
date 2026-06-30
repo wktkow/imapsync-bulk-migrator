@@ -39,8 +39,8 @@ def _resolve_one_secret(args: argparse.Namespace, prefix: str, label: str) -> Op
         return read_secret_file(str(file_value), label=f"{label} file")
     if env_value:
         env_name = str(env_value)
-        secret = os.environ.get(env_name, "").strip()
-        if not secret:
+        secret = os.environ.get(env_name)
+        if secret is None or secret == "":
             raise ValueError(f"{label} environment variable is unset or empty: {env_name}")
         return secret
     if value:
@@ -111,13 +111,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("No email accounts found for this cPanel account.")
         return 0
     selected_idx = prompt_select_from_list(domains, title="Available Email Domains")
+    if not selected_idx:
+        print("No valid domain selection provided.", file=sys.stderr)
+        return 2
     selected_domains = {domains[i] for i in selected_idx}
     selected_emails = sorted(email for email in all_emails if email.split("@", 1)[1].lower() in selected_domains)
 
     server = ServerSettings(
         host=args.imap_host,
         port=int(args.imap_port),
-        ssl=bool(args.imap_ssl),
+        ssl=bool(args.imap_ssl) and not bool(args.imap_starttls),
         starttls=bool(args.imap_starttls),
     )
     payload: Dict[str, Any] = build_config(server, selected_emails, default_password=default_password)

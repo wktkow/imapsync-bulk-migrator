@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -8,6 +9,8 @@ import math
 import socket
 import os
 import signal
+import stat
+import sys
 import threading
 from pathlib import Path
 from email.parser import BytesParser
@@ -20,26 +23,67 @@ from .cpanel_ensure import ensure_accounts_exist_cpanel
 from .da_client import DirectAdminClient
 from .da_ensure import ensure_accounts_exist_directadmin
 from .executor import parallel_process_accounts
-from .imap_ops import archive_legacy_import_journal_for_reset, export_account, import_account
+from .imap_ops import (
+    _is_legacy_flagged_source_view,
+    _legacy_fetch_body_part_matches_sequence,
+    _legacy_metadata_for_fetch_body_part,
+    _legacy_missing_target_flags,
+    _legacy_search_target_uids,
+    _legacy_used_uid_key,
+    _legacy_used_uid_namespace,
+    _normalized_legacy_internaldate,
+    _parse_fetch_response_for_uid,
+    ensure_private_dir as ensure_legacy_private_dir,
+    _fsync_legacy_directory_fd,
+    _open_legacy_dir,
+    _open_legacy_parent_dir,
+    _raise_if_legacy_parent_replaced,
+    _legacy_symlink_component,
+    _legacy_trusted_covered_by_regular_content,
+    _unlink_legacy_entry_and_fsync,
+    archive_legacy_import_journal_for_reset,
+    export_account,
+    import_account,
+    legacy_export_output_symlink_issues,
+)
 from .imapsync_cli import run_imapsync_justconnect
 from .models import Account, Config, ProviderMigrationConfig, load_config_file
+from .secret_files import read_secret_file_no_links
 from .provider_ops import (
     provider_audit_all,
     provider_export_all,
     provider_import_all,
     provider_preflight,
     provider_test_accounts,
+    provider_validate_account,
     provider_validate_all,
+    _raise_if_provider_path_symlink,
 )
-from .utils import check_environment, sanitize_for_path
+from .utils import (
+    canonical_imap_mailbox_name,
+    canonical_mailbox_path_key,
+    check_environment,
+    sanitize_for_path,
+    sanitized_path_key,
+)
 from .utils import check_free_space_for_path
 
 
+def _utc_log_timestamp() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
 def _read_required_secret_file(path: str, *, label: str) -> str:
-    value = Path(path).read_text(encoding="utf-8").strip()
+    value = read_secret_file_no_links(path, label=label)
     if not value:
         raise ValueError(f"{label} is empty: {path}")
     return value
+
+
+def _canonical_reset_confirm_host(value: str) -> str:
+    return value.strip().lower().rstrip(".")
 
 
 def _resolve_da_password(args: argparse.Namespace) -> str:
@@ -60,8 +104,8 @@ def _resolve_da_password(args: argparse.Namespace) -> str:
         return _read_required_secret_file(str(args.da_password_file), label="DirectAdmin password file")
     if getattr(args, "da_password_env", None):
         env_name = str(args.da_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"DirectAdmin password environment variable is unset or empty: {env_name}")
         return value
     logging.warning("--da-password exposes the DirectAdmin secret via shell history/process arguments; prefer --da-password-file or --da-password-env")
@@ -97,8 +141,8 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
         return _read_required_secret_file(str(args.cpanel_password_file), label="cPanel password file"), None
     if getattr(args, "cpanel_password_env", None):
         env_name = str(args.cpanel_password_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"cPanel password environment variable is unset or empty: {env_name}")
         return value, None
     if getattr(args, "cpanel_password", None):
@@ -108,8 +152,8 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
         return None, _read_required_secret_file(str(args.cpanel_token_file), label="cPanel API token file")
     if getattr(args, "cpanel_token_env", None):
         env_name = str(args.cpanel_token_env)
-        value = os.environ.get(env_name, "").strip()
-        if not value:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
             raise ValueError(f"cPanel API token environment variable is unset or empty: {env_name}")
         return None, value
     if getattr(args, "cpanel_token", None):
@@ -118,18 +162,60 @@ def _resolve_cpanel_auth(args: argparse.Namespace) -> Tuple[Optional[str], Optio
     raise ValueError("cPanel provisioning requires one of: --cpanel-token-file, --cpanel-token-env, --cpanel-token, --cpanel-password-file, --cpanel-password-env, --cpanel-password")
 
 
+def _ensure_directadmin_client_dependency() -> None:
+    from . import da_client as da_client_module
+
+    if da_client_module.requests is None:  # type: ignore[attr-defined]
+        raise RuntimeError("DirectAdmin auto-provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
+
+
+def _ensure_cpanel_client_dependency() -> None:
+    from . import cpanel_client as cpanel_client_module
+
+    if cpanel_client_module.requests is None:  # type: ignore[attr-defined]
+        raise RuntimeError("cPanel provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
+
+
 def _write_secure_json_file(path: Path, payload: Dict) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    parent_fd, name, parent_path = _open_legacy_parent_dir(path, "secure config file")
+    fd = -1
+    created = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    except Exception:
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
         try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        raise
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            try:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+            except RuntimeError as replaced_exc:
+                raise replaced_exc from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(f"refusing to use symlinked secure config file: {path}") from exc
+            raise
+        created = True
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+            _fsync_legacy_directory_fd(parent_fd, parent_path, "secure config file")
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "secure config file")
+        except Exception:
+            if created:
+                _unlink_legacy_entry_and_fsync(parent_fd, name, parent_path, "secure config file")
+            raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _message_id_header(data: bytes) -> str:
@@ -140,48 +226,195 @@ def _message_id_header(data: bytes) -> str:
         return ""
 
 
-def _legacy_remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
+def _legacy_remote_has_message(
+    imap,
+    mailbox: str,
+    data: bytes,
+    used_nums: Optional[Set[bytes]] = None,
+    expected_flags: str = "",
+    expected_internaldate: str = "",
+) -> bool:
+    from .imap_ops import _imap_append_wire_bytes, quote_mailbox_name
+
+    data = _imap_append_wire_bytes(data)
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    uidvalidity = _legacy_used_uid_namespace(imap)
+    message_id = _message_id_header(data)
+    expected_hash = hashlib.sha256(data).hexdigest()
+    expected_size = len(data)
+    search_uids = _legacy_search_target_uids(imap, message_id, mailbox=mailbox)
+    if not search_uids:
+        return False
+    flag_mismatches: List[List[str]] = []
+    date_mismatches: List[str] = []
+    expected_date = _normalized_legacy_internaldate(expected_internaldate)
+    for uid in search_uids:
+        uid_token = str(uid).encode("ascii")
+        used_key = _legacy_used_uid_key(uidvalidity, uid)
+        if used_nums is not None and (used_key in used_nums or uid_token in used_nums):
+            continue
+        status, fetched = imap.uid("fetch", str(uid), "(UID RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
+        if status != "OK":
+            continue
+        body, actual_flags, actual_date = _parse_fetch_response_for_uid(list(fetched or []), uid)
+        if body is None:
+            continue
+        if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_hash:
+            continue
+        missing_flags = _legacy_missing_target_flags(expected_flags, actual_flags)
+        if missing_flags:
+            flag_mismatches.append(missing_flags)
+            continue
+        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+            date_mismatches.append(actual_date or "<missing>")
+            continue
+        if used_nums is not None:
+            used_nums.add(used_key)
+        return True
+    if flag_mismatches:
+        missing = sorted({flag for flags in flag_mismatches for flag in flags}, key=str.upper)
+        raise RuntimeError("remote flags missing: " + ", ".join(missing))
+    if date_mismatches:
+        got = ", ".join(sorted(set(date_mismatches)))
+        raise RuntimeError(f"remote INTERNALDATE mismatch: expected {expected_date!r} got {got!r}")
+    return False
+
+
+def _legacy_content_identity_variants(data: bytes) -> Set[Tuple[int, str]]:
+    from .imap_ops import _imap_append_wire_bytes
+
+    variants = {data, _imap_append_wire_bytes(data)}
+    return {(len(candidate), hashlib.sha256(candidate).hexdigest()) for candidate in variants}
+
+
+def _legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
+    from .imap_ops import _is_legacy_all_source_view, _is_legacy_flagged_source_view
+
+    return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
+
+
+_LegacyCoverageSlot = Tuple[Set[Tuple[int, str]], str, str]
+
+
+def _legacy_identity_variant_slots_cover(
+    remote_slots: List[_LegacyCoverageSlot],
+    local_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
+    require_all_local: bool = False,
+) -> bool:
+    required_local_indexes = {
+        idx
+        for idx, (_local_identities, local_flags, _local_internaldate) in enumerate(local_slots)
+        if not required_flags or not _legacy_missing_target_flags(required_flags, local_flags)
+    }
+    if not remote_slots and (required_local_indexes if required_flags else local_slots):
+        return False
+    if require_all_local and len(remote_slots) < len(required_local_indexes):
+        return False
+    if len(remote_slots) > len(local_slots):
+        return False
+    edges: List[List[int]] = []
+    for remote_identities, remote_flags, remote_internaldate in remote_slots:
+        if required_flags and _legacy_missing_target_flags(required_flags, remote_flags):
+            return False
+        matches = [
+            idx
+            for idx, (local_identities, local_flags, local_internaldate) in enumerate(local_slots)
+            if remote_identities & local_identities
+            and not (required_flags and _legacy_missing_target_flags(required_flags, local_flags))
+            and not (
+                required_flags
+                and _normalized_legacy_internaldate(remote_internaldate)
+                and _normalized_legacy_internaldate(local_internaldate)
+                and _normalized_legacy_internaldate(remote_internaldate)
+                != _normalized_legacy_internaldate(local_internaldate)
+            )
+        ]
+        if not matches:
+            return False
+        edges.append(matches)
+    match_for_local: Dict[int, int] = {}
+
+    def assign(remote_idx: int, seen: Set[int]) -> bool:
+        for local_idx in edges[remote_idx]:
+            if local_idx in seen:
+                continue
+            seen.add(local_idx)
+            previous_remote = match_for_local.get(local_idx)
+            if previous_remote is None or assign(previous_remote, seen):
+                match_for_local[local_idx] = remote_idx
+                return True
+        return False
+
+    for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
+        if not assign(remote_idx, set()):
+            return False
+    if require_all_local and not required_local_indexes.issubset(match_for_local):
+        return False
+    return True
+
+
+def _legacy_remote_mailbox_content_covered(
+    imap,
+    mailbox: str,
+    local_identity_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
+    require_all_local: bool = False,
+) -> bool:
     from .imap_ops import quote_mailbox_name
 
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
-    message_id = _message_id_header(data)
-    expected_hash = hashlib.sha256(data).hexdigest()
-    expected_size = len(data)
-    if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
-    else:
-        status, search_data = imap.search(None, "ALL")
-    if status != "OK" or not search_data or not search_data[0]:
+    status, search_data = imap.search(None, "ALL")
+    if status != "OK":
         return False
-    for num in search_data[0].split():
-        if used_nums is not None and num in used_nums:
-            continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+    nums = search_data[0].split() if search_data and search_data[0] else []
+    remote_slots: List[_LegacyCoverageSlot] = []
+    fetch_query = "(RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])" if required_flags else "(RFC822.SIZE BODY.PEEK[])"
+    for num in nums:
+        status, fetched = imap.fetch(num, fetch_query)
         if status != "OK":
-            continue
-        for part in fetched or []:
+            return False
+        fetched_parts = list(fetched or [])
+        remote_identities: Set[Tuple[int, str]] = set()
+        body_part_index: Optional[int] = None
+        for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
-            body = bytes(part[1])
-            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
-                if used_nums is not None:
-                    used_nums.add(num)
-                return True
-    return False
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
+                continue
+            if body_part_index is None:
+                body_part_index = index
+            remote_identities.update(_legacy_content_identity_variants(bytes(part[1])))
+        if not remote_identities:
+            return False
+        actual_flags, actual_date = _legacy_metadata_for_fetch_body_part(fetched_parts, body_part_index)
+        remote_slots.append((
+            remote_identities,
+            actual_flags or "",
+            actual_date or "",
+        ))
+    return _legacy_identity_variant_slots_cover(
+        remote_slots,
+        local_identity_slots,
+        required_flags=required_flags,
+        require_all_local=require_all_local,
+    )
 
 
 def setup_logging(log_directory: Path) -> Path:
     """Initialize root logger with file + stdout handlers and return log path."""
-    log_directory.mkdir(parents=True, exist_ok=True)
-    from datetime import datetime, timezone
+    ensure_legacy_private_dir(log_directory, label="log directory")
     import logging
     import sys
     import time
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_file = log_directory / f"run-{timestamp}.log"
+    timestamp = _utc_log_timestamp()
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -194,7 +427,44 @@ def setup_logging(log_directory: Path) -> Path:
     )
     formatter.converter = time.gmtime
 
-    log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    log_file: Optional[Path] = None
+    log_fd: Optional[int] = None
+    log_dir_fd: Optional[int] = None
+    try:
+        log_dir_fd, log_dir_path = _open_legacy_dir(log_directory, "log directory")
+        for attempt in range(100):
+            suffix = "" if attempt == 0 else f"-{attempt}"
+            name = f"run-{timestamp}{suffix}.log"
+            candidate = log_directory / name
+            try:
+                _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                opened_fd = os.open(name, flags, 0o600, dir_fd=log_dir_fd)
+                try:
+                    _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                except Exception:
+                    os.close(opened_fd)
+                    raise
+                log_fd = opened_fd
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                try:
+                    _raise_if_legacy_parent_replaced(log_dir_path, log_dir_fd, "log directory")
+                except RuntimeError as replaced_exc:
+                    raise replaced_exc from exc
+                if exc.errno in {errno.ELOOP, errno.EMLINK} or candidate.is_symlink():
+                    raise RuntimeError(f"refusing to use symlinked log file: {candidate}") from exc
+                raise
+            log_file = candidate
+            break
+        if log_file is None or log_fd is None:
+            raise RuntimeError(f"could not create a unique log file in {log_directory}")
+    finally:
+        if log_dir_fd is not None:
+            os.close(log_dir_fd)
     os.fchmod(log_fd, 0o600)
     fh = logging.StreamHandler(os.fdopen(log_fd, "a", encoding="utf-8"))
     fh.setFormatter(formatter)
@@ -208,7 +478,13 @@ def setup_logging(log_directory: Path) -> Path:
     return log_file
 
 
-def test_accounts(config: Config, max_workers: int) -> None:
+def test_accounts(
+    config: Config,
+    max_workers: int,
+    *,
+    imap_timeout: float = 30.0,
+    stop_event: Optional[object] = None,
+) -> None:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     import concurrent.futures
@@ -216,11 +492,20 @@ def test_accounts(config: Config, max_workers: int) -> None:
     errors: queue.Queue[str] = queue.Queue()
     from .imap_ops import imap_connection
 
+    def stop_requested() -> bool:
+        return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+    def raise_if_stopped(label: str) -> None:
+        if stop_requested():
+            raise RuntimeError(f"{label}: stop requested before completion")
+
     def worker(acc: Account) -> None:
         try:
+            raise_if_stopped(f"connectivity test {acc.email}")
             # Properly open and logout via the context manager
             with imap_connection(config.server, acc):
                 pass
+            raise_if_stopped(f"connectivity test {acc.email}")
             ok, out = run_imapsync_justconnect(
                 host=config.server.host,
                 port=config.server.port,
@@ -228,17 +513,63 @@ def test_accounts(config: Config, max_workers: int) -> None:
                 starttls=config.server.starttls,
                 user=acc.email,
                 password=acc.password,
-                timeout_sec=30,
+                timeout_sec=imap_timeout,
+                stop_event=stop_event,
             )
+            raise_if_stopped(f"connectivity test {acc.email}")
             if not ok:
                 raise RuntimeError(f"imapsync justconnect failed for {acc.email}:\n{out}")
             logging.info("[test] %s: OK", acc.email)
         except Exception as exc:
             logging.error("[test] %s: FAILED: %s", acc.email, exc)
             errors.put(f"{acc.email}: {exc}")
+            if stop_requested():
+                raise
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="test") as ex:
-        list(ex.map(worker, config.accounts))
+    account_iter = iter(config.accounts)
+    futures: Dict[concurrent.futures.Future[None], Account] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="test")
+    wait_timeout = 0.2 if stop_event is not None else None
+
+    def submit_next() -> bool:
+        if stop_requested():
+            return False
+        try:
+            acc = next(account_iter)
+        except StopIteration:
+            return False
+        futures[executor.submit(worker, acc)] = acc
+        return True
+
+    try:
+        for _ in range(min(max_workers, len(config.accounts))):
+            if not submit_next():
+                break
+        while futures:
+            raise_if_stopped("connectivity tests")
+            done, _pending = concurrent.futures.wait(
+                futures,
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            completed_successfully = 0
+            for fut in done:
+                futures.pop(fut, None)
+                fut.result()
+                completed_successfully += 1
+                raise_if_stopped("connectivity tests")
+            for _ in range(completed_successfully):
+                submit_next()
+        raise_if_stopped("connectivity tests")
+    finally:
+        if stop_requested():
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     if not errors.empty():
         reason_lines: List[str] = []
@@ -263,6 +594,128 @@ def _invalid_panel_account_emails(config: Config) -> List[str]:
         ):
             invalid.append(acc.email)
     return invalid
+
+
+def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
+    issues: List[str] = []
+    for acc in config.accounts:
+        account_dir = in_root / sanitize_for_path(acc.email)
+        if account_dir.is_symlink():
+            issues.append(f"{acc.email}: account directory is a symlink: {account_dir}")
+            continue
+        if not account_dir.exists():
+            continue
+        if not account_dir.is_dir():
+            issues.append(f"{acc.email}: account path is not a directory: {account_dir}")
+            continue
+        for path in sorted(account_dir.rglob("*")):
+            if path.is_symlink():
+                rel_path = path.relative_to(account_dir).as_posix()
+                issues.append(f"{acc.email}: staged path is a symlink: {rel_path}")
+    return issues
+
+
+def _provider_staged_symlink_issues(account_dir: Path, account_label: str) -> List[str]:
+    issues: List[str] = []
+    stack = [account_dir]
+    while stack:
+        current = stack.pop()
+        try:
+            children = sorted(current.iterdir())
+        except OSError as exc:
+            rel = current.relative_to(account_dir).as_posix() if current != account_dir else "."
+            issues.append(f"{account_label}: failed to read staged provider path {rel}: {exc}")
+            continue
+        for child in children:
+            rel = child.relative_to(account_dir).as_posix()
+            if child.is_symlink():
+                issues.append(f"{account_label}: staged provider path is a symlink: {rel}")
+                continue
+            if child.is_dir():
+                stack.append(child)
+    return issues
+
+
+def _provider_cli_local_root_issues(
+    root: Path,
+    config: ProviderMigrationConfig,
+    *,
+    label: str,
+    require_exists: bool,
+) -> List[str]:
+    issues: List[str] = []
+    try:
+        _raise_if_provider_path_symlink(root, f"{label} root")
+    except RuntimeError as exc:
+        return [str(exc)]
+    if not root.exists():
+        if require_exists:
+            issues.append(f"{label.capitalize()} directory does not exist: {root}")
+        return issues
+    if not root.is_dir():
+        return [f"{label.capitalize()} directory is not a directory: {root}"]
+    for account in config.accounts:
+        account_dir = root / sanitize_for_path(account.source_email)
+        try:
+            _raise_if_provider_path_symlink(account_dir, "account directory")
+        except RuntimeError as exc:
+            issues.append(f"{account.source_email}: {exc}")
+            continue
+        if account_dir.exists() and not account_dir.is_dir():
+            issues.append(f"{account.source_email}: provider account path is not a directory: {account_dir}")
+            continue
+        if account_dir.exists():
+            issues.extend(_provider_staged_symlink_issues(account_dir, account.source_email))
+    return issues
+
+
+def _provider_cli_staged_validation_issues(
+    root: Path,
+    config: ProviderMigrationConfig,
+    *,
+    mode: str,
+) -> List[str]:
+    issues: List[str] = []
+    for account in config.accounts:
+        _name, report = provider_validate_account(
+            config,
+            account,
+            root,
+            check_target=False,
+            write_report=False,
+            allow_unresolved_pending=(mode == "import"),
+            repair_trailing_journal=(mode == "import"),
+            allow_missing_gmail_target_msgid=(mode == "import"),
+        )
+        keys = ("duplicates", "failed", "missing") if mode == "validate" else ("duplicates", "failed")
+        for key in keys:
+            for item in report.get(key, []):
+                issues.append(f"{account.source_email}: {key}: {item}")
+    return issues
+
+
+def _legacy_pending_import_journal_issues(root: Path, config: Config, *, repair_trailing: bool = False) -> List[str]:
+    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys
+
+    issues: List[str] = []
+    for account in config.accounts:
+        account_dir = root / sanitize_for_path(account.email)
+        if not account_dir.exists():
+            continue
+        try:
+            pending_keys = _unresolved_legacy_pending_keys(
+                _load_legacy_import_journal(account_dir, repair_trailing=repair_trailing),
+                _legacy_import_target_id(config.server, account),
+            )
+        except Exception as exc:
+            issues.append(f"{account.email}: import journal load failed: {exc}")
+            continue
+        if pending_keys:
+            issues.append(
+                f"{account.email}: import journal has {len(pending_keys)} pending append(s); "
+                "target state is uncertain"
+            )
+    return issues
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -311,11 +764,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    log_file = setup_logging(Path(args.log_dir))
+    try:
+        log_file = setup_logging(Path(args.log_dir))
+    except Exception as exc:
+        print(f"Failed to initialize logging: {exc}", file=sys.stderr)
+        return 2
     logging.info("Starting imapsync-bulk-migrator | mode=%s", args.mode)
 
     if int(args.max_workers) < 1:
         logging.error("--max-workers must be >= 1")
+        return 2
+    if int(args.da_quota_mb) < 0:
+        logging.error("--da-quota-mb must be >= 0")
+        return 2
+    if int(args.cpanel_quota_mb) < 0:
+        logging.error("--cpanel-quota-mb must be >= 0")
         return 2
     imap_timeout = float(args.imap_timeout)
     if not math.isfinite(imap_timeout) or imap_timeout <= 0:
@@ -362,6 +825,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     is_provider_config = isinstance(config, ProviderMigrationConfig)
     use_da_panel = bool(getattr(args, "auto_provision_da", False))
     use_cpanel = bool(getattr(args, "auto_provision_cpanel", False))
+    legacy_staged_audit_completed = False
+    free_space_checked_paths: Set[Path] = set()
+    stop_event = threading.Event()
+
+    def handle_sig(signum, _frame):
+        stop_event.set()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, handle_sig)
+        signal.signal(signal.SIGTERM, handle_sig)
+
+    def stop_requested_result(label: str) -> Optional[int]:
+        if not stop_event.is_set():
+            return None
+        logging.warning("%s: stop requested before completion", label)
+        return 130
+
+    if (
+        not is_provider_config
+        and args.mode != "import"
+        and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False)))
+    ):
+        logging.error("--auto-provision-da, --auto-provision-cpanel, and --reset are only valid with --mode import")
+        return 2
+    if use_da_panel and use_cpanel:
+        logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
+        return 2
+    if is_provider_config and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False))):
+        logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
+        return 2
+    if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
+        logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
+        return 2
+    if bool(getattr(args, "da_dry_run", False)) and not use_da_panel:
+        logging.error("--da-dry-run requires --auto-provision-da")
+        return 2
+    if bool(getattr(args, "cpanel_dry_run", False)) and not use_cpanel:
+        logging.error("--cpanel-dry-run requires --auto-provision-cpanel")
+        return 2
     panel_dry_run_requested = (
         args.mode == "import"
         and not is_provider_config
@@ -378,9 +880,136 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         target_host = config.target.host if isinstance(config, ProviderMigrationConfig) else config.server.host
         reset_confirm = str(getattr(args, "reset_confirm", "") or "")
-        if reset_confirm not in {target_host, "YES"}:
+        if reset_confirm != "YES" and _canonical_reset_confirm_host(reset_confirm) != _canonical_reset_confirm_host(target_host):
             logging.error("--reset-confirm must match target IMAP host %r or be YES for non-dry-run --reset", target_host)
             return 2
+    if args.mode in {"import", "validate", "audit"}:
+        input_root = Path(args.input_dir)
+        if is_provider_config:
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_local_issues = _provider_cli_local_root_issues(
+                input_root,
+                config,
+                label=args.mode,
+                require_exists=True,
+            )
+            if provider_local_issues:
+                logging.error("Provider %s input failed local preflight:", args.mode)
+                for issue in provider_local_issues:
+                    logging.error("[provider-local] %s", issue)
+                return 2
+        elif _legacy_symlink_component(input_root) is not None:
+            logging.error("Input directory is a symlink: %s", input_root)
+            return 2
+        if not input_root.exists():
+            logging.error("Input directory does not exist: %s", input_root)
+            return 2
+        if not input_root.is_dir():
+            logging.error("Input directory is not a directory: %s", input_root)
+            return 2
+        if not is_provider_config and args.mode in {"import", "validate"}:
+            assert isinstance(config, Config)
+            symlink_issues = _legacy_staged_symlink_issues(input_root, config)
+            if symlink_issues:
+                logging.error("Input directory failed local staged preflight:")
+                for issue in symlink_issues:
+                    logging.error("[staged-local] %s", issue)
+                return 2
+    if args.mode == "export":
+        output_root = Path(args.output_dir)
+        if is_provider_config:
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_local_issues = _provider_cli_local_root_issues(
+                output_root,
+                config,
+                label="export",
+                require_exists=False,
+            )
+            if provider_local_issues:
+                logging.error("Provider export output failed local preflight:")
+                for issue in provider_local_issues:
+                    logging.error("[provider-local] %s", issue)
+                return 2
+        elif _legacy_symlink_component(output_root) is not None:
+            logging.error("Output directory is a symlink: %s", output_root)
+            return 2
+        elif output_root.exists() and not output_root.is_dir():
+            logging.error("Output directory is not a directory: %s", output_root)
+            return 2
+        elif not is_provider_config:
+            assert isinstance(config, Config)
+            output_symlink_issues = legacy_export_output_symlink_issues(output_root, config.accounts)
+            if output_symlink_issues:
+                logging.error("Legacy export output failed local preflight:")
+                for issue in output_symlink_issues:
+                    logging.error("[export-local] %s", issue)
+                return 2
+
+    free_space_preflight_path: Optional[Path] = None
+    if args.mode == "export":
+        free_space_preflight_path = Path(args.output_dir)
+    elif args.mode in {"import", "validate", "audit"}:
+        free_space_preflight_path = Path(args.input_dir)
+    if free_space_preflight_path is not None:
+        try:
+            check_free_space_for_path(free_space_preflight_path, min_free_gb)
+        except Exception as exc:
+            logging.error("Free-space check failed before connectivity: %s", exc)
+            return 2
+        free_space_checked_paths.add(free_space_preflight_path)
+
+    if args.mode in {"import", "validate"}:
+        input_root = Path(args.input_dir)
+        if is_provider_config:
+            assert isinstance(config, ProviderMigrationConfig)
+            provider_staged_issues = _provider_cli_staged_validation_issues(input_root, config, mode=args.mode)
+            if provider_staged_issues:
+                logging.error("Provider %s staged data failed local validation:", args.mode)
+                for issue in provider_staged_issues:
+                    logging.error("[provider-staged] %s", issue)
+                return 4
+        else:
+            assert isinstance(config, Config)
+            if not use_da_panel and not use_cpanel:
+                try:
+                    logging.info("Running strict local staged export audit before connectivity...")
+                    ok, staged_audit_issues = audit_export(
+                        input_root,
+                        config,
+                        int(args.max_workers),
+                        check_remote=False,
+                        require_integrity_metadata=True,
+                        stop_event=stop_event,
+                    )
+                except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Staged export audit stopped: %s", exc)
+                        return 130
+                    logging.error("Staged export audit failed before connectivity: %s", exc)
+                    return 4
+                stop_rc = stop_requested_result("staged export audit")
+                if stop_rc is not None:
+                    return stop_rc
+                if not ok:
+                    logging.error(
+                        "Refusing %s because staged export audit found %d issue(s)",
+                        args.mode,
+                        len(staged_audit_issues),
+                    )
+                    for issue in staged_audit_issues:
+                        logging.error("[staged-audit] %s", issue)
+                    return 4
+                legacy_staged_audit_completed = True
+            pending_journal_issues = _legacy_pending_import_journal_issues(
+                input_root,
+                config,
+                repair_trailing=(args.mode == "import" and not panel_dry_run_requested),
+            )
+            if pending_journal_issues:
+                logging.error("Input directory has unresolved legacy import journal entries:")
+                for issue in pending_journal_issues:
+                    logging.error("[staged-journal] %s", issue)
+                return 4
 
     try:
         if (
@@ -398,16 +1027,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     da_client: Optional[DirectAdminClient] = None
     da_password: Optional[str] = None
     cpanel_client: Optional[CPanelClient] = None
+    cpanel_password: Optional[str] = None
+    cpanel_token: Optional[str] = None
     panel_reset_failed_accounts: set[str] = set()
-    if use_da_panel and use_cpanel:
-        logging.error("Choose only one control panel integration: --auto-provision-da or --auto-provision-cpanel")
-        return 2
-    if bool(getattr(args, "reset", False)) and not (use_da_panel or use_cpanel):
-        logging.error("--reset requires --auto-provision-da or --auto-provision-cpanel")
-        return 2
-    if is_provider_config and (use_da_panel or use_cpanel or bool(getattr(args, "reset", False))):
-        logging.error("Control-panel auto-provisioning is not supported for provider source/target configs; use provider IMAP configs without panel reset")
-        return 2
+
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         assert isinstance(config, Config)
         invalid_panel_accounts = _invalid_panel_account_emails(config)
@@ -418,56 +1041,106 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 2
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
-        if not panel_dry_run_requested:
-            staged_root = Path(args.input_dir)
-            if not staged_root.exists():
-                logging.error("Input directory does not exist: %s", staged_root)
-                return 2
-            assert isinstance(config, Config)
-            missing_account_dirs = [
-                acc.email
-                for acc in config.accounts
-                if not (staged_root / sanitize_for_path(acc.email)).exists()
-            ]
-            if missing_account_dirs:
-                logging.error(
-                    "Input directory is missing staged data for %d account(s): %s",
-                    len(missing_account_dirs),
-                    ", ".join(missing_account_dirs),
-                )
-                return 2
-            audit_for_reset = bool(getattr(args, "reset", False))
-            try:
-                logging.info(
-                    "[panel] Running strict local staged export audit before %s...",
-                    "destructive reset" if audit_for_reset else "panel provisioning",
-                )
-                ok, staged_audit_issues = audit_export(
-                    staged_root,
-                    config,
-                    int(args.max_workers),
-                    check_remote=False,
-                    require_integrity_metadata=True,
-                )
-            except Exception as exc:
-                logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
-                return 4
-            if not ok:
-                logging.error(
-                    "[panel] Refusing %s because staged export audit found %d issue(s)",
-                    "destructive reset" if audit_for_reset else "panel provisioning",
-                    len(staged_audit_issues),
-                )
-                for issue in staged_audit_issues:
-                    logging.error("[panel-staged-audit] %s", issue)
-                return 4
-    if (not is_provider_config) and args.mode == "import" and use_da_panel:
-        missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
-        if missing:
-            logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
+        staged_root = Path(args.input_dir)
+        if not staged_root.exists():
+            logging.error("Input directory does not exist: %s", staged_root)
             return 2
+        assert isinstance(config, Config)
+        missing_account_dirs = [
+            acc.email
+            for acc in config.accounts
+            if not (staged_root / sanitize_for_path(acc.email)).exists()
+        ]
+        if missing_account_dirs:
+            logging.error(
+                "Input directory is missing staged data for %d account(s): %s",
+                len(missing_account_dirs),
+                ", ".join(missing_account_dirs),
+            )
+            return 2
+        if staged_root not in free_space_checked_paths:
+            try:
+                check_free_space_for_path(staged_root, min_free_gb)
+            except Exception as exc:
+                logging.error("[panel] Free-space check failed before panel changes: %s", exc)
+                return 2
+            free_space_checked_paths.add(staged_root)
+        if use_da_panel:
+            missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
+            if missing:
+                logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
+                return 2
+            try:
+                da_password = _resolve_da_password(args)
+                _ensure_directadmin_client_dependency()
+            except Exception as exc:
+                logging.error("[da] Auto-provisioning setup failed: %s", exc)
+                return 2
+        if use_cpanel:
+            missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
+            if missing:
+                logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
+                return 2
+            try:
+                cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+                _ensure_cpanel_client_dependency()
+            except Exception as exc:
+                logging.error("[cpanel] Auto-provisioning setup failed: %s", exc)
+                return 2
+        audit_for_reset = bool(getattr(args, "reset", False))
         try:
-            da_password = _resolve_da_password(args)
+            logging.info(
+                "[panel] Running strict local staged export audit before %s...",
+                "destructive reset" if audit_for_reset else "panel provisioning",
+            )
+            ok, staged_audit_issues = audit_export(
+                staged_root,
+                config,
+                int(args.max_workers),
+                check_remote=False,
+                require_integrity_metadata=True,
+                stop_event=stop_event,
+            )
+        except Exception as exc:
+            if stop_event.is_set():
+                logging.warning("[panel] Staged export audit stopped: %s", exc)
+                return 130
+            logging.error("[panel] Staged export audit failed before panel changes: %s", exc)
+            return 4
+        stop_rc = stop_requested_result("panel staged audit")
+        if stop_rc is not None:
+            return stop_rc
+        if not ok:
+            logging.error(
+                "[panel] Refusing %s because staged export audit found %d issue(s)",
+                "destructive reset" if audit_for_reset else "panel provisioning",
+                len(staged_audit_issues),
+            )
+            for issue in staged_audit_issues:
+                logging.error("[panel-staged-audit] %s", issue)
+            return 4
+    if (
+        (not is_provider_config)
+        and args.mode == "import"
+        and bool(getattr(args, "reset", False))
+        and not (
+            (use_da_panel and bool(getattr(args, "da_dry_run", False)))
+            or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
+        )
+    ):
+        assert isinstance(config, Config)
+        reset_input_root = Path(args.input_dir)
+        try:
+            for acc in config.accounts:
+                archive_path = archive_legacy_import_journal_for_reset(reset_input_root / sanitize_for_path(acc.email))
+                if archive_path is not None:
+                    logging.info("[panel] Archived stale import journal before reset for %s: %s", acc.email, archive_path)
+        except Exception as exc:
+            logging.error("[panel] Failed to archive stale import journal before reset: %s", exc)
+            return 4
+    if (not is_provider_config) and args.mode == "import" and use_da_panel:
+        try:
+            assert da_password is not None
             logging.info("[da] Auto-provisioning missing mailboxes before import...")
             da_client = DirectAdminClient(
                 base_url=str(args.da_url),
@@ -484,29 +1157,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.da_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.da_quota_mb),
+                    stop_event=stop_event,
                 )
             else:
-                ensure_accounts_exist_directadmin(
+                failed_accounts = ensure_accounts_exist_directadmin(
                     config,
                     da_client,
                     dry_run=bool(args.da_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.da_quota_mb),
+                    stop_event=stop_event,
                 )
+                panel_reset_failed_accounts = set(failed_accounts or ())
             logging.info("[da] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[da] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
+            if stop_event.is_set():
+                return 130
+            if da_client is None or bool(getattr(args, "da_dry_run", False)) or not args.ignore_errors:
                 return 3
     if (not is_provider_config) and args.mode == "import" and use_cpanel:
-        missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
-        if missing:
-            logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
-            return 2
         try:
-            cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+            assert cpanel_password is not None or cpanel_token is not None
             logging.info("[cpanel] Auto-provisioning missing mailboxes before import...")
             cpanel_client = CPanelClient(
                 base_url=str(args.cpanel_url),
@@ -524,38 +1198,36 @@ def main(argv: Optional[List[str]] = None) -> int:
                     dry_run=bool(args.cpanel_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.cpanel_quota_mb),
+                    stop_event=stop_event,
                 )
             else:
-                ensure_accounts_exist_cpanel(
+                failed_accounts = ensure_accounts_exist_cpanel(
                     config,
                     cpanel_client,
                     dry_run=bool(args.cpanel_dry_run),
                     ignore_errors=bool(args.ignore_errors),
                     quota_mb=int(args.cpanel_quota_mb),
+                    stop_event=stop_event,
                 )
+                panel_reset_failed_accounts = set(failed_accounts or ())
             logging.info("[cpanel] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[cpanel] Auto-provisioning failed: %s", exc)
             if bool(getattr(args, "reset", False)):
                 panel_reset_failed_accounts = {acc.email for acc in config.accounts}
-            if bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
+            if stop_event.is_set():
+                return 130
+            if cpanel_client is None or bool(getattr(args, "cpanel_dry_run", False)) or not args.ignore_errors:
                 return 3
+    stop_rc = stop_requested_result("panel setup")
+    if stop_rc is not None:
+        return stop_rc
     if args.mode == "import" and (
         (use_da_panel and bool(getattr(args, "da_dry_run", False)))
         or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
     ):
         logging.info("[panel][dry-run] Skipping connectivity tests and IMAP import because panel dry-run was requested")
         return 0
-
-    if (not is_provider_config) and args.mode == "import" and bool(getattr(args, "reset", False)):
-        assert isinstance(config, Config)
-        reset_input_root = Path(args.input_dir)
-        for acc in config.accounts:
-            if acc.email in panel_reset_failed_accounts:
-                continue
-            archive_path = archive_legacy_import_journal_for_reset(reset_input_root / sanitize_for_path(acc.email))
-            if archive_path is not None:
-                logging.info("[panel] Archived stale import journal after reset for %s: %s", acc.email, archive_path)
 
     if args.mode in {"export", "import", "test", "validate"} and not bool(getattr(args, "no_connectivity_test", False)):
         try:
@@ -567,42 +1239,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     roles = ("source", "target")
                 logging.info("Running provider connectivity tests (roles=%s) ...", ",".join(roles))
-                provider_test_accounts(config, max_workers=int(args.max_workers), roles=roles)
+                provider_test_accounts(config, max_workers=int(args.max_workers), roles=roles, stop_event=stop_event)
             else:
                 logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
                 assert isinstance(config, Config)
                 connectivity_config = config
-                if args.mode == "import" and bool(getattr(args, "reset", False)) and panel_reset_failed_accounts:
+                if args.mode == "import" and panel_reset_failed_accounts:
                     active_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
                     skipped = len(config.accounts) - len(active_accounts)
                     logging.info(
-                        "[panel] Skipping connectivity tests for %d account(s) whose control-panel reset failed",
+                        "[panel] Skipping connectivity tests for %d account(s) whose control-panel setup failed",
                         skipped,
                     )
                     connectivity_config = Config(server=config.server, accounts=active_accounts, source_server=config.source_server)
-                test_accounts(connectivity_config, max_workers=int(args.max_workers))
+                test_accounts(connectivity_config, max_workers=int(args.max_workers), imap_timeout=imap_timeout, stop_event=stop_event)
             logging.info("Connectivity tests passed for all accounts")
         except Exception as exc:
+            if stop_event.is_set():
+                logging.warning("Connectivity tests stopped: %s", exc)
+                return 130
             logging.error("Connectivity tests failed: %s", exc)
             return 3
     elif args.mode in {"export", "import", "test", "validate"}:
         logging.info("Skipping connectivity tests due to --no-connectivity-test")
 
-    stop_event = threading.Event()
-
-    def handle_sig(signum, _frame):
-        logging.warning("Received signal %s, requesting stop...", signum)
-        stop_event.set()
-
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGINT, handle_sig)
-        signal.signal(signal.SIGTERM, handle_sig)
+    stop_rc = stop_requested_result("connectivity tests")
+    if stop_rc is not None:
+        return stop_rc
 
     try:
+        stop_rc = stop_requested_result(args.mode)
+        if stop_rc is not None:
+            return stop_rc
         if is_provider_config:
             assert isinstance(config, ProviderMigrationConfig)
             if args.mode == "preflight":
-                ok, issues = provider_preflight(config, max_workers=int(args.max_workers))
+                ok, issues = provider_preflight(config, max_workers=int(args.max_workers), stop_event=stop_event)
+                stop_rc = stop_requested_result("provider preflight")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider preflight passed")
                     return 0
@@ -612,8 +1287,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 4
             if args.mode == "export":
                 out_root = Path(args.output_dir)
-                out_root.mkdir(parents=True, exist_ok=True)
-                check_free_space_for_path(out_root, min_free_gb)
+                if out_root not in free_space_checked_paths:
+                    check_free_space_for_path(out_root, min_free_gb)
                 provider_export_all(
                     config,
                     out_root,
@@ -621,9 +1296,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ignore_errors=bool(args.ignore_errors),
                     stop_event=stop_event,
                 )
+                stop_rc = stop_requested_result("provider export")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider export finished. Data stored under: %s", out_root)
                 if not bool(getattr(args, "no_audit_after_export", False)):
-                    ok, issues = provider_audit_all(config, out_root, max_workers=int(args.max_workers))
+                    ok, issues = provider_audit_all(config, out_root, max_workers=int(args.max_workers), stop_event=stop_event)
+                    stop_rc = stop_requested_result("provider audit")
+                    if stop_rc is not None:
+                        return stop_rc
                     if ok:
                         logging.info("Provider audit passed")
                     else:
@@ -636,7 +1317,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
+                if in_root not in free_space_checked_paths:
+                    check_free_space_for_path(in_root, min_free_gb)
                 provider_import_all(
                     config,
                     in_root,
@@ -644,8 +1326,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ignore_errors=bool(args.ignore_errors),
                     stop_event=stop_event,
                 )
+                stop_rc = stop_requested_result("provider import")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider import finished into server %s", config.target.host)
             elif args.mode == "test":
+                stop_rc = stop_requested_result("provider test")
+                if stop_rc is not None:
+                    return stop_rc
                 logging.info("Provider test completed successfully.")
             elif args.mode == "validate":
                 if bool(getattr(args, "resync_missing", False)):
@@ -654,8 +1342,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
-                ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers))
+                ok, issues = provider_validate_all(config, in_root, max_workers=int(args.max_workers), stop_event=stop_event)
+                stop_rc = stop_requested_result("provider validate")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider validation successful.")
                 else:
@@ -668,8 +1358,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not in_root.exists():
                     logging.error("Input directory does not exist: %s", in_root)
                     return 2
-                check_free_space_for_path(in_root, min_free_gb)
-                ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers))
+                ok, issues = provider_audit_all(config, in_root, max_workers=int(args.max_workers), stop_event=stop_event)
+                stop_rc = stop_requested_result("provider audit")
+                if stop_rc is not None:
+                    return stop_rc
                 if ok:
                     logging.info("Provider audit passed")
                     return 0
@@ -686,9 +1378,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.mode == "export":
             assert isinstance(config, Config)
             out_root = Path(args.output_dir)
-            out_root.mkdir(parents=True, exist_ok=True)
+            if out_root.is_symlink():
+                logging.error("Output directory is a symlink: %s", out_root)
+                return 2
             # Ensure destination filesystem has enough free space
-            check_free_space_for_path(out_root, min_free_gb)
+            if out_root not in free_space_checked_paths:
+                check_free_space_for_path(out_root, min_free_gb)
             try:
                 payload_path = config_path.parent / "import.pass.config.json"
                 if not payload_path.exists():
@@ -716,13 +1411,38 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raise RuntimeError(f"legacy export {acc.email}: stop requested before completion")
                 export_account(acc, config.server, out_root, ignore_errors=bool(args.ignore_errors), stop_event=stop_event)
 
-            parallel_process_accounts("export", do_export, config.accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            parallel_process_accounts(
+                "export",
+                do_export,
+                config.accounts,
+                int(args.max_workers),
+                stop_on_error=not args.ignore_errors,
+                stop_event=stop_event,
+            )
+            stop_rc = stop_requested_result("legacy export")
+            if stop_rc is not None:
+                return stop_rc
             logging.info("Export finished. Data stored under: %s", out_root)
 
             if not bool(getattr(args, "no_audit_after_export", False)):
                 try:
                     logging.info("Running export audit (%s)...", "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
-                    ok, audit_issues = audit_export(out_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
+                    export_audit_config = Config(
+                        server=config.server,
+                        accounts=config.accounts,
+                        source_server=config.server,
+                    )
+                    ok, audit_issues = audit_export(
+                        out_root,
+                        export_audit_config,
+                        int(args.max_workers),
+                        check_remote=not bool(getattr(args, "audit_offline", False)),
+                        require_integrity_metadata=True,
+                        stop_event=stop_event,
+                    )
+                    stop_rc = stop_requested_result("legacy export audit")
+                    if stop_rc is not None:
+                        return stop_rc
                     if ok:
                         logging.info("Audit passed: exported data looks consistent for all accounts")
                     else:
@@ -731,17 +1451,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                             logging.error("[audit] %s", line)
                         return 4
                 except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Legacy export audit stopped: %s", exc)
+                        return 130
                     logging.error("Audit failed to complete: %s", exc)
                     return 4
         elif args.mode == "import":
             assert isinstance(config, Config)
             in_root = Path(args.input_dir)
+            if in_root.is_symlink():
+                logging.error("Input directory is a symlink: %s", in_root)
+                return 2
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
+            if in_root not in free_space_checked_paths:
+                check_free_space_for_path(in_root, min_free_gb)
             panel_dry_run = (use_da_panel and bool(getattr(args, "da_dry_run", False))) or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
-            if not panel_dry_run:
+            if not panel_dry_run and not legacy_staged_audit_completed:
                 try:
                     logging.info("Running strict local staged export audit before import...")
                     ok, staged_audit_issues = audit_export(
@@ -750,8 +1477,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         int(args.max_workers),
                         check_remote=False,
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
                 except Exception as exc:
+                    if stop_event.is_set():
+                        logging.warning("Staged export audit stopped before import: %s", exc)
+                        return 130
                     logging.error("Staged export audit failed before import: %s", exc)
                     return 4
                 if not ok:
@@ -767,7 +1498,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if stop_event.is_set():
                     raise RuntimeError(f"legacy import {acc.email}: stop requested before completion")
                 if acc.email in panel_reset_failed_accounts:
-                    logging.error("[panel] Skipping import for %s because control-panel reset failed", acc.email)
+                    logging.error("[panel] Skipping import for %s because control-panel setup failed", acc.email)
                     return
                 da_ctx = None
                 provision_ctx = None
@@ -788,19 +1519,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                     stop_event=stop_event,
                     da_context=da_ctx,
                     provision_context=provision_ctx,
+                    source_server=config.source_server,
                 )
 
             import_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
-            parallel_process_accounts("import", do_import, import_accounts, int(args.max_workers), stop_on_error=not args.ignore_errors)
+            parallel_process_accounts(
+                "import",
+                do_import,
+                import_accounts,
+                int(args.max_workers),
+                stop_on_error=not args.ignore_errors,
+                stop_event=stop_event,
+            )
+            stop_rc = stop_requested_result("legacy import")
+            if stop_rc is not None:
+                return stop_rc
             if panel_reset_failed_accounts:
                 logging.error(
-                    "[panel] Import skipped %d account(s) because control-panel reset failed: %s",
+                    "[panel] Import skipped %d account(s) because control-panel setup failed: %s",
                     len(panel_reset_failed_accounts),
                     ", ".join(sorted(panel_reset_failed_accounts)),
                 )
                 return 3
             logging.info("Import finished into server %s", config.server.host)
         elif args.mode == "test":
+            stop_rc = stop_requested_result("legacy test")
+            if stop_rc is not None:
+                return stop_rc
             logging.info("Test completed successfully.")
         elif args.mode == "validate":
             assert isinstance(config, Config)
@@ -808,82 +1553,240 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
+            if in_root not in free_space_checked_paths:
+                check_free_space_for_path(in_root, min_free_gb)
             mismatches: List[Tuple[str, str, int, int]] = []
             validation_errors: List[Tuple[str, str]] = []
             mismatches_lock = threading.Lock()
             def do_validate(acc: Account) -> None:
                 email = acc.email
+                account_dir_fd: Optional[int] = None
                 try:
-                    from .imap_ops import _legacy_import_target_id, _load_legacy_import_journal, _unresolved_legacy_pending_keys, imap_connection, list_all_mailboxes, quote_mailbox_name
+                    from .imap_ops import (
+                        _legacy_import_target_id,
+                        _legacy_hierarchy_metadata,
+                        _list_selectable_mailbox_entries,
+                        _load_legacy_import_journal,
+                        _open_legacy_dir,
+                        _raise_if_legacy_parent_replaced,
+                        _read_file_no_symlink,
+                        _require_legacy_payload_integrity,
+                        _should_skip_legacy_source_view,
+                        _legacy_target_hierarchy_delimiter,
+                        _legacy_target_mailbox_name,
+                        _legacy_validate_path_segments,
+                        _unresolved_legacy_pending_keys,
+                        _validate_legacy_delivery_metadata,
+                        _validate_legacy_sidecar_integrity,
+                        imap_connection,
+                        quote_mailbox_name,
+                    )
                     account_dir = in_root / sanitize_for_path(acc.email)
                     local_counts: Dict[str, int] = {}
-                    local_messages: Dict[str, List[Tuple[str, bytes]]] = {}
+                    local_messages: Dict[str, List[Tuple[str, bytes, str, str]]] = {}
+                    local_content_identity_slots: List[_LegacyCoverageSlot] = []
                     if not account_dir.exists():
                         with mismatches_lock:
                             validation_errors.append((email, f"account directory missing: {account_dir}"))
                         return
+                    account_dir_fd, account_dir_path = _open_legacy_dir(account_dir, "legacy account")
+
+                    def guard_account_dir() -> None:
+                        if account_dir_fd is None:
+                            raise RuntimeError(f"legacy account directory is not pinned: {account_dir}")
+                        _raise_if_legacy_parent_replaced(account_dir_path, account_dir_fd, "legacy account")
+
                     ok, audit_issues = audit_export(
                         in_root,
                         Config(server=config.server, accounts=[acc], source_server=config.source_server),
                         1,
                         check_remote=False,
                         require_integrity_metadata=True,
+                        stop_event=stop_event,
                     )
+                    guard_account_dir()
                     if not ok:
                         with mismatches_lock:
                             validation_errors.extend((email, issue) for issue in audit_issues)
                         return
                     current_target = _legacy_import_target_id(config.server, acc)
-                    unresolved_pending_keys = _unresolved_legacy_pending_keys(
-                        _load_legacy_import_journal(account_dir),
-                        current_target,
-                    )
+                    journal_rows = _load_legacy_import_journal(account_dir, repair_trailing=False)
+                    guard_account_dir()
+                    unresolved_pending_keys = _unresolved_legacy_pending_keys(journal_rows, current_target)
                     if unresolved_pending_keys:
                         with mismatches_lock:
                             validation_errors.append((email, f"import journal has {len(unresolved_pending_keys)} pending append(s); target state is uncertain"))
+                        return
 
-                    def marker_mailbox(folder_dir: Path) -> str:
+                    def marker_info(folder_dir: Path) -> Tuple[str, Tuple[str, Tuple[str, ...]], bool]:
                         marker_path = folder_dir / ".mailbox.json"
                         if not marker_path.exists():
-                            return folder_dir.name
+                            return folder_dir.name, ("", ()), False
                         try:
-                            raw = json.loads(marker_path.read_text(encoding="utf-8"))
+                            marker_bytes = _read_file_no_symlink(
+                                marker_path,
+                                "legacy mailbox marker",
+                                reject_hard_links=True,
+                            )
+                            raw = json.loads(marker_bytes.decode("utf-8"))
                         except Exception as exc:
                             raise RuntimeError(f"{marker_path}: failed to parse mailbox marker: {exc}") from exc
                         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
-                        return mailbox if isinstance(mailbox, str) and mailbox else folder_dir.name
+                        if not isinstance(mailbox, str) or not mailbox:
+                            return folder_dir.name, ("", ()), False
+                        hierarchy = _legacy_hierarchy_metadata(
+                            raw if isinstance(raw, dict) else {},
+                            mailbox,
+                            str(marker_path),
+                        )
+                        covered = (
+                            _legacy_trusted_covered_by_regular_content(raw, str(marker_path))
+                            if isinstance(raw, dict)
+                            else False
+                        )
+                        return mailbox, hierarchy, covered
 
-                    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+                    folder_dirs: List[Path] = []
+                    for child_name in sorted(os.listdir(account_dir_fd)):
+                        try:
+                            child_stat = os.stat(child_name, dir_fd=account_dir_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(child_stat.st_mode):
+                            with mismatches_lock:
+                                validation_errors.append((email, f"{child_name}: mailbox path is a symlink"))
+                            return
+                        if stat.S_ISDIR(child_stat.st_mode):
+                            folder_dirs.append(account_dir / child_name)
+                    guard_account_dir()
                     if not folder_dirs:
                         with mismatches_lock:
                             validation_errors.append((email, "no mailbox folders found"))
                         return
+                    local_mailboxes_by_key: Dict[str, str] = {}
+                    local_segments_by_key: Dict[str, Tuple[str, ...]] = {}
                     for folder_dir in folder_dirs:
-                        default_mailbox = marker_mailbox(folder_dir)
+                        guard_account_dir()
+                        default_mailbox, default_hierarchy, covered_by_regular_content = marker_info(folder_dir)
+                        guard_account_dir()
                         eml_paths = sorted(folder_dir.glob("*.eml"))
+                        guard_account_dir()
+                        if covered_by_regular_content and not eml_paths:
+                            continue
+                        folder_key = canonical_mailbox_path_key(folder_dir.name)
+                        local_mailboxes_by_key.setdefault(folder_key, default_mailbox)
+                        if default_hierarchy[1]:
+                            local_segments_by_key[folder_key] = default_hierarchy[1]
                         if not eml_paths:
-                            local_counts.setdefault(sanitize_for_path(default_mailbox), 0)
-                            local_messages.setdefault(default_mailbox, [])
+                            local_counts.setdefault(folder_key, 0)
+                            local_messages.setdefault(folder_key, [])
                             continue
                         for eml_path in eml_paths:
                             mailbox = default_mailbox
                             metadata_path = eml_path.with_suffix(".json")
-                            if metadata_path.exists():
-                                try:
-                                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                                except Exception as exc:
-                                    raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
-                                metadata_mailbox = metadata.get("mailbox") if isinstance(metadata, dict) else None
-                                if isinstance(metadata_mailbox, str) and metadata_mailbox:
-                                    mailbox = metadata_mailbox
-                            key = sanitize_for_path(mailbox)
-                            local_counts[key] = local_counts.get(key, 0) + 1
-                            local_messages.setdefault(mailbox, []).append((eml_path.relative_to(account_dir).as_posix(), eml_path.read_bytes()))
+                            if not metadata_path.exists():
+                                raise RuntimeError(f"{metadata_path}: missing message metadata")
+                            try:
+                                guard_account_dir()
+                                metadata_bytes = _read_file_no_symlink(
+                                    metadata_path,
+                                    "legacy message metadata",
+                                    reject_hard_links=True,
+                                )
+                                guard_account_dir()
+                                metadata = json.loads(metadata_bytes.decode("utf-8"))
+                            except Exception as exc:
+                                raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
+                            if not isinstance(metadata, dict):
+                                raise RuntimeError(f"{metadata_path}: message metadata is not an object")
+                            account_meta = str(metadata.get("account") or "")
+                            if account_meta != acc.email:
+                                raise RuntimeError(
+                                    f"{metadata_path}: account metadata mismatch "
+                                    f"(account={acc.email} meta={account_meta})"
+                                )
+                            expected_size, expected_hash = _validate_legacy_sidecar_integrity(metadata_path, metadata)
+                            expected_flags, _expected_internaldate = _validate_legacy_delivery_metadata(
+                                metadata,
+                                str(metadata_path),
+                            )
+                            metadata_mailbox = metadata.get("mailbox")
+                            if isinstance(metadata_mailbox, str) and metadata_mailbox:
+                                mailbox = metadata_mailbox
+                            message_hierarchy = _legacy_hierarchy_metadata(
+                                metadata,
+                                mailbox,
+                                str(metadata_path),
+                            )
+                            if message_hierarchy != default_hierarchy:
+                                raise RuntimeError(f"{metadata_path}: source_path_segments mismatch")
+                            local_mailboxes_by_key.setdefault(folder_key, mailbox)
+                            if message_hierarchy[1]:
+                                existing_segments = local_segments_by_key.get(folder_key)
+                                if existing_segments is not None and existing_segments != message_hierarchy[1]:
+                                    raise RuntimeError(f"{metadata_path}: source_path_segments mismatch")
+                                local_segments_by_key[folder_key] = message_hierarchy[1]
+                            local_counts[folder_key] = local_counts.get(folder_key, 0) + 1
+                            guard_account_dir()
+                            message_bytes = _read_file_no_symlink(
+                                eml_path,
+                                "legacy message file",
+                                reject_hard_links=True,
+                            )
+                            guard_account_dir()
+                            _require_legacy_payload_integrity(eml_path, message_bytes, expected_size, expected_hash)
+                            local_content_identity_slots.append((
+                                _legacy_content_identity_variants(message_bytes),
+                                expected_flags,
+                                _expected_internaldate or "",
+                            ))
+                            local_messages.setdefault(folder_key, []).append((
+                                eml_path.relative_to(account_dir).as_posix(),
+                                message_bytes,
+                                expected_flags,
+                                _expected_internaldate or "",
+                            ))
                     remote_counts: Dict[str, int] = {}
                     remote_mailboxes: Dict[str, str] = {}
+                    remote_attrs_by_key: Dict[str, Tuple[str, ...]] = {}
+                    remote_mailboxes_by_alias_key: Dict[str, Tuple[str, str]] = {}
+                    remote_name_mismatch_keys: Set[str] = set()
+                    guard_account_dir()
                     with imap_connection(config.server, acc) as imap:
-                        mailboxes = list_all_mailboxes(imap)
+                        target_delimiter = _legacy_target_hierarchy_delimiter(imap)
+                        target_mailboxes_by_key = {
+                            key: _legacy_target_mailbox_name(
+                                mailbox,
+                                local_segments_by_key.get(key, ()),
+                                target_delimiter,
+                            )
+                            for key, mailbox in local_mailboxes_by_key.items()
+                        }
+                        target_key_by_mailbox = {}
+                        for key, mailbox in target_mailboxes_by_key.items():
+                            target_key_by_mailbox[mailbox] = key
+                            target_key_by_mailbox.setdefault(canonical_imap_mailbox_name(mailbox), key)
+                        target_collision_keys: Dict[str, Tuple[str, str]] = {}
+                        for key, target_mailbox in target_mailboxes_by_key.items():
+                            alias = sanitized_path_key(target_mailbox)
+                            previous = target_collision_keys.get(alias)
+                            if previous is not None and previous[0] != key:
+                                raise RuntimeError(
+                                    f"legacy validate target mailbox collision: "
+                                    f"{previous[1]!r} and {target_mailbox!r}"
+                                )
+                            target_collision_keys[alias] = (key, target_mailbox)
+                        mailbox_entries = _list_selectable_mailbox_entries(imap)
+                        mailboxes = [
+                            name
+                            for name, attrs in mailbox_entries
+                            if not _should_skip_legacy_source_view(name, attrs, mailbox_entries)
+                        ]
+                        remote_attrs_by_mailbox = {name: attrs for name, attrs in mailbox_entries}
+                        remote_attrs_by_key = {
+                            canonical_mailbox_path_key(name): attrs
+                            for name, attrs in mailbox_entries
+                        }
                         for mailbox in mailboxes:
                             try:
                                 status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
@@ -893,36 +1796,125 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if status != "OK":
                                     raise RuntimeError(f"search failed: {mailbox}")
                                 num = len((data[0] or b"").split()) if data else 0
-                                key = sanitize_for_path(mailbox)
-                                if key in remote_mailboxes and remote_mailboxes[key] != mailbox:
-                                    raise RuntimeError(f"Remote mailbox name collision after sanitizing: {remote_mailboxes[key]!r} and {mailbox!r}")
+                                key = target_key_by_mailbox.get(mailbox)
+                                if key is None:
+                                    key = target_key_by_mailbox.get(
+                                        canonical_imap_mailbox_name(mailbox),
+                                        canonical_mailbox_path_key(mailbox),
+                                    )
+                                remote_attrs_by_key[key] = remote_attrs_by_mailbox.get(mailbox, ())
+                                alias_key = sanitized_path_key(key)
+                                expected_mailbox = target_mailboxes_by_key.get(key)
+                                if (
+                                    expected_mailbox is not None
+                                    and canonical_imap_mailbox_name(mailbox)
+                                    != canonical_imap_mailbox_name(expected_mailbox)
+                                ):
+                                    remote_counts[key] = num
+                                    remote_mailboxes[key] = mailbox
+                                    remote_name_mismatch_keys.add(key)
+                                    with mismatches_lock:
+                                        validation_errors.append((
+                                            email,
+                                            f"{expected_mailbox}: remote mailbox name mismatch for staged path {key}: "
+                                            f"expected {expected_mailbox!r} got {mailbox!r}",
+                                        ))
+                                    continue
+                                previous = remote_mailboxes_by_alias_key.get(alias_key)
+                                if (
+                                    previous is not None
+                                    and canonical_imap_mailbox_name(previous[0])
+                                    != canonical_imap_mailbox_name(mailbox)
+                                ):
+                                    previous_mailbox, previous_path = previous
+                                    remote_counts[previous_path] = -1
+                                    remote_counts[key] = -1
+                                    remote_mailboxes.setdefault(previous_path, previous_mailbox)
+                                    remote_mailboxes[key] = mailbox
+                                    with mismatches_lock:
+                                        validation_errors.append((
+                                            email,
+                                            f"{alias_key}: remote mailbox name collision after sanitizing: "
+                                            f"{previous_mailbox!r} and {mailbox!r}",
+                                        ))
+                                    continue
                                 remote_counts[key] = num
                                 remote_mailboxes[key] = mailbox
+                                remote_mailboxes_by_alias_key[alias_key] = (mailbox, key)
                             except Exception:
-                                key = sanitize_for_path(mailbox)
+                                key = canonical_mailbox_path_key(mailbox)
                                 remote_counts[key] = -1
                                 remote_mailboxes.setdefault(key, mailbox)
                         mismatched_folders = set()
                         for folder, local_count in local_counts.items():
+                            if folder in remote_name_mismatch_keys:
+                                mismatched_folders.add(folder)
+                                continue
                             remote = remote_counts.get(folder, -1)
                             if local_count != remote:
+                                remote_mailbox = remote_mailboxes.get(
+                                    folder,
+                                    target_mailboxes_by_key.get(folder, local_mailboxes_by_key.get(folder, folder)),
+                                )
+                                remote_attrs = remote_attrs_by_key.get(folder, ())
+                                if (
+                                    remote >= 0
+                                    and _legacy_virtual_source_attrs(remote_attrs)
+                                    and _legacy_remote_mailbox_content_covered(
+                                        imap,
+                                        remote_mailbox,
+                                        local_content_identity_slots,
+                                        required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
+                                        require_all_local=local_count > remote,
+                                    )
+                                ):
+                                    continue
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     mismatches.append((email, folder, local_count, remote))
                         for folder, remote_count in remote_counts.items():
-                            if folder not in local_counts and remote_count > 0:
+                            if folder not in local_counts:
+                                remote_mailbox = remote_mailboxes.get(folder, folder)
+                                remote_attrs = remote_attrs_by_key.get(folder, ())
+                                if (
+                                    remote_count >= 0
+                                    and _legacy_virtual_source_attrs(remote_attrs)
+                                    and _legacy_remote_mailbox_content_covered(
+                                        imap,
+                                        remote_mailbox,
+                                        local_content_identity_slots,
+                                        required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
+                                    )
+                                ):
+                                    continue
+                            if folder not in local_counts and remote_count < 0:
+                                mismatched_folders.add(folder)
+                                with mismatches_lock:
+                                    validation_errors.append((email, f"{remote_mailboxes.get(folder, folder)}: remote mailbox could not be counted"))
+                            elif folder not in local_counts and remote_count == 0:
+                                mismatched_folders.add(folder)
+                                with mismatches_lock:
+                                    validation_errors.append((email, f"{remote_mailboxes.get(folder, folder)}: missing locally but remote has 0 messages"))
+                            elif folder not in local_counts and remote_count > 0:
                                 mismatched_folders.add(folder)
                                 with mismatches_lock:
                                     mismatches.append((email, folder, 0, remote_count))
-                        for mailbox, messages in local_messages.items():
-                            key = sanitize_for_path(mailbox)
+                        for key, messages in local_messages.items():
+                            mailbox = local_mailboxes_by_key.get(key, key)
                             if key in mismatched_folders or remote_counts.get(key, -1) < 0:
                                 continue
-                            remote_mailbox = remote_mailboxes.get(key, mailbox)
+                            remote_mailbox = remote_mailboxes.get(key, target_mailboxes_by_key.get(key, mailbox))
                             used_remote_nums: Set[bytes] = set()
-                            for rel_path, data in messages:
+                            for rel_path, data, expected_flags, expected_internaldate in messages:
                                 try:
-                                    found = _legacy_remote_has_message(imap, remote_mailbox, data, used_remote_nums)
+                                    found = _legacy_remote_has_message(
+                                        imap,
+                                        remote_mailbox,
+                                        data,
+                                        used_remote_nums,
+                                        expected_flags,
+                                        expected_internaldate,
+                                    )
                                 except Exception as exc:
                                     with mismatches_lock:
                                         validation_errors.append((email, f"{mailbox}: identity check failed for {rel_path}: {exc}"))
@@ -933,7 +1925,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except Exception as exc:
                     with mismatches_lock:
                         validation_errors.append((email, str(exc)))
-            parallel_process_accounts("validate", do_validate, config.accounts, int(args.max_workers), stop_on_error=False)
+                finally:
+                    if account_dir_fd is not None:
+                        os.close(account_dir_fd)
+            parallel_process_accounts(
+                "validate",
+                do_validate,
+                config.accounts,
+                int(args.max_workers),
+                stop_on_error=False,
+                stop_event=stop_event,
+            )
+            stop_rc = stop_requested_result("legacy validate")
+            if stop_rc is not None:
+                return stop_rc
             if validation_errors:
                 logging.warning("Validation account failures found:")
                 for email, reason in validation_errors:
@@ -951,13 +1956,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.mode == "audit":
             assert isinstance(config, Config)
             in_root = Path(args.input_dir)
+            if in_root.is_symlink():
+                logging.error("Input directory is a symlink: %s", in_root)
+                return 2
             if not in_root.exists():
                 logging.error("Input directory does not exist: %s", in_root)
                 return 2
-            check_free_space_for_path(in_root, min_free_gb)
             try:
                 logging.info("Running audit on %s (%s) ...", in_root, "local-only" if bool(getattr(args, "audit_offline", False)) else "local + remote counts")
-                ok, audit_issues = audit_export(in_root, config, int(args.max_workers), check_remote=not bool(getattr(args, "audit_offline", False)))
+                audit_config = Config(
+                    server=config.server,
+                    accounts=config.accounts,
+                    source_server=config.source_server or config.server,
+                )
+                ok, audit_issues = audit_export(
+                    in_root,
+                    audit_config,
+                    int(args.max_workers),
+                    check_remote=not bool(getattr(args, "audit_offline", False)),
+                    require_integrity_metadata=True,
+                    stop_event=stop_event,
+                )
+                journal_issues = _legacy_pending_import_journal_issues(in_root, config, repair_trailing=False)
+                stop_rc = stop_requested_result("legacy audit")
+                if stop_rc is not None:
+                    return stop_rc
+                if journal_issues:
+                    audit_issues.extend(journal_issues)
+                    ok = False
                 if ok:
                     logging.info("Audit passed: exported data looks consistent for all accounts")
                     return 0
@@ -966,14 +1992,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.error("[audit] %s", line)
                 return 4
             except Exception as exc:
+                if stop_event.is_set():
+                    logging.warning("Legacy audit stopped: %s", exc)
+                    return 130
                 logging.exception("Fatal audit error: %s", exc)
                 return 4
         else:
             logging.error("Unknown mode: %s", args.mode)
             return 2
     except Exception as exc:
+        if stop_event.is_set():
+            logging.warning("Stop requested; aborting after interruption: %s", exc)
+            return 130
         logging.exception("Fatal error: %s", exc)
         return 1
 
+    stop_rc = stop_requested_result(args.mode)
+    if stop_rc is not None:
+        return stop_rc
     logging.info("Done. Log file: %s", log_file)
     return 0

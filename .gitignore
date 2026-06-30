@@ -49,6 +49,7 @@ secrets/
 prompt.md
 prompts/
 k.md
+charm_migration.map
 
 # Editor/OS backups for JSON configs
 *.json.bak

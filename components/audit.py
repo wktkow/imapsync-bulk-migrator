@@ -1,4 +1,5 @@
 import contextlib
+import concurrent.futures
 import hashlib
 import json
 import re
@@ -8,9 +9,55 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
+from .content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_issue
 from .models import Account, Config, ServerConfig
-from .imap_ops import imap_connection, legacy_server_endpoint, legacy_server_endpoint_digest, list_all_mailboxes, quote_mailbox_name
-from .utils import sanitize_for_path
+from .imap_ops import (
+    _imap_append_wire_bytes,
+    _is_legacy_all_source_view,
+    _is_legacy_flagged_source_view,
+    _legacy_fetch_body_part_matches_sequence,
+    _legacy_metadata_for_fetch_body_part,
+    _legacy_symlink_component,
+    _legacy_hierarchy_metadata,
+    _legacy_missing_target_flags,
+    _legacy_search_target_uids,
+    _legacy_source_attributes_key,
+    _legacy_source_attributes_metadata,
+    _legacy_trusted_covered_by_regular_content,
+    _legacy_used_uid_key,
+    _legacy_used_uid_namespace,
+    _normalized_legacy_internaldate,
+    _legacy_uidvalidity_metadata,
+    _list_selectable_mailbox_entries,
+    _read_file_no_symlink,
+    _parse_fetch_response_for_uid,
+    _require_legacy_payload_integrity,
+    _legacy_validate_path_segments,
+    _should_skip_legacy_source_view,
+    _validate_legacy_delivery_metadata,
+    _validate_legacy_sidecar_integrity,
+    imap_connection,
+    legacy_reserved_mailbox_path_issue,
+    legacy_server_endpoint,
+    legacy_server_endpoint_digest,
+    quote_mailbox_name,
+)
+from .utils import (
+    canonical_imap_mailbox_name,
+    canonical_mailbox_alias_key,
+    canonical_mailbox_path_key,
+    sanitize_for_path,
+    sanitized_path_key,
+)
+
+
+def _stop_requested(stop_event: Optional[object]) -> bool:
+    return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
+
+
+def _raise_if_stopped(stop_event: Optional[object], label: str) -> None:
+    if _stop_requested(stop_event):
+        raise RuntimeError(f"{label}: stop requested before completion")
 
 
 def _message_id_header(data: bytes) -> str:
@@ -20,42 +67,220 @@ def _message_id_header(data: bytes) -> str:
     return ""
 
 
-def _remote_has_message(imap, mailbox: str, data: bytes, used_nums: Optional[Set[bytes]] = None) -> bool:
+def _read_staged_artifact(path: Path, label: str) -> bytes:
+    return _read_file_no_symlink(path, label, reject_hard_links=True)
+
+
+def _read_bound_legacy_message(eml_path: Path, *, require_integrity_metadata: bool) -> Tuple[bytes, str, str]:
+    meta_path = eml_path.with_suffix(".json")
+    if not meta_path.exists():
+        if not require_integrity_metadata:
+            return _read_staged_artifact(eml_path, "legacy message file"), "", ""
+        raise RuntimeError(f"{meta_path}: missing message metadata")
+    meta = json.loads(_read_staged_artifact(meta_path, "legacy message metadata").decode("utf-8"))
+    if not isinstance(meta, dict):
+        if not require_integrity_metadata:
+            return _read_staged_artifact(eml_path, "legacy message file"), "", ""
+        raise RuntimeError(f"{meta_path}: message metadata is not an object")
+    integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
+    flags, internaldate = _validate_legacy_delivery_metadata(meta, str(meta_path))
+    if not require_integrity_metadata and not integrity_keys_present:
+        return _read_staged_artifact(eml_path, "legacy message file"), flags, internaldate or ""
+    expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, meta)
+    data = _read_staged_artifact(eml_path, "legacy message file")
+    _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
+    return data, flags, internaldate or ""
+
+
+def _content_identity_variants(data: bytes) -> Set[Tuple[int, str]]:
+    variants = {data}
+    append_data = _imap_append_wire_bytes(data)
+    variants.add(append_data)
+    return {(len(candidate), hashlib.sha256(candidate).hexdigest()) for candidate in variants}
+
+
+def _is_legacy_virtual_source_attrs(attributes: Tuple[str, ...]) -> bool:
+    return _is_legacy_all_source_view(attributes) or _is_legacy_flagged_source_view(attributes)
+
+
+_LegacyCoverageSlot = Tuple[Set[Tuple[int, str]], str, str]
+
+
+def _identity_variant_slots_cover(
+    remote_slots: List[_LegacyCoverageSlot],
+    local_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
+    require_all_local: bool = False,
+) -> bool:
+    required_local_indexes = {
+        idx
+        for idx, (_local_identities, local_flags, _local_internaldate) in enumerate(local_slots)
+        if not required_flags or not _legacy_missing_target_flags(required_flags, local_flags)
+    }
+    if not remote_slots and (required_local_indexes if required_flags else local_slots):
+        return False
+    if require_all_local and len(remote_slots) < len(required_local_indexes):
+        return False
+    if len(remote_slots) > len(local_slots):
+        return False
+    edges: List[List[int]] = []
+    for remote_identities, remote_flags, remote_internaldate in remote_slots:
+        if required_flags and _legacy_missing_target_flags(required_flags, remote_flags):
+            return False
+        matches = [
+            idx
+            for idx, (local_identities, local_flags, local_internaldate) in enumerate(local_slots)
+            if remote_identities & local_identities
+            and not (required_flags and _legacy_missing_target_flags(required_flags, local_flags))
+            and not (
+                required_flags
+                and _normalized_legacy_internaldate(remote_internaldate)
+                and _normalized_legacy_internaldate(local_internaldate)
+                and _normalized_legacy_internaldate(remote_internaldate)
+                != _normalized_legacy_internaldate(local_internaldate)
+            )
+        ]
+        if not matches:
+            return False
+        edges.append(matches)
+    match_for_local: Dict[int, int] = {}
+
+    def assign(remote_idx: int, seen: Set[int]) -> bool:
+        for local_idx in edges[remote_idx]:
+            if local_idx in seen:
+                continue
+            seen.add(local_idx)
+            previous_remote = match_for_local.get(local_idx)
+            if previous_remote is None or assign(previous_remote, seen):
+                match_for_local[local_idx] = remote_idx
+                return True
+        return False
+
+    for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
+        if not assign(remote_idx, set()):
+            return False
+    if require_all_local and not required_local_indexes.issubset(match_for_local):
+        return False
+    return True
+
+
+def _remote_mailbox_content_covered(
+    imap,
+    mailbox: str,
+    local_identity_slots: List[_LegacyCoverageSlot],
+    *,
+    required_flags: str = "",
+    require_all_local: bool = False,
+) -> bool:
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
         return False
-    message_id = _message_id_header(data)
-    expected_hash = hashlib.sha256(data).hexdigest()
-    expected_size = len(data)
-    if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", message_id)
-    else:
-        status, search_data = imap.search(None, "ALL")
-    if status != "OK" or not search_data or not search_data[0]:
+    status, search_data = imap.search(None, "ALL")
+    if status != "OK":
         return False
-    for num in search_data[0].split():
-        if used_nums is not None and num in used_nums:
-            continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
+    nums = search_data[0].split() if search_data and search_data[0] else []
+    remote_slots: List[_LegacyCoverageSlot] = []
+    fetch_query = "(RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])" if required_flags else "(RFC822.SIZE BODY.PEEK[])"
+    for num in nums:
+        status, fetched = imap.fetch(num, fetch_query)
         if status != "OK":
-            continue
-        for part in fetched or []:
+            return False
+        fetched_parts = list(fetched or [])
+        remote_identities: Set[Tuple[int, str]] = set()
+        body_part_index: Optional[int] = None
+        for index, part in enumerate(fetched_parts):
             if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
                 continue
-            body = bytes(part[1])
-            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
-                if used_nums is not None:
-                    used_nums.add(num)
-                return True
+            if not _legacy_fetch_body_part_matches_sequence(part, num):
+                continue
+            if body_part_index is None:
+                body_part_index = index
+            remote_identities.update(_content_identity_variants(bytes(part[1])))
+        if not remote_identities:
+            return False
+        actual_flags, actual_date = _legacy_metadata_for_fetch_body_part(fetched_parts, body_part_index)
+        remote_slots.append((
+            remote_identities,
+            actual_flags or "",
+            actual_date or "",
+        ))
+    return _identity_variant_slots_cover(
+        remote_slots,
+        local_identity_slots,
+        required_flags=required_flags,
+        require_all_local=require_all_local,
+    )
+
+
+def _remote_has_message(
+    imap,
+    mailbox: str,
+    data: bytes,
+    used_nums: Optional[Set[bytes]] = None,
+    expected_flags: str = "",
+    expected_internaldate: str = "",
+) -> bool:
+    status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
+    if status != "OK":
+        return False
+    uidvalidity = _legacy_used_uid_namespace(imap)
+    message_id = _message_id_header(data)
+    variants = [data]
+    append_data = _imap_append_wire_bytes(data)
+    if append_data != data:
+        variants.append(append_data)
+    expected_identities = {
+        (len(candidate), hashlib.sha256(candidate).hexdigest())
+        for candidate in variants
+    }
+    search_uids = _legacy_search_target_uids(imap, message_id, mailbox=mailbox)
+    if not search_uids:
+        return False
+    flag_mismatches: List[List[str]] = []
+    date_mismatches: List[str] = []
+    expected_date = _normalized_legacy_internaldate(expected_internaldate)
+    for uid in search_uids:
+        uid_token = str(uid).encode("ascii")
+        used_key = _legacy_used_uid_key(uidvalidity, uid)
+        if used_nums is not None and (used_key in used_nums or uid_token in used_nums):
+            continue
+        status, fetched = imap.uid("fetch", str(uid), "(UID RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
+        if status != "OK":
+            continue
+        body, actual_flags, actual_date = _parse_fetch_response_for_uid(list(fetched or []), uid)
+        if body is None:
+            continue
+        body_identity = (len(body), hashlib.sha256(body).hexdigest())
+        if body_identity not in expected_identities:
+            continue
+        missing_flags = _legacy_missing_target_flags(expected_flags, actual_flags)
+        if missing_flags:
+            flag_mismatches.append(missing_flags)
+            continue
+        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+            date_mismatches.append(actual_date or "<missing>")
+            continue
+        if used_nums is not None:
+            used_nums.add(used_key)
+        return True
+    if flag_mismatches:
+        missing = sorted({flag for flags in flag_mismatches for flag in flags}, key=str.upper)
+        raise RuntimeError("remote flags missing: " + ", ".join(missing))
+    if date_mismatches:
+        got = ", ".join(sorted(set(date_mismatches)))
+        raise RuntimeError(f"remote INTERNALDATE mismatch: expected {expected_date!r} got {got!r}")
     return False
 
 
 def _folder_mailbox_name(folder_dir: Path) -> str:
     marker_path = folder_dir / ".mailbox.json"
+    if marker_path.is_symlink():
+        return folder_dir.name
     if not marker_path.exists():
         return folder_dir.name
     with contextlib.suppress(Exception):
-        raw = json.loads(marker_path.read_text(encoding="utf-8"))
+        raw = json.loads(_read_staged_artifact(marker_path, "legacy mailbox marker").decode("utf-8"))
         mailbox = raw.get("mailbox") if isinstance(raw, dict) else None
         if isinstance(mailbox, str) and mailbox.strip():
             return mailbox
@@ -69,22 +294,28 @@ def _legacy_export_state_issues(
     *,
     require_state: bool,
     expected_source_server: Optional[ServerConfig] = None,
+    require_source_server_binding: bool = True,
 ) -> List[str]:
     issues: List[str] = []
     state_path = account_dir / "export-state.json"
+    if state_path.is_symlink():
+        return [f"{account.email}: export-state is a symlink"]
     if not state_path.exists():
         if require_state:
             issues.append(f"{account.email}: export-state missing; rerun legacy export before destructive reset")
         return issues
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(_read_staged_artifact(state_path, "legacy export-state").decode("utf-8"))
     except Exception as exc:
         return [f"{account.email}: export-state missing or invalid: {exc}"]
     if not isinstance(state, dict):
         return [f"{account.email}: export-state is not an object"]
     if state.get("complete") is not True:
         issues.append(f"{account.email}: export-state is not complete")
-    if state.get("account") not in {None, account.email}:
+    state_account = state.get("account")
+    if require_state and state_account != account.email:
+        issues.append(f"{account.email}: export-state account mismatch ({state_account})")
+    elif not require_state and state_account not in {None, account.email}:
         issues.append(f"{account.email}: export-state account mismatch ({state.get('account')})")
     source_server = state.get("source_server")
     source_server_sha256 = state.get("source_server_sha256")
@@ -100,7 +331,7 @@ def _legacy_export_state_issues(
             )
         if source_server_sha256 != expected_digest:
             issues.append(f"{account.email}: export-state source_server_sha256 does not match config source_server")
-    elif require_state:
+    elif require_state and require_source_server_binding:
         issues.append(f"{account.email}: config source_server missing; cannot bind staged export to source endpoint")
     raw_mailboxes = state.get("mailboxes")
     if not isinstance(raw_mailboxes, list):
@@ -108,6 +339,7 @@ def _legacy_export_state_issues(
         return issues
     staged_by_path = {folder_dir.name: folder_dir for folder_dir in folder_dirs}
     state_paths: set[str] = set()
+    state_mailbox_by_path: Dict[str, Tuple[str, str]] = {}
     for idx, raw in enumerate(raw_mailboxes, 1):
         if not isinstance(raw, dict):
             issues.append(f"{account.email}: export-state mailbox entry {idx} is not an object")
@@ -122,14 +354,116 @@ def _legacy_export_state_issues(
         if not isinstance(path, str) or path != expected_path:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} path mismatch")
             path = expected_path
-        if not isinstance(message_count, int) or message_count < 0:
+        reserved_issue = legacy_reserved_mailbox_path_issue(mailbox, path)
+        if reserved_issue is not None:
+            issues.append(f"{account.email}: export-state {reserved_issue}")
+        if type(message_count) is not int or message_count < 0:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} has invalid message_count")
             continue
+        try:
+            state_hierarchy = _legacy_hierarchy_metadata(
+                raw,
+                mailbox,
+                f"{account.email}: export-state mailbox {mailbox!r}",
+            )
+        except RuntimeError as exc:
+            issues.append(str(exc))
+            state_hierarchy = ("", ())
+        try:
+            state_uidvalidity = _legacy_uidvalidity_metadata(
+                raw,
+                f"{account.email}: export-state mailbox {mailbox!r}",
+            )
+        except RuntimeError as exc:
+            issues.append(str(exc))
+            state_uidvalidity = ""
+        state_covered = False
+        state_source_attributes: Tuple[str, ...] = ()
+        if raw.get("covered_by_regular_content") is True:
+            try:
+                state_covered = _legacy_trusted_covered_by_regular_content(
+                    raw,
+                    f"{account.email}: export-state mailbox {mailbox!r}",
+                )
+                state_source_attributes = _legacy_source_attributes_metadata(
+                    raw,
+                    f"{account.email}: export-state mailbox {mailbox!r}",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
+        collision_key = sanitized_path_key(mailbox)
+        previous_mailbox = state_mailbox_by_path.get(collision_key)
+        if previous_mailbox is not None:
+            issues.append(
+                f"{account.email}: export-state mailbox path collision after sanitizing: "
+                f"{previous_mailbox[0]!r} -> {previous_mailbox[1]!r} and {mailbox!r} -> {path!r} "
+                "alias on case-insensitive filesystems"
+            )
+            continue
+        state_mailbox_by_path[collision_key] = (mailbox, path)
         state_paths.add(path)
         folder_dir = staged_by_path.get(path)
         if folder_dir is None:
             issues.append(f"{account.email}: export-state mailbox {mailbox!r} missing staged folder {path}")
             continue
+        marker_path = folder_dir / ".mailbox.json"
+        if marker_path.exists() and not marker_path.is_symlink():
+            try:
+                marker = json.loads(_read_staged_artifact(marker_path, "legacy mailbox marker").decode("utf-8"))
+            except Exception as exc:
+                issues.append(f"{account.email}:{path}: failed to parse mailbox marker for export-state comparison: {exc}")
+            else:
+                if isinstance(marker, dict) and marker.get("mailbox") == mailbox:
+                    marker_covered = False
+                    marker_source_attributes: Tuple[str, ...] = ()
+                    if marker.get("covered_by_regular_content") is True:
+                        try:
+                            marker_covered = _legacy_trusted_covered_by_regular_content(
+                                marker,
+                                f"{account.email}:{path}: mailbox marker",
+                            )
+                            marker_source_attributes = _legacy_source_attributes_metadata(
+                                marker,
+                                f"{account.email}:{path}: mailbox marker",
+                            )
+                        except RuntimeError as exc:
+                            issues.append(str(exc))
+                    if marker_covered != state_covered:
+                        issues.append(
+                            f"{account.email}:{path}: mailbox marker covered_by_regular_content mismatch with export-state"
+                        )
+                    elif marker_covered and (
+                        _legacy_source_attributes_key(marker_source_attributes)
+                        != _legacy_source_attributes_key(state_source_attributes)
+                    ):
+                        issues.append(
+                            f"{account.email}:{path}: mailbox marker source_attributes mismatch with export-state"
+                        )
+                    try:
+                        marker_hierarchy = _legacy_hierarchy_metadata(
+                            marker,
+                            mailbox,
+                            f"{account.email}:{path}: mailbox marker",
+                        )
+                    except RuntimeError as exc:
+                        issues.append(str(exc))
+                    else:
+                        if marker_hierarchy != state_hierarchy:
+                            issues.append(
+                                f"{account.email}:{path}: mailbox marker source_path_segments mismatch with export-state"
+                            )
+                        try:
+                            marker_uidvalidity = _legacy_uidvalidity_metadata(
+                                marker,
+                                f"{account.email}:{path}: mailbox marker",
+                            )
+                        except RuntimeError as exc:
+                            issues.append(str(exc))
+                        else:
+                            if marker_uidvalidity != state_uidvalidity:
+                                issues.append(
+                                    f"{account.email}:{path}: mailbox marker uidvalidity mismatch with export-state"
+                                )
         eml_count = len(list(folder_dir.glob("*.eml")))
         if eml_count != message_count:
             issues.append(
@@ -145,12 +479,13 @@ def _legacy_export_state_issues(
 def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     """Perform lightweight sanity checks on a single exported .eml file."""
     issues: List[str] = []
+    if eml_path.is_symlink():
+        return [f"{eml_path}: message file is a symlink"]
     try:
-        data = eml_path.read_bytes()
+        data = _read_staged_artifact(eml_path, "legacy message file")
     except Exception as exc:
         return [f"{eml_path}: failed to read: {exc}"]
     if not data:
-        issues.append(f"{eml_path}: empty file")
         return issues
     try:
         msg = BytesParser(policy=compat32_policy).parsebytes(data)
@@ -165,15 +500,6 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     ):
         issues.append(f"{eml_path}: suspicious raw IMAP metadata present in payload (possible concatenation)")
     if msg is not None:
-        header_keys = ["From", "To", "Subject", "Date", "Message-Id", "MIME-Version", "Content-Type", "Received"]
-        def _safe_get(h: str) -> bool:
-            try:
-                return bool(msg.get(h))
-            except Exception:
-                return False
-        present = sum(1 for k in header_keys if _safe_get(k))
-        if present < 2:
-            issues.append(f"{eml_path}: sparse headers (found {present}/8 common headers)")
         if msg.is_multipart():
             parts = [p for p in msg.walk()]
             if len(parts) <= 1:
@@ -189,14 +515,39 @@ def audit_account(
     *,
     require_integrity_metadata: bool = False,
     expected_source_server: Optional[ServerConfig] = None,
+    stop_event: Optional[object] = None,
 ) -> Tuple[str, List[str]]:
     """Audit a single account directory and optionally compare to remote counts."""
+    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
     issues: List[str] = []
+    remote_safe = True
     account_dir = in_root / sanitize_for_path(account.email)
+    if account_dir.is_symlink():
+        issues.append(f"{account.email}: account directory is a symlink: {account_dir}")
+        return account.email, issues
     if not account_dir.exists():
         issues.append(f"account directory missing: {account_dir}")
         return account.email, issues
-    folder_dirs = [p for p in account_dir.iterdir() if p.is_dir()]
+    if not account_dir.is_dir():
+        issues.append(f"{account.email}: account path is not a directory: {account_dir}")
+        return account.email, issues
+    provider_manifest = account_dir / "manifest.jsonl"
+    if provider_manifest.exists() or provider_manifest.is_symlink():
+        issues.append(f"{account.email}: provider manifest present in legacy account directory: {provider_manifest}")
+        remote_safe = False
+    folder_dirs: List[Path] = []
+    for child in account_dir.iterdir():
+        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+        if child.is_symlink():
+            issues.append(f"{account.email}:{child.name}: mailbox path is a symlink")
+            remote_safe = False
+            continue
+        if child.is_dir():
+            reserved_issue = legacy_reserved_mailbox_path_issue(child.name, child.name)
+            if reserved_issue is not None:
+                issues.append(f"{account.email}:{child.name}: {reserved_issue}")
+                remote_safe = False
+            folder_dirs.append(child)
     if not folder_dirs:
         issues.append(f"{account.email}: no mailbox folders found")
     issues.extend(
@@ -209,23 +560,66 @@ def audit_account(
         )
     )
     for folder_dir in folder_dirs:
+        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
         folder = folder_dir.name
         emls = list(folder_dir.glob("*.eml"))
         jsons = [p for p in folder_dir.glob("*.json") if p.name != ".mailbox.json"]
         mailbox_marker = folder_dir / ".mailbox.json"
+        mailbox_marker_present = mailbox_marker.exists() or mailbox_marker.is_symlink()
+        marker_mailbox: Optional[str] = None
+        marker_hierarchy: Tuple[str, Tuple[str, ...]] = ("", ())
+        marker_uidvalidity = ""
+        folder_uidvalidity: Optional[str] = None
         if not emls and not mailbox_marker.exists():
             issues.append(f"{account.email}:{folder}: no .eml files found")
-        if mailbox_marker.exists():
+        if mailbox_marker.is_symlink():
+            issues.append(f"{account.email}:{folder}: mailbox marker is a symlink")
+            remote_safe = False
+        elif mailbox_marker.exists():
             try:
-                marker = json.loads(mailbox_marker.read_text(encoding="utf-8"))
+                marker = json.loads(_read_staged_artifact(mailbox_marker, "legacy mailbox marker").decode("utf-8"))
                 expected_count = marker.get("message_count") if isinstance(marker, dict) else None
-                if isinstance(expected_count, int) and expected_count != len(emls):
+                if type(expected_count) is not int or expected_count < 0:
+                    issues.append(f"{account.email}:{folder}: mailbox marker has invalid message_count")
+                elif expected_count != len(emls):
                     issues.append(f"{account.email}:{folder}: mailbox marker count mismatch (marker={expected_count} eml={len(emls)})")
                 mailbox_name = marker.get("mailbox") if isinstance(marker, dict) else None
-                if isinstance(mailbox_name, str) and mailbox_name and sanitize_for_path(mailbox_name) != folder:
+                if not isinstance(mailbox_name, str) or not mailbox_name.strip():
+                    issues.append(f"{account.email}:{folder}: mailbox marker missing mailbox")
+                elif sanitize_for_path(mailbox_name) != folder:
                     issues.append(f"{account.email}:{folder}: mailbox marker name mismatch (marker={mailbox_name})")
+                else:
+                    marker_mailbox = mailbox_name
+                    if marker.get("covered_by_regular_content") is True:
+                        try:
+                            _legacy_trusted_covered_by_regular_content(
+                                marker,
+                                f"{account.email}:{folder}: mailbox marker",
+                            )
+                        except RuntimeError as exc:
+                            issues.append(str(exc))
+                            remote_safe = False
+                    try:
+                        marker_hierarchy = _legacy_hierarchy_metadata(
+                            marker,
+                            marker_mailbox,
+                            f"{account.email}:{folder}: mailbox marker",
+                        )
+                    except RuntimeError as exc:
+                        issues.append(str(exc))
+                    try:
+                        marker_uidvalidity = _legacy_uidvalidity_metadata(
+                            marker,
+                            f"{account.email}:{folder}: mailbox marker",
+                        )
+                    except RuntimeError as exc:
+                        issues.append(str(exc))
+                    else:
+                        if marker_uidvalidity:
+                            folder_uidvalidity = marker_uidvalidity
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}: failed to parse mailbox marker: {exc}")
+                remote_safe = False
         eml_stems = {p.stem for p in emls}
         json_stems = {p.stem for p in jsons}
         missing_meta = eml_stems - json_stems
@@ -234,20 +628,42 @@ def audit_account(
             issues.append(f"{account.email}:{folder}: {len(missing_meta)} message(s) missing .json metadata")
         if missing_eml:
             issues.append(f"{account.email}:{folder}: {len(missing_eml)} metadata file(s) without .eml counterpart")
+        symlink_jsons = {p for p in jsons if p.is_symlink()}
+        for json_path in sorted(symlink_jsons):
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+            issues.append(f"{account.email}:{folder}:{json_path.name}: message metadata is a symlink")
+            remote_safe = False
         for eml_path in emls:
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+            eml_is_symlink = eml_path.is_symlink()
+            if eml_is_symlink:
+                remote_safe = False
             issues.extend(_audit_eml_file(eml_path, folder))
             stem = eml_path.stem
             meta_path = eml_path.with_suffix(".json")
             if not meta_path.exists():
                 continue
+            if meta_path.is_symlink():
+                if meta_path not in symlink_jsons:
+                    issues.append(f"{account.email}:{folder}:{meta_path.name}: message metadata is a symlink")
+                continue
             try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta = json.loads(_read_staged_artifact(meta_path, "legacy message metadata").decode("utf-8"))
             except Exception as exc:
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: failed to parse message metadata: {exc}")
                 continue
             if not isinstance(meta, dict):
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: message metadata is not an object")
                 continue
+            account_meta = meta.get("account")
+            if not isinstance(account_meta, str) or not account_meta.strip():
+                if require_integrity_metadata:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing account metadata")
+            elif account_meta != account.email:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: account metadata mismatch "
+                    f"(account={account.email} meta={account_meta})"
+                )
             mailbox_meta = meta.get("mailbox")
             if not isinstance(mailbox_meta, str) or not mailbox_meta.strip():
                 issues.append(f"{account.email}:{folder}:{eml_path.name}: missing mailbox metadata")
@@ -256,80 +672,259 @@ def audit_account(
                     f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
                     f"(folder={folder} meta={mailbox_meta})"
                 )
+            elif marker_mailbox is not None and mailbox_meta != marker_mailbox:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: mailbox metadata mismatch "
+                    f"(marker={marker_mailbox} meta={mailbox_meta})"
+                )
+            elif not mailbox_marker_present and mailbox_meta != folder:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: missing mailbox marker "
+                    f"for original mailbox {mailbox_meta}"
+                )
+            if isinstance(mailbox_meta, str) and mailbox_meta.strip():
+                try:
+                    message_hierarchy = _legacy_hierarchy_metadata(
+                        meta,
+                        mailbox_meta,
+                        f"{account.email}:{folder}:{eml_path.name}",
+                    )
+                except RuntimeError as exc:
+                    issues.append(str(exc))
+                    message_hierarchy = ("", ())
+                else:
+                    if marker_mailbox is not None and message_hierarchy != marker_hierarchy:
+                        issues.append(
+                            f"{account.email}:{folder}:{eml_path.name}: "
+                            "source_path_segments mismatch with mailbox marker"
+                        )
+            try:
+                message_uidvalidity = _legacy_uidvalidity_metadata(
+                    meta,
+                    f"{account.email}:{folder}:{eml_path.name}",
+                )
+            except RuntimeError as exc:
+                issues.append(str(exc))
+                message_uidvalidity = ""
+            if marker_mailbox is not None and message_uidvalidity != marker_uidvalidity:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: uidvalidity mismatch with mailbox marker"
+                )
+            elif folder_uidvalidity is None:
+                folder_uidvalidity = message_uidvalidity
+            elif message_uidvalidity != folder_uidvalidity:
+                issues.append(
+                    f"{account.email}:{folder}:{eml_path.name}: uidvalidity mismatch within mailbox"
+                )
             if stem.startswith("u") and stem[1:].isdigit():
                 uid_in_name = int(stem[1:])
                 uid_meta = meta.get("uid")
-                if isinstance(uid_meta, int) and uid_meta != uid_in_name:
+                if "uid" in meta and type(uid_meta) is not int:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid uid metadata")
+                elif isinstance(uid_meta, int) and uid_meta != uid_in_name:
                     issues.append(f"{account.email}:{folder}:{eml_path.name}: uid mismatch (name={uid_in_name} meta={uid_meta})")
-            if require_integrity_metadata:
-                expected_hash = meta.get("content_sha256")
-                expected_size = meta.get("rfc822_size")
-                if not isinstance(expected_hash, str) or not expected_hash:
-                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
-                if not isinstance(expected_size, int):
-                    issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
-                if isinstance(expected_hash, str) and expected_hash and isinstance(expected_size, int):
+            try:
+                _validate_legacy_delivery_metadata(meta, f"{account.email}:{folder}:{eml_path.name}")
+            except RuntimeError as exc:
+                issues.append(str(exc))
+            integrity_keys_present = any(key in meta for key in ("content_sha256", "rfc822_size", CONTENT_BINDING_FIELD))
+            if require_integrity_metadata or integrity_keys_present:
+                expected_hash_raw = meta.get("content_sha256")
+                expected_size_raw = meta.get("rfc822_size")
+                expected_hash: Optional[str] = None
+                expected_size: Optional[int] = None
+                if expected_hash_raw is None:
+                    if require_integrity_metadata:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing content_sha256 metadata")
+                elif not isinstance(expected_hash_raw, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash_raw):
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid content_sha256 metadata")
+                else:
+                    expected_hash = expected_hash_raw.lower()
+                if expected_size_raw is None:
+                    if require_integrity_metadata:
+                        issues.append(f"{account.email}:{folder}:{eml_path.name}: missing rfc822_size metadata")
+                elif type(expected_size_raw) is not int or expected_size_raw < 0:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: invalid rfc822_size metadata")
+                else:
+                    expected_size = expected_size_raw
+                binding_issue = legacy_content_binding_issue(meta, required=require_integrity_metadata)
+                if binding_issue:
+                    issues.append(f"{account.email}:{folder}:{eml_path.name}: {binding_issue}")
+                if not eml_is_symlink and (expected_hash is not None or expected_size is not None):
                     try:
-                        data = eml_path.read_bytes()
-                        actual_hash = hashlib.sha256(data).hexdigest()
-                        if actual_hash != expected_hash:
+                        data = _read_staged_artifact(eml_path, "legacy message file")
+                        if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: content_sha256 mismatch")
-                        if len(data) != expected_size:
+                        if expected_size is not None and len(data) != expected_size:
                             issues.append(
                                 f"{account.email}:{folder}:{eml_path.name}: rfc822_size mismatch "
                                 f"(metadata={expected_size} actual={len(data)})"
                             )
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: failed integrity read: {exc}")
-    if check_remote and server is not None:
+    if check_remote and server is not None and remote_safe:
         try:
+            _raise_if_stopped(stop_event, f"legacy audit {account.email}")
             with imap_connection(server, account) as imap:
-                remote_mailboxes = list_all_mailboxes(imap)
+                remote_entries = _list_selectable_mailbox_entries(imap)
+                remote_mailboxes = [
+                    name
+                    for name, attrs in remote_entries
+                    if not _should_skip_legacy_source_view(name, attrs, remote_entries)
+                ]
                 remote_counts: Dict[str, int] = {}
-                remote_mailbox_by_key: Dict[str, str] = {}
+                remote_mailbox_by_key: Dict[str, Tuple[str, str]] = {}
+                remote_mailbox_by_path: Dict[str, str] = {}
+                remote_attrs_by_path: Dict[str, Tuple[str, ...]] = {
+                    canonical_mailbox_path_key(name): attrs
+                    for name, attrs in remote_entries
+                }
+                count_mismatched = set()
                 for mbox in remote_mailboxes:
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     status, _ = imap.select(quote_mailbox_name(mbox), readonly=True)
+                    path = canonical_mailbox_path_key(mbox)
+                    key = canonical_mailbox_alias_key(mbox)
                     if status != "OK":
+                        count_mismatched.add(path)
+                        issues.append(f"{account.email}:{path}: remote mailbox could not be selected: {mbox!r}")
                         continue
                     status, data = imap.uid("search", "ALL")
                     if status != "OK":
+                        count_mismatched.add(path)
+                        issues.append(f"{account.email}:{path}: remote mailbox UID search failed: {mbox!r}")
                         continue
                     num = len((data[0] or b"").split()) if data else 0
-                    key = sanitize_for_path(mbox)
-                    remote_counts[key] = num
-                    remote_mailbox_by_key[key] = mbox
-                count_mismatched = set()
-                identity_candidates: List[Tuple[Path, str, str]] = []
+                    previous = remote_mailbox_by_key.get(key)
+                    if (
+                        previous is not None
+                        and canonical_imap_mailbox_name(previous[0])
+                        != canonical_imap_mailbox_name(mbox)
+                    ):
+                        count_mismatched.update({previous[1], path})
+                        issues.append(
+                            f"{account.email}:{key}: remote mailbox name collision after sanitizing: "
+                            f"{previous[0]!r} -> {previous[1]!r} and {mbox!r} -> {path!r} "
+                            "alias on case-insensitive filesystems"
+                        )
+                        continue
+                    remote_counts[path] = num
+                    remote_mailbox_by_key[key] = (mbox, path)
+                    remote_mailbox_by_path[path] = mbox
+                identity_candidates: List[Tuple[Path, str, str, bytes, str, str]] = []
+                local_content_identity_slots: List[_LegacyCoverageSlot] = []
+                local_folder_info: Dict[str, Tuple[str, int]] = {}
                 for folder_dir in folder_dirs:
-                    folder = folder_dir.name
-                    local_count = len(list(folder_dir.glob("*.eml")))
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+                    folder = canonical_mailbox_path_key(folder_dir.name)
+                    if folder_dir.is_symlink():
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: mailbox path is a symlink")
+                        continue
+                    if not folder_dir.is_dir():
+                        count_mismatched.add(folder)
+                        issues.append(f"{account.email}:{folder}: mailbox path is not a directory")
+                        continue
+                    local_mailbox = _folder_mailbox_name(folder_dir)
+                    eml_paths = sorted(folder_dir.glob("*.eml"))
+                    local_count = len(eml_paths)
+                    local_folder_info[folder] = (local_mailbox, local_count)
+                    for eml_path in eml_paths:
+                        _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+                        if eml_path.is_symlink():
+                            continue
+                        try:
+                            data, expected_flags, expected_internaldate = _read_bound_legacy_message(
+                                eml_path,
+                                require_integrity_metadata=require_integrity_metadata,
+                            )
+                        except Exception as exc:
+                            issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
+                            continue
+                        local_content_identity_slots.append((
+                            _content_identity_variants(data),
+                            expected_flags,
+                            expected_internaldate,
+                        ))
+                        identity_candidates.append((
+                            eml_path,
+                            folder,
+                            local_mailbox,
+                            data,
+                            expected_flags,
+                            expected_internaldate,
+                        ))
+                for folder, (local_mailbox, local_count) in local_folder_info.items():
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     remote_count = remote_counts.get(folder, -1)
-                    if remote_count < 0 and local_count > 0:
+                    remote_mailbox = remote_mailbox_by_path.get(folder)
+                    if remote_count < 0:
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: missing remotely or not selectable but local has {local_count} messages")
                     elif remote_count >= 0 and local_count != remote_count:
+                        remote_attrs = remote_attrs_by_path.get(folder, ())
+                        if (
+                            _is_legacy_virtual_source_attrs(remote_attrs)
+                            and _remote_mailbox_content_covered(
+                                imap,
+                                remote_mailbox or local_mailbox,
+                                local_content_identity_slots,
+                                required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
+                                require_all_local=local_count > remote_count,
+                            )
+                        ):
+                            continue
                         count_mismatched.add(folder)
                         issues.append(f"{account.email}:{folder}: local={local_count} remote={remote_count} mismatch")
-                    elif local_count > 0:
-                        mailbox = remote_mailbox_by_key.get(folder, _folder_mailbox_name(folder_dir))
-                        for eml_path in sorted(folder_dir.glob("*.eml")):
-                            identity_candidates.append((eml_path, folder, mailbox))
+                    elif (
+                        remote_mailbox is not None
+                        and canonical_imap_mailbox_name(remote_mailbox)
+                        != canonical_imap_mailbox_name(local_mailbox)
+                    ):
+                        count_mismatched.add(folder)
+                        issues.append(
+                            f"{account.email}:{folder}: remote mailbox name mismatch for sanitized path "
+                            f"(local={local_mailbox!r} remote={remote_mailbox!r})"
+                        )
                 for folder_name, rcount in remote_counts.items():
-                    if rcount > 0 and not (account_dir / folder_name).exists():
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
+                    if folder_name not in local_folder_info:
+                        attrs = remote_attrs_by_path.get(folder_name, ())
+                        remote_mailbox = remote_mailbox_by_path.get(folder_name, folder_name)
+                        if (
+                            rcount >= 0
+                            and _is_legacy_virtual_source_attrs(attrs)
+                            and _remote_mailbox_content_covered(
+                                imap,
+                                remote_mailbox,
+                                local_content_identity_slots,
+                                required_flags="\\Flagged" if _is_legacy_flagged_source_view(attrs) else "",
+                            )
+                        ):
+                            continue
                         count_mismatched.add(folder_name)
                         issues.append(f"{account.email}:{folder_name}: missing locally but remote has {rcount} messages")
                 used_remote_nums_by_folder: Dict[str, Set[bytes]] = {}
-                for eml_path, folder, mailbox in identity_candidates:
+                for eml_path, folder, mailbox, data, expected_flags, expected_internaldate in identity_candidates:
+                    _raise_if_stopped(stop_event, f"legacy audit {account.email}")
                     if folder in count_mismatched:
                         continue
                     try:
-                        data = eml_path.read_bytes()
                         used_remote_nums = used_remote_nums_by_folder.setdefault(folder, set())
-                        if not _remote_has_message(imap, mailbox, data, used_remote_nums):
+                        if not _remote_has_message(
+                            imap,
+                            mailbox,
+                            data,
+                            used_remote_nums,
+                            expected_flags,
+                            expected_internaldate,
+                        ):
                             issues.append(f"{account.email}:{folder}:{eml_path.name}: remote message identity missing")
                     except Exception as exc:
                         issues.append(f"{account.email}:{folder}:{eml_path.name}: remote identity check failed: {exc}")
         except Exception as exc:
+            if _stop_requested(stop_event):
+                raise
             issues.append(f"remote check failed: {exc}")
     return account.email, issues
 
@@ -341,6 +936,7 @@ def audit_export(
     check_remote: bool = True,
     *,
     require_integrity_metadata: bool = False,
+    stop_event: Optional[object] = None,
 ) -> Tuple[bool, List[str]]:
     """Audit all accounts concurrently and aggregate issues.
 
@@ -348,27 +944,87 @@ def audit_export(
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+    _raise_if_stopped(stop_event, "legacy audit")
+    if _legacy_symlink_component(in_root) is not None:
+        return False, [f"audit root is a symlink: {in_root}"]
     issues_accum: List[str] = []
     expected_source_server = config.source_server if config.source_server is not None else None
     if expected_source_server is None and not require_integrity_metadata:
         expected_source_server = config.server
+    remote_server = config.source_server or config.server
 
     def worker(acc: Account) -> List[str]:
+        _raise_if_stopped(stop_event, f"legacy audit {acc.email}")
         _email, issues = audit_account(
             acc,
             in_root,
-            config.server if check_remote else None,
+            remote_server if check_remote else None,
             check_remote=check_remote,
             require_integrity_metadata=require_integrity_metadata,
             expected_source_server=expected_source_server,
+            stop_event=stop_event,
         )
+        _raise_if_stopped(stop_event, f"legacy audit {acc.email}")
         if not issues:
             return []
         return [f"{acc.email}: {msg}" if not msg.startswith(acc.email) else msg for msg in issues]
 
-    import concurrent.futures
+    results: List[List[str]] = []
+    account_iter = iter(config.accounts)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="audit") as ex:
-        results = list(ex.map(worker, config.accounts))
+        futures: Dict[concurrent.futures.Future[List[str]], Account] = {}
+
+        def submit_next() -> bool:
+            if _stop_requested(stop_event):
+                return False
+            try:
+                acc = next(account_iter)
+            except StopIteration:
+                return False
+            futures[ex.submit(worker, acc)] = acc
+            return True
+
+        def cancel_and_drain_pending() -> None:
+            for pending in futures:
+                pending.cancel()
+            for fut in concurrent.futures.as_completed(list(futures)):
+                try:
+                    fut.result()
+                except concurrent.futures.CancelledError:
+                    pass
+            futures.clear()
+
+        for _ in range(min(max_workers, len(config.accounts))):
+            submit_next()
+
+        wait_timeout = 0.2 if stop_event is not None else None
+        while futures:
+            if _stop_requested(stop_event):
+                cancel_and_drain_pending()
+                _raise_if_stopped(stop_event, "legacy audit")
+            done, _pending = concurrent.futures.wait(
+                futures,
+                timeout=wait_timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                continue
+            completed_successfully = 0
+            for fut in done:
+                futures.pop(fut, None)
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    cancel_and_drain_pending()
+                    raise
+                else:
+                    completed_successfully += 1
+            if _stop_requested(stop_event):
+                cancel_and_drain_pending()
+                _raise_if_stopped(stop_event, "legacy audit")
+            for _ in range(completed_successfully):
+                submit_next()
+    _raise_if_stopped(stop_event, "legacy audit")
     for lst in results:
         if lst:
             issues_accum.extend(lst)

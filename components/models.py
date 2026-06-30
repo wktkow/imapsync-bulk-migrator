@@ -3,9 +3,9 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .utils import sanitize_for_path
+from .utils import sanitize_for_path, sanitized_path_key
 
 
 @dataclasses.dataclass
@@ -15,15 +15,18 @@ class Account:
 
 
 def _reject_sanitized_path_collisions(values: List[str], *, context: str) -> None:
-    seen: Dict[str, str] = {}
+    seen: Dict[str, Tuple[str, str]] = {}
     for value in values:
-        key = sanitize_for_path(value)
+        path = sanitize_for_path(value)
+        key = sanitized_path_key(value)
         previous = seen.get(key)
-        if previous is not None and previous != value:
+        if previous is not None and previous[0] != value:
             raise ValueError(
-                f"{context} path collision after sanitizing: {previous!r} and {value!r} both map to {key!r}"
+                f"{context} path collision after sanitizing: "
+                f"{previous[0]!r} -> {previous[1]!r} and {value!r} -> {path!r} "
+                "alias on case-insensitive filesystems"
             )
-        seen[key] = value
+        seen[key] = (value, path)
 
 
 @dataclasses.dataclass
@@ -60,7 +63,7 @@ class AuthConfig:
         auth = AuthConfig(
             method=method,
             username=_optional_str(raw, "username", f"{context}.auth"),
-            password=_optional_str(raw, "password", f"{context}.auth"),
+            password=_optional_secret_str(raw, "password", f"{context}.auth"),
             password_file=_optional_path_str(raw, "password_file", f"{context}.auth", base_dir),
             token_file=_optional_path_str(raw, "token_file", f"{context}.auth", base_dir),
             env_var=_optional_str(raw, "env_var", f"{context}.auth"),
@@ -102,8 +105,9 @@ class ProviderEndpoint:
         if provider not in {"gmail", "icloud", "imap"}:
             raise ValueError(f"{context}.provider must be one of: gmail, icloud, imap")
         host = raw.get("host")
-        if not host or not isinstance(host, str):
+        if not isinstance(host, str) or not host.strip():
             raise ValueError(f"{context}.host must be a non-empty string")
+        host = host.strip()
         port = _int_value(raw.get("port", 993), f"{context}.port", min_value=1, max_value=65535)
         use_ssl = _bool_value(raw.get("ssl", True), f"{context}.ssl")
         starttls = _bool_value(raw.get("starttls", False), f"{context}.starttls")
@@ -189,10 +193,12 @@ class MigrationAccount:
             raise ValueError(f"accounts[{index}] must be an object")
         source_email = raw.get("source_email")
         target_email = raw.get("target_email")
-        if not source_email or not isinstance(source_email, str):
+        if not isinstance(source_email, str) or not source_email.strip():
             raise ValueError(f"accounts[{index}].source_email must be a non-empty string")
-        if not target_email or not isinstance(target_email, str):
+        if not isinstance(target_email, str) or not target_email.strip():
             raise ValueError(f"accounts[{index}].target_email must be a non-empty string")
+        source_email = source_email.strip()
+        target_email = target_email.strip()
         return MigrationAccount(
             source_email=source_email,
             target_email=target_email,
@@ -235,7 +241,13 @@ class MigrationSettings:
         folder_map_raw = raw.get("folder_map", {})
         if not isinstance(folder_map_raw, dict):
             raise ValueError("migration.folder_map must be an object")
-        folder_map = {str(k): str(v) for k, v in folder_map_raw.items()}
+        folder_map: Dict[str, str] = {}
+        for key, value in folder_map_raw.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("migration.folder_map keys must be non-empty strings")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("migration.folder_map values must be non-empty strings")
+            folder_map[key] = value
         validation = str(raw.get("validation", "manifest_exact"))
         if validation != "manifest_exact":
             raise ValueError("migration.validation must be 'manifest_exact'")
@@ -300,6 +312,10 @@ def auth_username_identity(endpoint: ProviderEndpoint, username: str) -> str:
         if sep and domain in {"gmail.com", "googlemail.com"}:
             return f"{local.replace('.', '')}@gmail.com"
         return identity
+    if endpoint.provider == "icloud":
+        local, sep, domain = username.partition("@")
+        if sep and domain.lower() in {"icloud.com", "me.com", "mac.com"}:
+            return local
     return username
 
 
@@ -346,6 +362,7 @@ class ProviderMigrationConfig:
         allow_target_duplicates = self.migration.account_merge_mode == "many_to_one"
         unique_target_keys = {auth_username_identity(self.target, account.target_email) for account in self.accounts}
         shared_single_target = allow_target_duplicates and len(unique_target_keys) == 1
+        source_labels_by_username: Dict[str, Dict[str, int]] = {}
         target_usernames_by_target: Dict[str, Dict[str, int]] = {}
         target_labels_by_username: Dict[str, Dict[str, int]] = {}
         for idx, account in enumerate(self.accounts):
@@ -357,12 +374,27 @@ class ProviderMigrationConfig:
                 raise ValueError(f"accounts[{idx}].target_email duplicates accounts[{seen_targets[target_key]}].target_email")
             seen_sources[source_key] = idx
             seen_targets[target_key] = idx
+            source_username_key = auth_username_identity(
+                self.source,
+                _effective_auth_username(self.source, account, role="source"),
+            )
             target_username_key = auth_username_identity(
                 self.target,
                 _effective_auth_username(self.target, account, role="target"),
             )
+            source_labels_by_username.setdefault(source_username_key, {}).setdefault(source_key, idx)
             target_usernames_by_target.setdefault(target_key, {}).setdefault(target_username_key, idx)
             target_labels_by_username.setdefault(target_username_key, {}).setdefault(target_key, idx)
+        for username_key, source_indexes in sorted(source_labels_by_username.items()):
+            if len(source_indexes) > 1:
+                details = ", ".join(
+                    f"accounts[{idx}]={source!r}"
+                    for source, idx in sorted(source_indexes.items(), key=lambda item: item[1])
+                )
+                raise ValueError(
+                    f"effective source_auth.username {username_key!r} is reused by multiple source_email labels "
+                    f"({details})"
+                )
         for username_key, target_indexes in sorted(target_labels_by_username.items()):
             if len(target_indexes) > 1:
                 details = ", ".join(
@@ -416,12 +448,12 @@ class ProviderMigrationConfig:
                 expected_email = account.source_email if role == "source" else account.target_email
                 auth_username = auth.username or endpoint.auth.username
                 if (
-                    endpoint.provider == "gmail"
+                    endpoint.provider in {"gmail", "icloud"}
                     and auth_username
                     and auth_username_identity(endpoint, auth_username) != auth_username_identity(endpoint, expected_email)
                 ):
                     raise ValueError(
-                        f"accounts[{idx}].{role}_auth.username must match {role}_email for Gmail "
+                        f"accounts[{idx}].{role}_auth.username must match {role}_email for {endpoint.provider} "
                         f"({expected_email})"
                     )
             if self.source.provider == "gmail" and multi_account and not account.gmail_full_visibility_verified:
@@ -477,8 +509,9 @@ class Config:
                 raise ValueError(f"accounts[{idx}] must be an object")
             email = item.get("email")
             password = item.get("password")
-            if not email or not isinstance(email, str):
+            if not isinstance(email, str) or not email.strip():
                 raise ValueError(f"accounts[{idx}].email must be a non-empty string")
+            email = email.strip()
             if not isinstance(password, str):
                 raise ValueError(f"accounts[{idx}].password must be a string (can be empty)")
             email_key = email.strip()
@@ -495,8 +528,9 @@ def _server_config_from_dict(raw: Any, *, context: str) -> ServerConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config must include '{context}' object" if context == "server" else f"{context} must be an object")
     host = raw.get("host")
-    if not host or not isinstance(host, str):
+    if not isinstance(host, str) or not host.strip():
         raise ValueError(f"{context}.host must be a non-empty string")
+    host = host.strip()
     host_key = host.strip().lower().rstrip(".")
     known_provider_hosts = {"imap.gmail.com": "gmail", "imap.mail.me.com": "icloud"}
     if host_key in known_provider_hosts:
@@ -533,7 +567,19 @@ def _optional_str(raw: Dict[str, Any], key: str, context: str) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise ValueError(f"{context}.{key} must be a string")
-    if not value.strip():
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{context}.{key} must be a non-empty string")
+    return value
+
+
+def _optional_secret_str(raw: Dict[str, Any], key: str, context: str) -> Optional[str]:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{context}.{key} must be a string")
+    if value == "":
         raise ValueError(f"{context}.{key} must be a non-empty string")
     return value
 

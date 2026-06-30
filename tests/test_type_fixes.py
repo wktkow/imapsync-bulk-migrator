@@ -6,6 +6,7 @@ Validates that the type fixes are correct at runtime and don't alter behavior.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -16,6 +17,37 @@ import imaplib
 import pytest
 
 from components.models import Account, ServerConfig
+from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+
+
+def _legacy_import_metadata(data: bytes, **extra: object) -> dict:
+    meta = {
+        "account": "user@example.com",
+        "mailbox": "INBOX",
+        "uid": 1,
+        "rfc822_size": len(data),
+        "content_sha256": hashlib.sha256(data).hexdigest(),
+        **extra,
+    }
+    meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+    return meta
+
+
+def _write_export_state(account_dir: Path, source_server: ServerConfig | None = None) -> None:
+    from components.imap_ops import legacy_server_endpoint, legacy_server_endpoint_digest
+
+    source_server = source_server or ServerConfig(host="dummy", port=993, ssl=True)
+    (account_dir / "export-state.json").write_text(json.dumps({
+        "schema_version": 1,
+        "account": account_dir.name,
+        "source_server": legacy_server_endpoint(source_server),
+        "source_server_sha256": legacy_server_endpoint_digest(source_server),
+        "complete": True,
+        "completed_at": 0,
+        "mailboxes": [
+            {"mailbox": "INBOX", "path": "INBOX", "message_count": 1},
+        ],
+    }))
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +121,7 @@ class TestUidSearchNoNone:
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"3"])
+        fake_imap.response.return_value = ("OK", [b"123"])
         fake_imap.uid.return_value = ("OK", [b"1 2 3"])
 
         result = fetch_all_uids(fake_imap, "INBOX")
@@ -127,9 +160,11 @@ class TestImapFactoryTyping:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "", "internaldate": ""}))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
+        _write_export_state(acc_dir.parent, server)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -143,6 +178,7 @@ class TestImapFactoryTyping:
         import_account(
             account, server, tmp_path, ignore_errors=False,
             imap_factory=typed_factory,
+            source_server=server,
         )
 
         assert fake_imap.append.called
@@ -175,10 +211,12 @@ class TestFlagsAlwaysStr:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
         # Empty flags and no internaldate
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "", "internaldate": ""}))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="", internaldate="")))
+        _write_export_state(acc_dir.parent, server)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -188,7 +226,7 @@ class TestFlagsAlwaysStr:
         def factory(srv: ServerConfig, acc: Account) -> Iterator[imaplib.IMAP4]:
             yield fake_imap
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=factory)
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=factory, source_server=server)
 
         # Verify append was called with a str for flags, not None
         call_args = fake_imap.append.call_args
@@ -205,9 +243,11 @@ class TestFlagsAlwaysStr:
         acc_dir = tmp_path / "user@example.com" / "INBOX"
         acc_dir.mkdir(parents=True)
         eml = acc_dir / "u0000000001.eml"
-        eml.write_bytes(b"From: a@b.com\n\nbody")
+        data = b"From: a@b.com\n\nbody"
+        eml.write_bytes(data)
         meta = acc_dir / "u0000000001.json"
-        meta.write_text(json.dumps({"mailbox": "INBOX", "uid": 1, "flags": "\\Recent", "internaldate": ""}))
+        meta.write_text(json.dumps(_legacy_import_metadata(data, flags="\\Recent", internaldate="")))
+        _write_export_state(acc_dir.parent, server)
 
         fake_imap = mock.MagicMock(spec=imaplib.IMAP4)
         fake_imap.select.return_value = ("OK", [b"0"])
@@ -217,7 +257,7 @@ class TestFlagsAlwaysStr:
         def factory(srv: ServerConfig, acc: Account) -> Iterator[imaplib.IMAP4]:
             yield fake_imap
 
-        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=factory)
+        import_account(account, server, tmp_path, ignore_errors=False, imap_factory=factory, source_server=server)
 
         call_args = fake_imap.append.call_args
         flags_arg = call_args[0][1]
