@@ -4538,7 +4538,7 @@ def _target_gmail_label_and_flag_keys(imap: imaplib.IMAP4, num: bytes) -> Tuple[
     status, fetched = imap.fetch(num, "(X-GM-LABELS FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
-    parsed = parse_provider_fetch_response(fetched or [])
+    parsed = parse_provider_fetch_response(_provider_fetch_response_for_sequence(fetched or [], num))
     labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
     flags = {token.upper() for token in str(parsed.get("flags") or "").split()}
     labels.update(_gmail_label_key(token) for token in flags)

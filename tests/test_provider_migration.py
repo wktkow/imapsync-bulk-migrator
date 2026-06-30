@@ -7782,6 +7782,24 @@ def test_restore_gmail_starred_flag_uses_selected_target_message() -> None:
     assert fake.stored_labels == [(b"2", "+FLAGS", "(\\Flagged)")]
 
 
+def test_target_gmail_label_state_ignores_unsolicited_fetch_for_other_sequence() -> None:
+    from components.provider_ops import _target_gmail_label_and_flag_keys
+
+    class UnsolicitedFetchGmailTarget:
+        def fetch(self, num: bytes, query: str):
+            assert num == b"2"
+            assert query == "(X-GM-LABELS FLAGS)"
+            return "OK", [
+                b'1 (FLAGS (\\Seen \\Flagged) X-GM-LABELS ("Wrong Label" \\Starred))',
+                b'2 (FLAGS (\\Seen) X-GM-LABELS ())',
+            ]
+
+    labels, flags = _target_gmail_label_and_flag_keys(UnsolicitedFetchGmailTarget(), b"2")
+
+    assert labels == {"label:\\seen"}
+    assert flags == {"\\SEEN"}
+
+
 def test_restore_gmail_labels_requires_target_match() -> None:
     fake = FakeGmailTargetImap()
 
