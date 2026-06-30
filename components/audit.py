@@ -500,15 +500,6 @@ def _audit_eml_file(eml_path: Path, expected_folder_name: str) -> List[str]:
     ):
         issues.append(f"{eml_path}: suspicious raw IMAP metadata present in payload (possible concatenation)")
     if msg is not None:
-        header_keys = ["From", "To", "Subject", "Date", "Message-Id", "MIME-Version", "Content-Type", "Received"]
-        def _safe_get(h: str) -> bool:
-            try:
-                return bool(msg.get(h))
-            except Exception:
-                return False
-        present = sum(1 for k in header_keys if _safe_get(k))
-        if present < 2:
-            issues.append(f"{eml_path}: sparse headers (found {present}/8 common headers)")
         if msg.is_multipart():
             parts = [p for p in msg.walk()]
             if len(parts) <= 1:

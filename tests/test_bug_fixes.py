@@ -16764,6 +16764,16 @@ class TestRound7ConfirmedBugs:
         assert not ok
         assert any("mismatch" in issue for issue in issues)
 
+    def test_legacy_audit_accepts_header_light_imap_draft_message(self, tmp_path: Path) -> None:
+        from components.audit import _audit_eml_file
+
+        folder = tmp_path / "Drafts"
+        folder.mkdir()
+        eml = folder / "u0000000001.eml"
+        eml.write_bytes(b"Subject: draft only\r\n\r\nbody")
+
+        assert _audit_eml_file(eml, "Drafts") == []
+
     def test_validate_rechecks_regular_message_file_against_sidecar_after_audit(self, tmp_path: Path) -> None:
         from components.audit import audit_export as real_audit_export
         from components.main import main
