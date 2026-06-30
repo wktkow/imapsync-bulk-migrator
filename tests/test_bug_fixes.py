@@ -965,6 +965,31 @@ class TestLegacyExportCompleteness:
         assert flags == "\\Seen"
         assert internaldate == "01-Jan-2024 00:00:00 +0000"
 
+    def test_fetch_parser_ignores_uid_like_flag_atoms(self) -> None:
+        from components.imap_ops import _legacy_fetch_metadata_for_uid, _parse_fetch_response_for_uid
+
+        body = b"Message-ID: <uid-like-flags@example.com>\r\n\r\nbody"
+
+        flags, internaldate = _legacy_fetch_metadata_for_uid(
+            [b'1 (UID 42 FLAGS (UID 99) INTERNALDATE "01-Jan-2024 00:00:00 +0000")'],
+            42,
+        )
+        msg_bytes, body_flags, body_date = _parse_fetch_response_for_uid(
+            [(b'1 (FLAGS (UID 99) UID 42 BODY[] {46}', body)],
+            42,
+        )
+
+        assert flags == "UID 99"
+        assert internaldate == "01-Jan-2024 00:00:00 +0000"
+        assert msg_bytes == body
+        assert body_flags == "UID 99"
+        assert body_date is None
+
+    def test_fetch_parser_ignores_quoted_uid_like_text(self) -> None:
+        from components.imap_ops import _fetch_response_uids
+
+        assert _fetch_response_uids('1 (UID 42 X-GM-LABELS ("UID 99"))') == [42]
+
     @pytest.mark.parametrize("uid_token", ["00042", "0", "4294967296"])
     def test_fetch_parser_rejects_invalid_uid_metadata(self, uid_token: str) -> None:
         from components.imap_ops import _parse_fetch_response_for_uid

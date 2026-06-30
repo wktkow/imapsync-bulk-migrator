@@ -1335,16 +1335,64 @@ def _append_legacy_import_journal(account_dir: Path, row: Dict[str, str]) -> Non
 
 
 def _fetch_response_uid(meta_str: str) -> Optional[int]:
-    match = re.search(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE)
-    if match is None:
+    uids = _fetch_response_uids(meta_str)
+    if not uids:
         return None
-    return parse_imap_uid_token(match.group(1), label="FETCH UID response")
+    return uids[0]
 
 
 def _fetch_response_uids(meta_str: str) -> List[int]:
     uids: List[int] = []
-    for match in re.finditer(r"\bUID\s+(\d+)\b", meta_str, flags=re.IGNORECASE):
-        uids.append(parse_imap_uid_token(match.group(1), label="FETCH UID response"))
+    depth = 0
+    in_quote = False
+    escaped = False
+    idx = 0
+    while idx < len(meta_str):
+        ch = meta_str[idx]
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quote = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+            idx += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            idx += 1
+            continue
+        if depth <= 1 and meta_str[idx : idx + 3].upper() == "UID":
+            before = meta_str[idx - 1] if idx else ""
+            after_idx = idx + 3
+            after = meta_str[after_idx] if after_idx < len(meta_str) else ""
+            if (not before or not (before.isalnum() or before in "_-")) and after.isspace():
+                digit_idx = after_idx
+                while digit_idx < len(meta_str) and meta_str[digit_idx].isspace():
+                    digit_idx += 1
+                digit_start = digit_idx
+                while digit_idx < len(meta_str) and meta_str[digit_idx].isdigit():
+                    digit_idx += 1
+                next_ch = meta_str[digit_idx] if digit_idx < len(meta_str) else ""
+                if digit_idx > digit_start and (not next_ch or not (next_ch.isalnum() or next_ch in "_-")):
+                    uids.append(
+                        parse_imap_uid_token(
+                            meta_str[digit_start:digit_idx],
+                            label="FETCH UID response",
+                        )
+                    )
+                    idx = digit_idx
+                    continue
+        idx += 1
     return uids
 
 
