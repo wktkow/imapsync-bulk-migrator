@@ -443,6 +443,8 @@ class TestBug7ImportConfigPlaceholder:
             def uid(self, command: str, *args):
                 if command == "search":
                     return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
                 raise AssertionError(command)
 
             def search(self, charset, *criteria):
@@ -1174,14 +1176,15 @@ class TestLegacyExportCompleteness:
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1"]
 
-            def search(self, charset, *criteria):
-                return "OK", [b"1"]
-
-            def fetch(self, num: bytes, query: str):
-                return "OK", [
-                    b"2 (FLAGS (\\Seen))",
-                    (b"1 (FLAGS (\\Deleted) BODY[] {65}", body),
-                ]
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [
+                        b"2 (UID 2 FLAGS (\\Seen))",
+                        (b"1 (UID 1 FLAGS (\\Deleted) BODY[] {65}", body),
+                    ]
+                raise AssertionError(command)
 
         assert not _legacy_remote_has_message(
             UnsolicitedTargetFlagsImap(),
@@ -1191,30 +1194,73 @@ class TestLegacyExportCompleteness:
             expected_flags="\\Seen",
         )
 
-    def test_legacy_target_checks_ignore_body_from_wrong_sequence(self) -> None:
+    def test_legacy_target_checks_reject_body_from_wrong_uid(self) -> None:
         from components import audit as audit_module
         from components import main as main_module
         from components.imap_ops import _legacy_remote_has_message
 
-        body = b"Message-ID: <wrong-sequence-legacy@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+        body = b"Message-ID: <wrong-uid-legacy@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
 
-        class WrongSequenceTarget:
+        class WrongUidTarget:
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1"]
 
-            def search(self, charset, *criteria):
-                return "OK", [b"1"]
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"2 (UID 2 FLAGS (\\Seen) BODY[] {70}", body)]
+                raise AssertionError(command)
 
-            def fetch(self, num: bytes, query: str):
-                return "OK", [(b"2 (FLAGS (\\Seen) BODY[] {76}", body)]
-
-        assert not _legacy_remote_has_message(WrongSequenceTarget(), "INBOX", body, set())
+        with pytest.raises(RuntimeError, match="unexpected UID 2"):
+            _legacy_remote_has_message(WrongUidTarget(), "INBOX", body, set())
         used_main: set[bytes] = set()
-        assert not main_module._legacy_remote_has_message(WrongSequenceTarget(), "INBOX", body, used_main)
+        with pytest.raises(RuntimeError, match="unexpected UID 2"):
+            main_module._legacy_remote_has_message(WrongUidTarget(), "INBOX", body, used_main)
         assert used_main == set()
         used_audit: set[bytes] = set()
-        assert not audit_module._remote_has_message(WrongSequenceTarget(), "INBOX", body, used_audit)
+        with pytest.raises(RuntimeError, match="unexpected UID 2"):
+            audit_module._remote_has_message(WrongUidTarget(), "INBOX", body, used_audit)
         assert used_audit == set()
+
+    def test_legacy_target_identity_tracks_used_uids_after_sequence_renumbering(self) -> None:
+        from components import audit as audit_module
+        from components import main as main_module
+        from components.imap_ops import _legacy_remote_has_message
+
+        first = b"Message-ID: <renumber-a@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nfirst\r\n"
+        second = b"Message-ID: <renumber-b@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nsecond\r\n"
+
+        class RenumberedSequenceTarget:
+            def __init__(self) -> None:
+                self.search_uids = [101, 202]
+
+            def select(self, mailbox: str, readonly: bool = False):
+                return "OK", [b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [str(self.search_uids.pop(0)).encode("ascii")]
+                if command == "fetch":
+                    uid = int(args[0])
+                    body = first if uid == 101 else second
+                    return "OK", [(
+                        b'2 (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {%d}'
+                        % (uid, len(body), len(body)),
+                        body,
+                    )]
+                raise AssertionError(command)
+
+        for remote_has_message in (
+            _legacy_remote_has_message,
+            main_module._legacy_remote_has_message,
+            audit_module._remote_has_message,
+        ):
+            target = RenumberedSequenceTarget()
+            used: set[bytes] = set()
+            assert remote_has_message(target, "INBOX", first, used)
+            assert remote_has_message(target, "INBOX", second, used)
+            assert used == {b"101", b"202"}
 
     def test_export_accepts_case_insensitive_fetch_metadata(self, tmp_path: Path) -> None:
         from components.imap_ops import export_account
@@ -3344,6 +3390,15 @@ class TestLegacyListParsing:
                 self.selected = mailbox.strip('"').replace(r"\"", '"')
                 return ("OK", [b"1"]) if self.selected == "Projects.2024" else ("OK", [b"0"])
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if self.selected == "Projects.2024":
+                        return "OK", [b"1"]
+                    return "OK", [b""]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                raise AssertionError(command)
+
             def search(self, charset, *criteria):
                 if self.selected == "Projects.2024":
                     return "OK", [b"1"]
@@ -3441,6 +3496,21 @@ class TestLegacyListParsing:
             def select(self, mailbox: str, readonly: bool = False):
                 self.selected = mailbox.strip('"').replace(r"\"", '"')
                 return "OK", [b"1" if self.selected == "INBOX" else b"2"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if len(args) == 3 and args[:2] == ("HEADER", "Message-ID"):
+                        wanted = str(args[2]).strip('"')
+                        if wanted == "<translated-all-inbox@example.com>":
+                            return "OK", [b"1"]
+                        if wanted == "<translated-all-archived@example.com>" and self.selected == "[Gmail].All Mail":
+                            return "OK", [b"2"]
+                    return "OK", [b"1" if self.selected == "INBOX" else b"1 2"]
+                if command == "fetch":
+                    uid = int(args[0])
+                    body = inbox_body if uid == 1 else archived_body
+                    return "OK", [(b"%d (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (uid, uid, len(body), len(body)), body)]
+                raise AssertionError(command)
 
             def search(self, charset, *criteria):
                 if criteria == ("ALL",):
@@ -3601,6 +3671,16 @@ class TestLegacyImportJournal:
                     return "OK", [b"1"]
                 return "OK", [b""]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if self.has_message:
+                        return "OK", [b"1"]
+                    return "OK", [b""]
+                if command == "fetch":
+                    body = b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody"
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE 77 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {77}", body)]
+                raise AssertionError(command)
+
             def fetch(self, *_args, **_kwargs):
                 return "OK", [(b"1 (RFC822.SIZE 77 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {77}", b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody")]
 
@@ -3683,6 +3763,23 @@ class TestLegacyImportJournal:
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    flags = " ".join(sorted(self.flags))
+                    if args[-1] == "(UID FLAGS)":
+                        return "OK", [f"1 (UID 1 FLAGS ({flags}))".encode("ascii")]
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (%s) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (
+                        len(append_data),
+                        flags.encode("ascii"),
+                        len(append_data),
+                    ), append_data)]
+                if command == "store":
+                    uid, store_command, flags = args
+                    return self.store(str(uid).encode("ascii"), store_command, flags)
+                raise AssertionError(command)
+
             def fetch(self, num: bytes, query: str):
                 flags = " ".join(sorted(self.flags))
                 if query == "(FLAGS)":
@@ -3760,6 +3857,17 @@ class TestLegacyImportJournal:
             def search(self, charset, *criteria):
                 self.search_count += 1
                 return "OK", [b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    self.search_count += 1
+                    return "OK", [b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))]
+                if command == "fetch":
+                    self.fetch_count += 1
+                    uid = int(args[0])
+                    body = self.stored[uid - 1]
+                    return "OK", [(b"%d (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (uid, uid, len(body), len(body)), body)]
+                raise AssertionError(command)
 
             def fetch(self, num: bytes, query: str):
                 self.fetch_count += 1
@@ -3911,6 +4019,16 @@ class TestLegacyImportJournal:
                 nums = b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))
                 return "OK", [nums]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    nums = b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))
+                    return "OK", [nums]
+                if command == "fetch":
+                    uid = int(args[0])
+                    body = self.stored[uid - 1]
+                    return "OK", [(b"%d (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (uid, uid, len(body), len(body)), body)]
+                raise AssertionError(command)
+
             def fetch(self, num: bytes, query: str):
                 body = self.stored[int(num) - 1]
                 return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
@@ -3970,6 +4088,15 @@ class TestLegacyImportJournal:
 
             def search(self, charset, *criteria):
                 return "OK", [b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b" ".join(str(idx).encode("ascii") for idx in range(1, len(self.stored) + 1))]
+                if command == "fetch":
+                    uid = int(args[0])
+                    body = self.stored[uid - 1]
+                    return "OK", [(b"%d (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (uid, uid, len(body), len(body)), body)]
+                raise AssertionError(command)
 
             def fetch(self, num: bytes, query: str):
                 body = self.stored[int(num) - 1]
@@ -4176,6 +4303,20 @@ class TestLegacyImportJournal:
                         return "OK", [b"1"]
                 return "OK", [b""]
 
+            def uid(self, command: str, *args):
+                payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
+                if command == "search":
+                    if len(args) == 3 and args[:2] == ("HEADER", "Message-ID"):
+                        wanted = str(args[2]).strip('"')
+                        if wanted == "<covered-virtual-import@example.com>" and payloads:
+                            return "OK", [b"1"]
+                    return "OK", [b" ".join(str(i).encode("ascii") for i in range(1, len(payloads) + 1))]
+                if command == "fetch":
+                    uid = int(args[0])
+                    payload = payloads[uid - 1]
+                    return "OK", [(b"%d (UID %d RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (uid, uid, len(payload), len(payload)), payload)]
+                raise AssertionError(command)
+
             def fetch(self, num: bytes, query: str):
                 payloads = self.payloads_by_mailbox.get(self.selected[-1] if self.selected else "", [])
                 payload = payloads[int(num) - 1]
@@ -4257,6 +4398,13 @@ class TestLegacyImportJournal:
 
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
+                raise AssertionError(command)
 
             def fetch(self, num: bytes, query: str):
                 return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(self.stored), len(self.stored)), self.stored)]
@@ -4782,6 +4930,13 @@ class TestLegacyImportJournal:
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
+                raise AssertionError(command)
+
             def fetch(self, *_args, **_kwargs):
                 return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
 
@@ -4835,6 +4990,18 @@ class TestLegacyImportJournal:
 
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1" if self.has_message else b"0"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if self.has_message:
+                        return "OK", [b"1"]
+                    return "OK", [b""]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE 77 FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {77}',
+                        data,
+                    )]
+                raise AssertionError(command)
 
             def search(self, charset, *criteria):
                 if self.has_message:
@@ -5960,6 +6127,18 @@ class TestCliAndConfigHardening:
                         return "OK", [b"1"]
                 return "OK", [b""]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if len(args) == 3 and args[:2] == ("HEADER", "Message-ID"):
+                        wanted = str(args[2]).strip('"')
+                        if wanted == "<flag-mismatch@example.com>":
+                            return "OK", [b"1"]
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    assert "FLAGS" in args[-1]
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
+                raise AssertionError(command)
+
             def fetch(self, num: bytes, query: str):
                 assert "FLAGS" in query
                 return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(body), len(body)), body)]
@@ -6014,6 +6193,20 @@ class TestCliAndConfigHardening:
                 if criteria == ("HEADER", "Message-ID", "<dup@example.com>"):
                     return "OK", [b"1"]
                 raise AssertionError(criteria)
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    if len(args) == 3 and args[:2] == ("HEADER", "Message-ID"):
+                        wanted = str(args[2]).strip('"')
+                        if wanted == "<dup@example.com>":
+                            return "OK", [b"1"]
+                    return "OK", [b"1 2"]
+                if command == "fetch":
+                    uid = int(args[0])
+                    if uid == 1:
+                        return "OK", [(b"1 (UID 1 RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {36}", duplicate)]
+                    return "OK", [(b"2 (UID 2 RFC822.SIZE 37 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {37}", b"Message-ID: <other@example.com>\r\n\r\nbody")]
+                raise AssertionError(command)
 
             def fetch(self, num: bytes, *_args, **_kwargs):
                 if num == b"1":
@@ -6075,6 +6268,13 @@ class TestCliAndConfigHardening:
 
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
+                raise AssertionError(command)
 
             def fetch(self, *_args, **_kwargs):
                 return "OK", [(b"1 (RFC822.SIZE 36 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {36}", b"Message-ID: <m@example.com>\r\n\r\nbody")]
@@ -6194,6 +6394,13 @@ class TestCliAndConfigHardening:
 
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
+                raise AssertionError(command)
 
             def fetch(self, *_args, **_kwargs):
                 return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(data), len(data)), data)]
@@ -7171,6 +7378,13 @@ class TestAuditHardening:
             def uid(self, command: str, *args):
                 if command == "search":
                     return "OK", [b"1"]
+                if command == "fetch":
+                    assert "FLAGS" in args[1]
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {%d}'
+                        % (len(body), len(body)),
+                        body,
+                    )]
                 raise AssertionError(command)
 
             def search(self, charset, *criteria):
@@ -10019,14 +10233,15 @@ print("ok")
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1"]
 
-            def search(self, charset, *criteria):
-                self.criteria = criteria
-                if criteria == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"'):
-                    return "OK", [b"1"]
-                return "BAD", [b"bad search"]
-
-            def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE 49 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {49}", message)]
+            def uid(self, command: str, *args):
+                if command == "search":
+                    self.criteria = args
+                    if args == ("HEADER", "Message-ID", '"<x@[127.0.0.1]>"'):
+                        return "OK", [b"7"]
+                    return "BAD", [b"bad search"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 7 RFC822.SIZE 49 FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {49}", message)]
+                raise AssertionError(command)
 
         fake = SpecialMessageIdImap()
 
@@ -10066,11 +10281,12 @@ print("ok")
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1"]
 
-            def search(self, charset, *criteria):
-                return "OK", [b"1"]
-
-            def fetch(self, num: bytes, query: str):
-                return "OK", [(b"1 (RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(stored), len(stored)), stored)]
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(b"1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" BODY[] {%d}" % (len(stored), len(stored)), stored)]
+                raise AssertionError(command)
 
         assert _legacy_remote_has_message(NormalizedRemote(), "INBOX", message, set())
 
@@ -11704,8 +11920,16 @@ class TestRound7ConfirmedBugs:
             def select(self, mailbox: str, readonly: bool = False):
                 return "OK", [b"1"]
 
-            def uid(self, command: str, criterion: str):
-                return "OK", [b"1"]
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE %d FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {%d}'
+                        % (len(stored), len(stored)),
+                        stored,
+                    )]
+                raise AssertionError(command)
 
             def search(self, charset, *criteria):
                 assert criteria == ("HEADER", "Message-ID", "<audit-wire@example.com>")
@@ -14059,6 +14283,20 @@ class TestRound7ConfirmedBugs:
             def subscribe(self, mailbox: str):
                 return "OK", [b""]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE '
+                        + str(len(data)).encode("ascii")
+                        + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                        + str(len(data)).encode("ascii")
+                        + b"}",
+                        data,
+                    )]
+                raise AssertionError(command)
+
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
 
@@ -14127,6 +14365,20 @@ class TestRound7ConfirmedBugs:
             def search(self, charset, *criteria):
                 return "OK", [b"1"]
 
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE '
+                        + str(len(data)).encode("ascii")
+                        + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                        + str(len(data)).encode("ascii")
+                        + b"}",
+                        data,
+                    )]
+                raise AssertionError(command)
+
             def fetch(self, num: bytes, query: str):
                 return "OK", [(
                     b'1 (RFC822.SIZE '
@@ -14176,6 +14428,15 @@ class TestRound7ConfirmedBugs:
             def uid(self, command: str, *args):
                 if command == "search":
                     return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE '
+                        + str(len(data)).encode("ascii")
+                        + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                        + str(len(data)).encode("ascii")
+                        + b"}",
+                        data,
+                    )]
                 raise AssertionError(command)
 
             def search(self, charset, *criteria):
@@ -14241,6 +14502,15 @@ class TestRound7ConfirmedBugs:
             def uid(self, command: str, *args):
                 if command == "search":
                     return "OK", [b"1"]
+                if command == "fetch":
+                    return "OK", [(
+                        b'1 (UID 1 RFC822.SIZE '
+                        + str(len(data)).encode("ascii")
+                        + b' FLAGS (\\Seen) INTERNALDATE "02-Jan-2024 00:00:00 +0000" BODY[] {'
+                        + str(len(data)).encode("ascii")
+                        + b"}",
+                        data,
+                    )]
                 raise AssertionError(command)
 
             def search(self, charset, *criteria):

@@ -823,6 +823,17 @@ def _legacy_fetch_body_part_matches_sequence(part: object, expected_sequence: by
     return sequence_num == _imap_sequence_number(expected_sequence)
 
 
+def _legacy_search_target_uids(imap: imaplib.IMAP4, message_id: str, *, mailbox: str) -> List[int]:
+    if message_id:
+        quoted_message_id = quote_imap_search_value(message_id)
+        status, search_data = imap.uid("search", "HEADER", "Message-ID", quoted_message_id)
+    else:
+        status, search_data = imap.uid("search", "ALL")
+    if status != "OK" or not search_data or not search_data[0]:
+        return []
+    return parse_imap_uid_search_data(search_data, label=f"target UID SEARCH response for {mailbox}")
+
+
 def _legacy_fetch_metadata_for_sequence(
     fetch_response: List[object],
     expected_sequence: bytes,
@@ -1060,60 +1071,54 @@ def _legacy_remote_has_message(
     if status != "OK":
         return False
     message_id = _message_id_header(data)
-    if message_id:
-        status, search_data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
-    else:
-        status, search_data = imap.search(None, "ALL")
-    if status != "OK" or not search_data or not search_data[0]:
+    search_uids = _legacy_search_target_uids(imap, message_id, mailbox=mailbox)
+    if not search_uids:
         return False
     expected_hash = hashlib.sha256(data).hexdigest()
     expected_size = len(data)
-    for num in search_data[0].split():
-        if num in used_nums:
+    for uid in search_uids:
+        uid_token = str(uid).encode("ascii")
+        if uid_token in used_nums:
             continue
-        status, fetched = imap.fetch(num, "(RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
+        status, fetched = imap.uid("fetch", str(uid), "(UID RFC822.SIZE FLAGS INTERNALDATE BODY.PEEK[])")
         if status != "OK":
             continue
-        fetched_parts = list(fetched or [])
-        for index, part in enumerate(fetched_parts):
-            if not (isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], (bytes, bytearray))):
+        body, actual_flags, actual_date = _parse_fetch_response_for_uid(list(fetched or []), uid)
+        if body is None:
+            continue
+        if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_hash:
+            continue
+        expected_date = _normalized_legacy_internaldate(expected_internaldate)
+        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+            continue
+        missing_flags = _legacy_missing_target_flags(
+            expected_flags,
+            actual_flags,
+        )
+        if missing_flags:
+            if not restore_missing_flags:
                 continue
-            if not _legacy_fetch_body_part_matches_sequence(part, num):
-                continue
-            body = bytes(part[1])
-            if len(body) == expected_size and hashlib.sha256(body).hexdigest() == expected_hash:
-                expected_date = _normalized_legacy_internaldate(expected_internaldate)
-                actual_flags, actual_date = _legacy_metadata_for_fetch_body_part(fetched_parts, index)
-                if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
-                    continue
-                missing_flags = _legacy_missing_target_flags(
-                    expected_flags,
-                    actual_flags,
+            flags_arg = _legacy_flags_arg_from_tokens(missing_flags)
+            status, response = imap.uid("store", str(uid), "+FLAGS.SILENT", flags_arg)
+            if status != "OK":
+                raise RuntimeError(f"failed to restore legacy flags in {mailbox}: {response}")
+            status, refetched = imap.uid("fetch", str(uid), "(UID FLAGS)")
+            if status != "OK":
+                raise RuntimeError(f"failed to verify restored legacy flags in {mailbox}: {refetched}")
+            refetched_flags, _refetched_date = _legacy_fetch_metadata_for_uid(
+                list(refetched or []),
+                uid,
+            )
+            remaining = _legacy_missing_target_flags(
+                expected_flags,
+                refetched_flags,
+            )
+            if remaining:
+                raise RuntimeError(
+                    f"remote flags missing after restore in {mailbox}: " + ", ".join(remaining)
                 )
-                if missing_flags:
-                    if not restore_missing_flags:
-                        continue
-                    flags_arg = _legacy_flags_arg_from_tokens(missing_flags)
-                    status, response = imap.store(num, "+FLAGS.SILENT", flags_arg)
-                    if status != "OK":
-                        raise RuntimeError(f"failed to restore legacy flags in {mailbox}: {response}")
-                    status, refetched = imap.fetch(num, "(FLAGS)")
-                    if status != "OK":
-                        raise RuntimeError(f"failed to verify restored legacy flags in {mailbox}: {refetched}")
-                    refetched_flags, _refetched_date = _legacy_fetch_metadata_for_sequence(
-                        list(refetched or []),
-                        num,
-                    )
-                    remaining = _legacy_missing_target_flags(
-                        expected_flags,
-                        refetched_flags,
-                    )
-                    if remaining:
-                        raise RuntimeError(
-                            f"remote flags missing after restore in {mailbox}: " + ", ".join(remaining)
-                        )
-                used_nums.add(num)
-                return True
+        used_nums.add(uid_token)
+        return True
     return False
 
 
