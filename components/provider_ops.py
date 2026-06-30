@@ -5731,12 +5731,12 @@ def merge_group_empty_target_context(
                 if target_gmail_msgid:
                     gmail_journal_msgids[key] = target_gmail_msgid
         journaled.update(
-            journal_row_target_key(
-                row,
+            key
+            for key, row in latest_journal_rows(
+                journal_rows,
                 target_provider=config.target.provider,
                 target_mailboxes=target_mailboxes,
-            )
-            for row in journal_rows
+            ).items()
             if row.get("status") == "pending"
         )
         if not journaled:

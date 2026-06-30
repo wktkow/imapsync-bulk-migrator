@@ -6403,6 +6403,57 @@ def test_provider_import_many_to_one_empty_mode_rejects_unjournaled_target_conte
     assert fake.appended == []
 
 
+def test_provider_import_many_to_one_empty_mode_rejects_stale_peer_pending_after_failure(tmp_path: Path) -> None:
+    config = _many_to_one_config()
+    first, second = config.accounts
+    target = first.target_email
+    first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
+    first_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=target,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=first_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=target,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=second_body,
+    )
+    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
+    pending = _journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "pending",
+    }, account=first)
+    failed = _journal_fixture_for_manifest_row(config, first_row, {
+        "canonical_id": "physical-a",
+        "target_account": target,
+        "target_mailbox": "Archive",
+        "status": "failed",
+    }, account=first)
+    (first_dir / "import-merged@example.com.journal.jsonl").write_text(
+        json.dumps(pending) + "\n" + json.dumps(failed) + "\n"
+    )
+    fake = StoredMessageTarget({"Archive": [first_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target_mode=empty"):
+            provider_import_account(config, second, tmp_path)
+
+    assert fake.appended == []
+
+
 def test_provider_validation_many_to_one_empty_mode_rejects_unjournaled_group_target_content(tmp_path: Path) -> None:
     config = _many_to_one_config()
     first, second = config.accounts
