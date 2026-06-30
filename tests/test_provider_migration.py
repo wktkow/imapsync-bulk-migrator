@@ -3012,6 +3012,72 @@ def test_target_match_bookkeeping_keeps_case_distinct_generic_mailboxes_separate
     assert consume_target_match_num(fake, "project", row, used_by_mailbox, create_if_missing=False) == b"1"
 
 
+def test_provider_target_match_bookkeeping_tracks_uid_not_sequence() -> None:
+    body_a = b"Message-ID: <a@example.com>\r\n\r\nbody-a"
+    body_b = b"Message-ID: <b@example.com>\r\n\r\nbody-b"
+
+    def row_for(body: bytes, message_id: str) -> dict:
+        return {
+            "message_id_header": message_id,
+            "content_sha256": hashlib.sha256(body).hexdigest(),
+            "rfc822_size": len(body),
+        }
+
+    class UidTarget:
+        def __init__(self) -> None:
+            self.selected_mailbox = ""
+            self.uid_stores: List[tuple[bytes, str, str]] = []
+            self.bodies = {b"200": body_a, b"201": body_b}
+            self.message_ids = {"<a@example.com>": b"200", "<b@example.com>": b"201"}
+
+        def select(self, mailbox: str, readonly: bool = False):
+            self.selected_mailbox = mailbox.strip('"')
+            return "OK", [b"2"]
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                if args[1:3] == ("HEADER", "Message-ID"):
+                    return "OK", [self.message_ids.get(str(args[3]), b"")]
+                return "OK", [b"200 201"]
+            if command == "fetch":
+                uid = bytes(args[0])
+                body = self.bodies[uid]
+                return "OK", [(
+                    b"2 (UID "
+                    + uid
+                    + b" RFC822.SIZE "
+                    + str(len(body)).encode("ascii")
+                    + b" BODY[] {"
+                    + str(len(body)).encode("ascii")
+                    + b"}",
+                    body,
+                )]
+            if command == "store":
+                self.uid_stores.append((bytes(args[0]), str(args[1]), str(args[2])))
+                return "OK", [b""]
+            raise AssertionError(command)
+
+        def search(self, *_args):
+            raise AssertionError("sequence SEARCH should not be used when UID is available")
+
+        def fetch(self, *_args):
+            raise AssertionError("sequence FETCH should not be used when UID is available")
+
+        def store(self, *_args):
+            raise AssertionError("sequence STORE should not be used when UID is available")
+
+    fake = UidTarget()
+    used_by_mailbox: dict[str, set[bytes]] = {}
+
+    assert consume_target_match_num(fake, "Archive", row_for(body_a, "<a@example.com>"), used_by_mailbox, create_if_missing=False) == b"200"
+    assert consume_target_match_num(fake, "Archive", row_for(body_b, "<b@example.com>"), used_by_mailbox, create_if_missing=False) == b"201"
+
+    restore_gmail_starred_flag(fake, "Archive", {"canonical_id": "b", "gmail_labels": ["\\Starred"]}, target_num=b"201")
+
+    assert used_by_mailbox == {"Archive": {b"200", b"201"}}
+    assert fake.uid_stores == [(b"201", "+FLAGS", "(\\Flagged)")]
+
+
 def test_icloud_target_default_folder_resolution() -> None:
     icloud_mailboxes = [
         MailboxInfo(name="INBOX", delimiter="/", attributes=("\\HasNoChildren",)),

@@ -3990,6 +3990,13 @@ def required_provider_flag_set(
 
 
 def target_message_flag_set(imap: imaplib.IMAP4, num: bytes) -> set[str]:
+    if _target_uid_command_available(imap):
+        uid = parse_imap_uid_token(num, label="target UID")
+        status, fetched = imap.uid("fetch", num, "(UID FLAGS)")
+        if status != "OK":
+            raise RuntimeError(f"failed to fetch target flags for message {num!r}")
+        parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+        return {token.upper() for token in str(parsed.get("flags") or "").split()}
     status, fetched = imap.fetch(num, "(FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch target flags for message {num!r}")
@@ -4007,6 +4014,13 @@ def _normalized_provider_internaldate(value: object) -> str:
 
 
 def target_message_internaldate(imap: imaplib.IMAP4, num: bytes) -> str:
+    if _target_uid_command_available(imap):
+        uid = parse_imap_uid_token(num, label="target UID")
+        status, fetched = imap.uid("fetch", num, "(UID INTERNALDATE)")
+        if status != "OK":
+            raise RuntimeError(f"failed to fetch target INTERNALDATE for message {num!r}")
+        parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+        return _normalized_provider_internaldate(parsed.get("internaldate"))
     status, fetched = imap.fetch(num, "(INTERNALDATE)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch target INTERNALDATE for message {num!r}")
@@ -4352,7 +4366,7 @@ def restore_gmail_labels(
     if status != "OK":
         raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail labels")
     label_list = "(" + " ".join(_quote_gmail_label(label) for label in labels) + ")"
-    status, response = imap.store(num, "+X-GM-LABELS", label_list)
+    status, response = _target_store(imap, num, "+X-GM-LABELS", label_list)
     if status != "OK":
         raise RuntimeError(f"failed to restore Gmail labels for {row.get('canonical_id')}: {response}")
 
@@ -4364,9 +4378,23 @@ def restore_gmail_starred_flag(imap: imaplib.IMAP4, target_mailbox: str, row: Di
     status, _ = select_mailbox(imap, target_mailbox)
     if status != "OK":
         raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail starred flag")
-    status, response = imap.store(num, "+FLAGS", "(\\Flagged)")
+    status, response = _target_store(imap, num, "+FLAGS", "(\\Flagged)")
     if status != "OK":
         raise RuntimeError(f"failed to restore Gmail starred flag for {row.get('canonical_id')}: {response}")
+
+
+def _target_uid_command_available(imap: imaplib.IMAP4) -> bool:
+    return callable(getattr(imap, "uid", None))
+
+
+def _target_uid_bytes(uid: int) -> bytes:
+    return str(uid).encode("ascii")
+
+
+def _target_store(imap: imaplib.IMAP4, num: bytes, command: str, value: str):
+    if _target_uid_command_available(imap):
+        return imap.uid("store", num, command, value)
+    return imap.store(num, command, value)
 
 
 def _expected_content_identities(
@@ -4409,12 +4437,6 @@ def target_matching_message_nums(
     status, _ = select_mailbox(imap, mailbox, readonly=True)
     if status != "OK":
         return []
-    if message_id:
-        status, data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
-    else:
-        status, data = imap.search(None, "ALL")
-    if status != "OK" or not data or not data[0]:
-        return []
     try:
         expected_size = int(manifest_row.get("rfc822_size") or 0)
     except (TypeError, ValueError):
@@ -4422,6 +4444,54 @@ def target_matching_message_nums(
     expected_hash = str(manifest_row.get("content_sha256") or "").lower()
     content_identities = _expected_content_identities(manifest_row, expected_content_identities)
     if expected_hash and not content_identities:
+        return []
+    if _target_uid_command_available(imap):
+        if message_id:
+            status, data = imap.uid("search", None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
+        else:
+            status, data = imap.uid("search", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return []
+        uids = parse_imap_uid_search_data(data, label="target UID SEARCH response")
+        if expected_size <= 0 and not expected_hash and message_id:
+            return [_target_uid_bytes(uid) for uid in uids]
+        matches: List[bytes] = []
+        for uid in uids:
+            uid_bytes = _target_uid_bytes(uid)
+            status, fetched = imap.uid("fetch", uid_bytes, "(UID RFC822.SIZE BODY.PEEK[])")
+            if status != "OK":
+                continue
+            try:
+                parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+            except RuntimeError:
+                continue
+            body = parsed.get("message_bytes")
+            body_bytes = bytes(body) if isinstance(body, (bytes, bytearray)) else None
+            if content_identities:
+                if body_bytes is not None and (len(body_bytes), hashlib.sha256(body_bytes).hexdigest()) in content_identities:
+                    matches.append(uid_bytes)
+                continue
+            if expected_size > 0:
+                body_size = len(body_bytes) if body_bytes is not None else None
+                parsed_size = int(parsed.get("rfc822_size") or 0)
+                if body_size != expected_size and parsed_size != expected_size:
+                    continue
+            if expected_hash:
+                if (
+                    body_bytes is not None
+                    and len(body_bytes) == expected_size
+                    and hashlib.sha256(body_bytes).hexdigest() == expected_hash
+                ):
+                    matches.append(uid_bytes)
+                continue
+            if int(parsed.get("rfc822_size") or 0) > 0:
+                matches.append(uid_bytes)
+        return matches
+    if message_id:
+        status, data = imap.search(None, "HEADER", "Message-ID", quote_imap_search_value(message_id))
+    else:
+        status, data = imap.search(None, "ALL")
+    if status != "OK" or not data or not data[0]:
         return []
     if expected_size <= 0 and not expected_hash and message_id:
         return list(data[0].split())
@@ -4470,6 +4540,20 @@ def target_message_content_identity(
     imap: imaplib.IMAP4,
     num: bytes,
 ) -> Optional[Tuple[int, str]]:
+    if _target_uid_command_available(imap):
+        uid = parse_imap_uid_token(num, label="target UID")
+        status, fetched = imap.uid("fetch", num, "(UID RFC822.SIZE BODY.PEEK[])")
+        if status != "OK":
+            return None
+        try:
+            parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+        except RuntimeError:
+            return None
+        body = parsed.get("message_bytes")
+        if isinstance(body, (bytes, bytearray)):
+            body_bytes = bytes(body)
+            return (len(body_bytes), hashlib.sha256(body_bytes).hexdigest())
+        return None
     status, fetched = imap.fetch(num, "(RFC822.SIZE BODY.PEEK[])")
     if status != "OK":
         return None
@@ -4529,6 +4613,16 @@ def target_has_message(
 
 
 def _target_gmail_msgid(imap: imaplib.IMAP4, num: bytes) -> str:
+    if _target_uid_command_available(imap):
+        uid = parse_imap_uid_token(num, label="target UID")
+        status, fetched = imap.uid("fetch", num, "(UID X-GM-MSGID)")
+        if status != "OK":
+            raise RuntimeError(f"failed to fetch Gmail message id for target message {num!r}")
+        parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+        gmail_msgid = str(parsed.get("gmail_msgid") or "")
+        if not gmail_msgid:
+            raise RuntimeError(f"target Gmail did not return X-GM-MSGID for message {num!r}")
+        return gmail_msgid
     status, fetched = imap.fetch(num, "(X-GM-MSGID)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail message id for target message {num!r}")
@@ -4674,6 +4768,16 @@ def consume_target_match(
 
 
 def _target_gmail_label_and_flag_keys(imap: imaplib.IMAP4, num: bytes) -> Tuple[set[str], set[str]]:
+    if _target_uid_command_available(imap):
+        uid = parse_imap_uid_token(num, label="target UID")
+        status, fetched = imap.uid("fetch", num, "(UID X-GM-LABELS FLAGS)")
+        if status != "OK":
+            raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
+        parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
+        labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
+        flags = {token.upper() for token in str(parsed.get("flags") or "").split()}
+        labels.update(_gmail_label_key(token) for token in flags)
+        return {label for label in labels if label}, flags
     status, fetched = imap.fetch(num, "(X-GM-LABELS FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
