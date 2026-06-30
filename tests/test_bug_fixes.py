@@ -13803,6 +13803,39 @@ class TestRound7ConfirmedBugs:
         assert target.exists()
         assert target.read_bytes() == b"new\n"
 
+    def test_legacy_atomic_write_removes_published_file_after_post_rename_parent_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        parent = tmp_path / "user@example.com"
+        parent.mkdir()
+        backup = tmp_path / "user@example.com.old"
+        target = parent / "export-state.json"
+        real_rename = imap_ops.os.rename
+        swapped = False
+
+        def racing_rename(src, dst, *args, **kwargs):
+            nonlocal swapped
+            result = real_rename(src, dst, *args, **kwargs)
+            if dst == "export-state.json" and not swapped:
+                swapped = True
+                real_rename(parent, backup)
+                parent.mkdir()
+            return result
+
+        monkeypatch.setattr(imap_ops.os, "rename", racing_rename)
+
+        with pytest.raises(RuntimeError, match="replaced legacy file directory"):
+            imap_ops._secure_atomic_write_bytes(target, b"SECRET\n")
+
+        assert swapped
+        assert not target.exists()
+        assert not (backup / "export-state.json").exists()
+        assert list(backup.glob(".export-state.json.*.tmp")) == []
+
     def test_legacy_append_journal_fsyncs_parent_directory_after_create(
         self,
         tmp_path: Path,

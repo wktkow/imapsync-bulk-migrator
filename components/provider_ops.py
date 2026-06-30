@@ -1483,11 +1483,21 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            tmp_name = ""
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                _unlink_provider_entry_and_fsync(parent_fd, name, parent_path, "file")
+                raise
             _fsync_provider_directory_fd(parent_fd, parent_path, "file")
-            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                _unlink_provider_entry_and_fsync(parent_fd, name, parent_path, "file")
+                raise
         except Exception:
-            _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
+            if tmp_name:
+                _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
             raise
     finally:
         os.close(parent_fd)
@@ -1522,11 +1532,21 @@ def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            tmp_name = ""
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                _unlink_provider_entry_and_fsync(parent_fd, name, parent_path, "file")
+                raise
             _fsync_provider_directory_fd(parent_fd, parent_path, "file")
-            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            try:
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            except Exception:
+                _unlink_provider_entry_and_fsync(parent_fd, name, parent_path, "file")
+                raise
         except Exception:
-            _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
+            if tmp_name:
+                _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
             raise
     finally:
         os.close(parent_fd)

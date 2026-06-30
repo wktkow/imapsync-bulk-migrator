@@ -338,11 +338,21 @@ def _secure_atomic_write_bytes(path: Path, payload: bytes) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
+            tmp_name = ""
+            try:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
+            except Exception:
+                _unlink_legacy_entry_and_fsync(parent_fd, name, parent_path, "legacy file")
+                raise
             _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy file")
-            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
+            try:
+                _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy file")
+            except Exception:
+                _unlink_legacy_entry_and_fsync(parent_fd, name, parent_path, "legacy file")
+                raise
         except Exception:
-            _unlink_legacy_entry_and_fsync(parent_fd, tmp_name, parent_path, "legacy file")
+            if tmp_name:
+                _unlink_legacy_entry_and_fsync(parent_fd, tmp_name, parent_path, "legacy file")
             raise
     finally:
         os.close(parent_fd)

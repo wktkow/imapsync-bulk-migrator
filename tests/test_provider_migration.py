@@ -411,6 +411,44 @@ def test_provider_atomic_writers_preserve_visible_target_after_directory_fsync_f
         assert target.read_text(encoding="utf-8") == '{"canonical_id": "id"}\n'
 
 
+@pytest.mark.parametrize("writer_name", ["bytes", "jsonl"])
+def test_provider_atomic_writers_remove_published_file_after_post_rename_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    backup = tmp_path / "source@example.com.old"
+    target = account_dir / ("message.eml" if writer_name == "bytes" else "manifest.jsonl")
+    real_rename = provider_ops.os.rename
+    swapped = False
+
+    def racing_rename(src, dst, *args, **kwargs):
+        nonlocal swapped
+        result = real_rename(src, dst, *args, **kwargs)
+        if dst == target.name and not swapped:
+            swapped = True
+            real_rename(account_dir, backup)
+            account_dir.mkdir()
+        return result
+
+    monkeypatch.setattr(provider_ops.os, "rename", racing_rename)
+
+    with pytest.raises(RuntimeError, match="replaced provider file directory"):
+        if writer_name == "bytes":
+            provider_ops._atomic_bytes(target, b"SECRET\n")
+        else:
+            provider_ops._write_jsonl(target, [{"password": "SECRET"}])
+
+    assert swapped
+    assert not target.exists()
+    assert not (backup / target.name).exists()
+    assert list(backup.glob(f".{target.name}.*.tmp")) == []
+
+
 def test_provider_append_journal_rejects_replaced_symlink_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
