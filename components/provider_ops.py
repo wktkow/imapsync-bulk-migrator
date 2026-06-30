@@ -3483,10 +3483,6 @@ def _uncovered_provider_virtual_items(
             consumed += 1
         else:
             kept.append(item)
-    fallback = min(max(remaining_ordinary - consumed, 0), len(kept))
-    if fallback:
-        kept = kept[fallback:]
-        consumed += fallback
     return kept, consumed
 
 

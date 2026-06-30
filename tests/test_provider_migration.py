@@ -3754,6 +3754,53 @@ class FakeGenericAllAmbiguousOverlapSourceImap:
         return "OK", []
 
 
+class FakeGenericAllDifferentDeliverySourceImap:
+    def __init__(self) -> None:
+        self.selected = ""
+        self.fetch_queries_by_mailbox: dict[str, List[str]] = {}
+        self.body = b"Message-ID: <different-delivery@example.com>\r\n\r\nsame"
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "All Mail"',
+        ]
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r"\"", '"')
+        return "OK", [b"1"]
+
+    def response(self, name: str):
+        return "OK", [b"111" if self.selected == "INBOX" else b"222"]
+
+    def uid(self, command: str, *args):
+        if command == "search":
+            return "OK", [b"1"]
+        if command == "fetch":
+            query = str(args[-1])
+            self.fetch_queries_by_mailbox.setdefault(self.selected, []).append(query)
+            flags = r"\Flagged" if self.selected == "All Mail" else r"\Seen"
+            internaldate = (
+                "02-Jan-2024 00:00:00 +0000"
+                if self.selected == "All Mail"
+                else "01-Jan-2024 00:00:00 +0000"
+            )
+            meta = (
+                f'1 (UID 1 RFC822.SIZE {len(self.body)} FLAGS ({flags}) '
+                f'INTERNALDATE "{internaldate}")'
+            ).encode("ascii")
+            if "BODY.PEEK[]" not in query:
+                return "OK", [meta]
+            return "OK", [(meta + f" BODY[] {{{len(self.body)}}}".encode("ascii"), self.body)]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
+
+
 class FakeGenericAllBeforeProjectSourceImap:
     def __init__(self, *, all_uidvalidity: str = "111") -> None:
         self.selected = ""
@@ -4768,6 +4815,41 @@ def test_provider_export_counts_only_uncovered_generic_all_overlap_occurrences(t
     flagged_row = all_rows[0]
     assert "\\Flagged" in flagged_row["flags"]
     assert flagged_row["internaldate"] == "02-Jan-2024 00:00:00 +0000"
+
+
+def test_provider_export_preserves_generic_all_same_body_different_delivery(tmp_path: Path) -> None:
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    source = FakeGenericAllDifferentDeliverySourceImap()
+
+    @contextlib.contextmanager
+    def fake_source_connection(*_args, **_kwargs) -> Iterator[FakeGenericAllDifferentDeliverySourceImap]:
+        yield source
+
+    with mock.patch("components.provider_ops.imap_connection", fake_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
+    rows_by_mailbox = {tuple(row["source_mailboxes"]): row for row in manifest}
+    assert set(rows_by_mailbox) == {("INBOX",), ("All Mail",)}
+    assert rows_by_mailbox[("INBOX",)]["flags"] == "\\Seen"
+    assert rows_by_mailbox[("All Mail",)]["flags"] == "\\Flagged"
+    assert rows_by_mailbox[("INBOX",)]["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert rows_by_mailbox[("All Mail",)]["internaldate"] == "02-Jan-2024 00:00:00 +0000"
 
 
 def test_provider_export_resume_checks_stripped_generic_all_uidvalidity(tmp_path: Path) -> None:
@@ -13147,6 +13229,38 @@ def test_provider_preflight_counts_only_uncovered_generic_all_overlap_occurrence
         ok, issues = provider_preflight(config, max_workers=1)
 
     assert ok, issues
+
+
+def test_provider_preflight_counts_generic_all_same_body_different_delivery(tmp_path: Path) -> None:
+    source = FakeGenericAllDifferentDeliverySourceImap()
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(method="password", username="source@example.com", password="imap-secret"),
+        ),
+        target=ProviderEndpoint(
+            provider="icloud",
+            host="imap.mail.me.com",
+            auth=AuthConfig(method="app_password", username="target", password="icloud-secret"),
+            available_bytes=len(source.body),
+        ),
+        accounts=[MigrationAccount(source_email="source@example.com", target_email="target@icloud.com")],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+
+    @contextlib.contextmanager
+    def fake_connection(endpoint, *_args, **_kwargs):
+        yield source if endpoint.provider == "imap" else FakePreflightTarget()
+
+    with mock.patch("components.provider_ops.imap_connection", fake_connection):
+        ok, issues = provider_preflight(config, max_workers=1)
+
+    assert not ok
+    assert any(
+        f"estimated source bytes {len(source.body) * 2} exceed target.available_bytes {len(source.body)}" in issue
+        for issue in issues
+    )
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
