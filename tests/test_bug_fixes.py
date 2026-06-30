@@ -15828,6 +15828,35 @@ class TestRound7ConfirmedBugs:
 
         assert out.read_text() == "raced\n"
 
+    def test_indexer_write_json_removes_temp_after_file_fsync_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import directadmin_indexer
+
+        out = tmp_path / "export.pass.config.json"
+        payload = {"accounts": [{"email": "a@example.com", "password": "SECRET"}]}
+        fsynced_dirs: List[int] = []
+        real_fsync = directadmin_indexer.os.fsync
+
+        def fail_regular_file_fsync(fd: int) -> None:
+            mode = directadmin_indexer.os.fstat(fd).st_mode
+            if stat.S_ISREG(mode):
+                raise OSError("simulated file fsync failure")
+            if stat.S_ISDIR(mode):
+                fsynced_dirs.append(directadmin_indexer.os.fstat(fd).st_ino)
+            real_fsync(fd)
+
+        monkeypatch.setattr(directadmin_indexer.os, "fsync", fail_regular_file_fsync)
+
+        with pytest.raises(OSError, match="simulated file fsync failure"):
+            directadmin_indexer.write_json(payload, str(out), overwrite=False)
+
+        assert not out.exists()
+        assert list(tmp_path.glob(".export.pass.config.json.*.tmp")) == []
+        assert tmp_path.stat().st_ino in fsynced_dirs
+
     def test_legacy_export_refuses_preexisting_temp_symlink(
         self,
         tmp_path: Path,

@@ -377,6 +377,7 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
     out = Path(out_path)
     parent_fd, name, parent_path = _open_or_create_indexer_parent_dir(out, "output")
     tmp_name = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
+    created_tmp = False
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -391,13 +392,14 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
             if exc.errno in {errno.ELOOP, errno.EMLINK}:
                 raise RuntimeError(f"refusing to use symlinked indexer temporary file: {out.with_name(tmp_name)}") from exc
             raise
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
+        created_tmp = True
         try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             if overwrite:
                 os.rename(tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 tmp_name = ""
@@ -425,9 +427,15 @@ def write_json(payload: Dict[str, Any], out_path: str, overwrite: bool) -> None:
                 _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
                 _raise_if_indexer_parent_replaced(parent_path, parent_fd, "output")
         except Exception:
-            if tmp_name:
-                with contextlib.suppress(FileNotFoundError):
+            if tmp_name and created_tmp:
+                removed_tmp = False
+                try:
                     os.unlink(tmp_name, dir_fd=parent_fd)
+                    removed_tmp = True
+                except FileNotFoundError:
+                    pass
+                if removed_tmp:
+                    _fsync_indexer_directory_fd(parent_fd, parent_path, "output")
             raise
     finally:
         os.close(parent_fd)
