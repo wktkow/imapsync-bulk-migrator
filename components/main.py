@@ -1699,6 +1699,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 raise RuntimeError(f"{metadata_path}: failed to parse message metadata: {exc}") from exc
                             if not isinstance(metadata, dict):
                                 raise RuntimeError(f"{metadata_path}: message metadata is not an object")
+                            account_meta = str(metadata.get("account") or "")
+                            if account_meta != acc.email:
+                                raise RuntimeError(
+                                    f"{metadata_path}: account metadata mismatch "
+                                    f"(account={acc.email} meta={account_meta})"
+                                )
                             expected_size, expected_hash = _validate_legacy_sidecar_integrity(metadata_path, metadata)
                             expected_flags, _expected_internaldate = _validate_legacy_delivery_metadata(
                                 metadata,

@@ -16819,6 +16819,86 @@ class TestRound7ConfirmedBugs:
         assert eml.read_bytes() == swapped
         assert rc == 4
 
+    def test_validate_rejects_sidecar_account_changed_after_audit(self, tmp_path: Path) -> None:
+        from components.audit import audit_export as real_audit_export
+        from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
+        from components.main import main
+        from components.models import ServerConfig
+
+        input_root = tmp_path / "exported"
+        folder = input_root / "user@example.com" / "INBOX"
+        source_server = {
+            "host": "source.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        target_server = {
+            "host": "target.example.com",
+            "port": 993,
+            "ssl": True,
+            "starttls": False,
+        }
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <validate-account-swap@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody",
+            source_server=ServerConfig(**source_server),
+        )
+        meta_path = eml.with_suffix(".json")
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": target_server,
+            "source_server": source_server,
+            "accounts": [{"email": "user@example.com", "password": "secret"}],
+        }))
+        calls = 0
+
+        class FakeRemote:
+            def list(self):
+                return "OK", [b'(\\HasNoChildren) "/" "INBOX"']
+
+            def select(self, *_args, **_kwargs):
+                return "OK", [b"1"]
+
+            def uid(self, command: str, *args):
+                if command == "search":
+                    return "OK", [b"1"]
+                raise AssertionError(command)
+
+        @contextlib.contextmanager
+        def fake_connection(*_args, **_kwargs):
+            yield FakeRemote()
+
+        def audit_then_change_account(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = real_audit_export(*args, **kwargs)
+            if calls == 2:
+                meta = json.loads(meta_path.read_text())
+                meta["account"] = "other@example.com"
+                meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+                meta_path.write_text(json.dumps(meta))
+            return result
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", side_effect=audit_then_change_account), \
+            mock.patch("components.imap_ops.imap_connection", fake_connection), \
+            mock.patch("components.imap_ops._legacy_remote_has_message", return_value=True):
+            rc = main([
+                "--mode", "validate",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+            ])
+
+        assert calls == 2
+        assert json.loads(meta_path.read_text())["account"] == "other@example.com"
+        assert rc == 4
+
     def test_main_signal_handler_sets_stop_without_logging_first(self, tmp_path: Path) -> None:
         from components.main import main
 
