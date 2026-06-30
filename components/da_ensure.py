@@ -36,7 +36,8 @@ def ensure_accounts_exist_directadmin(
     ignore_errors: bool = False,
     quota_mb: int = 0,
     stop_event: Optional[Any] = None,
-) -> None:
+) -> Set[str]:
+    failed: Set[str] = set()
     per_domain = _accounts_by_domain(config)
     for domain, accounts in per_domain.items():
         _raise_if_stopped(stop_event, f"directadmin provisioning {domain}")
@@ -46,6 +47,7 @@ def ensure_accounts_exist_directadmin(
             logging.error("[da] Failed to list accounts for domain %s: %s", domain, exc)
             if dry_run or not ignore_errors:
                 raise
+            failed.update(acc.email for acc in accounts)
             continue
         for acc in accounts:
             local = acc.email.split("@", 1)[0]
@@ -62,8 +64,10 @@ def ensure_accounts_exist_directadmin(
                 logging.info("[da] Created mailbox: %s", acc.email)
             except Exception as exc:
                 logging.error("[da] Failed to create %s: %s", acc.email, exc)
+                failed.add(acc.email)
                 if not ignore_errors:
                     raise
+    return failed
 
 
 def reset_accounts_directadmin(

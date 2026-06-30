@@ -1160,7 +1160,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     stop_event=stop_event,
                 )
             else:
-                ensure_accounts_exist_directadmin(
+                failed_accounts = ensure_accounts_exist_directadmin(
                     config,
                     da_client,
                     dry_run=bool(args.da_dry_run),
@@ -1168,6 +1168,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     quota_mb=int(args.da_quota_mb),
                     stop_event=stop_event,
                 )
+                panel_reset_failed_accounts = set(failed_accounts or ())
             logging.info("[da] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[da] Auto-provisioning failed: %s", exc)
@@ -1200,7 +1201,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     stop_event=stop_event,
                 )
             else:
-                ensure_accounts_exist_cpanel(
+                failed_accounts = ensure_accounts_exist_cpanel(
                     config,
                     cpanel_client,
                     dry_run=bool(args.cpanel_dry_run),
@@ -1208,6 +1209,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     quota_mb=int(args.cpanel_quota_mb),
                     stop_event=stop_event,
                 )
+                panel_reset_failed_accounts = set(failed_accounts or ())
             logging.info("[cpanel] Auto-provisioning step completed")
         except Exception as exc:
             logging.error("[cpanel] Auto-provisioning failed: %s", exc)
@@ -1242,11 +1244,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 logging.info("Running connectivity tests (imaplib + imapsync --justconnect) ...")
                 assert isinstance(config, Config)
                 connectivity_config = config
-                if args.mode == "import" and bool(getattr(args, "reset", False)) and panel_reset_failed_accounts:
+                if args.mode == "import" and panel_reset_failed_accounts:
                     active_accounts = [acc for acc in config.accounts if acc.email not in panel_reset_failed_accounts]
                     skipped = len(config.accounts) - len(active_accounts)
                     logging.info(
-                        "[panel] Skipping connectivity tests for %d account(s) whose control-panel reset failed",
+                        "[panel] Skipping connectivity tests for %d account(s) whose control-panel setup failed",
                         skipped,
                     )
                     connectivity_config = Config(server=config.server, accounts=active_accounts, source_server=config.source_server)
@@ -1496,7 +1498,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if stop_event.is_set():
                     raise RuntimeError(f"legacy import {acc.email}: stop requested before completion")
                 if acc.email in panel_reset_failed_accounts:
-                    logging.error("[panel] Skipping import for %s because control-panel reset failed", acc.email)
+                    logging.error("[panel] Skipping import for %s because control-panel setup failed", acc.email)
                     return
                 da_ctx = None
                 provision_ctx = None
@@ -1534,7 +1536,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return stop_rc
             if panel_reset_failed_accounts:
                 logging.error(
-                    "[panel] Import skipped %d account(s) because control-panel reset failed: %s",
+                    "[panel] Import skipped %d account(s) because control-panel setup failed: %s",
                     len(panel_reset_failed_accounts),
                     ", ".join(sorted(panel_reset_failed_accounts)),
                 )

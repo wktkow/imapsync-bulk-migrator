@@ -38,7 +38,8 @@ def ensure_accounts_exist_cpanel(
     ignore_errors: bool = False,
     quota_mb: int = 0,
     stop_event: Optional[Any] = None,
-) -> None:
+) -> Set[str]:
+    failed: Set[str] = set()
     for domain, accounts in _accounts_by_domain(config).items():
         _raise_if_stopped(stop_event, f"cpanel provisioning {domain}")
         try:
@@ -47,6 +48,7 @@ def ensure_accounts_exist_cpanel(
             logging.error("[cpanel] Failed to list accounts for domain %s: %s", domain, exc)
             if dry_run or not ignore_errors:
                 raise
+            failed.update(acc.email for acc in accounts)
             continue
         for acc in accounts:
             local = acc.email.split("@", 1)[0]
@@ -63,8 +65,10 @@ def ensure_accounts_exist_cpanel(
                 logging.info("[cpanel] Created mailbox: %s", acc.email)
             except Exception as exc:
                 logging.error("[cpanel] Failed to create %s: %s", acc.email, exc)
+                failed.add(acc.email)
                 if not ignore_errors:
                     raise
+    return failed
 
 
 def reset_accounts_cpanel(

@@ -8167,6 +8167,75 @@ class TestDirectAdminIndexerHardening:
         assert tested == [["ok@example.com"]]
         assert imported == ["ok@example.com"]
 
+    def test_directadmin_create_ignore_errors_skips_failed_account_for_connectivity_and_import(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            _write_legacy_message_fixture(input_dir / email / "INBOX")
+
+        class DummyDirectAdminClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def list_pop_accounts(self, domain: str) -> List[str]:
+                return []
+
+            def create_pop_account(
+                self,
+                domain: str,
+                local_part: str,
+                password: str,
+                quota_mb: int = 0,
+                *,
+                allow_existing: bool = True,
+            ) -> None:
+                if local_part == "skip":
+                    raise RuntimeError("quota exceeded")
+
+        tested: List[List[str]] = []
+        imported: List[str] = []
+
+        def fake_test_accounts(config, *_args, **_kwargs) -> None:
+            tested.append([acc.email for acc in config.accounts])
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
+            mock.patch("components.main.test_accounts", fake_test_accounts), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-da",
+                "--ignore-errors",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+            ])
+
+        assert rc == 3
+        assert tested == [["ok@example.com"]]
+        assert imported == ["ok@example.com"]
+
     def test_import_skips_all_accounts_when_reset_setup_fails_under_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
@@ -8472,6 +8541,75 @@ class TestCPanelProvisioning:
             ])
 
         assert rc == 3
+        assert imported == ["ok@example.com"]
+
+    def test_cpanel_create_ignore_errors_skips_failed_account_for_connectivity_and_import(self, tmp_path: Path) -> None:
+        from components.main import main
+
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "source_server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},
+            "accounts": [
+                {"email": "skip@example.com", "password": "secret"},
+                {"email": "ok@example.com", "password": "secret"},
+            ],
+        }))
+        input_dir = tmp_path / "exported"
+        for email in ("skip@example.com", "ok@example.com"):
+            _write_legacy_message_fixture(input_dir / email / "INBOX")
+
+        class DummyCPanelClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def list_pop_accounts(self, domain: str) -> List[str]:
+                return []
+
+            def create_pop_account(
+                self,
+                domain: str,
+                local_part: str,
+                password: str,
+                quota_mb: int = 0,
+                *,
+                allow_existing: bool = True,
+            ) -> None:
+                if local_part == "skip":
+                    raise RuntimeError("quota exceeded")
+
+        tested: List[List[str]] = []
+        imported: List[str] = []
+
+        def fake_test_accounts(config, *_args, **_kwargs) -> None:
+            tested.append([acc.email for acc in config.accounts])
+
+        def fake_import_account(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.utils.ensure_imapsync_available"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.audit_export", return_value=(True, [])), \
+            mock.patch("components.main.CPanelClient", DummyCPanelClient), \
+            mock.patch("components.main.test_accounts", fake_test_accounts), \
+            mock.patch("components.main.import_account", fake_import_account):
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_dir),
+                "--log-dir", str(tmp_path / "logs"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--auto-provision-cpanel",
+                "--ignore-errors",
+                "--cpanel-url", "https://panel.example.com:2083",
+                "--cpanel-username", "cpuser",
+                "--cpanel-token", "api-token",
+            ])
+
+        assert rc == 3
+        assert tested == [["ok@example.com"]]
         assert imported == ["ok@example.com"]
 
     def test_cpanel_reset_archives_journal_and_skips_failed_connectivity_account(self, tmp_path: Path) -> None:
