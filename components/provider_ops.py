@@ -934,11 +934,82 @@ def _parse_parenthesized_words(raw: str, *, drop_literal_markers: bool = False) 
     return words
 
 
-def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
-    match = re.search(rf"{re.escape(atom)}\s+\(", meta_str, flags=re.IGNORECASE)
-    if not match:
+def _provider_fetch_atom_value_start(meta_str: str, atom: str) -> Optional[int]:
+    atom_upper = atom.upper()
+    atom_len = len(atom)
+    depth = 0
+    in_quote = False
+    escaped = False
+    idx = 0
+    while idx < len(meta_str):
+        ch = meta_str[idx]
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quote = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+            idx += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            idx += 1
+            continue
+        if depth <= 1 and meta_str[idx : idx + atom_len].upper() == atom_upper:
+            before = meta_str[idx - 1] if idx else ""
+            after_idx = idx + atom_len
+            after = meta_str[after_idx] if after_idx < len(meta_str) else ""
+            if (not before or not (before.isalnum() or before in "_.-")) and after.isspace():
+                value_idx = after_idx
+                while value_idx < len(meta_str) and meta_str[value_idx].isspace():
+                    value_idx += 1
+                return value_idx
+        idx += 1
+    return None
+
+
+_PROVIDER_FETCH_ITEM_ATOMS = (
+    "BODY.PEEK[]",
+    "RFC822.SIZE",
+    "INTERNALDATE",
+    "X-GM-LABELS",
+    "X-GM-MSGID",
+    "X-GM-THRID",
+    "BODY[]",
+    "FLAGS",
+    "RFC822",
+    "UID",
+)
+
+
+def _provider_fetch_item_atom_at(meta_str: str, idx: int) -> bool:
+    before = meta_str[idx - 1] if idx else ""
+    if before and (before.isalnum() or before in "_.-"):
+        return False
+    for atom in _PROVIDER_FETCH_ITEM_ATOMS:
+        atom_len = len(atom)
+        if meta_str[idx : idx + atom_len].upper() != atom:
+            continue
+        after_idx = idx + atom_len
+        after = meta_str[after_idx] if after_idx < len(meta_str) else ""
+        if not after or after.isspace() or after in "({":
+            return True
+    return False
+
+
+def _extract_parenthesized_from(meta_str: str, start: int) -> str:
+    if start >= len(meta_str) or meta_str[start] != "(":
         return ""
-    start = match.end() - 1
     depth = 0
     in_quote = False
     escaped = False
@@ -976,13 +1047,185 @@ def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
     return ""
 
 
+def _extract_parenthesized_after(meta_str: str, atom: str) -> str:
+    start = _provider_fetch_atom_value_start(meta_str, atom)
+    if start is None:
+        return ""
+    return _extract_parenthesized_from(meta_str, start)
+
+
+def _provider_fetch_number_after(meta_str: str, atom: str) -> str:
+    start = _provider_fetch_atom_value_start(meta_str, atom)
+    if start is None:
+        return ""
+    idx = start
+    while idx < len(meta_str) and meta_str[idx].isdigit():
+        idx += 1
+    if idx == start:
+        return ""
+    next_ch = meta_str[idx] if idx < len(meta_str) else ""
+    if next_ch and (next_ch.isalnum() or next_ch in "_.-"):
+        return ""
+    return meta_str[start:idx]
+
+
+def _provider_fetch_quoted_after(meta_str: str, atom: str) -> str:
+    start = _provider_fetch_atom_value_start(meta_str, atom)
+    if start is None or start >= len(meta_str) or meta_str[start] != '"':
+        return ""
+    chars: List[str] = []
+    escaped = False
+    for ch in meta_str[start + 1 :]:
+        if escaped:
+            chars.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            return "".join(chars)
+        else:
+            chars.append(ch)
+    return ""
+
+
+def _provider_fetch_labels_has_literal_marker(meta_str: str) -> bool:
+    start = _provider_fetch_atom_value_start(meta_str, "X-GM-LABELS")
+    if start is None:
+        return False
+    tail = meta_str[start:]
+    idx = 0
+    while idx < len(tail) and tail[idx].isspace():
+        idx += 1
+    if re.match(r"\{\d+\}", tail[idx:]):
+        return True
+    if idx >= len(tail) or tail[idx] != "(":
+        return False
+    depth = 0
+    in_quote = False
+    escaped = False
+    while idx < len(tail):
+        ch = tail[idx]
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quote = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+            idx += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            if depth == 0:
+                return False
+            idx += 1
+            continue
+        if depth >= 1 and re.match(r"\{\d+\}", tail[idx:]):
+            return True
+        idx += 1
+    return False
+
+
 def _trim_gmail_label_list_at_fetch_item(raw: str) -> str:
-    match = re.search(
-        r'(?i)(?:^|\s)(?:UID\s+\d+|RFC822\.SIZE\s+\d+|FLAGS\s+\(|INTERNALDATE\s+"|'
-        r"X-GM-(?:MSGID|THRID|LABELS)\s+|BODY(?:\.PEEK)?\[)",
-        raw,
-    )
-    return raw[: match.start()].rstrip() if match else raw
+    in_quote = False
+    escaped = False
+    saw_literal_marker = False
+    idx = 0
+    while idx < len(raw):
+        ch = raw[idx]
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quote = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            idx += 1
+            continue
+        literal_match = re.match(r"\{\d+\}", raw[idx:])
+        if literal_match:
+            saw_literal_marker = True
+            idx += len(literal_match.group(0))
+            continue
+        if saw_literal_marker and _provider_fetch_item_atom_at(raw, idx):
+            return raw[:idx].rstrip()
+        idx += 1
+    return raw
+
+
+def _provider_fetch_label_value_end(meta_str: str, start: int) -> int:
+    idx = start
+    while idx < len(meta_str) and meta_str[idx].isspace():
+        idx += 1
+    if idx >= len(meta_str):
+        return idx
+    literal_match = re.match(r"\{\d+\}", meta_str[idx:])
+    if literal_match:
+        return idx + len(literal_match.group(0))
+    if meta_str[idx] != "(":
+        while idx < len(meta_str) and not meta_str[idx].isspace() and meta_str[idx] != ")":
+            idx += 1
+        return idx
+    depth = 0
+    in_quote = False
+    escaped = False
+    saw_literal_marker = False
+    while idx < len(meta_str):
+        ch = meta_str[idx]
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quote = False
+            idx += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+            idx += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            idx += 1
+            if depth == 0:
+                return idx
+            continue
+        literal_match = re.match(r"\{\d+\}", meta_str[idx:])
+        if depth >= 1 and literal_match:
+            saw_literal_marker = True
+            idx += len(literal_match.group(0))
+            continue
+        if depth == 1 and saw_literal_marker and _provider_fetch_item_atom_at(meta_str, idx):
+            return idx
+        idx += 1
+    return idx
+
+
+def _provider_fetch_meta_without_label_values(meta_str: str) -> str:
+    start = _provider_fetch_atom_value_start(meta_str, "X-GM-LABELS")
+    if start is None:
+        return meta_str
+    end = _provider_fetch_label_value_end(meta_str, start)
+    return f"{meta_str[:start]}(){meta_str[end:]}"
 
 
 _MAX_GMAIL_UINT64 = (1 << 64) - 1
@@ -1221,11 +1464,12 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
             matches_expected = classify_meta(meta_text, is_body=bool(body_is_message))
             if meta_text and matches_expected:
                 meta_chunks.append(meta_text)
-            if re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE):
+            has_label_literal = _provider_fetch_labels_has_literal_marker(meta_text)
+            if has_label_literal:
                 label_literal_context = True
                 label_literal_matches_expected = matches_expected
             is_label_literal = bool(
-                re.search(r"\bX-GM-LABELS\b[^\r\n]*\{\d+\}", meta_text, flags=re.IGNORECASE)
+                has_label_literal
                 or (label_literal_context and re.fullmatch(r"\s*\{\d+\}\s*", meta_text))
             )
             if body_is_message:
@@ -1274,12 +1518,9 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
     if not seen_expected_uid and expected_uid_int is not None:
         raise RuntimeError(f"fetch response for UID {expected_uid_int} did not include UID metadata")
     meta_str = " ".join(meta_chunks)
+    meta_without_labels = _provider_fetch_meta_without_label_values(meta_str)
 
-    def group(pattern: str) -> Optional[str]:
-        match = re.search(pattern, meta_str, flags=re.IGNORECASE)
-        return match.group(1) if match else None
-
-    size_raw = group(r"RFC822\.SIZE\s+(\d+)")
+    size_raw = _provider_fetch_number_after(meta_without_labels, "RFC822.SIZE")
     labels_raw = _extract_parenthesized_after(meta_str, "X-GM-LABELS")
     if literal_labels and labels_raw:
         labels_raw = _trim_gmail_label_list_at_fetch_item(labels_raw)
@@ -1287,12 +1528,12 @@ def parse_provider_fetch_response(fetch_response: Iterable[Any], *, expected_uid
     for label in literal_labels:
         if label not in labels:
             labels.append(label)
-    gmail_msgid = _valid_gmail_uint64(group(r"X-GM-MSGID\s+(\d+)") or "")
-    gmail_thrid = _valid_gmail_uint64(group(r"X-GM-THRID\s+(\d+)") or "")
+    gmail_msgid = _valid_gmail_uint64(_provider_fetch_number_after(meta_without_labels, "X-GM-MSGID"))
+    gmail_thrid = _valid_gmail_uint64(_provider_fetch_number_after(meta_without_labels, "X-GM-THRID"))
     return {
         "message_bytes": msg_bytes,
-        "flags": group(r"FLAGS\s+\((.*?)\)") or "",
-        "internaldate": group(r'INTERNALDATE\s+"([^"]+)"') or "",
+        "flags": _extract_parenthesized_after(meta_without_labels, "FLAGS"),
+        "internaldate": _provider_fetch_quoted_after(meta_without_labels, "INTERNALDATE"),
         "rfc822_size": int(size_raw) if size_raw else (len(msg_bytes) if msg_bytes is not None else 0),
         "gmail_msgid": gmail_msgid,
         "gmail_thrid": gmail_thrid,
