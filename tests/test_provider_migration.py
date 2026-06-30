@@ -1003,6 +1003,43 @@ def test_provider_prune_rejects_artifact_root_swap_before_unlink(tmp_path: Path)
     assert (checked_messages / "stale.eml").exists()
 
 
+def test_provider_prune_rejects_child_artifact_dir_swap_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    account_dir = tmp_path / "source@example.com"
+    nested = account_dir / "messages" / "nested"
+    nested.mkdir(parents=True)
+    stale = nested / "stale.eml"
+    stale.write_bytes(b"stale")
+    checked_nested = tmp_path / "checked-nested"
+    replacement = stale
+    real_open = provider_ops.os.open
+    real_rename = provider_ops.os.rename
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "nested" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            real_rename(nested, checked_nested)
+            nested.mkdir()
+            replacement.write_bytes(b"replacement")
+        return fd
+
+    monkeypatch.setattr(provider_ops.os, "open", racing_open)
+
+    with pytest.raises(RuntimeError, match="replaced provider artifact directory"):
+        _prune_provider_artifact_orphans(account_dir, [])
+
+    assert swapped
+    assert (checked_nested / "stale.eml").read_bytes() == b"stale"
+    assert replacement.read_bytes() == b"replacement"
+
+
 def test_provider_prune_fsyncs_parent_after_unlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

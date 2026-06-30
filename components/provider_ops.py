@@ -2577,10 +2577,17 @@ def _prune_provider_artifact_orphans_at(
     file_suffix: str,
     expected: set[str],
     guard: Callable[[], None],
+    current_guard: Optional[Callable[[], None]] = None,
 ) -> None:
     parent_path = account_dir / root_name
     for part in relative_parts:
         parent_path /= part
+
+    def ensure_current() -> None:
+        guard()
+        if current_guard is not None:
+            current_guard()
+
     for name in sorted(os.listdir(parent_fd)):
         child_parts = relative_parts + (name,)
         rel_path = "/".join((root_name, *child_parts))
@@ -2599,6 +2606,22 @@ def _prune_provider_artifact_orphans_at(
                     raise RuntimeError(f"refusing to prune non-directory provider artifact path: {display_path}")
                 if child_stat.st_dev != stat_result.st_dev or child_stat.st_ino != stat_result.st_ino:
                     raise RuntimeError(f"refusing to prune replaced provider artifact directory: {display_path}")
+
+                def child_guard() -> None:
+                    ensure_current()
+                    try:
+                        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError as exc:
+                        raise RuntimeError(f"refusing to prune replaced provider artifact directory: {display_path}") from exc
+                    pinned = os.fstat(child_fd)
+                    if (
+                        not stat.S_ISDIR(current.st_mode)
+                        or current.st_dev != pinned.st_dev
+                        or current.st_ino != pinned.st_ino
+                    ):
+                        raise RuntimeError(f"refusing to prune replaced provider artifact directory: {display_path}")
+
+                child_guard()
                 _prune_provider_artifact_orphans_at(
                     child_fd,
                     account_dir,
@@ -2607,7 +2630,9 @@ def _prune_provider_artifact_orphans_at(
                     file_suffix,
                     expected,
                     guard,
+                    child_guard,
                 )
+                child_guard()
             finally:
                 os.close(child_fd)
             continue
@@ -2618,10 +2643,10 @@ def _prune_provider_artifact_orphans_at(
                 raise RuntimeError(f"refusing to prune non-regular provider artifact: {display_path}")
             continue
         if rel_path not in expected:
-            guard()
+            ensure_current()
             os.unlink(name, dir_fd=parent_fd)
             _fsync_provider_directory_fd(parent_fd, parent_path, "artifact directory")
-            guard()
+            ensure_current()
 
 
 def journal_row_issues(rows: List[Dict[str, Any]], account: MigrationAccount) -> List[str]:

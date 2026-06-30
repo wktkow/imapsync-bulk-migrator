@@ -1513,6 +1513,20 @@ def _remove_stale_export_files(folder_dir: Path, expected_stems: set[str]) -> No
         os.close(dir_fd)
 
 
+def _raise_if_legacy_child_dir_replaced(parent_fd: int, name: str, child_fd: int, display_path: Path) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"refusing to delete replaced legacy mailbox directory: {display_path}") from exc
+    pinned = os.fstat(child_fd)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != pinned.st_dev
+        or current.st_ino != pinned.st_ino
+    ):
+        raise RuntimeError(f"refusing to delete replaced legacy mailbox directory: {display_path}")
+
+
 def _remove_legacy_dir_tree_at(
     parent_fd: int,
     name: str,
@@ -1535,6 +1549,12 @@ def _remove_legacy_dir_tree_at(
             raise RuntimeError(f"refusing to delete non-directory legacy mailbox path: {display_path}")
         if child_stat.st_dev != stat_result.st_dev or child_stat.st_ino != stat_result.st_ino:
             raise RuntimeError(f"refusing to delete replaced legacy mailbox directory: {display_path}")
+
+        def child_guard() -> None:
+            guard()
+            _raise_if_legacy_child_dir_replaced(parent_fd, name, child_fd, display_path)
+
+        child_guard()
         for child_name in sorted(os.listdir(child_fd)):
             child_path = display_path / child_name
             try:
@@ -1544,20 +1564,21 @@ def _remove_legacy_dir_tree_at(
             if stat.S_ISLNK(child_entry_stat.st_mode):
                 raise RuntimeError(f"refusing to delete symlinked legacy mailbox path: {child_path}")
             if stat.S_ISDIR(child_entry_stat.st_mode):
-                _remove_legacy_dir_tree_at(child_fd, child_name, child_path, guard)
+                child_guard()
+                _remove_legacy_dir_tree_at(child_fd, child_name, child_path, child_guard)
                 continue
             if not stat.S_ISREG(child_entry_stat.st_mode):
                 raise RuntimeError(f"refusing to delete non-regular legacy mailbox path: {child_path}")
-            guard()
+            child_guard()
             os.unlink(child_name, dir_fd=child_fd)
             _fsync_legacy_directory_fd(child_fd, display_path, "legacy mailbox directory")
-            guard()
+            child_guard()
+        child_guard()
+        os.rmdir(name, dir_fd=parent_fd)
+        _fsync_legacy_directory_fd(parent_fd, display_path.parent, "legacy mailbox directory")
+        guard()
     finally:
         os.close(child_fd)
-    guard()
-    os.rmdir(name, dir_fd=parent_fd)
-    _fsync_legacy_directory_fd(parent_fd, display_path.parent, "legacy mailbox directory")
-    guard()
 
 
 def _remove_stale_mailbox_dirs(account_dir: Path, expected_paths: set[str]) -> None:

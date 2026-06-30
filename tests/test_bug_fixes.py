@@ -10192,6 +10192,43 @@ print("ok")
         assert outside_file.exists()
         assert (checked_account / "Archive" / "u0000000001.eml").exists()
 
+    def test_legacy_export_stale_mailbox_cleanup_rejects_child_dir_swap_after_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from components import imap_ops
+
+        account_dir = tmp_path / "user@example.com"
+        stale_dir = account_dir / "Archive"
+        stale_dir.mkdir(parents=True)
+        stale_file = stale_dir / "u0000000001.eml"
+        stale_file.write_text("stale\n")
+        checked_stale_dir = tmp_path / "checked-archive"
+        replacement_file = stale_file
+        real_open = imap_ops.os.open
+        real_rename = imap_ops.os.rename
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == "Archive" and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                real_rename(stale_dir, checked_stale_dir)
+                stale_dir.mkdir()
+                replacement_file.write_text("replacement\n")
+            return fd
+
+        monkeypatch.setattr(imap_ops.os, "open", racing_open)
+
+        with pytest.raises(RuntimeError, match="replaced legacy mailbox directory"):
+            imap_ops._remove_stale_mailbox_dirs(account_dir, set())
+
+        assert swapped
+        assert (checked_stale_dir / "u0000000001.eml").read_text() == "stale\n"
+        assert replacement_file.read_text() == "replacement\n"
+
     def test_legacy_export_stale_mailbox_cleanup_rejects_nested_symlink(self, tmp_path: Path) -> None:
         from components import imap_ops
 
