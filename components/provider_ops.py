@@ -3429,6 +3429,42 @@ def _provider_export_flag_set(flags: object) -> set[str]:
     }
 
 
+_ProviderVirtualDeliveryKey = Tuple[Tuple[str, ...], str]
+
+
+def _provider_virtual_delivery_key(parsed: Dict[str, Any]) -> _ProviderVirtualDeliveryKey:
+    return (
+        tuple(sorted(_provider_export_flag_set(parsed.get("flags")))),
+        _normalized_provider_internaldate(parsed.get("internaldate")),
+    )
+
+
+def _uncovered_provider_virtual_items(
+    pending_items: List[Any],
+    *,
+    remaining_ordinary: int,
+    ordinary_delivery_remaining: Dict[_ProviderVirtualDeliveryKey, int],
+    delivery_key: Callable[[Any], _ProviderVirtualDeliveryKey],
+) -> Tuple[List[Any], int]:
+    if remaining_ordinary <= 0 or not pending_items:
+        return pending_items, 0
+    kept: List[Any] = []
+    consumed = 0
+    for item in pending_items:
+        key = delivery_key(item)
+        key_remaining = ordinary_delivery_remaining.get(key, 0)
+        if consumed < remaining_ordinary and key_remaining > 0:
+            ordinary_delivery_remaining[key] = key_remaining - 1
+            consumed += 1
+        else:
+            kept.append(item)
+    fallback = min(max(remaining_ordinary - consumed, 0), len(kept))
+    if fallback:
+        kept = kept[fallback:]
+        consumed += fallback
+    return kept, consumed
+
+
 def _merge_provider_export_flag_strings(existing_flags: object, additional_flags: object) -> str:
     merged: List[str] = []
     seen: set[str] = set()
@@ -3474,6 +3510,7 @@ def provider_export_account(
     previous_rows_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
+    ordinary_delivery_remaining_for_all: Dict[Tuple[int, str], Dict[_ProviderVirtualDeliveryKey, int]] = {}
     mergeable_provider_records_by_content: Dict[Tuple[int, str], List[Tuple[str, str]]] = {}
     scanned_uidvalidity_by_mailbox: Dict[str, str] = {}
     exported_delivery_by_mailbox_uid: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -3901,12 +3938,21 @@ def provider_export_account(
                     ordinary_content_remaining_for_all[content_identity] = (
                         ordinary_content_remaining_for_all.get(content_identity, 0) + 1
                     )
+                    delivery_key = _provider_virtual_delivery_key(parsed)
+                    delivery_remaining = ordinary_delivery_remaining_for_all.setdefault(content_identity, {})
+                    delivery_remaining[delivery_key] = delivery_remaining.get(delivery_key, 0) + 1
                 if not non_gmail_flagged_source:
                     remember_provider_mergeable_record(identity, content_identity)
             for content_identity, pending_messages in pending_all_messages_by_content.items():
                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
-                if len(pending_messages) <= remaining_ordinary:
-                    ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - len(pending_messages)
+                pending_messages, consumed_ordinary = _uncovered_provider_virtual_items(
+                    pending_messages,
+                    remaining_ordinary=remaining_ordinary,
+                    ordinary_delivery_remaining=ordinary_delivery_remaining_for_all.get(content_identity, {}),
+                    delivery_key=lambda item: _provider_virtual_delivery_key(item[3]),
+                )
+                ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - consumed_ordinary
+                if not pending_messages:
                     continue
                 for (
                     identity,
@@ -7136,6 +7182,7 @@ def provider_preflight(
                     and any(_is_non_gmail_all_mailbox(provider_key, mailbox) for mailbox in retained_source_mailboxes)
                 )
                 ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
+                ordinary_delivery_remaining_for_all: Dict[Tuple[int, str], Dict[_ProviderVirtualDeliveryKey, int]] = {}
                 for mailbox in retained_source_mailboxes:
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     try:
@@ -7146,7 +7193,7 @@ def provider_preflight(
                         account_issues.append(f"source mailbox {mailbox.name} scan failed: {exc}")
                         continue
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
-                    pending_all_sizes_by_content: Dict[Tuple[int, str], List[int]] = {}
+                    pending_all_sizes_by_content: Dict[Tuple[int, str], List[Tuple[int, _ProviderVirtualDeliveryKey]]] = {}
                     for uid in uids:
                         _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         status, data = source_imap.uid(
@@ -7187,7 +7234,10 @@ def provider_preflight(
                             if non_gmail_all_source:
                                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                                 if remaining_ordinary > 0:
-                                    pending_all_sizes_by_content.setdefault(content_identity, []).append(size)
+                                    pending_all_sizes_by_content.setdefault(content_identity, []).append((
+                                        size,
+                                        _provider_virtual_delivery_key(parsed),
+                                    ))
                                     continue
                                 source_total += size
                                 continue
@@ -7195,6 +7245,9 @@ def provider_preflight(
                                 ordinary_content_remaining_for_all[content_identity] = (
                                     ordinary_content_remaining_for_all.get(content_identity, 0) + 1
                                 )
+                                delivery_key = _provider_virtual_delivery_key(parsed)
+                                delivery_remaining = ordinary_delivery_remaining_for_all.setdefault(content_identity, {})
+                                delivery_remaining[delivery_key] = delivery_remaining.get(delivery_key, 0) + 1
                             else:
                                 identity = f"{mailbox.name}:{uid}"
                                 if identity in seen_identity:
@@ -7213,10 +7266,16 @@ def provider_preflight(
                         source_total += int(parsed.get("rfc822_size") or 0)
                     for content_identity, pending_sizes in pending_all_sizes_by_content.items():
                         remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
-                        if len(pending_sizes) <= remaining_ordinary:
-                            ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - len(pending_sizes)
+                        pending_sizes, consumed_ordinary = _uncovered_provider_virtual_items(
+                            pending_sizes,
+                            remaining_ordinary=remaining_ordinary,
+                            ordinary_delivery_remaining=ordinary_delivery_remaining_for_all.get(content_identity, {}),
+                            delivery_key=lambda item: item[1],
+                        )
+                        ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - consumed_ordinary
+                        if not pending_sizes:
                             continue
-                        source_total += sum(pending_sizes)
+                        source_total += sum(size for size, _delivery_key in pending_sizes)
         except Exception as exc:
             if _stop_requested(stop_event):
                 raise

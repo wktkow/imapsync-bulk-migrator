@@ -4698,7 +4698,7 @@ def test_provider_export_keeps_identical_generic_all_only_messages_distinct(tmp_
     assert all(row["source_mailboxes"] == ["All Mail"] for row in manifest)
 
 
-def test_provider_export_keeps_ambiguous_generic_all_overlap_occurrences(tmp_path: Path) -> None:
+def test_provider_export_counts_only_uncovered_generic_all_overlap_occurrences(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
             provider="imap",
@@ -4726,9 +4726,9 @@ def test_provider_export_keeps_ambiguous_generic_all_overlap_occurrences(tmp_pat
     account_dir = tmp_path / "source@example.com"
     manifest = [json.loads(line) for line in (account_dir / "manifest.jsonl").read_text().splitlines()]
     all_rows = [row for row in manifest if row["source_mailboxes"] == ["All Mail"]]
-    assert len(manifest) == 3
-    assert {row["uid_by_mailbox"]["All Mail"] for row in all_rows} == {1, 2}
-    flagged_row = next(row for row in all_rows if row["uid_by_mailbox"]["All Mail"] == 1)
+    assert len(manifest) == 2
+    assert {row["uid_by_mailbox"]["All Mail"] for row in all_rows} == {1}
+    flagged_row = all_rows[0]
     assert "\\Flagged" in flagged_row["flags"]
     assert flagged_row["internaldate"] == "02-Jan-2024 00:00:00 +0000"
 
@@ -13058,7 +13058,7 @@ def test_provider_preflight_counts_identical_generic_all_only_occurrences(tmp_pa
     )
 
 
-def test_provider_preflight_counts_ambiguous_generic_all_overlap_occurrences(tmp_path: Path) -> None:
+def test_provider_preflight_counts_only_uncovered_generic_all_overlap_occurrences(tmp_path: Path) -> None:
     source = FakeGenericAllAmbiguousOverlapSourceImap()
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(
@@ -13083,11 +13083,7 @@ def test_provider_preflight_counts_ambiguous_generic_all_overlap_occurrences(tmp
     with mock.patch("components.provider_ops.imap_connection", fake_connection):
         ok, issues = provider_preflight(config, max_workers=1)
 
-    assert not ok
-    assert any(
-        f"estimated source bytes {len(source.body) * 3} exceed target.available_bytes {len(source.body) * 2}" in issue
-        for issue in issues
-    )
+    assert ok, issues
 
 
 def test_provider_preflight_many_to_one_aggregates_target_available_bytes(tmp_path: Path) -> None:
