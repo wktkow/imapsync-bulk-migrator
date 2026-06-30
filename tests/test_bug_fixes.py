@@ -14751,6 +14751,38 @@ class TestRound7ConfirmedBugs:
         assert not audit_module._identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
         assert not main_module._legacy_identity_variant_slots_cover([], [local_slot], required_flags="\\Flagged")
 
+    def test_legacy_virtual_coverage_requires_all_local_slots_when_local_is_larger(self) -> None:
+        from components import audit as audit_module
+        from components import main as main_module
+
+        first = b"Message-ID: <partial-remote-virtual-1@example.com>\r\n\r\nbody"
+        second = b"Message-ID: <partial-remote-virtual-2@example.com>\r\n\r\nbody"
+        first_slot = ({(len(first), hashlib.sha256(first).hexdigest())}, "\\Seen \\Flagged", "")
+        second_slot = ({(len(second), hashlib.sha256(second).hexdigest())}, "\\Seen \\Flagged", "")
+
+        assert audit_module._identity_variant_slots_cover(
+            [first_slot],
+            [first_slot, second_slot],
+            required_flags="\\Flagged",
+        )
+        assert main_module._legacy_identity_variant_slots_cover(
+            [first_slot],
+            [first_slot, second_slot],
+            required_flags="\\Flagged",
+        )
+        assert not audit_module._identity_variant_slots_cover(
+            [first_slot],
+            [first_slot, second_slot],
+            required_flags="\\Flagged",
+            require_all_local=True,
+        )
+        assert not main_module._legacy_identity_variant_slots_cover(
+            [first_slot],
+            [first_slot, second_slot],
+            required_flags="\\Flagged",
+            require_all_local=True,
+        )
+
     def test_legacy_target_used_uids_are_scoped_by_uidvalidity(self) -> None:
         from components import audit as audit_module
         from components import imap_ops

@@ -111,8 +111,16 @@ def _identity_variant_slots_cover(
     local_slots: List[_LegacyCoverageSlot],
     *,
     required_flags: str = "",
+    require_all_local: bool = False,
 ) -> bool:
     if local_slots and not remote_slots:
+        return False
+    required_local_indexes = {
+        idx
+        for idx, (_local_identities, local_flags, _local_internaldate) in enumerate(local_slots)
+        if not required_flags or not _legacy_missing_target_flags(required_flags, local_flags)
+    }
+    if require_all_local and len(remote_slots) < len(required_local_indexes):
         return False
     if len(remote_slots) > len(local_slots):
         return False
@@ -152,6 +160,8 @@ def _identity_variant_slots_cover(
     for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
         if not assign(remote_idx, set()):
             return False
+    if require_all_local and not required_local_indexes.issubset(match_for_local):
+        return False
     return True
 
 
@@ -161,6 +171,7 @@ def _remote_mailbox_content_covered(
     local_identity_slots: List[_LegacyCoverageSlot],
     *,
     required_flags: str = "",
+    require_all_local: bool = False,
 ) -> bool:
     status, _ = imap.select(quote_mailbox_name(mailbox), readonly=True)
     if status != "OK":
@@ -194,7 +205,12 @@ def _remote_mailbox_content_covered(
             actual_flags or "",
             actual_date or "",
         ))
-    return _identity_variant_slots_cover(remote_slots, local_identity_slots, required_flags=required_flags)
+    return _identity_variant_slots_cover(
+        remote_slots,
+        local_identity_slots,
+        required_flags=required_flags,
+        require_all_local=require_all_local,
+    )
 
 
 def _remote_has_message(
@@ -863,6 +879,7 @@ def audit_account(
                                 remote_mailbox or local_mailbox,
                                 local_content_identity_slots,
                                 required_flags="\\Flagged" if _is_legacy_flagged_source_view(remote_attrs) else "",
+                                require_all_local=local_count > remote_count,
                             )
                         ):
                             continue
