@@ -27,10 +27,12 @@ from .imap_ops import (
     _is_legacy_flagged_source_view,
     _legacy_fetch_body_part_matches_sequence,
     _legacy_metadata_for_fetch_body_part,
+    _legacy_internaldates_equal,
     _legacy_missing_target_flags,
     _legacy_search_target_uids,
     _legacy_used_uid_key,
     _legacy_used_uid_namespace,
+    _maximum_bipartite_matching,
     _normalized_legacy_internaldate,
     _parse_fetch_response_for_uid,
     ensure_private_dir as ensure_legacy_private_dir,
@@ -65,6 +67,7 @@ from .utils import (
     check_environment,
     sanitize_for_path,
     sanitized_path_key,
+    validate_panel_base_url,
 )
 from .utils import check_free_space_for_path
 
@@ -267,7 +270,7 @@ def _legacy_remote_has_message(
         if missing_flags:
             flag_mismatches.append(missing_flags)
             continue
-        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+        if expected_date and not _legacy_internaldates_equal(actual_date, expected_date):
             date_mismatches.append(actual_date or "<missing>")
             continue
         if used_nums is not None:
@@ -329,30 +332,16 @@ def _legacy_identity_variant_slots_cover(
                 required_flags
                 and _normalized_legacy_internaldate(remote_internaldate)
                 and _normalized_legacy_internaldate(local_internaldate)
-                and _normalized_legacy_internaldate(remote_internaldate)
-                != _normalized_legacy_internaldate(local_internaldate)
+                and not _legacy_internaldates_equal(remote_internaldate, local_internaldate)
             )
         ]
         if not matches:
             return False
         edges.append(matches)
-    match_for_local: Dict[int, int] = {}
-
-    def assign(remote_idx: int, seen: Set[int]) -> bool:
-        for local_idx in edges[remote_idx]:
-            if local_idx in seen:
-                continue
-            seen.add(local_idx)
-            previous_remote = match_for_local.get(local_idx)
-            if previous_remote is None or assign(previous_remote, seen):
-                match_for_local[local_idx] = remote_idx
-                return True
+    matched_count, matched_local_indexes = _maximum_bipartite_matching(edges, len(local_slots))
+    if matched_count != len(remote_slots):
         return False
-
-    for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
-        if not assign(remote_idx, set()):
-            return False
-    if require_all_local and not required_local_indexes.issubset(match_for_local):
+    if require_all_local and not required_local_indexes.issubset(matched_local_indexes):
         return False
     return True
 
@@ -408,7 +397,7 @@ def _legacy_remote_mailbox_content_covered(
 
 
 def setup_logging(log_directory: Path) -> Path:
-    """Initialize root logger with file + stdout handlers and return log path."""
+    """Initialize root logger with file + stderr handlers and return log path."""
     ensure_legacy_private_dir(log_directory, label="log directory")
     import logging
     import sys
@@ -470,7 +459,7 @@ def setup_logging(log_directory: Path) -> Path:
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-    ch = logging.StreamHandler(sys.stdout)
+    ch = logging.StreamHandler(sys.stderr)
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
@@ -578,7 +567,7 @@ def test_accounts(
                 reason_lines.append(errors.get_nowait())
             except Exception:
                 break
-        raise RuntimeError(f"Connectivity test failed for some accounts:\n" + "\n".join(reason_lines))
+        raise RuntimeError("Connectivity test failed for some accounts:\n" + "\n".join(reason_lines))
 
 
 def _invalid_panel_account_emails(config: Config) -> List[str]:
@@ -594,6 +583,10 @@ def _invalid_panel_account_emails(config: Config) -> List[str]:
         ):
             invalid.append(acc.email)
     return invalid
+
+
+def _empty_panel_account_passwords(config: Config) -> List[str]:
+    return [acc.email for acc in config.accounts if not acc.password]
 
 
 def _legacy_staged_symlink_issues(in_root: Path, config: Config) -> List[str]:
@@ -733,14 +726,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-free-gb", type=float, default=1.0, help="Fail-fast if free disk space is lower")
     parser.add_argument("--resync-missing", action="store_true", help="Deprecated; validation reports missing messages without automatic APPEND replay")
     parser.add_argument("--no-audit-after-export", action="store_true", help="Do not run audit automatically after export")
-    parser.add_argument("--no-connectivity-test", action="store_true", help="Skip preflight connectivity tests")
+    parser.add_argument(
+        "--no-connectivity-test",
+        action="store_true",
+        help="Skip connectivity tests (not valid with test or preflight modes)",
+    )
     parser.add_argument("--audit-offline", action="store_true", help="Do not contact IMAP server during audit; perform local-only checks")
     parser.add_argument("--imap-timeout", type=float, default=60.0, help="Default IMAP socket timeout in seconds")
 
     parser.add_argument("--auto-provision-da", action="store_true", help="In import mode, if accounts don't exist on the panel, auto-create them via DirectAdmin API before tests and import")
     parser.add_argument("--reset", action="store_true", help="Import mode only: delete and recreate each mailbox on the panel before importing")
     parser.add_argument("--reset-confirm", required=False, help="Required for non-dry-run --reset; must match the target IMAP host or be YES")
-    parser.add_argument("--da-url", required=False, help="DirectAdmin base URL, e.g. https://panel.example.com:2222")
+    parser.add_argument("--da-url", required=False, help="DirectAdmin HTTPS base URL (literal loopback HTTP is also allowed)")
     parser.add_argument("--da-username", required=False, help="DirectAdmin API username")
     parser.add_argument("--da-password", required=False, help="DirectAdmin API password or login key; insecure because process args can expose it")
     parser.add_argument("--da-password-file", required=False, help="Path to a file containing the DirectAdmin API password or login key")
@@ -750,7 +747,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--da-quota-mb", type=int, default=0, help="New mailbox quota in MiB (0 = unlimited)")
 
     parser.add_argument("--auto-provision-cpanel", action="store_true", help="In import mode, auto-create/reset missing target mailboxes via cPanel UAPI")
-    parser.add_argument("--cpanel-url", required=False, help="cPanel base URL, e.g. https://panel.example.com:2083")
+    parser.add_argument("--cpanel-url", required=False, help="cPanel HTTPS base URL (literal loopback HTTP is also allowed)")
     parser.add_argument("--cpanel-username", required=False, help="cPanel account username for UAPI")
     parser.add_argument("--cpanel-password", required=False, help="cPanel password; insecure because process args can expose it")
     parser.add_argument("--cpanel-password-file", required=False, help="Path to a file containing the cPanel password")
@@ -788,8 +785,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not math.isfinite(min_free_gb) or min_free_gb < 0:
         logging.error("--min-free-gb must be a non-negative finite number")
         return 2
-    if args.mode == "test" and bool(getattr(args, "no_connectivity_test", False)):
-        logging.error("--no-connectivity-test cannot be used with --mode test")
+    if args.mode in {"test", "preflight"} and bool(getattr(args, "no_connectivity_test", False)):
+        logging.error("--no-connectivity-test cannot be used with --mode %s", args.mode)
         return 2
 
     # Apply default IMAP socket timeout early so all imaplib ops inherit it
@@ -872,6 +869,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             or (use_cpanel and bool(getattr(args, "cpanel_dry_run", False)))
         )
     )
+    if (
+        args.mode == "import"
+        and not is_provider_config
+        and (use_da_panel or use_cpanel)
+        and not panel_dry_run_requested
+    ):
+        assert isinstance(config, Config)
+        empty_panel_passwords = _empty_panel_account_passwords(config)
+        if empty_panel_passwords:
+            logging.error(
+                "Control-panel provisioning requires a non-empty accounts[].password before making changes; "
+                "populate the password for: %s",
+                ", ".join(empty_panel_passwords),
+            )
+            return 2
     if (
         args.mode == "import"
         and bool(getattr(args, "reset", False))
@@ -958,6 +970,68 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         free_space_checked_paths.add(free_space_preflight_path)
 
+    da_client: Optional[DirectAdminClient] = None
+    da_password: Optional[str] = None
+    cpanel_client: Optional[CPanelClient] = None
+    cpanel_password: Optional[str] = None
+    cpanel_token: Optional[str] = None
+    panel_reset_failed_accounts: set[str] = set()
+
+    if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
+        assert isinstance(config, Config)
+        invalid_panel_accounts = _invalid_panel_account_emails(config)
+        if invalid_panel_accounts:
+            logging.error(
+                "Control-panel provisioning requires mailbox accounts in local@domain form; invalid account(s): %s",
+                ", ".join(invalid_panel_accounts),
+            )
+            return 2
+        staged_root = Path(args.input_dir)
+        missing_account_dirs = [
+            acc.email
+            for acc in config.accounts
+            if not (staged_root / sanitize_for_path(acc.email)).exists()
+        ]
+        if missing_account_dirs:
+            logging.error(
+                "Input directory is missing staged data for %d account(s): %s",
+                len(missing_account_dirs),
+                ", ".join(missing_account_dirs),
+            )
+            return 2
+        if use_da_panel:
+            missing = [name for name in ("da_url", "da_username") if not getattr(args, name)]
+            if missing:
+                logging.error(
+                    "DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source "
+                    "(missing: %s)",
+                    ", ".join(missing),
+                )
+                return 2
+            try:
+                validate_panel_base_url(str(args.da_url), label="DirectAdmin")
+                da_password = _resolve_da_password(args)
+                _ensure_directadmin_client_dependency()
+            except Exception as exc:
+                logging.error("[da] Auto-provisioning setup failed: %s", exc)
+                return 2
+        if use_cpanel:
+            missing = [name for name in ("cpanel_url", "cpanel_username") if not getattr(args, name)]
+            if missing:
+                logging.error(
+                    "cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token "
+                    "source (missing: %s)",
+                    ", ".join(missing),
+                )
+                return 2
+            try:
+                validate_panel_base_url(str(args.cpanel_url), label="cPanel")
+                cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
+                _ensure_cpanel_client_dependency()
+            except Exception as exc:
+                logging.error("[cpanel] Auto-provisioning setup failed: %s", exc)
+                return 2
+
     if args.mode in {"import", "validate"}:
         input_root = Path(args.input_dir)
         if is_provider_config:
@@ -1024,69 +1098,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Environment/dependency check failed: %s", exc)
         return 2
 
-    da_client: Optional[DirectAdminClient] = None
-    da_password: Optional[str] = None
-    cpanel_client: Optional[CPanelClient] = None
-    cpanel_password: Optional[str] = None
-    cpanel_token: Optional[str] = None
-    panel_reset_failed_accounts: set[str] = set()
-
-    if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
-        assert isinstance(config, Config)
-        invalid_panel_accounts = _invalid_panel_account_emails(config)
-        if invalid_panel_accounts:
-            logging.error(
-                "Control-panel provisioning requires mailbox accounts in local@domain form; invalid account(s): %s",
-                ", ".join(invalid_panel_accounts),
-            )
-            return 2
     if (not is_provider_config) and args.mode == "import" and (use_da_panel or use_cpanel):
         staged_root = Path(args.input_dir)
-        if not staged_root.exists():
-            logging.error("Input directory does not exist: %s", staged_root)
-            return 2
         assert isinstance(config, Config)
-        missing_account_dirs = [
-            acc.email
-            for acc in config.accounts
-            if not (staged_root / sanitize_for_path(acc.email)).exists()
-        ]
-        if missing_account_dirs:
-            logging.error(
-                "Input directory is missing staged data for %d account(s): %s",
-                len(missing_account_dirs),
-                ", ".join(missing_account_dirs),
-            )
-            return 2
-        if staged_root not in free_space_checked_paths:
-            try:
-                check_free_space_for_path(staged_root, min_free_gb)
-            except Exception as exc:
-                logging.error("[panel] Free-space check failed before panel changes: %s", exc)
-                return 2
-            free_space_checked_paths.add(staged_root)
-        if use_da_panel:
-            missing = [n for n in ("da_url", "da_username") if not getattr(args, n)]
-            if missing:
-                logging.error("DirectAdmin auto-provisioning requires: --da-url, --da-username, and a password source (missing: %s)", ", ".join(missing))
-                return 2
-            try:
-                da_password = _resolve_da_password(args)
-                _ensure_directadmin_client_dependency()
-            except Exception as exc:
-                logging.error("[da] Auto-provisioning setup failed: %s", exc)
-                return 2
-        if use_cpanel:
-            missing = [n for n in ("cpanel_url", "cpanel_username") if not getattr(args, n)]
-            if missing:
-                logging.error("cPanel auto-provisioning requires: --cpanel-url, --cpanel-username, and a password/token source (missing: %s)", ", ".join(missing))
-                return 2
-            try:
-                cpanel_password, cpanel_token = _resolve_cpanel_auth(args)
-                _ensure_cpanel_client_dependency()
-            except Exception as exc:
-                logging.error("[cpanel] Auto-provisioning setup failed: %s", exc)
-                return 2
         audit_for_reset = bool(getattr(args, "reset", False))
         try:
             logging.info(
@@ -1574,7 +1588,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                         _should_skip_legacy_source_view,
                         _legacy_target_hierarchy_delimiter,
                         _legacy_target_mailbox_name,
-                        _legacy_validate_path_segments,
                         _unresolved_legacy_pending_keys,
                         _validate_legacy_delivery_metadata,
                         _validate_legacy_sidecar_integrity,

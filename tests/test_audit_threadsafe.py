@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 from components.audit import audit_export
@@ -28,5 +27,4 @@ def test_audit_export_threadsafe_accum(tmp_path: Path) -> None:
     # Should have at least one issue per account, demonstrating accumulation worked without crashing
     assert any(i.startswith("a@example.com") for i in issues)
     assert any(i.startswith("b@example.com") for i in issues)
-
 

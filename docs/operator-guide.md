@@ -8,7 +8,8 @@ migrations and server decommissioning workflows.
 Migrations are staged:
 
 1. Export selected source mailboxes into local `.eml` files and metadata.
-2. Audit the staged export before touching the target.
+2. Audit the staged export before touching the target. Export performs this
+   audit automatically unless `--no-audit-after-export` is explicitly used.
 3. Import into the target with resume journals.
 4. Validate staged identities against the target.
 5. Decide whether the old server can be decommissioned.
@@ -38,6 +39,22 @@ Common flags include `--config`, `--output-dir`, `--input-dir`,
 `--max-workers`, `--ignore-errors`, `--log-dir`, `--min-free-gb`, and
 `--imap-timeout`.
 
+The main CLI writes its console log to standard error and also creates a
+mode-`0600` file under `--log-dir`; standard output stays clean for calling
+scripts. Exit codes tell the operator what to do next:
+
+| Code | Meaning | Next action |
+| ---: | --- | --- |
+| `0` | The requested stage completed successfully. | Continue to the next migration stage. |
+| `1` | An unexpected fatal operation error occurred. | Inspect the log and traceback, correct the underlying problem, then rerun the same stage. |
+| `2` | CLI, config, dependency, path, or local setup is invalid. | Correct the named input or prerequisite before retrying. |
+| `3` | Connectivity/control-panel setup failed, or panel `--ignore-errors` skipped accounts. | Inspect the per-account log first. With `--ignore-errors`, successful accounts may already have been provisioned or imported; fix only the failed accounts and rerun safely. |
+| `4` | Preflight, staged audit, integrity gate, or validation found issues. | Stop the migration progression and resolve every reported evidence issue. |
+| `130` | The process received a stop signal. | Review the journals/log, then safely rerun the interrupted stage. |
+
+`--no-connectivity-test` is intentionally rejected with `--mode test` and
+`--mode preflight`, because connectivity is the purpose of those modes.
+
 ## Provider Mode
 
 Supported providers are:
@@ -54,15 +71,22 @@ passwords require Apple Account two-factor authentication.
 Known Gmail and iCloud IMAP hosts are rejected under provider `imap` so their
 provider-specific safeguards cannot be bypassed by accident.
 
+Generic IMAP endpoints require encrypted transport. Use implicit TLS with
+`"ssl": true, "starttls": false`, or STARTTLS with `"ssl": false,
+"starttls": true`. Configs that enable both transports or neither transport
+are rejected before authentication.
+
 Typical command sequence:
 
 ```bash
 python3 imapsync_bulk_migrator.py --mode preflight --config migration.config.json
 python3 imapsync_bulk_migrator.py --mode export --config migration.config.json --output-dir ./exported
-python3 imapsync_bulk_migrator.py --mode audit --config migration.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode import --config migration.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode validate --config migration.config.json --input-dir ./exported
 ```
+
+That is the shortest safe sequence because export audits automatically. Use an
+explicit `--mode audit` command to re-check an existing staged export.
 
 Important provider settings:
 
@@ -148,14 +172,17 @@ Generic IMAP mode is the correct provider mode for mailboxes normally accessed
 through Roundcube, DirectAdmin webmail, cPanel webmail, or another hosted
 webmail UI. Use the underlying IMAP server and mailbox credentials.
 
-Generic IMAP exports every selectable mailbox. Special-use attributes such as
-`\All` and `\Flagged` are advisory for generic IMAP and are not treated as
-proof that a mailbox is virtual. Use the exact spelling and case returned by
-IMAP `LIST` for non-INBOX mailbox names in `folder_map` and review output;
-only `INBOX` is case-insensitive by the IMAP standard. During empty-target
-resume checks, generic target `\All` and `\Flagged` views are allowed only for
-messages already matched by committed journal rows or recoverable pending rows
-from the same migration; unmatched messages still fail the empty-target gate.
+Generic IMAP scans every selectable mailbox. Special-use attributes such as
+`\All` and `\Flagged` are advisory rather than proof that a mailbox is purely
+virtual: those views are scanned after ordinary mailboxes, byte-identical
+occurrences with compatible delivery metadata are folded into already exported
+messages, and unmatched occurrences are preserved as separate messages. Use
+the exact spelling and case returned by IMAP `LIST` for non-INBOX mailbox names
+in `folder_map` and review output; only `INBOX` is case-insensitive by the IMAP
+standard. During empty-target resume checks, generic target `\All` and
+`\Flagged` views are allowed only for messages already matched by committed
+journal rows or recoverable pending rows from the same migration; unmatched
+messages still fail the empty-target gate.
 A pending row is not production proof by itself: import must resolve it to
 committed, and validation must pass before decommissioning.
 
@@ -183,10 +210,13 @@ Use legacy mode for straightforward same-address migrations:
 
 ```bash
 python3 imapsync_bulk_migrator.py --mode export --config export.pass.config.json --output-dir ./exported
-python3 imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode import --config import.pass.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode validate --config import.pass.config.json --input-dir ./exported
 ```
+
+Legacy export runs its staged audit automatically. Use `--mode audit` when
+rechecking an existing export rather than repeating it after every successful
+export.
 
 Example legacy config:
 
@@ -220,6 +250,12 @@ Legacy account configs accept inline `accounts[].password` values. For
 large/public workflows, keep those configs in ignored local files and protect
 them like secrets.
 
+An active legacy `server` follows the same transport rule as generic provider
+endpoints: enable implicit TLS or STARTTLS. A historical `source_server`
+descriptor may remain cleartext so old staged exports can still be bound and
+audited offline, but any attempt to connect to it is rejected before
+authentication.
+
 ## Artifacts and Resume Data
 
 Provider exports write per-account staged data including:
@@ -245,6 +281,19 @@ Provider configs do not call hosting panel APIs.
 
 Every configured account must be in `local@domain` form. Panel workflows fail
 fast for malformed accounts.
+
+Remote panel base URLs must use HTTPS. Plain HTTP is accepted only with a
+literal loopback address such as `http://127.0.0.1:2222`, for a client running
+on the panel host itself. `--da-no-verify-ssl` and `--cpanel-no-verify-ssl` may
+be used for a controlled self-signed certificate; prefer installing the correct
+CA certificate whenever possible.
+
+Before a non-dry-run create or reset, every configured mailbox must have a
+non-empty `accounts[].password`. This is validated before panel API changes and
+before a reset archives any import journal, so an empty placeholder cannot
+leave a mailbox deleted. Read-only indexers may generate empty password
+placeholders; fill them in the import config before the real panel run. Panel
+dry-run remains available while passwords are still placeholders.
 
 DirectAdmin create-missing import:
 
@@ -410,6 +459,9 @@ python3 verify_export.py
 
 ## Official Behavior References
 
+- IMAP4rev2 protocol and `INTERNALDATE` semantics: https://www.rfc-editor.org/rfc/rfc9051.html
+- TLS for email access: https://www.rfc-editor.org/rfc/rfc8314.html
+- IMAP special-use mailboxes: https://www.rfc-editor.org/rfc/rfc6154.html
 - Gmail IMAP/SMTP: https://developers.google.com/workspace/gmail/imap/imap-smtp
 - Gmail XOAUTH2: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
 - Gmail IMAP extensions: https://developers.google.com/workspace/gmail/imap/imap-extensions

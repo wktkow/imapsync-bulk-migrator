@@ -9,14 +9,13 @@ export.pass.config.json-compatible legacy IMAP config.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from components.cpanel_client import CPanelClient
+from components.utils import validate_panel_base_url
 from directadmin_indexer import build_config, prompt_select_from_list, read_secret_file, write_json
 
 
@@ -26,6 +25,13 @@ class ServerSettings:
     port: int = 993
     ssl: bool = True
     starttls: bool = False
+
+
+def _imap_port(value: str) -> int:
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return port
 
 
 def _resolve_one_secret(args: argparse.Namespace, prefix: str, label: str) -> Optional[str]:
@@ -67,7 +73,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Index mailboxes via cPanel UAPI and write export.pass.config.json",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--url", required=True, help="cPanel URL, e.g. https://panel.example.com:2083")
+    parser.add_argument("--url", required=True, help="cPanel HTTPS URL (literal loopback HTTP is also allowed)")
     parser.add_argument("--username", required=True, help="cPanel account username")
     parser.add_argument("--password", required=False, help="cPanel password; insecure because process args can expose it")
     parser.add_argument("--password-file", required=False, help="Path to a file containing the cPanel password")
@@ -77,20 +83,45 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--token-env", required=False, help="Environment variable containing the cPanel API token")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable TLS certificate verification")
     parser.add_argument("--imap-host", required=True, help="IMAP server hostname to place into generated config")
-    parser.add_argument("--imap-port", type=int, default=993, help="IMAP server port")
-    parser.add_argument("--imap-ssl", action="store_true", default=True, help="Use SSL for IMAP connection")
-    parser.add_argument("--no-imap-ssl", dest="imap_ssl", action="store_false", help="Disable SSL for IMAP connection")
-    parser.add_argument("--imap-starttls", action="store_true", default=False, help="Use STARTTLS when SSL is disabled")
-    parser.add_argument("--default-password", default="", help="Password value to put for each account; insecure because process args can expose it")
+    parser.add_argument(
+        "--imap-port",
+        type=_imap_port,
+        default=argparse.SUPPRESS,
+        help="IMAP server port (defaults to 993, or 143 with --imap-starttls)",
+    )
+    parser.add_argument(
+        "--imap-ssl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use implicit TLS for the IMAP connection",
+    )
+    parser.add_argument("--imap-starttls", action="store_true", default=False, help="Use STARTTLS instead of implicit TLS")
+    parser.add_argument("--default-password", default="", help="Password value to put for each account (fill before a non-dry-run panel import); insecure because process args can expose it")
     parser.add_argument("--default-password-file", required=False, help="Path to a file containing the default mailbox password")
     parser.add_argument("--default-password-env", required=False, help="Environment variable containing the default mailbox password")
     parser.add_argument("--out", default="export.pass.config.json", help="Output JSON path")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not hasattr(args, "imap_port"):
+        args.imap_port = 143 if args.imap_starttls else 993
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if not bool(args.imap_ssl) and not bool(args.imap_starttls):
+        print("Refusing to write a cleartext IMAP config; enable --imap-ssl or --imap-starttls.", file=sys.stderr)
+        return 2
+    try:
+        validate_panel_base_url(str(args.url), label="cPanel")
+        if not str(args.username).strip():
+            raise ValueError("cPanel username must be non-empty")
+        imap_host = str(args.imap_host).strip()
+        if not imap_host:
+            raise ValueError("IMAP host must be non-empty")
+    except ValueError as exc:
+        print(f"Invalid arguments: {exc}", file=sys.stderr)
+        return 2
     try:
         password, token = resolve_cpanel_auth(args)
         default_password = resolve_default_password(args)
@@ -118,7 +149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     selected_emails = sorted(email for email in all_emails if email.split("@", 1)[1].lower() in selected_domains)
 
     server = ServerSettings(
-        host=args.imap_host,
+        host=imap_host,
         port=int(args.imap_port),
         ssl=bool(args.imap_ssl) and not bool(args.imap_starttls),
         starttls=bool(args.imap_starttls),

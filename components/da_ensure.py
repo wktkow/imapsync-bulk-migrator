@@ -28,6 +28,15 @@ def _raise_if_stopped(stop_event: Optional[Any], label: str) -> None:
         raise RuntimeError(f"{label}: stop requested before completion")
 
 
+def _require_mailbox_passwords(config: Config) -> None:
+    missing = [acc.email for acc in config.accounts if not acc.password]
+    if missing:
+        raise ValueError(
+            "DirectAdmin provisioning requires a non-empty accounts[].password for: "
+            + ", ".join(missing)
+        )
+
+
 def ensure_accounts_exist_directadmin(
     config: "Config",
     client: DirectAdminClient,
@@ -37,6 +46,8 @@ def ensure_accounts_exist_directadmin(
     quota_mb: int = 0,
     stop_event: Optional[Any] = None,
 ) -> Set[str]:
+    if not dry_run:
+        _require_mailbox_passwords(config)
     failed: Set[str] = set()
     per_domain = _accounts_by_domain(config)
     for domain, accounts in per_domain.items():
@@ -83,6 +94,8 @@ def reset_accounts_directadmin(
 
     Intended for use prior to import when a clean mailbox is desired.
     """
+    if not dry_run:
+        _require_mailbox_passwords(config)
     failed: Set[str] = set()
     per_domain = _accounts_by_domain(config)
 

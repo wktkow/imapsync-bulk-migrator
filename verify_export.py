@@ -22,7 +22,6 @@ from components.imap_ops import (
     _legacy_source_attributes_metadata,
     _legacy_trusted_covered_by_regular_content,
     _legacy_uidvalidity_metadata,
-    _legacy_validate_path_segments,
     _valid_legacy_flag_token,
     _valid_legacy_internaldate,
     legacy_reserved_mailbox_path_issue,
@@ -835,7 +834,7 @@ def verify_provider_account(account_path):
     if symlink_component is not None:
         account_name = account_path.name
         print(f"\n=== Verifying {account_name} (provider layout) ===")
-        print(f"\n⚠️  1 errors found:")
+        print("\n⚠️  1 errors found:")
         print(f"  account path contains a symlink: {symlink_component}")
         return _empty_error_stats(account_name)
 
@@ -939,7 +938,7 @@ def verify_account(account_path):
     if symlink_component is not None:
         account_name = account_path.name
         print(f"\n=== Verifying {account_name} ===")
-        print(f"\n⚠️  1 errors found:")
+        print("\n⚠️  1 errors found:")
         print(f"  account path contains a symlink: {symlink_component}")
         return _empty_error_stats(account_name)
     if (account_path / "manifest.jsonl").exists():
@@ -1147,7 +1146,7 @@ def main():
     for account_path in sorted(export_dir.iterdir()):
         if account_path.is_symlink():
             print(f"\n=== Verifying {account_path.name} ===")
-            print(f"\n⚠️  1 errors found:")
+            print("\n⚠️  1 errors found:")
             print(f"  account path is a symlink: {account_path}")
             all_stats.append({
                 'account': account_path.name,

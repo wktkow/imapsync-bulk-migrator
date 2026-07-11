@@ -30,6 +30,15 @@ def _raise_if_stopped(stop_event: Optional[Any], label: str) -> None:
         raise RuntimeError(f"{label}: stop requested before completion")
 
 
+def _require_mailbox_passwords(config: Config) -> None:
+    missing = [acc.email for acc in config.accounts if not acc.password]
+    if missing:
+        raise ValueError(
+            "cPanel provisioning requires a non-empty accounts[].password for: "
+            + ", ".join(missing)
+        )
+
+
 def ensure_accounts_exist_cpanel(
     config: Config,
     client: CPanelClient,
@@ -39,6 +48,8 @@ def ensure_accounts_exist_cpanel(
     quota_mb: int = 0,
     stop_event: Optional[Any] = None,
 ) -> Set[str]:
+    if not dry_run:
+        _require_mailbox_passwords(config)
     failed: Set[str] = set()
     for domain, accounts in _accounts_by_domain(config).items():
         _raise_if_stopped(stop_event, f"cpanel provisioning {domain}")
@@ -80,6 +91,8 @@ def reset_accounts_cpanel(
     quota_mb: int = 0,
     stop_event: Optional[Any] = None,
 ) -> Set[str]:
+    if not dry_run:
+        _require_mailbox_passwords(config)
     failed: Set[str] = set()
     for domain, accounts in _accounts_by_domain(config).items():
         _raise_if_stopped(stop_event, f"cpanel reset {domain}")

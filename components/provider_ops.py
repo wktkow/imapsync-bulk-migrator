@@ -27,7 +27,15 @@ from .content_binding import (
     provider_content_binding_sha256,
 )
 from .executor import parallel_process_accounts
-from .imap_ops import _imap_append_wire_bytes, _valid_legacy_flag_token, _valid_legacy_internaldate
+from .imap_ops import (
+    _imap_append_wire_bytes,
+    _legacy_internaldate_for_append,
+    _legacy_internaldate_utc_key,
+    _legacy_internaldates_equal,
+    _normalized_legacy_internaldate,
+    _valid_legacy_flag_token,
+    _valid_legacy_internaldate,
+)
 from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
 from .secret_files import read_secret_file_no_links
 from .utils import (
@@ -492,6 +500,8 @@ def provider_target_journal_binding(config: ProviderMigrationConfig, account: Mi
 def imap_connection(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> Iterator[imaplib.IMAP4]:
     provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
     host = provider_hosts.get(endpoint.provider, endpoint.host)
+    if not endpoint.ssl and not endpoint.starttls:
+        raise RuntimeError("refusing to send IMAP authentication credentials over a cleartext connection; enable SSL or STARTTLS")
     if endpoint.ssl:
         imap = imaplib.IMAP4_SSL(host=host, port=endpoint.port, ssl_context=ssl.create_default_context())
     else:
@@ -2343,13 +2353,8 @@ def provider_delivery_metadata_issues(rows: List[Dict[str, Any]]) -> List[str]:
         if "internaldate" in row:
             if not isinstance(internaldate_raw, str):
                 issues.append(f"{identity}: invalid internaldate metadata")
-            elif internaldate_raw.strip():
-                stripped = internaldate_raw.strip()
-                parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
-                if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
-                    issues.append(f"{identity}: invalid internaldate metadata")
-                elif not _valid_legacy_internaldate(parse_value):
-                    issues.append(f"{identity}: invalid internaldate metadata")
+            elif internaldate_raw != "" and not _valid_legacy_internaldate(internaldate_raw):
+                issues.append(f"{identity}: invalid internaldate metadata")
     return issues
 
 
@@ -3458,9 +3463,10 @@ _ProviderVirtualDeliveryKey = Tuple[Tuple[str, ...], str]
 
 
 def _provider_virtual_delivery_key(parsed: Dict[str, Any]) -> _ProviderVirtualDeliveryKey:
+    internaldate = parsed.get("internaldate")
     return (
         tuple(sorted(_provider_export_flag_set(parsed.get("flags")))),
-        _normalized_provider_internaldate(parsed.get("internaldate")),
+        _legacy_internaldate_utc_key(internaldate) or _normalized_provider_internaldate(internaldate),
     )
 
 
@@ -3672,7 +3678,7 @@ def provider_export_account(
         same_date_identities = [
             identity
             for identity, candidate_internaldate in mergeable_provider_records_by_content.get(content_identity, [])
-            if _normalized_provider_internaldate(candidate_internaldate) == flagged_internaldate
+            if _legacy_internaldates_equal(candidate_internaldate, flagged_internaldate)
         ]
         if len(same_date_identities) != 1:
             return False
@@ -4313,12 +4319,7 @@ def target_message_flag_set(imap: imaplib.IMAP4, num: bytes) -> set[str]:
 
 
 def _normalized_provider_internaldate(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    normalized = value.strip()
-    if len(normalized) >= 2 and normalized.startswith('"') and normalized.endswith('"'):
-        normalized = normalized[1:-1]
-    return normalized
+    return _normalized_legacy_internaldate(value)
 
 
 def target_message_internaldate(imap: imaplib.IMAP4, num: bytes) -> str:
@@ -4347,7 +4348,7 @@ def append_target_internaldate_failure(
     expected_internaldate = _normalized_provider_internaldate(row.get("internaldate"))
     if not expected_internaldate:
         return
-    if actual_internaldate != expected_internaldate:
+    if not _legacy_internaldates_equal(actual_internaldate, expected_internaldate):
         failures.append(
             f"target INTERNALDATE mismatch for {identity} in {target_mailbox}: "
             f"expected {expected_internaldate!r} got {(actual_internaldate or '<missing>')!r}"
@@ -4358,7 +4359,7 @@ def _target_internaldate_matches_row(imap: imaplib.IMAP4, num: bytes, row: Dict[
     expected_internaldate = _normalized_provider_internaldate(row.get("internaldate"))
     if not expected_internaldate:
         return True
-    return target_message_internaldate(imap, num) == expected_internaldate
+    return _legacy_internaldates_equal(target_message_internaldate(imap, num), expected_internaldate)
 
 
 def restore_imap_flags(
@@ -4379,19 +4380,17 @@ def restore_imap_flags(
     )
     if not flags:
         return
-    status, response = imap.store(target_num, "+FLAGS.SILENT", flags)
+    status, response = _target_store(imap, target_num, "+FLAGS.SILENT", flags)
     if status != "OK":
         raise RuntimeError(f"failed to restore IMAP flags for {row.get('canonical_id')}: {response}")
 
 
 def _internaldate_for_append(internaldate: str) -> str:
-    if internaldate.strip():
-        value = internaldate.strip()
-        parse_value = value[1:-1] if value.startswith('"') and value.endswith('"') else value
-        if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value) or not _valid_legacy_internaldate(parse_value):
-            raise RuntimeError("invalid provider internaldate")
-        return value if value.startswith('"') and value.endswith('"') else f'"{value}"'
-    return imaplib.Time2Internaldate(time.time())
+    try:
+        value = _legacy_internaldate_for_append(internaldate)
+    except ValueError as exc:
+        raise RuntimeError("invalid provider internaldate") from exc
+    return value if value is not None else imaplib.Time2Internaldate(time.time())
 
 
 def _quote_gmail_label(label: str) -> str:
@@ -4880,25 +4879,65 @@ def _max_expected_content_identity_matches(
     target_content_identities: List[Tuple[int, str]],
     expected_identity_sets: List[set[Tuple[int, str]]],
 ) -> int:
-    assigned_targets_by_expected: Dict[int, int] = {}
+    target_capacity_by_identity: Dict[Tuple[int, str], int] = {}
+    target_identity_order: List[Tuple[int, str]] = []
+    for identity in target_content_identities:
+        if identity not in target_capacity_by_identity:
+            target_identity_order.append(identity)
+            target_capacity_by_identity[identity] = 0
+        target_capacity_by_identity[identity] += 1
 
-    def assign(target_index: int, seen_expected: set[int]) -> bool:
-        target_identity = target_content_identities[target_index]
-        for expected_index, expected_identities in enumerate(expected_identity_sets):
-            if expected_index in seen_expected or target_identity not in expected_identities:
-                continue
-            seen_expected.add(expected_index)
-            previous_target = assigned_targets_by_expected.get(expected_index)
-            if previous_target is None or assign(previous_target, seen_expected):
-                assigned_targets_by_expected[expected_index] = target_index
+    allowed_identities_by_expected = [
+        [identity for identity in target_identity_order if identity in expected_identities]
+        for expected_identities in expected_identity_sets
+    ]
+    assigned_identity_by_expected: Dict[int, Tuple[int, str]] = {}
+    assigned_expected_by_identity: Dict[Tuple[int, str], List[int]] = {
+        identity: [] for identity in target_identity_order
+    }
+
+    def assign(start_expected: int) -> bool:
+        pending = [start_expected]
+        pending_index = 0
+        seen_expected = {start_expected}
+        seen_identities: set[Tuple[int, str]] = set()
+        parent_expected_by_identity: Dict[Tuple[int, str], int] = {}
+        free_identity: Optional[Tuple[int, str]] = None
+
+        while pending_index < len(pending) and free_identity is None:
+            expected_index = pending[pending_index]
+            pending_index += 1
+            for identity in allowed_identities_by_expected[expected_index]:
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                parent_expected_by_identity[identity] = expected_index
+                assigned_expected = assigned_expected_by_identity[identity]
+                if len(assigned_expected) < target_capacity_by_identity[identity]:
+                    free_identity = identity
+                    break
+                for assigned_index in assigned_expected:
+                    if assigned_index not in seen_expected:
+                        seen_expected.add(assigned_index)
+                        pending.append(assigned_index)
+
+        if free_identity is None:
+            return False
+
+        identity = free_identity
+        while True:
+            expected_index = parent_expected_by_identity[identity]
+            previous_identity = assigned_identity_by_expected.get(expected_index)
+            assigned_identity_by_expected[expected_index] = identity
+            assigned_expected_by_identity[identity].append(expected_index)
+            if previous_identity is None:
                 return True
-        return False
+            assigned_expected_by_identity[previous_identity].remove(expected_index)
+            identity = previous_identity
 
-    matched = 0
-    for target_index in range(len(target_content_identities)):
-        if assign(target_index, set()):
-            matched += 1
-    return matched
+    for expected_index in range(len(expected_identity_sets)):
+        assign(expected_index)
+    return len(assigned_identity_by_expected)
 
 
 def target_has_message(

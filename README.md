@@ -56,16 +56,21 @@ official behavior references.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 
 # Optional, for local tests
 python3 -m pip install -r requirements-dev.txt
 ```
 
-Python 3.9+ is required. Provider-aware copy operations use Python `imaplib`.
+Python 3.10+ is required. Provider-aware copy operations use Python `imaplib`.
 DirectAdmin and cPanel integrations use `requests`. Legacy generic IMAP
 connectivity tests also use the `imapsync` binary unless connectivity checks
 are skipped or a panel dry-run exits before import.
+
+Every IMAP endpoint the tool connects to must use encrypted transport: either implicit TLS
+(`"ssl": true`) or STARTTLS (`"ssl": false, "starttls": true`). Cleartext
+IMAP configs are rejected before credentials can be sent.
 
 Inspect the CLI with:
 
@@ -91,10 +96,13 @@ iCloud, generic IMAP, and many-to-one account merges.
 ```bash
 python3 imapsync_bulk_migrator.py --mode preflight --config migration.config.json
 python3 imapsync_bulk_migrator.py --mode export --config migration.config.json --output-dir ./exported
-python3 imapsync_bulk_migrator.py --mode audit --config migration.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode import --config migration.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode validate --config migration.config.json --input-dir ./exported
 ```
+
+Export runs the strict staged audit automatically by default. Use `--mode
+audit` to re-check an existing export, or after an export that deliberately
+used `--no-audit-after-export`.
 
 Minimal provider config:
 
@@ -275,10 +283,12 @@ workflows.
 
 ```bash
 python3 imapsync_bulk_migrator.py --mode export --config export.pass.config.json --output-dir ./exported
-python3 imapsync_bulk_migrator.py --mode audit --config export.pass.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode import --config import.pass.config.json --input-dir ./exported
 python3 imapsync_bulk_migrator.py --mode validate --config import.pass.config.json --input-dir ./exported
 ```
+
+Legacy export also audits automatically. Run `--mode audit` separately only
+when you need to re-check staged data.
 
 During legacy export, the tool writes an `import.pass.config.json` template with
 the old server recorded as `source_server`. Edit the generated target `server`
@@ -311,6 +321,13 @@ python3 imapsync_bulk_migrator.py --mode import --config import.pass.config.json
 ```
 
 Use `--da-dry-run` or `--cpanel-dry-run` before destructive panel runs.
+Panel API URLs must use HTTPS. The only cleartext exception is `http://` with a
+literal loopback address such as `127.0.0.1`, for a panel client running on the
+same machine. `--da-no-verify-ssl` and `--cpanel-no-verify-ssl` support
+controlled self-signed TLS deployments; they disable certificate verification,
+not encryption. Before any non-dry-run panel create or reset, fill a non-empty
+`accounts[].password` for every mailbox. Indexer output may leave these values
+empty as placeholders.
 
 ## Indexers
 
@@ -353,6 +370,11 @@ Do not retire a source server until all of these are true:
 ## Safety Notes
 
 - DirectAdmin/cPanel reset deletes target mailbox contents.
+- Generic IMAP credentials are sent only after implicit TLS or STARTTLS is
+  active; cleartext IMAP is not supported.
+- Remote DirectAdmin and cPanel API connections require HTTPS even when
+  certificate verification is explicitly disabled; cleartext is limited to a
+  literal loopback address.
 - OAuth token acquisition and refresh are external to this project.
 - Staged exports contain full mailbox data; protect `exported/`, logs, configs,
   and secrets as sensitive data.

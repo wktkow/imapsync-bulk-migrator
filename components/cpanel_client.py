@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from .utils import validate_panel_base_url
+
 try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover
@@ -22,6 +24,7 @@ class CPanelClient:
         verify_ssl: bool = True,
         timeout_sec: int = 20,
     ) -> None:
+        base_url = validate_panel_base_url(base_url, label="cPanel")
         if requests is None:  # type: ignore
             raise RuntimeError("cPanel provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
         if bool(password) == bool(token):
@@ -60,11 +63,23 @@ class CPanelClient:
 
     def _call(self, module: str, function: str, params: Optional[Dict[str, Any]] = None) -> Any:
         endpoint = self._endpoint(module, function)
+        response = None
         try:
-            response = self.session.get(endpoint, params=dict(params or {}), timeout=self.timeout_sec)
+            response = self.session.get(
+                endpoint,
+                params=dict(params or {}),
+                timeout=self.timeout_sec,
+                allow_redirects=False,
+            )
+            status_code = getattr(response, "status_code", None)
+            if type(status_code) is int and 300 <= status_code < 400:
+                raise RuntimeError("redirect responses are not allowed")
             response.raise_for_status()
         except Exception as exc:
-            raise RuntimeError(f"cPanel UAPI {module}/{function} request failed: {type(exc).__name__}") from None
+            error_response = response if response is not None else getattr(exc, "response", None)
+            status_code = getattr(error_response, "status_code", None)
+            detail = f"HTTP {status_code}" if type(status_code) is int else type(exc).__name__
+            raise RuntimeError(f"cPanel UAPI {module}/{function} request failed: {detail}") from None
         try:
             payload = response.json()
         except Exception as exc:
