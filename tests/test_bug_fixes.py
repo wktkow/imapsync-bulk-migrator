@@ -3637,7 +3637,7 @@ class TestLegacyImportJournal:
 
     def _make_export(self, tmp_path: Path) -> Path:
         account_dir = tmp_path / "user@example.com" / "INBOX"
-        eml = _write_legacy_message_fixture(
+        _write_legacy_message_fixture(
             account_dir,
             data=b"Message-ID: <m@example.com>\r\nFrom: a@example.com\r\nTo: b@example.com\r\n\r\nbody",
             source_server=self._source_server(),
@@ -8328,8 +8328,9 @@ class TestCPanelProvisioning:
         class Session:
             verify = True
 
-            def get(self, url, params=None, timeout=None):
+            def get(self, url, params=None, timeout=None, allow_redirects=None):
                 assert params == {"password": "super-secret", "email": "a", "domain": "example.com"}
+                assert allow_redirects is False
                 raise RuntimeError(f"failed URL {url}?password=super-secret")
 
             def post(self, *_args, **_kwargs):
@@ -8345,6 +8346,34 @@ class TestCPanelProvisioning:
 
         assert "super-secret" not in str(exc_info.value)
         assert "request failed" in str(exc_info.value)
+
+    def test_cpanel_call_reports_http_status_without_leaking_request_details(self) -> None:
+        from components.cpanel_client import CPanelClient
+
+        class Response:
+            status_code = 401
+
+            def raise_for_status(self) -> None:
+                raise RuntimeError(
+                    "401 for https://panel.example.com:2083/execute/Email/add_pop?password=super-secret"
+                )
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        client = object.__new__(CPanelClient)
+        client.base_url = "https://panel.example.com:2083"
+        client.session = Session()
+        client.timeout_sec = 20
+
+        with pytest.raises(RuntimeError) as exc_info:
+            client._call("Email", "add_pop", {"password": "super-secret"})
+
+        error = str(exc_info.value)
+        assert error == "cPanel UAPI Email/add_pop request failed: HTTP 401"
+        assert "super-secret" not in error
+        assert "https://" not in error
 
     def test_cpanel_client_uses_token_header_and_parses_accounts(self) -> None:
         from components.cpanel_client import CPanelClient
@@ -11853,8 +11882,10 @@ class TestRound6ConfirmedBugs:
 
         assert directadmin_config.server.ssl is False
         assert directadmin_config.server.starttls is True
+        assert directadmin_config.server.port == 143
         assert cpanel_config.server.ssl is False
         assert cpanel_config.server.starttls is True
+        assert cpanel_config.server.port == 143
 
     def test_remote_audit_rejects_missing_empty_mailbox(self, tmp_path: Path) -> None:
         from components.audit import audit_export
@@ -17643,3 +17674,152 @@ class TestRound7ConfirmedBugs:
         )
 
         assert target.appended_flags == [f"({flag})"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "31-Feb-2024 12:00:00 +0000",
+        "01-Jan-2024 12:00:00 +2400",
+        "01-Jan-2024 12:00:00 +1260",
+        "01-Jan-2024 12:00:00 +9999",
+        "01-ſep-2024 12:00:00 +0000",
+        " 01-Jan-2024 12:00:00 +0000",
+        "01-Jan-2024 12:00:00 +0000 ",
+    ],
+)
+def test_legacy_internaldate_validation_rejects_impossible_values(value: str) -> None:
+    from components.imap_ops import _validate_legacy_delivery_metadata
+
+    with pytest.raises(RuntimeError, match="invalid internaldate metadata"):
+        _validate_legacy_delivery_metadata({"internaldate": value}, "message")
+
+
+@pytest.mark.parametrize(
+    ("value", "wire_value"),
+    [
+        (" 1-Jan-2024 12:00:00 +0000", '" 1-Jan-2024 12:00:00 +0000"'),
+        ('" 1-Jan-2024 12:00:00 +0000"', '" 1-Jan-2024 12:00:00 +0000"'),
+        ("01-Jan-2024 12:00:00 +0000", '"01-Jan-2024 12:00:00 +0000"'),
+        ("01-JAN-2024 12:00:00 +0000", '"01-JAN-2024 12:00:00 +0000"'),
+    ],
+)
+def test_legacy_internaldate_preserves_valid_wire_text(value: str, wire_value: str) -> None:
+    from components.imap_ops import _legacy_internaldate_for_append, _validate_legacy_delivery_metadata
+
+    _flags, parsed = _validate_legacy_delivery_metadata({"internaldate": value}, "message")
+
+    assert parsed == value
+    assert _legacy_internaldate_for_append(parsed) == wire_value
+
+
+def test_legacy_internaldate_compares_canonical_utc_instants() -> None:
+    from components.imap_ops import _legacy_internaldates_equal
+
+    assert _legacy_internaldates_equal(
+        "01-Jan-2024 12:00:00 +0000",
+        "01-Jan-2024 13:00:00 +0100",
+    )
+    assert _legacy_internaldates_equal(
+        "01-jAn-2024 12:00:00 +0000",
+        "01-JAN-2024 13:00:00 +0100",
+    )
+    assert not _legacy_internaldates_equal(
+        "01-Jan-2024 12:00:00 +0000",
+        "01-Jan-2024 13:00:01 +0100",
+    )
+    assert _legacy_internaldates_equal(
+        "01-Jan-0001 00:00:00 +2359",
+        "01-Jan-0001 00:00:00 +2359",
+    )
+    assert _legacy_internaldates_equal(
+        "31-Dec-9999 23:59:59 -2359",
+        "31-Dec-9999 23:59:59 -2359",
+    )
+
+
+def test_legacy_resume_accepts_equivalent_target_internaldate_offset() -> None:
+    from components.imap_ops import _legacy_remote_has_message
+
+    body = b"Message-ID: <internaldate@example.com>\r\n\r\nbody\r\n"
+
+    class Target:
+        internaldate = "01-Jan-2024 13:00:00 +0100"
+
+        def select(self, *_args, **_kwargs):
+            return "OK", [b"1"]
+
+        def response(self, _name: str):
+            return "OK", [b"123"]
+
+        def uid(self, command: str, *_args):
+            if command == "search":
+                return "OK", [b"7"]
+            if command == "fetch":
+                metadata = (
+                    f'1 (UID 7 FLAGS (\\Seen) INTERNALDATE "{self.internaldate}" '
+                    f"BODY[] {{{len(body)}}}"
+                ).encode("ascii")
+                return "OK", [(metadata, body), b")"]
+            raise AssertionError(command)
+
+    target = Target()
+    assert _legacy_remote_has_message(
+        target,
+        "INBOX",
+        body,
+        set(),
+        "\\Seen",
+        "01-Jan-2024 12:00:00 +0000",
+    )
+
+    target.internaldate = "01-Jan-2024 13:00:01 +0100"
+    assert not _legacy_remote_has_message(
+        target,
+        "INBOX",
+        body,
+        set(),
+        "\\Seen",
+        "01-Jan-2024 12:00:00 +0000",
+    )
+
+
+def test_iterative_bipartite_matching_matches_bruteforce_on_small_graphs() -> None:
+    from components.imap_ops import _maximum_bipartite_matching
+
+    def brute_force(edges: List[List[int]], right_count: int) -> int:
+        best = 0
+
+        def visit(left: int, used: set[int]) -> None:
+            nonlocal best
+            if left == len(edges):
+                best = max(best, len(used))
+                return
+            visit(left + 1, used)
+            for right in edges[left]:
+                if right not in used:
+                    visit(left + 1, used | {right})
+
+        visit(0, set())
+        return best
+
+    for graph_mask in range(1 << 9):
+        edges = [
+            [right for right in range(3) if graph_mask & (1 << (left * 3 + right))]
+            for left in range(3)
+        ]
+        matched, matched_rights = _maximum_bipartite_matching(edges, 3)
+        assert matched == brute_force(edges, 3)
+        assert len(matched_rights) == matched
+
+
+def test_legacy_coverage_matchers_handle_more_than_recursion_limit() -> None:
+    from components.audit import _identity_variant_slots_cover
+    from components.main import _legacy_identity_variant_slots_cover
+
+    slot = ({(1, "digest")}, "", "")
+    remote_slots = [slot] * 1100
+    local_slots = [slot] * 1100
+
+    assert _identity_variant_slots_cover(remote_slots, local_slots, require_all_local=True)
+    assert _legacy_identity_variant_slots_cover(remote_slots, local_slots, require_all_local=True)

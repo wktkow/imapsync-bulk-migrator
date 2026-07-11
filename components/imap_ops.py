@@ -8,12 +8,13 @@ import re
 import ssl
 import stat
 import time
-from collections import Counter
+from collections import Counter, deque
 from contextlib import AbstractContextManager
+from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default as default_policy
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
 import imaplib
 
@@ -41,10 +42,20 @@ _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _LEGACY_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
 _LEGACY_UIDVALIDITY_MAX = 0xFFFFFFFF
 _IMAP_INTERNALDATE_RE = re.compile(
-    r'^(?:[ 0][1-9]|[12][0-9]|3[01])-'
-    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-'
-    r'\d{4} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d [+-]\d{4}$'
+    r"^(?P<day>[ 0][1-9]|[12][0-9]|3[01])-"
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
+    r"(?P<year>\d{4}) "
+    r"(?P<hour>[01]\d|2[0-3]):(?P<minute>[0-5]\d):(?P<second>[0-5]\d) "
+    r"(?P<zone_sign>[+-])(?P<zone_hour>\d{2})(?P<zone_minute>\d{2})$",
+    re.IGNORECASE | re.ASCII,
 )
+_IMAP_MONTH_NUMBER = {
+    month.lower(): index
+    for index, month in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+        1,
+    )
+}
 _FETCH_RESPONSE_START_RE = re.compile(r"^\s*\d+\s+\(")
 
 
@@ -402,6 +413,8 @@ def imap_connection(server: ServerConfig, account: Account) -> Iterator[imaplib.
 
     Handles SSL/STARTTLS negotiation and ensures logout on exit.
     """
+    if not server.ssl and not server.starttls:
+        raise RuntimeError("refusing to send IMAP login credentials over a cleartext connection; enable SSL or STARTTLS")
     if server.ssl:
         imap = imaplib.IMAP4_SSL(host=server.host, port=server.port, ssl_context=ssl.create_default_context())
     else:
@@ -1061,10 +1074,109 @@ def _imap_append_wire_bytes(data: bytes) -> bytes:
 def _normalized_legacy_internaldate(value: object) -> str:
     if not isinstance(value, str):
         return ""
-    normalized = value.strip()
-    if len(normalized) >= 2 and normalized.startswith('"') and normalized.endswith('"'):
-        normalized = normalized[1:-1]
-    return normalized
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_legacy_internaldate(value: object) -> Optional[datetime]:
+    """Parse an IMAP INTERNALDATE without locale-dependent month handling."""
+    normalized = _normalized_legacy_internaldate(value)
+    match = _IMAP_INTERNALDATE_RE.fullmatch(normalized)
+    if match is None:
+        return None
+    zone_hour = int(match.group("zone_hour"))
+    zone_minute = int(match.group("zone_minute"))
+    if zone_hour > 23 or zone_minute > 59:
+        return None
+    zone_delta = timedelta(hours=zone_hour, minutes=zone_minute)
+    if match.group("zone_sign") == "-":
+        zone_delta = -zone_delta
+    try:
+        parsed = datetime(
+            int(match.group("year")),
+            _IMAP_MONTH_NUMBER[match.group("month").lower()],
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+            int(match.group("second")),
+            tzinfo=timezone(zone_delta),
+        )
+        return parsed
+    except (KeyError, OverflowError, ValueError):
+        return None
+
+
+def _legacy_internaldate_utc_key(value: object) -> str:
+    parsed = _parse_legacy_internaldate(value)
+    if parsed is None:
+        return ""
+    offset = parsed.utcoffset()
+    if offset is None:
+        return ""
+    local_seconds = (
+        (parsed.toordinal() - 1) * 24 * 60 * 60
+        + parsed.hour * 60 * 60
+        + parsed.minute * 60
+        + parsed.second
+    )
+    return str(local_seconds - int(offset.total_seconds()))
+
+
+def _legacy_internaldates_equal(first: object, second: object) -> bool:
+    first_key = _legacy_internaldate_utc_key(first)
+    return bool(first_key and first_key == _legacy_internaldate_utc_key(second))
+
+
+def _legacy_internaldate_for_append(value: str) -> Optional[str]:
+    if value == "":
+        return None
+    if _parse_legacy_internaldate(value) is None:
+        raise ValueError("invalid IMAP INTERNALDATE")
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    return f'"{value}"'
+
+
+def _maximum_bipartite_matching(
+    edges: List[List[int]],
+    right_count: int,
+) -> Tuple[int, set[int]]:
+    """Return maximum match size/right vertices without recursive augmenting paths."""
+    match_for_left = [-1] * len(edges)
+    match_for_right = [-1] * right_count
+    for start_left in sorted(range(len(edges)), key=lambda index: (len(edges[index]), index)):
+        visited_left = {start_left}
+        visited_right: set[int] = set()
+        parent_left_for_right: Dict[int, int] = {}
+        pending = deque([start_left])
+        free_right = -1
+        while pending and free_right < 0:
+            left = pending.popleft()
+            for right in edges[left]:
+                if right in visited_right:
+                    continue
+                visited_right.add(right)
+                parent_left_for_right[right] = left
+                matched_left = match_for_right[right]
+                if matched_left < 0:
+                    free_right = right
+                    break
+                if matched_left not in visited_left:
+                    visited_left.add(matched_left)
+                    pending.append(matched_left)
+        if free_right < 0:
+            continue
+        right = free_right
+        while right >= 0:
+            left = parent_left_for_right[right]
+            previous_right = match_for_left[left]
+            match_for_left[left] = right
+            match_for_right[right] = left
+            right = previous_right
+    return sum(1 for right in match_for_left if right >= 0), {
+        right for right in match_for_left if right >= 0
+    }
 
 
 def _message_id_header(data: bytes) -> str:
@@ -1117,7 +1229,7 @@ def _legacy_remote_has_message(
         if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_hash:
             continue
         expected_date = _normalized_legacy_internaldate(expected_internaldate)
-        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+        if expected_date and not _legacy_internaldates_equal(actual_date, expected_date):
             continue
         missing_flags = _legacy_missing_target_flags(
             expected_flags,
@@ -1709,7 +1821,7 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         same_date_paths = [
             path
             for path, regular_internaldate in metadata_entries
-            if _normalized_legacy_internaldate(regular_internaldate) == virtual_internaldate
+            if _legacy_internaldates_equal(regular_internaldate, virtual_internaldate)
         ]
         if len(same_date_paths) != 1:
             return False
@@ -2020,7 +2132,7 @@ def _valid_legacy_flag_token(token: str) -> bool:
 
 
 def _valid_legacy_internaldate(value: str) -> bool:
-    return bool(_IMAP_INTERNALDATE_RE.fullmatch(value))
+    return _parse_legacy_internaldate(value) is not None
 
 
 def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -> Tuple[str, Optional[str]]:
@@ -2040,15 +2152,11 @@ def _validate_legacy_delivery_metadata(meta: Dict[str, object], label: object) -
     if "internaldate" in meta:
         if not isinstance(internaldate_raw, str):
             errors.append("invalid internaldate metadata")
-        elif internaldate_raw.strip():
-            stripped = internaldate_raw.strip()
-            parse_value = stripped[1:-1] if stripped.startswith('"') and stripped.endswith('"') else stripped
-            if any(ord(ch) < 32 or ord(ch) == 127 for ch in parse_value):
+        elif internaldate_raw != "":
+            if _parse_legacy_internaldate(internaldate_raw) is None:
                 errors.append("invalid internaldate metadata")
-            elif _valid_legacy_internaldate(parse_value):
-                internaldate = stripped
             else:
-                errors.append("invalid internaldate metadata")
+                internaldate = internaldate_raw
     if errors:
         raise RuntimeError(f"{label}: " + "; ".join(errors))
     return flags, internaldate
@@ -2396,11 +2504,10 @@ def import_account(
                         if filtered_tokens:
                             flags_str = "(" + " ".join(filtered_tokens) + ")"
                     # Build IMAP INTERNALDATE value. If missing, use current time (RFC3501 format).
-                    if isinstance(internaldate, str) and internaldate.strip():
-                        dt_str = internaldate.strip()
-                        if not (dt_str.startswith("\"") and dt_str.endswith("\"")):
-                            dt_str = f'"{dt_str}"'
-                        date_time = dt_str
+                    if internaldate is not None:
+                        date_time = _legacy_internaldate_for_append(internaldate)
+                        if date_time is None:
+                            raise RuntimeError(f"invalid internaldate metadata for {eml_path}")
                     else:
                         import imaplib as _imaplib
                         date_time = _imaplib.Time2Internaldate(time.time())

@@ -24,13 +24,13 @@ import stat
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import urllib.parse
 
 from components.secret_files import read_secret_file_no_links
+from components.utils import validate_panel_base_url
 
 try:
     import requests
@@ -44,6 +44,13 @@ class ServerSettings:
     port: int = 993
     ssl: bool = True
     starttls: bool = False
+
+
+def _imap_port(value: str) -> int:
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return port
 
 
 PRIVATE_DIR_MODE = 0o700
@@ -62,6 +69,7 @@ class DirectAdminClient:
     """
 
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout_sec: int = 20) -> None:
+        base_url = validate_panel_base_url(base_url, label="DirectAdmin")
         if requests is None:  # type: ignore
             raise RuntimeError("DirectAdmin indexer requires the 'requests' package. Install via: pip install -r requirements.txt")
         self.base_url = base_url.rstrip("/")
@@ -83,7 +91,9 @@ class DirectAdminClient:
         # Ask for JSON when supported by the server
         params.setdefault("json", "yes")
         url = self._endpoint(path)
-        resp = self.session.get(url, params=params, timeout=self.timeout_sec)
+        resp = self.session.get(url, params=params, timeout=self.timeout_sec, allow_redirects=False)
+        if 300 <= resp.status_code < 400:
+            raise RuntimeError(f"DirectAdmin API request failed: HTTP {resp.status_code}")
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
 
@@ -511,7 +521,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Index domains and mailboxes via DirectAdmin-compatible API and write export.pass.config.json",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--url", required=True, help="Base URL to the control panel API, e.g. https://panel.example.com:2222")
+    p.add_argument("--url", required=True, help="HTTPS panel URL (literal loopback HTTP is also allowed)")
     p.add_argument("--username", required=True, help="API username (user-level is sufficient)")
     p.add_argument("--password", required=False, help="API password or login key; insecure because process args can expose it")
     p.add_argument("--password-file", required=False, help="Path to a file containing the API password or login key")
@@ -519,22 +529,49 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-verify-ssl", action="store_true", help="Disable TLS certificate verification")
 
     p.add_argument("--imap-host", required=True, help="IMAP server hostname to place into generated config")
-    p.add_argument("--imap-port", type=int, default=993, help="IMAP server port")
-    p.add_argument("--imap-ssl", action="store_true", default=True, help="Use SSL for IMAP connection (default on)")
-    p.add_argument("--no-imap-ssl", dest="imap_ssl", action="store_false", help="Disable SSL for IMAP connection")
-    p.add_argument("--imap-starttls", action="store_true", default=False, help="Use STARTTLS when SSL is disabled")
+    p.add_argument(
+        "--imap-port",
+        type=_imap_port,
+        default=argparse.SUPPRESS,
+        help="IMAP server port (defaults to 993, or 143 with --imap-starttls)",
+    )
+    p.add_argument(
+        "--imap-ssl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use implicit TLS for the IMAP connection",
+    )
+    p.add_argument("--imap-starttls", action="store_true", default=False, help="Use STARTTLS instead of implicit TLS")
 
-    p.add_argument("--default-password", default="", help="Password value to put for each account (leave empty to fill later); insecure because process args can expose it")
+    p.add_argument("--default-password", default="", help="Password value to put for each account (fill before a non-dry-run panel import); insecure because process args can expose it")
     p.add_argument("--default-password-file", required=False, help="Path to a file containing the default mailbox password")
     p.add_argument("--default-password-env", required=False, help="Environment variable containing the default mailbox password")
     p.add_argument("--out", default="export.pass.config.json", help="Output JSON path")
     p.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists")
 
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not hasattr(args, "imap_port"):
+        args.imap_port = 143 if args.imap_starttls else 993
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    if not bool(args.imap_ssl) and not bool(args.imap_starttls):
+        print("Refusing to write a cleartext IMAP config; enable --imap-ssl or --imap-starttls.", file=sys.stderr)
+        return 2
+
+    try:
+        validate_panel_base_url(str(args.url), label="DirectAdmin")
+        if not str(args.username).strip():
+            raise ValueError("DirectAdmin username must be non-empty")
+        imap_host = str(args.imap_host).strip()
+        if not imap_host:
+            raise ValueError("IMAP host must be non-empty")
+    except ValueError as exc:
+        print(f"Invalid arguments: {exc}", file=sys.stderr)
+        return 2
 
     try:
         password = resolve_password(args)
@@ -576,7 +613,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Build config
     server = ServerSettings(
-        host=args.imap_host,
+        host=imap_host,
         port=int(args.imap_port),
         ssl=bool(args.imap_ssl) and not bool(args.imap_starttls),
         starttls=bool(args.imap_starttls),

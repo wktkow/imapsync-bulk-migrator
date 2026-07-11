@@ -19,6 +19,7 @@ from .imap_ops import (
     _legacy_metadata_for_fetch_body_part,
     _legacy_symlink_component,
     _legacy_hierarchy_metadata,
+    _legacy_internaldates_equal,
     _legacy_missing_target_flags,
     _legacy_search_target_uids,
     _legacy_source_attributes_key,
@@ -26,13 +27,13 @@ from .imap_ops import (
     _legacy_trusted_covered_by_regular_content,
     _legacy_used_uid_key,
     _legacy_used_uid_namespace,
+    _maximum_bipartite_matching,
     _normalized_legacy_internaldate,
     _legacy_uidvalidity_metadata,
     _list_selectable_mailbox_entries,
     _read_file_no_symlink,
     _parse_fetch_response_for_uid,
     _require_legacy_payload_integrity,
-    _legacy_validate_path_segments,
     _should_skip_legacy_source_view,
     _validate_legacy_delivery_metadata,
     _validate_legacy_sidecar_integrity,
@@ -137,30 +138,16 @@ def _identity_variant_slots_cover(
                 required_flags
                 and _normalized_legacy_internaldate(remote_internaldate)
                 and _normalized_legacy_internaldate(local_internaldate)
-                and _normalized_legacy_internaldate(remote_internaldate)
-                != _normalized_legacy_internaldate(local_internaldate)
+                and not _legacy_internaldates_equal(remote_internaldate, local_internaldate)
             )
         ]
         if not matches:
             return False
         edges.append(matches)
-    match_for_local: Dict[int, int] = {}
-
-    def assign(remote_idx: int, seen: Set[int]) -> bool:
-        for local_idx in edges[remote_idx]:
-            if local_idx in seen:
-                continue
-            seen.add(local_idx)
-            previous_remote = match_for_local.get(local_idx)
-            if previous_remote is None or assign(previous_remote, seen):
-                match_for_local[local_idx] = remote_idx
-                return True
+    matched_count, matched_local_indexes = _maximum_bipartite_matching(edges, len(local_slots))
+    if matched_count != len(remote_slots):
         return False
-
-    for remote_idx in sorted(range(len(remote_slots)), key=lambda idx: len(edges[idx])):
-        if not assign(remote_idx, set()):
-            return False
-    if require_all_local and not required_local_indexes.issubset(match_for_local):
+    if require_all_local and not required_local_indexes.issubset(matched_local_indexes):
         return False
     return True
 
@@ -258,7 +245,7 @@ def _remote_has_message(
         if missing_flags:
             flag_mismatches.append(missing_flags)
             continue
-        if expected_date and _normalized_legacy_internaldate(actual_date) != expected_date:
+        if expected_date and not _legacy_internaldates_equal(actual_date, expected_date):
             date_mismatches.append(actual_date or "<missing>")
             continue
         if used_nums is not None:

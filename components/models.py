@@ -150,6 +150,11 @@ class ProviderEndpoint:
                 )
             if self.ssl and self.starttls:
                 raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")
+            if not self.ssl and not self.starttls:
+                raise ValueError(
+                    f"{context}.ssl or {context}.starttls must be true; "
+                    "cleartext IMAP authentication is not allowed"
+                )
             self.validate_auth_method(self.auth, context=f"{context}.auth")
             return
         if host_key != expected_hosts[self.provider]:
@@ -497,7 +502,11 @@ class Config:
         server = _server_config_from_dict(data.get("server"), context="server")
         source_server = None
         if "source_server" in data and data.get("source_server") is not None:
-            source_server = _server_config_from_dict(data.get("source_server"), context="source_server")
+            source_server = _server_config_from_dict(
+                data.get("source_server"),
+                context="source_server",
+                require_encrypted=False,
+            )
 
         accounts_raw = data.get("accounts")
         if not isinstance(accounts_raw, list) or not accounts_raw:
@@ -524,7 +533,12 @@ class Config:
         return Config(server=server, accounts=accounts, source_server=source_server)
 
 
-def _server_config_from_dict(raw: Any, *, context: str) -> ServerConfig:
+def _server_config_from_dict(
+    raw: Any,
+    *,
+    context: str,
+    require_encrypted: bool = True,
+) -> ServerConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Config must include '{context}' object" if context == "server" else f"{context} must be an object")
     host = raw.get("host")
@@ -544,6 +558,11 @@ def _server_config_from_dict(raw: Any, *, context: str) -> ServerConfig:
     starttls = _bool_value(raw.get("starttls", False), f"{context}.starttls")
     if use_ssl and starttls:
         raise ValueError(f"{context}.ssl and {context}.starttls cannot both be true")
+    if require_encrypted and not use_ssl and not starttls:
+        raise ValueError(
+            f"{context}.ssl or {context}.starttls must be true; "
+            "cleartext IMAP authentication is not allowed"
+        )
     return ServerConfig(host=host, port=port, ssl=use_ssl, starttls=starttls)
 
 

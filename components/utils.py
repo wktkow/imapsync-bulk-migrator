@@ -1,9 +1,11 @@
 import base64
+import ipaddress
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,40 @@ SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.@+-]+")
 IMAPSYNC_VERSION_TIMEOUT_SEC = 10
 IMAP_UID_MAX = 0xFFFFFFFF
 _IMAP_UID_TOKEN_RE = re.compile(r"[1-9][0-9]*")
+
+
+def validate_panel_base_url(value: str, *, label: str) -> str:
+    """Require HTTPS, except for HTTP addressed directly to a loopback IP."""
+    base_url = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        host = parsed.hostname
+        port = parsed.port
+        valid_port = port is None or 1 <= port <= 65535
+        valid_shape = (
+            not parsed.query
+            and not parsed.fragment
+            and parsed.username is None
+            and parsed.password is None
+        )
+        try:
+            loopback = bool(host) and ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        allowed_transport = parsed.scheme.lower() == "https" or (
+            parsed.scheme.lower() == "http" and loopback
+        )
+    except (ValueError, TypeError):
+        valid_port = False
+        valid_shape = False
+        allowed_transport = False
+        host = None
+    if not host or not valid_port or not valid_shape or not allowed_transport:
+        raise ValueError(
+            f"{label} base URL must use https:// with a valid host and port; "
+            "http:// is allowed only for a literal loopback address"
+        )
+    return base_url
 
 
 def sanitize_for_path(name: str) -> str:
@@ -152,8 +188,8 @@ def ensure_imapsync_available() -> str:
 
 
 def check_environment(min_free_gb: float = 1.0) -> None:
-    if sys.version_info < (3, 9):
-        raise RuntimeError("Python 3.9+ is required.")
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Python 3.10+ is required.")
     _ = min_free_gb
 
 

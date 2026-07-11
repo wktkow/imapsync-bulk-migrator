@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+from collections import Counter
 import hashlib
-import itertools
 import json
+import math
 import re
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 
 
 CONTENT_BINDING_FIELD = "content_binding_sha256"
@@ -139,6 +140,18 @@ def provider_content_binding_sha256_legacy_mailbox_attribute_order(row: Mapping[
 
 
 def _provider_content_binding_sha256(row: Mapping[str, Any], *, normalize_mailbox_attributes: bool) -> str:
+    fields = _provider_content_binding_fields(
+        row,
+        normalize_mailbox_attributes=normalize_mailbox_attributes,
+    )
+    return _content_binding_sha256("provider-manifest", fields)
+
+
+def _provider_content_binding_fields(
+    row: Mapping[str, Any],
+    *,
+    normalize_mailbox_attributes: bool,
+) -> Dict[str, Any]:
     fields = _required_content_fields(row)
     for key in (
         "canonical_id",
@@ -160,7 +173,7 @@ def _provider_content_binding_sha256(row: Mapping[str, Any], *, normalize_mailbo
         _add_optional_mailbox_attributes(fields, row)
     else:
         _add_optional_text_list_map(fields, row, "source_mailbox_attributes")
-    return _content_binding_sha256("provider-manifest", fields)
+    return fields
 
 
 def provider_content_binding_matches(row: Mapping[str, Any], actual: str) -> bool:
@@ -178,33 +191,108 @@ def _provider_legacy_mailbox_attribute_order_binding_candidates(
     row: Mapping[str, Any],
     *,
     limit: int = 4096,
+    work_limit_bytes: int = 16 * 1024 * 1024,
 ) -> set[str]:
     value = row.get("source_mailbox_attributes")
     if not isinstance(value, Mapping):
         return set()
     keys: list[str] = []
-    variants_by_key: list[list[tuple[str, ...]]] = []
+    fixed_attributes: dict[str, list[str]] = {}
+    variable_attributes: list[tuple[str, list[str]]] = []
     candidate_count = 1
     for raw_key, raw_value in value.items():
         if not isinstance(raw_key, str):
             raise ValueError("invalid source_mailbox_attributes")
         if not isinstance(raw_value, list) or any(not isinstance(item, str) for item in raw_value):
             raise ValueError("invalid source_mailbox_attributes")
-        variants = sorted(set(itertools.permutations(raw_value)))
-        candidate_count *= max(1, len(variants))
-        if candidate_count > limit:
+        remaining_limit = limit // candidate_count
+        permutation_count = _bounded_unique_permutation_count(raw_value, remaining_limit)
+        if permutation_count > remaining_limit:
             return set()
+        candidate_count *= permutation_count
         keys.append(raw_key)
-        variants_by_key.append(variants)
+        if permutation_count == 1:
+            fixed_attributes[raw_key] = sorted(raw_value)
+        else:
+            variable_attributes.append((raw_key, raw_value))
+
+    representative = dict(row)
+    representative["source_mailbox_attributes"] = {
+        key: sorted(value[key])
+        for key in keys
+    }
+    representative_fields = _provider_content_binding_fields(
+        representative,
+        normalize_mailbox_attributes=False,
+    )
+    representative_payload = {
+        "binding": "email-content-v1",
+        "kind": "provider-manifest",
+        "fields": representative_fields,
+    }
+    canonical_size = len(
+        json.dumps(
+            representative_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if candidate_count * canonical_size > work_limit_bytes:
+        return set()
+
     candidates: set[str] = set()
-    for combo in itertools.product(*variants_by_key):
-        variant = dict(row)
-        variant["source_mailbox_attributes"] = {
-            key: list(attrs)
-            for key, attrs in zip(keys, combo)
-        }
-        candidates.add(provider_content_binding_sha256_legacy_mailbox_attribute_order(variant))
+    selected_attributes = dict(fixed_attributes)
+
+    def add_candidates(index: int) -> None:
+        if index == len(variable_attributes):
+            variant = dict(row)
+            variant["source_mailbox_attributes"] = {
+                key: selected_attributes[key]
+                for key in keys
+            }
+            candidates.add(provider_content_binding_sha256_legacy_mailbox_attribute_order(variant))
+            return
+        key, attributes = variable_attributes[index]
+        for permutation in _unique_text_permutations(attributes):
+            selected_attributes[key] = list(permutation)
+            add_candidates(index + 1)
+        selected_attributes.pop(key, None)
+
+    # Each variable entry has at least two permutations, so the candidate cap
+    # also bounds this recursion depth to at most 12.
+    add_candidates(0)
     return candidates
+
+
+def _bounded_unique_permutation_count(values: list[str], limit: int) -> int:
+    count = 1
+    placed = 0
+    for duplicate_count in Counter(values).values():
+        count *= math.comb(placed + duplicate_count, duplicate_count)
+        if count > limit:
+            return limit + 1
+        placed += duplicate_count
+    return count
+
+
+def _unique_text_permutations(values: list[str]) -> Iterator[tuple[str, ...]]:
+    current = sorted(values)
+    if not current:
+        yield ()
+        return
+    while True:
+        yield tuple(current)
+        pivot = len(current) - 2
+        while pivot >= 0 and current[pivot] >= current[pivot + 1]:
+            pivot -= 1
+        if pivot < 0:
+            return
+        successor = len(current) - 1
+        while current[successor] <= current[pivot]:
+            successor -= 1
+        current[pivot], current[successor] = current[successor], current[pivot]
+        current[pivot + 1 :] = reversed(current[pivot + 1 :])
 
 
 def content_binding_issue(record: Mapping[str, Any], expected: str, *, required: bool = True) -> Optional[str]:

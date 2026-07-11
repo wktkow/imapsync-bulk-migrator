@@ -8,14 +8,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Iterator
 from unittest import mock
 
 import imaplib
-import pytest
-
 from components.models import Account, ServerConfig
 from components.content_binding import CONTENT_BINDING_FIELD, legacy_content_binding_sha256
 
@@ -290,3 +287,13 @@ class TestBuildConfigReturnType:
         sig = inspect.signature(build_config)
         ret_str = str(sig.return_annotation)
         assert "Any" in ret_str, f"Expected Dict[str, Any], got: {ret_str}"
+
+
+def test_legacy_flags_helper_type_hints_resolve() -> None:
+    from typing import get_type_hints
+
+    from components.imap_ops import _legacy_flags_arg_from_tokens
+
+    hints = get_type_hints(_legacy_flags_arg_from_tokens)
+    assert "tokens" in hints
+    assert hints["return"] is str

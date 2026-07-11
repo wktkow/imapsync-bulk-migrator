@@ -1,5 +1,7 @@
-import urllib.parse
 import re
+import urllib.parse
+
+from .utils import validate_panel_base_url
 
 try:
     import requests  # type: ignore
@@ -9,6 +11,7 @@ except Exception:  # pragma: no cover
 
 class DirectAdminClient:
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout_sec: int = 20) -> None:
+        base_url = validate_panel_base_url(base_url, label="DirectAdmin")
         if requests is None:  # type: ignore
             raise RuntimeError("DirectAdmin auto-provisioning requires the 'requests' package. Install it via: pip install -r requirements.txt")
         self.base_url = base_url.rstrip("/")
@@ -27,7 +30,9 @@ class DirectAdminClient:
         params = dict(params or {})
         params.setdefault("json", "yes")
         url = self._endpoint(path)
-        resp = self.session.get(url, params=params, timeout=self.timeout_sec)
+        resp = self.session.get(url, params=params, timeout=self.timeout_sec, allow_redirects=False)
+        if 300 <= resp.status_code < 400:
+            raise RuntimeError(f"DirectAdmin API request failed: HTTP {resp.status_code}")
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
         if "json" in ctype:
@@ -47,7 +52,9 @@ class DirectAdminClient:
     def _post(self, path: str, data):
         """POST wrapper that returns either a JSON object or parsed key-values."""
         url = self._endpoint(path)
-        resp = self.session.post(url, data=data, timeout=self.timeout_sec)
+        resp = self.session.post(url, data=data, timeout=self.timeout_sec, allow_redirects=False)
+        if 300 <= resp.status_code < 400:
+            raise RuntimeError(f"DirectAdmin API request failed: HTTP {resp.status_code}")
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
         if "json" in ctype:

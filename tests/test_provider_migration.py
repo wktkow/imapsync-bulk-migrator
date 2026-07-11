@@ -9,7 +9,7 @@ import re
 import stat
 import threading
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 from unittest import mock
 
 import pytest
@@ -74,6 +74,7 @@ from components.provider_ops import (
     resolve_target_mailbox,
     restore_gmail_labels,
     restore_gmail_starred_flag,
+    restore_imap_flags,
     target_merge_group_key,
     target_has_message,
     translate_source_mailbox_for_target,
@@ -5977,6 +5978,80 @@ def test_provider_import_merge_mode_restores_supported_imap_keywords_on_existing
     assert journal[-1]["action"] == "existing"
 
 
+def test_restore_imap_flags_uses_uid_store_when_uid_commands_are_available() -> None:
+    class UidStoreTarget:
+        def __init__(self) -> None:
+            self.uid_calls: List[tuple] = []
+
+        def select(self, _mailbox: str, readonly: bool = False):
+            assert not readonly
+            return "OK", [b"1"]
+
+        def response(self, name: str):
+            assert name == "PERMANENTFLAGS"
+            return "OK", [b"(\\Seen)"]
+
+        def uid(self, command: str, *args):
+            self.uid_calls.append((command, *args))
+            return "OK", [b""]
+
+        def store(self, *_args):
+            raise AssertionError("plain STORE would interpret the UID as a sequence number")
+
+    target = UidStoreTarget()
+
+    restore_imap_flags(
+        target,  # type: ignore[arg-type]
+        "INBOX",
+        {"canonical_id": "message-1", "flags": "\\Seen"},
+        target_num=b"4242",
+        target_provider="imap",
+    )
+
+    assert target.uid_calls == [("store", b"4242", "+FLAGS.SILENT", "(\\Seen)")]
+
+
+def test_max_expected_content_identity_matches_is_recursion_free_for_many_identical_messages() -> None:
+    from components.provider_ops import _max_expected_content_identity_matches
+
+    identity = (123, "a" * 64)
+    occurrence_count = 1_200
+
+    assert _max_expected_content_identity_matches(
+        [identity] * occurrence_count,
+        [{identity} for _ in range(occurrence_count)],
+    ) == occurrence_count
+
+
+def test_max_expected_content_identity_matches_reassigns_capacity_to_find_maximum() -> None:
+    from components.provider_ops import _max_expected_content_identity_matches
+
+    first = (1, "a" * 64)
+    second = (2, "b" * 64)
+
+    assert _max_expected_content_identity_matches(
+        [first, second],
+        [{first, second}, {first}],
+    ) == 2
+
+
+@pytest.mark.parametrize("invalid_port", ["0", "65536", "-1"])
+def test_panel_indexers_reject_invalid_imap_ports(invalid_port: str, capsys: pytest.CaptureFixture[str]) -> None:
+    from cpanel_indexer import parse_args as parse_cpanel_args
+    from directadmin_indexer import parse_args as parse_directadmin_args
+
+    for parse_args in (parse_cpanel_args, parse_directadmin_args):
+        with pytest.raises(SystemExit) as exc_info:
+            parse_args([
+                "--url", "https://panel.example.com",
+                "--username", "panel-user",
+                "--imap-host", "imap.example.com",
+                "--imap-port", invalid_port,
+            ])
+        assert exc_info.value.code == 2
+        assert "argument --imap-port: must be between 1 and 65535" in capsys.readouterr().err
+
+
 def test_provider_import_merge_reuses_content_match_when_internaldate_differs(tmp_path: Path) -> None:
     config = _provider_config(target_mode="merge")
     account = config.accounts[0]
@@ -10329,6 +10404,83 @@ def test_provider_content_binding_ignores_mailbox_attribute_order() -> None:
     )
 
 
+def test_provider_content_binding_bounds_legacy_attribute_permutations_before_generation() -> None:
+    from components.content_binding import _provider_legacy_mailbox_attribute_order_binding_candidates
+
+    row = _default_manifest_fixture_row()
+    row["source_mailbox_attributes"] = {
+        "INBOX": [f"attribute-{index}" for index in range(10)],
+    }
+
+    with mock.patch(
+        "components.content_binding._unique_text_permutations",
+        side_effect=AssertionError("permutations must not be generated above the limit"),
+    ):
+        assert _provider_legacy_mailbox_attribute_order_binding_candidates(row) == set()
+
+
+def test_provider_content_binding_bounds_large_duplicate_permutation_work() -> None:
+    from components.content_binding import _provider_legacy_mailbox_attribute_order_binding_candidates
+
+    row = _default_manifest_fixture_row()
+    row["source_mailbox_attributes"] = {
+        "INBOX": ["same"] * 4095 + ["different"],
+    }
+
+    with mock.patch(
+        "components.content_binding._unique_text_permutations",
+        side_effect=AssertionError("oversized aggregate work must not be generated"),
+    ):
+        assert _provider_legacy_mailbox_attribute_order_binding_candidates(row) == set()
+
+
+def test_provider_content_binding_preserves_realistic_legacy_permutation_search() -> None:
+    from components.content_binding import _provider_legacy_mailbox_attribute_order_binding_candidates
+
+    row = _default_manifest_fixture_row()
+    row["source_mailbox_attributes"] = {
+        f"Mailbox-{index}": ["\\HasNoChildren", "\\Sent"]
+        for index in range(9)
+    }
+    legacy_variant = dict(row)
+    legacy_variant["source_mailbox_attributes"] = {
+        key: list(reversed(attributes))
+        for key, attributes in row["source_mailbox_attributes"].items()
+    }
+    legacy_digest = provider_content_binding_sha256_legacy_mailbox_attribute_order(legacy_variant)
+
+    assert len(_provider_legacy_mailbox_attribute_order_binding_candidates(row)) == 512
+    assert provider_content_binding_matches(row, legacy_digest)
+
+
+def test_provider_content_binding_budget_includes_large_mailbox_keys() -> None:
+    from components.content_binding import _provider_legacy_mailbox_attribute_order_binding_candidates
+
+    row = _default_manifest_fixture_row()
+    row["source_mailbox_attributes"] = {
+        "M" * 100_000: [f"attribute-{index}" for index in range(6)],
+    }
+
+    with mock.patch(
+        "components.content_binding._unique_text_permutations",
+        side_effect=AssertionError("full-payload work above the byte budget must not be generated"),
+    ):
+        assert _provider_legacy_mailbox_attribute_order_binding_candidates(row) == set()
+
+
+def test_provider_content_binding_generates_each_duplicate_attribute_permutation_once() -> None:
+    from components.content_binding import _provider_legacy_mailbox_attribute_order_binding_candidates
+
+    row = _default_manifest_fixture_row()
+    row["source_mailbox_attributes"] = {
+        "INBOX": ["\\HasNoChildren", "\\Sent", "\\Sent"],
+    }
+
+    candidates = _provider_legacy_mailbox_attribute_order_binding_candidates(row)
+
+    assert len(candidates) == 3
+
+
 def test_provider_content_binding_accepts_uppercase_equivalent_digest() -> None:
     row = _default_manifest_fixture_row()
     row[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(row).upper()
@@ -14195,3 +14347,78 @@ def test_main_routes_provider_preflight(tmp_path: Path) -> None:
 
     assert rc == 0
     preflight.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "31-Feb-2024 12:00:00 +0000",
+        "01-Jan-2024 12:00:00 +2400",
+        "01-Jan-2024 12:00:00 +1260",
+        "01-Jan-2024 12:00:00 +9999",
+        " 01-Jan-2024 12:00:00 +0000",
+        "01-Jan-2024 12:00:00 +0000 ",
+    ],
+)
+def test_provider_internaldate_validation_rejects_impossible_values(value: str) -> None:
+    from components.provider_ops import _internaldate_for_append, provider_delivery_metadata_issues
+
+    assert provider_delivery_metadata_issues([{"canonical_id": "id", "internaldate": value}]) == [
+        "id: invalid internaldate metadata"
+    ]
+    with pytest.raises(RuntimeError, match="invalid provider internaldate"):
+        _internaldate_for_append(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "wire_value"),
+    [
+        (" 1-Jan-2024 12:00:00 +0000", '" 1-Jan-2024 12:00:00 +0000"'),
+        ('" 1-Jan-2024 12:00:00 +0000"', '" 1-Jan-2024 12:00:00 +0000"'),
+        ("01-Jan-2024 12:00:00 +0000", '"01-Jan-2024 12:00:00 +0000"'),
+    ],
+)
+def test_provider_internaldate_preserves_valid_wire_text(value: str, wire_value: str) -> None:
+    from components.provider_ops import _internaldate_for_append, provider_delivery_metadata_issues
+
+    assert provider_delivery_metadata_issues([{"canonical_id": "id", "internaldate": value}]) == []
+    assert _internaldate_for_append(value) == wire_value
+
+
+def test_provider_internaldate_comparison_uses_canonical_utc_instant() -> None:
+    from components.provider_ops import _target_internaldate_matches_row, append_target_internaldate_failure
+
+    class Target:
+        internaldate = "01-Jan-2024 13:00:00 +0100"
+
+        def uid(self, command: str, uid: bytes, query: str):
+            assert (command, uid, query) == ("fetch", b"7", "(UID INTERNALDATE)")
+            return "OK", [f'1 (UID 7 INTERNALDATE "{self.internaldate}")'.encode("ascii")]
+
+    row = {"canonical_id": "id", "internaldate": "01-Jan-2024 12:00:00 +0000"}
+    target = Target()
+    failures: List[str] = []
+
+    assert _target_internaldate_matches_row(target, b"7", row)
+    append_target_internaldate_failure(
+        failures,
+        identity="id",
+        target_mailbox="INBOX",
+        row=row,
+        actual_internaldate=target.internaldate,
+    )
+    assert failures == []
+
+    target.internaldate = "01-Jan-2024 13:00:01 +0100"
+    assert not _target_internaldate_matches_row(target, b"7", row)
+    append_target_internaldate_failure(
+        failures,
+        identity="id",
+        target_mailbox="INBOX",
+        row=row,
+        actual_internaldate=target.internaldate,
+    )
+    assert failures == [
+        "target INTERNALDATE mismatch for id in INBOX: "
+        "expected '01-Jan-2024 12:00:00 +0000' got '01-Jan-2024 13:00:01 +0100'"
+    ]
