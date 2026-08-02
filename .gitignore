@@ -55,6 +55,7 @@ prompt.md
 prompts/
 k.md
 charm_migration.map
+migration-notes.md
 
 # Editor/OS backups for JSON configs
 *.json.bak

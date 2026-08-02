@@ -583,12 +583,18 @@ def provider_target_journal_binding(config: ProviderMigrationConfig, account: Mi
 def imap_connection(endpoint: ProviderEndpoint, account: MigrationAccount, *, role: str) -> Iterator[imaplib.IMAP4]:
     provider_hosts = {"gmail": "imap.gmail.com", "icloud": "imap.mail.me.com"}
     host = provider_hosts.get(endpoint.provider, endpoint.host)
+    socket_timeout = 60.0
     if not endpoint.ssl and not endpoint.starttls:
         raise RuntimeError("refusing to send IMAP authentication credentials over a cleartext connection; enable SSL or STARTTLS")
     if endpoint.ssl:
-        imap = imaplib.IMAP4_SSL(host=host, port=endpoint.port, ssl_context=ssl.create_default_context())
+        imap = imaplib.IMAP4_SSL(
+            host=host,
+            port=endpoint.port,
+            ssl_context=ssl.create_default_context(),
+            timeout=socket_timeout,
+        )
     else:
-        imap = imaplib.IMAP4(host=host, port=endpoint.port)
+        imap = imaplib.IMAP4(host=host, port=endpoint.port, timeout=socket_timeout)
     try:
         if (not endpoint.ssl) and endpoint.starttls:
             imap.starttls(ssl_context=ssl.create_default_context())
@@ -11555,6 +11561,12 @@ def _provider_import_account_unlocked(
                     recovery=True,
                 )
             ensure_mailbox(imap, target_mailbox)
+            # Capture writable-mailbox capabilities before Gmail discovery
+            # selects All Mail and other views read-only. EXAMINE legitimately
+            # reports PERMANENTFLAGS as an empty set, which must not be treated
+            # as proof that portable flags such as \\Seen are unsupported by
+            # the APPEND destination.
+            append_permanent_flags = target_permanent_flags(imap)
             pre_append_gmail_msgids: Optional[List[str]] = None
             if config.target.provider == "gmail":
                 pre_append_gmail_msgids = _gmail_pre_append_message_ids(
@@ -11567,7 +11579,7 @@ def _provider_import_account_unlocked(
             append_flags = _flags_for_provider_append(
                 str(row.get("flags") or ""),
                 target_provider=config.target.provider,
-                permanent_flags=target_permanent_flags(imap),
+                permanent_flags=append_permanent_flags,
             )
             _provider_throttle_wait(
                 limiter,

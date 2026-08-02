@@ -1937,10 +1937,12 @@ def test_imap_connection_uses_canonical_provider_host() -> None:
     class RecordingImap:
         host = ""
         port = 0
+        timeout = None
 
-        def __init__(self, host: str, port: int, ssl_context=None) -> None:
+        def __init__(self, host: str, port: int, ssl_context=None, timeout=None) -> None:
             RecordingImap.host = host
             RecordingImap.port = port
+            RecordingImap.timeout = timeout
 
         def authenticate(self, *_args):
             return "OK", []
@@ -1954,6 +1956,7 @@ def test_imap_connection_uses_canonical_provider_host() -> None:
 
     assert RecordingImap.host == "imap.gmail.com"
     assert RecordingImap.port == 993
+    assert RecordingImap.timeout == 60.0
 
 
 def test_multi_account_provider_auth_requires_per_account_usernames(tmp_path: Path) -> None:
@@ -11536,6 +11539,74 @@ def test_provider_import_to_gmail_strips_deleted_append_flag(tmp_path: Path) -> 
     assert fake.append_flags == ["(\\Seen \\Flagged)"]
     journal = load_import_journal(account_dir, account)
     assert journal[-1]["target_gmail_msgid"] == "9001"
+
+
+def test_provider_import_to_gmail_uses_writable_permanentflags_before_readonly_discovery(
+    tmp_path: Path,
+) -> None:
+    class ReadonlyClearsPermanentFlagsTarget(FakeGmailTargetImap):
+        def __init__(self) -> None:
+            super().__init__(
+                permanent_flags="(\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)"
+            )
+
+        def response(self, name: str):
+            if (
+                name.upper() == "PERMANENTFLAGS"
+                and self.select_readonly
+                and self.select_readonly[-1]
+            ):
+                return "OK", [b"()"]
+            return super().response(name)
+
+    config = ProviderMigrationConfig(
+        source=ProviderEndpoint(
+            provider="imap",
+            host="mail.example.com",
+            auth=AuthConfig(
+                method="password",
+                username="source@example.com",
+                password="imap-secret",
+            ),
+        ),
+        target=ProviderEndpoint(
+            provider="gmail",
+            host="imap.gmail.com",
+            auth=AuthConfig(
+                method="xoauth2",
+                username="target@gmail.com",
+                password="gmail-token",
+            ),
+            gmail_full_visibility_verified=True,
+        ),
+        accounts=[
+            MigrationAccount(
+                source_email="source@example.com",
+                target_email="target@gmail.com",
+            )
+        ],
+        migration=MigrationSettings(target_mode="empty"),
+    )
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    row["source_provider"] = "imap"
+    row["target_account"] = "target@gmail.com"
+    row["primary_mailbox"] = "INBOX"
+    row["flags"] = "\\Seen"
+    _write_single_manifest_row(account_dir, row)
+    _write_provider_export_state(account_dir, target="target@gmail.com")
+    fake = ReadonlyClearsPermanentFlagsTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[ReadonlyClearsPermanentFlagsTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == ["INBOX"]
+    assert fake.appended_flags == ["(\\Seen)"]
 
 
 def test_provider_import_to_gmail_requires_x_gm_ext_before_append(tmp_path: Path) -> None:
