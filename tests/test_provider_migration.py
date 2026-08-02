@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import imaplib
 import json
 import os
+import queue
 import re
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -31,6 +35,7 @@ from components.models import (
 )
 from components.provider_ops import (
     MailboxInfo,
+    ProviderImportIntegrityGateError,
     _atomic_json,
     _provider_account_worker_results,
     _prune_provider_artifact_orphans,
@@ -68,6 +73,7 @@ from components.provider_ops import (
     provider_validate_all,
     quote_mailbox_name,
     RateLimiter,
+    require_merge_group_pending_internaldates_compatible,
     require_merge_group_unique_manifest_identities,
     resolve_secret,
     resolve_primary_mailbox,
@@ -321,6 +327,101 @@ def test_provider_ensure_private_dir_fsyncs_parent_after_mkdir(
 
     assert tmp_path.stat().st_ino in fsynced_dir_inodes
     assert (tmp_path / "source@example.com").stat().st_ino in fsynced_dir_inodes
+
+
+def test_provider_ensure_private_dir_secures_owned_directory(tmp_path: Path) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "owned"
+    target.mkdir(mode=0o700)
+    target.chmod(0o755)
+
+    provider_ops.ensure_private_dir(target)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert target.stat().st_uid == os.geteuid()
+
+
+def test_provider_ensure_private_dir_fails_closed_on_chmod_eperm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "owned"
+    target.mkdir(mode=0o700)
+
+    def denied_chmod(_fd: int, _mode: int) -> None:
+        raise PermissionError(errno.EPERM, "simulated EPERM")
+
+    monkeypatch.setattr(provider_ops.os, "fchmod", denied_chmod)
+
+    with pytest.raises(RuntimeError, match="unable to set private permissions") as exc_info:
+        provider_ops.ensure_private_dir(target)
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+def test_provider_ensure_private_dir_rejects_foreign_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "foreign"
+    target.mkdir(mode=0o700)
+    chmod_called = False
+
+    def unexpected_chmod(_fd: int, _mode: int) -> None:
+        nonlocal chmod_called
+        chmod_called = True
+
+    monkeypatch.setattr(provider_ops, "_provider_effective_uid", lambda: target.stat().st_uid + 1)
+    monkeypatch.setattr(provider_ops.os, "fchmod", unexpected_chmod)
+
+    with pytest.raises(RuntimeError, match="not owned by effective UID"):
+        provider_ops.ensure_private_dir(target)
+
+    assert not chmod_called
+
+
+def test_provider_ensure_private_dir_rejects_shared_mode_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "shared"
+    target.mkdir(mode=0o700)
+    target.chmod(0o770)
+    chmod_called = False
+
+    def unexpected_chmod(_fd: int, _mode: int) -> None:
+        nonlocal chmod_called
+        chmod_called = True
+
+    monkeypatch.setattr(provider_ops.os, "fchmod", unexpected_chmod)
+
+    with pytest.raises(RuntimeError, match="shared provider directory"):
+        provider_ops.ensure_private_dir(target)
+
+    assert not chmod_called
+    assert stat.S_IMODE(target.stat().st_mode) == 0o770
+
+
+def test_provider_ensure_private_dir_verifies_final_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    target = tmp_path / "wrong-mode"
+    target.mkdir(mode=0o700)
+    target.chmod(0o755)
+    monkeypatch.setattr(provider_ops.os, "fchmod", lambda _fd, _mode: None)
+
+    with pytest.raises(RuntimeError, match="permissions are not private"):
+        provider_ops.ensure_private_dir(target)
 
 
 def test_provider_write_jsonl_fsyncs_parent_directory_after_rename(
@@ -1191,6 +1292,46 @@ def _hybrid_many_to_one_config(*, target_mode: str = "empty") -> ProviderMigrati
         ],
         migration=MigrationSettings(target_mode=target_mode, account_merge_mode="many_to_one"),
     )
+
+
+def _run_real_provider_import_cli(
+    config: ProviderMigrationConfig,
+    tmp_path: Path,
+    in_root: Path,
+    connection,
+    *,
+    ignore_errors: bool = False,
+) -> int:
+    from components.main import main
+
+    config_path = tmp_path / "real-provider-import.json"
+    config_path.write_text("{}\n")
+    args = [
+        "--mode",
+        "import",
+        "--config",
+        str(config_path),
+        "--input-dir",
+        str(in_root),
+        "--output-dir",
+        str(in_root),
+        "--log-dir",
+        str(tmp_path / "logs"),
+        "--min-free-gb",
+        "0",
+        "--max-workers",
+        "4",
+        "--no-connectivity-test",
+    ]
+    if ignore_errors:
+        args.append("--ignore-errors")
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch("components.main.setup_logging", return_value=tmp_path / "run.log"))
+        stack.enter_context(mock.patch("components.main.check_environment"))
+        stack.enter_context(mock.patch("components.main.check_free_space_for_path"))
+        stack.enter_context(mock.patch("components.main.load_config_file", return_value=config))
+        stack.enter_context(mock.patch("components.provider_ops.imap_connection", connection))
+        return main(args)
 
 
 def test_provider_config_parse_and_legacy_detection(tmp_path: Path) -> None:
@@ -4078,6 +4219,230 @@ def test_provider_export_resume_refreshes_delivery_metadata_without_body_fetch(t
     assert updated_row[CONTENT_BINDING_FIELD] == provider_content_binding_sha256(updated_row)
 
 
+def test_provider_export_active_committed_snapshot_wins_over_source_delivery_drift(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield FakeSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    committed_row = load_manifest(account_dir)[0]
+    payload_path = account_dir / committed_row["eml_path"]
+    metadata_path = account_dir / committed_row["metadata_path"]
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            _journal_fixture_for_manifest_row(
+                config,
+                committed_row,
+                {
+                    "canonical_id": committed_row["canonical_id"],
+                    "target_account": account.target_email,
+                    "status": "committed",
+                    "action": "appended",
+                    "target_mailbox": "INBOX",
+                },
+            )
+        )
+        + "\n"
+    )
+    payload_before = payload_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    journal_before = journal_path.read_bytes()
+    changed_source = FakeSourceChangedMetadataNoBody()
+
+    @contextlib.contextmanager
+    def changed_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield changed_source
+
+    with mock.patch("components.provider_ops.imap_connection", changed_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    assert load_manifest(account_dir) == [committed_row]
+    assert payload_path.read_bytes() == payload_before
+    assert metadata_path.read_bytes() == metadata_before
+    assert journal_path.read_bytes() == journal_before
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["complete"] is True
+    assert state["manifest_sha256"] == provider_manifest_digest([committed_row])
+    assert state["warnings"] == [
+        {
+            "canonical_id": committed_row["canonical_id"],
+            "code": "committed-source-drift",
+            "fields": ["flags", "internaldate"],
+            "message": (
+                f"Source data for committed message {committed_row['canonical_id']} changed in "
+                "flags, internaldate; the exact committed export snapshot was retained."
+            ),
+        }
+    ]
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert audit_issues == []
+
+
+def test_provider_export_active_pending_snapshot_wins_over_source_delivery_drift(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield FakeSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    pending_row = load_manifest(account_dir)[0]
+    payload_path = account_dir / pending_row["eml_path"]
+    metadata_path = account_dir / pending_row["metadata_path"]
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            _journal_fixture_for_manifest_row(
+                config,
+                pending_row,
+                {
+                    "canonical_id": pending_row["canonical_id"],
+                    "target_account": account.target_email,
+                    "status": "pending",
+                    "action": "append-started",
+                    "target_mailbox": "INBOX",
+                },
+            )
+        )
+        + "\n"
+    )
+    payload_before = payload_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    journal_before = journal_path.read_bytes()
+
+    @contextlib.contextmanager
+    def changed_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield FakeSourceChangedMetadataNoBody()
+
+    with mock.patch("components.provider_ops.imap_connection", changed_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    assert load_manifest(account_dir) == [pending_row]
+    assert payload_path.read_bytes() == payload_before
+    assert metadata_path.read_bytes() == metadata_before
+    assert journal_path.read_bytes() == journal_before
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["warnings"] == [
+        {
+            "canonical_id": pending_row["canonical_id"],
+            "code": "pending-source-drift",
+            "fields": ["flags", "internaldate"],
+            "message": (
+                f"Source data for pending APPEND recovery message {pending_row['canonical_id']} "
+                "changed in flags, internaldate; the exact pending recovery snapshot was retained."
+            ),
+        }
+    ]
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert audit_issues == []
+
+
+def test_provider_export_active_pending_snapshot_wins_over_source_payload_drift(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+
+    @contextlib.contextmanager
+    def first_source_connection(*_args, **_kwargs) -> Iterator[FakeSourceImap]:
+        yield FakeSourceImap()
+
+    with mock.patch("components.provider_ops.imap_connection", first_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    account_dir = tmp_path / "source@example.com"
+    pending_row = load_manifest(account_dir)[0]
+    payload_path = account_dir / pending_row["eml_path"]
+    metadata_path = account_dir / pending_row["metadata_path"]
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            _journal_fixture_for_manifest_row(
+                config,
+                pending_row,
+                {
+                    "canonical_id": pending_row["canonical_id"],
+                    "target_account": account.target_email,
+                    "status": "pending",
+                    "action": "append-started",
+                    "target_mailbox": "INBOX",
+                },
+            )
+        )
+        + "\n"
+    )
+    payload_before = payload_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    journal_before = journal_path.read_bytes()
+
+    class ChangedPayloadSource(FakeSourceImap):
+        body = b"Message-ID: <m1@example.com>\r\n\r\nchanged-body"
+
+        def uid(self, command: str, *args):
+            if command == "search":
+                return "OK", [b"1"]
+            if command == "fetch":
+                query = args[-1]
+                labels = b"(\\Inbox \"Project A\")" if self.selected == "INBOX" else b"(\"Project A\")"
+                meta = (
+                    f'1 (UID 1 RFC822.SIZE {len(self.body)} FLAGS (\\Seen) '
+                    'INTERNALDATE "01-Jan-2024 00:00:00 +0000" '
+                    'X-GM-MSGID 123 X-GM-THRID 456 X-GM-LABELS '
+                ).encode("ascii") + labels + b")"
+                if "BODY.PEEK[]" not in query:
+                    return "OK", [meta]
+                self.body_fetches += 1
+                return "OK", [
+                    (meta[:-1] + f" BODY[] {{{len(self.body)}}}".encode("ascii"), self.body),
+                    b")",
+                ]
+            raise AssertionError(command)
+
+    changed_source = ChangedPayloadSource()
+
+    @contextlib.contextmanager
+    def changed_source_connection(*_args, **_kwargs) -> Iterator[ChangedPayloadSource]:
+        yield changed_source
+
+    with mock.patch("components.provider_ops.imap_connection", changed_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    assert changed_source.body_fetches == 0
+    assert load_manifest(account_dir) == [pending_row]
+    assert payload_path.read_bytes() == payload_before
+    assert metadata_path.read_bytes() == metadata_before
+    assert journal_path.read_bytes() == journal_before
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["warnings"] == [
+        {
+            "canonical_id": pending_row["canonical_id"],
+            "code": "pending-source-drift",
+            "fields": ["rfc822_size"],
+            "message": (
+                f"Source data for pending APPEND recovery message {pending_row['canonical_id']} "
+                "changed in rfc822_size; the exact pending recovery snapshot was retained."
+            ),
+        }
+    ]
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert audit_issues == []
+
+
 def test_provider_export_fails_when_source_flags_change_during_export(tmp_path: Path) -> None:
     config = ProviderMigrationConfig(
         source=ProviderEndpoint(provider="imap", host="mail.example.com"),
@@ -4328,6 +4693,330 @@ def test_provider_export_rerun_prunes_stale_manifest_rows(tmp_path: Path) -> Non
     assert state["complete"] is True
     assert state["canonical_messages"] == 0
     assert state["manifest_sha256"] == provider_manifest_digest([])
+
+
+def test_provider_export_retains_committed_evidence_when_source_message_disappears(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    committed_row = json.loads((account_dir / "manifest.jsonl").read_text())
+    stale_body = b"Message-ID: <stale@example.com>\r\n\r\nstale"
+    stale_row = dict(committed_row)
+    stale_row.update({
+        "canonical_id": "gmail-456",
+        "message_id_header": "<stale@example.com>",
+        "content_sha256": hashlib.sha256(stale_body).hexdigest(),
+        "rfc822_size": len(stale_body),
+        "eml_path": "messages/gmail-456.eml",
+        "metadata_path": "metadata/gmail-456.json",
+    })
+    _refresh_provider_binding(stale_row)
+    (account_dir / stale_row["eml_path"]).write_bytes(stale_body)
+    (account_dir / stale_row["metadata_path"]).write_text(json.dumps(stale_row))
+    (account_dir / "manifest.jsonl").write_text(
+        json.dumps(committed_row) + "\n" + json.dumps(stale_row) + "\n"
+    )
+    _write_provider_export_state(account_dir)
+    committed_row = load_manifest(account_dir)[0]
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, committed_row, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "action": "appended",
+        "internaldate": committed_row["internaldate"],
+    })) + "\n")
+    committed_payload_before = (account_dir / committed_row["eml_path"]).read_bytes()
+    committed_metadata_before = (account_dir / committed_row["metadata_path"]).read_bytes()
+    journal_before = journal_path.read_bytes()
+
+    @contextlib.contextmanager
+    def empty_source_connection(*_args, **_kwargs) -> Iterator[FakeGmailEmptySource]:
+        yield FakeGmailEmptySource()
+
+    with mock.patch("components.provider_ops.imap_connection", empty_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    assert load_manifest(account_dir) == [committed_row]
+    assert (account_dir / committed_row["eml_path"]).read_bytes() == committed_payload_before
+    assert (account_dir / committed_row["metadata_path"]).read_bytes() == committed_metadata_before
+    assert journal_path.read_bytes() == journal_before
+    assert not (account_dir / stale_row["eml_path"]).exists()
+    assert not (account_dir / stale_row["metadata_path"]).exists()
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["complete"] is True
+    assert state["canonical_messages"] == 1
+    assert state["manifest_sha256"] == provider_manifest_digest([committed_row])
+    _email, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert audit_issues == []
+
+    target = StoredMessageTarget({"Archive": [committed_payload_before]})
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert target.appended == []
+    assert report["ok"]
+
+
+def test_provider_export_retains_pending_recovery_when_source_message_disappears(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    pending_row = load_manifest(account_dir)[0]
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(
+            _journal_fixture_for_manifest_row(
+                config,
+                pending_row,
+                {
+                    "canonical_id": pending_row["canonical_id"],
+                    "target_account": account.target_email,
+                    "target_mailbox": "Archive",
+                    "status": "pending",
+                    "action": "append-started",
+                },
+            )
+        )
+        + "\n"
+    )
+    payload_path = account_dir / pending_row["eml_path"]
+    metadata_path = account_dir / pending_row["metadata_path"]
+    payload_before = payload_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    journal_before = journal_path.read_bytes()
+
+    @contextlib.contextmanager
+    def empty_source_connection(*_args, **_kwargs) -> Iterator[FakeGmailEmptySource]:
+        yield FakeGmailEmptySource()
+
+    with mock.patch("components.provider_ops.imap_connection", empty_source_connection):
+        provider_export_account(config, account, tmp_path)
+
+    assert load_manifest(account_dir) == [pending_row]
+    assert payload_path.read_bytes() == payload_before
+    assert metadata_path.read_bytes() == metadata_before
+    assert journal_path.read_bytes() == journal_before
+    state = json.loads((account_dir / "export-state.json").read_text())
+    assert state["complete"] is True
+    assert state["canonical_messages"] == 1
+    assert state["manifest_sha256"] == provider_manifest_digest([pending_row])
+    _email, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert audit_issues == []
+
+    target = StoredMessageTarget({"Archive": [payload_before]})
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(
+            config,
+            account,
+            tmp_path,
+            check_target=True,
+        )
+
+    assert target.appended == []
+    assert report["ok"]
+
+
+def test_provider_audit_and_import_reject_orphan_pending_identity_before_target_contact(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = load_manifest(account_dir)[0]
+    orphan = _journal_fixture_for_manifest_row(
+        config,
+        row,
+        {
+            "canonical_id": "gmail-orphan-pending",
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "pending",
+            "action": "append-started",
+        },
+    )
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps(orphan) + "\n"
+    )
+
+    _name, audit_issues = provider_audit_account(config, account, tmp_path)
+    assert any("journal pending identity not in manifest" in issue for issue in audit_issues)
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("target should not be contacted"),
+    ):
+        with pytest.raises(RuntimeError, match="journal pending identity not in manifest"):
+            provider_import_account(config, account, tmp_path)
+
+
+@pytest.mark.parametrize("defect", ["missing-payload", "corrupt-payload", "corrupt-metadata"])
+def test_provider_export_fails_closed_on_corrupt_committed_evidence(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, row, {
+            "canonical_id": "gmail-123",
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "committed",
+            "action": "appended",
+            "internaldate": row["internaldate"],
+        })) + "\n"
+    )
+    payload_path = account_dir / row["eml_path"]
+    metadata_path = account_dir / row["metadata_path"]
+    if defect == "missing-payload":
+        payload_path.unlink()
+    elif defect == "corrupt-payload":
+        payload_path.write_bytes(b"corrupt")
+    elif defect == "corrupt-metadata":
+        metadata_path.write_text("{}")
+    else:  # pragma: no cover - keeps the parametrization exhaustive
+        raise AssertionError(defect)
+    state_before = (account_dir / "export-state.json").read_bytes()
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("source must not be contacted"),
+    ):
+        with pytest.raises(RuntimeError, match="invalid committed export evidence"):
+            provider_export_account(config, account, tmp_path)
+
+    assert (account_dir / "export-state.json").read_bytes() == state_before
+    assert load_manifest(account_dir) == [row]
+    if defect == "missing-payload":
+        assert not payload_path.exists()
+    elif defect == "corrupt-payload":
+        assert payload_path.read_bytes() == b"corrupt"
+    else:
+        assert metadata_path.read_text() == "{}"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["content_sha256", CONTENT_BINDING_FIELD],
+)
+def test_provider_export_fails_closed_on_tampered_committed_journal_binding(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = load_manifest(account_dir)[0]
+    committed = _journal_fixture_for_manifest_row(
+        config,
+        row,
+        {
+            "canonical_id": row["canonical_id"],
+            "target_account": account.target_email,
+            "status": "committed",
+            "action": "appended",
+            "target_mailbox": "Archive",
+        },
+    )
+    committed[field] = "0" * 64
+    journal_path = account_dir / "import-target@icloud.com.journal.jsonl"
+    journal_path.write_text(json.dumps(committed) + "\n")
+    manifest_before = (account_dir / "manifest.jsonl").read_bytes()
+    metadata_before = (account_dir / row["metadata_path"]).read_bytes()
+    state_before = (account_dir / "export-state.json").read_bytes()
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("source must not be contacted"),
+    ):
+        with pytest.raises(RuntimeError, match="invalid committed export evidence"):
+            provider_export_account(config, account, tmp_path)
+
+    assert (account_dir / "manifest.jsonl").read_bytes() == manifest_before
+    assert (account_dir / row["metadata_path"]).read_bytes() == metadata_before
+    assert (account_dir / "export-state.json").read_bytes() == state_before
+
+
+def test_provider_export_rejects_committed_journal_identity_not_in_manifest(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, row, {
+            "canonical_id": "gmail-missing",
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "committed",
+            "action": "appended",
+            "internaldate": row["internaldate"],
+        })) + "\n"
+    )
+    state_before = (account_dir / "export-state.json").read_bytes()
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("source must not be contacted"),
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="journal committed identity not in manifest: gmail-missing",
+        ):
+            provider_export_account(config, account, tmp_path)
+
+    assert (account_dir / "export-state.json").read_bytes() == state_before
+    assert load_manifest(account_dir) == [row]
+
+
+def test_provider_export_rejects_committed_journal_when_manifest_is_missing(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = tmp_path / "source@example.com"
+    account_dir.mkdir()
+    row = _default_manifest_fixture_row()
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, row, {
+            "canonical_id": "gmail-123",
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "committed",
+            "action": "appended",
+            "internaldate": row["internaldate"],
+        })) + "\n"
+    )
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("source must not be contacted"),
+    ):
+        with pytest.raises(RuntimeError, match="committed or pending rows but the manifest is missing"):
+            provider_export_account(config, account, tmp_path)
+
+    assert not (account_dir / "export-state.json").exists()
 
 
 def test_provider_export_resume_preserves_complete_state_on_gmail_readiness_failure(tmp_path: Path) -> None:
@@ -5557,6 +6246,93 @@ class StoredMessageTarget(FakeTargetImap):
         )]
 
 
+@pytest.mark.parametrize(
+    "reported_internaldate",
+    ["", "02-Jan-2024 00:00:00 +0000"],
+    ids=["missing", "wrong"],
+)
+def test_provider_import_does_not_commit_unconfirmed_appended_internaldate_and_pending_rerun_is_diagnostic(
+    tmp_path: Path,
+    reported_internaldate: str,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+
+    class RewritingInternaldateTarget(StoredMessageTarget):
+        def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+            result = super().append(mailbox, flags, date_time, data)
+            target = self._normalize_mailbox(mailbox)
+            self.internaldates_by_mailbox[target][-1] = reported_internaldate
+            return result
+
+    target = RewritingInternaldateTarget()
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        with pytest.raises(RuntimeError, match="cannot confirm fresh append"):
+            provider_import_account(config, account, tmp_path)
+
+    journal = load_import_journal(account_dir, account)
+    assert [row["status"] for row in journal] == ["pending"]
+    assert not any(row.get("status") == "committed" for row in journal)
+    assert target.appended == ["Archive"]
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        with pytest.raises(RuntimeError, match="cannot confirm pending append recovery"):
+            provider_import_account(config, account, tmp_path)
+
+    rerun_journal = load_import_journal(account_dir, account)
+    assert rerun_journal == journal
+    assert target.appended == ["Archive"]
+
+
+def test_provider_import_commits_appended_target_with_utc_equivalent_internaldate(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = load_manifest(account_dir)[0]
+    row["internaldate"] = "01-Jan-2024 02:00:00 +0200"
+    _refresh_provider_binding(row)
+    _write_single_manifest_row(account_dir, row)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    _write_provider_export_state(account_dir)
+
+    class NormalizingInternaldateTarget(StoredMessageTarget):
+        def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+            result = super().append(mailbox, flags, date_time, data)
+            target = self._normalize_mailbox(mailbox)
+            self.internaldates_by_mailbox[target][-1] = "01-Jan-2024 00:00:00 +0000"
+            return result
+
+    target = NormalizingInternaldateTarget()
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    journal = load_import_journal(account_dir, account)
+    assert [row["status"] for row in journal] == ["pending", "committed"]
+    assert journal[-1]["action"] == "appended"
+    assert not any(
+        field in journal[-1]
+        for field in (
+            "source_internaldate",
+            "target_internaldate",
+            "internaldate_provenance",
+            "internaldate_origin_action",
+        )
+    )
+
+
 class ImaplibNormalizingStoredMessageTarget(StoredMessageTarget):
     def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
         return super().append(mailbox, flags, date_time, imaplib.MapCRLF.sub(imaplib.CRLF, data))
@@ -5654,6 +6430,38 @@ def _write_provider_account_fixture(
     return account_dir
 
 
+def _append_identical_provider_fixture_row(
+    account_dir: Path,
+    canonical_id: str,
+) -> dict:
+    rows = [
+        json.loads(line)
+        for line in (account_dir / "manifest.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    base = rows[0]
+    body = (account_dir / str(base["eml_path"])).read_bytes()
+    row = dict(base)
+    row.update({
+        "canonical_id": canonical_id,
+        "eml_path": f"messages/{canonical_id}.eml",
+        "metadata_path": f"metadata/{canonical_id}.json",
+    })
+    _refresh_provider_binding(row)
+    (account_dir / row["eml_path"]).write_bytes(body)
+    (account_dir / row["metadata_path"]).write_text(json.dumps(row))
+    rows.append(row)
+    (account_dir / "manifest.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in rows)
+    )
+    state_path = account_dir / "export-state.json"
+    state = json.loads(state_path.read_text())
+    state["canonical_messages"] = len(rows)
+    state["manifest_sha256"] = provider_manifest_digest(rows)
+    state_path.write_text(json.dumps(state))
+    return row
+
+
 def _write_provider_export_state(
     account_dir: Path,
     *,
@@ -5735,6 +6543,31 @@ def _write_single_manifest_row(account_dir: Path, row: dict, *, refresh_binding:
     (account_dir / "manifest.jsonl").write_text(json.dumps(row) + "\n")
 
 
+def _set_single_provider_fixture_internaldate(account_dir: Path, internaldate: str) -> dict:
+    row = load_manifest(account_dir)[0]
+    row["internaldate"] = internaldate
+    _write_single_manifest_row(account_dir, row)
+    state_path = account_dir / "export-state.json"
+    state = json.loads(state_path.read_text())
+    state["manifest_sha256"] = provider_manifest_digest([row])
+    state_path.write_text(json.dumps(state))
+    return row
+
+
+def _write_provider_fixture_manifest_rows(account_dir: Path, rows: List[dict]) -> None:
+    for row in rows:
+        _refresh_provider_binding(row)
+        (account_dir / str(row["metadata_path"])).write_text(json.dumps(row))
+    (account_dir / "manifest.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    state_path = account_dir / "export-state.json"
+    state = json.loads(state_path.read_text())
+    state["canonical_messages"] = len(rows)
+    state["manifest_sha256"] = provider_manifest_digest(rows)
+    state_path.write_text(json.dumps(state))
+
+
 def test_provider_audit_rejects_route_tamper_with_recomputed_manifest_state(tmp_path: Path) -> None:
     config = _provider_config()
     account = config.accounts[0]
@@ -5813,6 +6646,369 @@ def test_provider_import_is_idempotent_from_journal(tmp_path: Path) -> None:
         provider_import_account(config, account, tmp_path)
 
     assert fake.appended == ["Archive"]
+
+
+def test_provider_import_serializes_concurrent_invocations_and_reloads_committed_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    append_entered = threading.Event()
+    release_append = threading.Event()
+    lock_contended = threading.Event()
+    loaded_journals: List[Tuple[str, List[str]]] = []
+    loaded_journals_guard = threading.Lock()
+    errors: queue.Queue[BaseException] = queue.Queue()
+
+    class BlockingTarget(StoredMessageTarget):
+        def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+            result = super().append(mailbox, flags, date_time, data)
+            append_entered.set()
+            if not release_append.wait(5):
+                raise AssertionError("timed out waiting to release first APPEND")
+            return result
+
+    fake = BlockingTarget()
+    real_flock = provider_ops.fcntl.flock
+    real_load_journal = provider_ops.load_import_journal
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def recording_load_journal(*args, **kwargs):
+        rows = real_load_journal(*args, **kwargs)
+        with loaded_journals_guard:
+            loaded_journals.append(
+                (threading.current_thread().name, [str(row.get("status")) for row in rows])
+            )
+        return rows
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    def run_import() -> None:
+        try:
+            provider_ops.provider_import_account(config, account, tmp_path)
+        except BaseException as exc:  # pragma: no cover - asserted through the queue
+            errors.put(exc)
+
+    monkeypatch.setattr(provider_ops.fcntl, "flock", recording_flock)
+    monkeypatch.setattr(provider_ops, "load_import_journal", recording_load_journal)
+    monkeypatch.setattr(provider_ops, "imap_connection", fake_target_connection)
+
+    first = threading.Thread(target=run_import, name="first-import")
+    second = threading.Thread(target=run_import, name="second-import")
+    first.start()
+    assert append_entered.wait(5), "first import did not reach APPEND"
+    second.start()
+    assert lock_contended.wait(5), "second import never contended on the staging lock"
+    release_append.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors.empty(), list(errors.queue)
+    assert fake.appended == ["Archive"]
+    assert any(
+        thread_name == "second-import" and statuses == ["pending", "committed"]
+        for thread_name, statuses in loaded_journals
+    )
+    journal_rows = provider_ops.load_import_journal(account_dir, account)
+    assert [row["status"] for row in journal_rows] == ["pending", "committed"]
+
+
+def test_provider_import_lock_is_cross_process_and_released_after_exception(tmp_path: Path) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    child_probe = (
+        "import fcntl, os, sys; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError:\n sys.exit(23)"
+        "\nfinally:\n os.close(fd)"
+    )
+
+    with pytest.raises(LookupError, match="release lock"):
+        with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=None):
+            lock_path = provider_ops._provider_import_lock_path(config, account, tmp_path)
+            blocked = subprocess.run(
+                [sys.executable, "-c", child_probe, str(lock_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert blocked.returncode == 23, blocked.stderr
+            raise LookupError("release lock")
+
+    released = subprocess.run(
+        [sys.executable, "-c", child_probe, str(lock_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert released.returncode == 0, released.stderr
+
+
+def test_provider_workflow_lock_is_distinct_cross_process_and_released_after_exception(
+    tmp_path: Path,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    workflow_path = provider_ops._provider_workflow_lock_path(tmp_path)
+    import_path = provider_ops._provider_import_lock_path(config, account, tmp_path)
+    child_probe = (
+        "import fcntl, os, sys; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError:\n sys.exit(23)"
+        "\nfinally:\n os.close(fd)"
+    )
+
+    assert workflow_path != import_path
+    with pytest.raises(LookupError, match="release workflow lock"):
+        with provider_ops.provider_workflow_lock(tmp_path, stop_event=None):
+            lock_stat = workflow_path.stat(follow_symlinks=False)
+            assert stat.S_ISREG(lock_stat.st_mode)
+            assert lock_stat.st_nlink == 1
+            assert lock_stat.st_uid == os.geteuid()
+            assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+            blocked = subprocess.run(
+                [sys.executable, "-c", child_probe, str(workflow_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert blocked.returncode == 23, blocked.stderr
+            raise LookupError("release workflow lock")
+
+    released = subprocess.run(
+        [sys.executable, "-c", child_probe, str(workflow_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert released.returncode == 0, released.stderr
+
+
+def test_provider_workflow_lock_wait_is_cancellable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    stop_event = threading.Event()
+    lock_contended = threading.Event()
+    entered = threading.Event()
+    errors: queue.Queue[BaseException] = queue.Queue()
+    real_flock = provider_ops.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def wait_for_lock() -> None:
+        try:
+            with provider_ops.provider_workflow_lock(tmp_path, stop_event=stop_event):
+                entered.set()
+        except BaseException as exc:  # pragma: no cover - asserted through the queue
+            errors.put(exc)
+
+    monkeypatch.setattr(provider_ops.fcntl, "flock", recording_flock)
+
+    with provider_ops.provider_workflow_lock(tmp_path, stop_event=None):
+        waiter = threading.Thread(target=wait_for_lock, name="stopped-workflow")
+        waiter.start()
+        assert lock_contended.wait(5), "waiter never contended on the workflow lock"
+        stop_event.set()
+        waiter.join(5)
+        assert not waiter.is_alive()
+
+    assert not entered.is_set()
+    assert errors.qsize() == 1
+    assert "stop requested" in str(errors.get_nowait())
+
+
+def test_provider_import_lock_wait_stops_without_entering_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    stop_event = threading.Event()
+    lock_contended = threading.Event()
+    entered = threading.Event()
+    errors: queue.Queue[BaseException] = queue.Queue()
+    real_flock = provider_ops.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def wait_for_lock() -> None:
+        try:
+            with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=stop_event):
+                entered.set()
+        except BaseException as exc:  # pragma: no cover - asserted through the queue
+            errors.put(exc)
+
+    monkeypatch.setattr(provider_ops.fcntl, "flock", recording_flock)
+
+    with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=None):
+        waiter = threading.Thread(target=wait_for_lock, name="stopped-import")
+        waiter.start()
+        assert lock_contended.wait(5), "waiter never contended on the staging lock"
+        stop_event.set()
+        waiter.join(5)
+        assert not waiter.is_alive()
+
+    assert not entered.is_set()
+    assert errors.qsize() == 1
+    assert "stop requested" in str(errors.get_nowait())
+
+
+def test_provider_import_lock_fails_closed_when_filesystem_locking_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+
+    def unsupported_lock(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOTSUP, "simulated unsupported flock")
+
+    monkeypatch.setattr(provider_ops.fcntl, "flock", unsupported_lock)
+
+    with pytest.raises(RuntimeError, match="unable to acquire provider import lock"):
+        with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=None):
+            raise AssertionError("import proceeded without serialization")
+
+
+def test_provider_import_lock_closes_descriptors_when_post_open_uid_lookup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    opened_fds: List[int] = []
+    real_open = provider_ops._open_provider_import_lock
+    real_effective_uid = provider_ops._provider_effective_uid
+
+    def capture_open(lock_path: Path):
+        opened = real_open(lock_path)
+        opened_fds.extend(opened[:2])
+        return opened
+
+    def fail_after_open() -> int:
+        if opened_fds:
+            raise RuntimeError("simulated post-open effective UID failure")
+        return real_effective_uid()
+
+    monkeypatch.setattr(provider_ops, "_open_provider_import_lock", capture_open)
+    monkeypatch.setattr(provider_ops, "_provider_effective_uid", fail_after_open)
+
+    with pytest.raises(RuntimeError, match="post-open effective UID failure"):
+        with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=None):
+            raise AssertionError("import proceeded after UID lookup failure")
+
+    assert len(opened_fds) == 2
+    for fd in opened_fds:
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fd)
+        assert exc_info.value.errno == errno.EBADF
+
+
+def test_provider_import_lock_key_serializes_many_to_one_targets(tmp_path: Path) -> None:
+    from components import provider_ops
+
+    config = _many_to_one_config()
+    first, second = config.accounts
+
+    first_path = provider_ops._provider_import_lock_path(config, first, tmp_path)
+    second_path = provider_ops._provider_import_lock_path(config, second, tmp_path)
+
+    assert first_path == second_path
+    with provider_ops._provider_import_lock(config, first, tmp_path, stop_event=None):
+        assert first_path.exists()
+        lock_stat = first_path.stat(follow_symlinks=False)
+        assert stat.S_ISREG(lock_stat.st_mode)
+        assert lock_stat.st_nlink == 1
+        assert lock_stat.st_uid == os.geteuid()
+        assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("artifact_kind", "message"),
+    [
+        ("symlink", "symlinked provider import lock"),
+        ("hardlink", "hard-linked provider import lock"),
+        ("directory", "non-regular provider import lock"),
+        ("unsafe-mode", "unsafe mode"),
+    ],
+)
+def test_provider_import_lock_rejects_unsafe_artifact(
+    tmp_path: Path,
+    artifact_kind: str,
+    message: str,
+) -> None:
+    from components import provider_ops
+
+    config = _provider_config()
+    account = config.accounts[0]
+    lock_path = provider_ops._provider_import_lock_path(config, account, tmp_path)
+    lock_path.parent.mkdir(mode=0o700)
+    if artifact_kind == "symlink":
+        victim = lock_path.parent / "victim"
+        victim.write_bytes(b"")
+        try:
+            lock_path.symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+    elif artifact_kind == "hardlink":
+        victim = lock_path.parent / "victim"
+        victim.write_bytes(b"")
+        victim.chmod(0o600)
+        try:
+            os.link(victim, lock_path)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard-link creation unavailable: {exc}")
+    elif artifact_kind == "directory":
+        lock_path.mkdir(mode=0o700)
+    else:
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match=message):
+        with provider_ops._provider_import_lock(config, account, tmp_path, stop_event=None):
+            raise AssertionError("unsafe lock artifact was accepted")
 
 
 def test_provider_import_stop_event_after_throttle_prevents_journal_and_append(tmp_path: Path) -> None:
@@ -6071,11 +7267,65 @@ def test_provider_import_merge_reuses_content_match_when_internaldate_differs(tm
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+        journal_after_validation = load_import_journal(account_dir, account)
+        provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
     journal = load_import_journal(account_dir, account)
+    assert journal == journal_after_validation
     assert journal[-1]["status"] == "committed"
     assert journal[-1]["action"] == "existing"
+    assert journal[-1]["internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert journal[-1]["source_internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert journal[-1]["target_internaldate"] == "02-Jan-2024 00:00:00 +0000"
+    assert journal[-1]["internaldate_provenance"] == "existing-content-reuse"
+    assert journal[-1]["internaldate_origin_action"] == "existing"
+    assert report["ok"]
+    assert report["warnings"] == [
+        {
+            "code": "existing-target-internaldate-differs",
+            "canonical_id": "gmail-123",
+            "target_mailbox": "Archive",
+            "source_internaldate": "01-Jan-2024 00:00:00 +0000",
+            "target_internaldate": "02-Jan-2024 00:00:00 +0000",
+            "provenance": "existing-content-reuse",
+            "message": (
+                "Existing byte-identical target message reused for gmail-123 in Archive; "
+                "target INTERNALDATE '02-Jan-2024 00:00:00 +0000' differs from source "
+                "'01-Jan-2024 00:00:00 +0000', so source date metadata was not preserved "
+                "and no duplicate was appended."
+            ),
+        }
+    ]
+
+
+def test_provider_import_does_not_commit_existing_match_without_target_internaldate(
+    tmp_path: Path,
+) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
+    target = FakeTargetImap(
+        has_existing=True,
+        existing_body=body,
+        existing_internaldate="",
+    )
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[FakeTargetImap]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        with pytest.raises(RuntimeError, match="missing target INTERNALDATE"):
+            provider_import_account(config, account, tmp_path)
+
+    assert target.appended == []
+    assert not any(
+        journal_row.get("status") == "committed"
+        for journal_row in load_import_journal(account_dir, account)
+    )
 
 
 def test_provider_import_to_gmail_restores_imap_flags_on_reused_messages(tmp_path: Path) -> None:
@@ -6315,15 +7565,23 @@ def test_provider_import_many_to_one_rejects_missing_group_committed_target_befo
     assert fake.appended == []
 
 
-def test_provider_import_many_to_one_rejects_group_pending_before_append(tmp_path: Path) -> None:
-    config = _many_to_one_config()
-    first, second = config.accounts
-    target = first.target_email
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_accounts", [False, True])
+def test_provider_import_many_to_one_recovers_group_pending_before_ordinary_append(
+    tmp_path: Path,
+    target_mode: str,
+    reverse_accounts: bool,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    pending_account, ordinary_account = config.accounts
+    if reverse_accounts:
+        config.accounts = list(reversed(config.accounts))
+    target = pending_account.target_email
     first_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
     second_body = b"Message-ID: <b@example.com>\r\n\r\nfrom-b"
     first_dir = _write_provider_account_fixture(
         tmp_path,
-        source=first.source_email,
+        source=pending_account.source_email,
         target=target,
         canonical_id="physical-a",
         message_id="<a@example.com>",
@@ -6331,7 +7589,7 @@ def test_provider_import_many_to_one_rejects_group_pending_before_append(tmp_pat
     )
     _write_provider_account_fixture(
         tmp_path,
-        source=second.source_email,
+        source=ordinary_account.source_email,
         target=target,
         canonical_id="physical-b",
         message_id="<b@example.com>",
@@ -6343,7 +7601,7 @@ def test_provider_import_many_to_one_rejects_group_pending_before_append(tmp_pat
         "target_account": target,
         "target_mailbox": "Archive",
         "status": "pending",
-    }, account=first)) + "\n")
+    }, account=pending_account)) + "\n")
     fake = StoredMessageTarget({"Archive": [first_body]})
 
     @contextlib.contextmanager
@@ -6351,10 +7609,2184 @@ def test_provider_import_many_to_one_rejects_group_pending_before_append(tmp_pat
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="unresolved pending import journal row"):
-            provider_import_account(config, second, tmp_path)
+        provider_import_account(config, ordinary_account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    recovered = load_import_journal(first_dir, pending_account)
+    assert [row["status"] for row in recovered] == ["pending", "committed"]
+    assert recovered[-1]["action"] == "appended"
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_accounts", [False, True])
+def test_provider_import_many_to_one_recovers_multiple_pending_sources(
+    tmp_path: Path,
+    target_mode: str,
+    reverse_accounts: bool,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    first, second = config.accounts
+    target = first.target_email
+    bodies = {
+        first.source_email: b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+        second.source_email: b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    }
+    account_dirs = {}
+    for account, canonical_id in ((first, "physical-a"), (second, "physical-b")):
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=target,
+            canonical_id=canonical_id,
+            message_id=f"<{account.source_email[0]}@example.com>",
+            body=bodies[account.source_email],
+        )
+        row = json.loads((account_dir / "manifest.jsonl").read_text())
+        (account_dir / "import-merged@example.com.journal.jsonl").write_text(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": canonical_id,
+                "target_account": target,
+                "target_mailbox": "Archive",
+                "status": "pending",
+            }, account=account)) + "\n"
+        )
+        account_dirs[account.source_email] = account_dir
+    if reverse_accounts:
+        config.accounts = list(reversed(config.accounts))
+    fake = StoredMessageTarget({"Archive": [bodies[first.source_email]]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    # The accepted first APPEND is journaled from exact evidence; the second
+    # pending-before-APPEND crash is retried before ordinary import resumes.
+    assert fake.appended == ["Archive"]
+    for account in (first, second):
+        rows = load_import_journal(account_dirs[account.source_email], account)
+        assert rows[-1]["status"] == "committed"
+        assert rows[-1]["action"] == "appended"
+
+
+def _many_to_one_incompatible_pending_internaldates_fixture(
+    tmp_path: Path,
+    target_mode: str,
+    *,
+    reverse_accounts: bool,
+) -> tuple[
+    ProviderMigrationConfig,
+    tuple[MigrationAccount, MigrationAccount],
+    dict[str, Path],
+    bytes,
+    tuple[str, str],
+]:
+    config = _many_to_one_config(target_mode=target_mode)
+    first, second = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    expected_dates = (
+        "01-Jan-2024 00:00:00 +0000",
+        "02-Jan-2024 00:00:00 +0000",
+    )
+    account_dirs = {}
+    for account, canonical_id, internaldate in (
+        (first, "pending-a", expected_dates[0]),
+        (second, "pending-b", expected_dates[1]),
+    ):
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=canonical_id,
+            message_id="<shared@example.com>",
+            body=shared_body,
+        )
+        row = _set_single_provider_fixture_internaldate(account_dir, internaldate)
+        (account_dir / "import-merged@example.com.journal.jsonl").write_text(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": canonical_id,
+                "target_account": account.target_email,
+                "target_mailbox": "Archive",
+                "status": "pending",
+            }, account=account)) + "\n"
+        )
+        account_dirs[account.source_email] = account_dir
+    if reverse_accounts:
+        config.accounts = list(reversed(config.accounts))
+    return config, (first, second), account_dirs, shared_body, expected_dates
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_accounts", [False, True])
+@pytest.mark.parametrize(
+    "target_date_indexes",
+    [(), (0,), (0, 1)],
+    ids=["target-empty", "target-one-date", "target-both-dates"],
+)
+def test_provider_import_many_to_one_rejects_pending_content_with_incompatible_cross_source_dates(
+    tmp_path: Path,
+    target_mode: str,
+    reverse_accounts: bool,
+    target_date_indexes: tuple[int, ...],
+) -> None:
+    config, accounts, account_dirs, shared_body, expected_dates = (
+        _many_to_one_incompatible_pending_internaldates_fixture(
+            tmp_path,
+            target_mode,
+            reverse_accounts=reverse_accounts,
+        )
+    )
+    original_journals = {
+        account.source_email: account_dirs[account.source_email]
+        .joinpath("import-merged@example.com.journal.jsonl")
+        .read_bytes()
+        for account in accounts
+    }
+    target_bodies = [shared_body for _index in target_date_indexes]
+    fake = StoredMessageTarget({"Archive": target_bodies})
+    fake.internaldates_by_mailbox["Archive"] = [
+        expected_dates[index]
+        for index in target_date_indexes
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(ProviderImportIntegrityGateError) as exc_info:
+            provider_import_account(config, config.accounts[0], tmp_path)
+
+    message = str(exc_info.value)
+    assert message.startswith(
+        "merge group unresolved pending APPENDs have incompatible INTERNALDATE values: "
+    )
+    assert message.index("a@example.com/pending-a") < message.index("b@example.com/pending-b")
+    assert expected_dates[0] in message
+    assert expected_dates[1] in message
+    assert fake.appended == []
+    assert fake.stored_flags == []
+    assert fake.subscribed == []
+    for account in accounts:
+        journal_path = account_dirs[account.source_email] / "import-merged@example.com.journal.jsonl"
+        assert journal_path.read_bytes() == original_journals[account.source_email]
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_accounts", [False, True])
+def test_provider_import_many_to_one_pending_sources_reuse_recovery_created_occurrence(
+    tmp_path: Path,
+    target_mode: str,
+    reverse_accounts: bool,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    first, second = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    account_dirs = {}
+    for account, canonical_id in ((first, "pending-a"), (second, "pending-b")):
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=canonical_id,
+            message_id="<shared@example.com>",
+            body=shared_body,
+        )
+        row = load_manifest(account_dir)[0]
+        (account_dir / "import-merged@example.com.journal.jsonl").write_text(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": canonical_id,
+                "target_account": account.target_email,
+                "target_mailbox": "Archive",
+                "status": "pending",
+            }, account=account)) + "\n"
+        )
+        account_dirs[account.source_email] = account_dir
+    if reverse_accounts:
+        config.accounts = list(reversed(config.accounts))
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.bodies_by_mailbox["Archive"] == [shared_body]
+    journal_statuses = []
+    for account in (first, second):
+        journal = load_import_journal(account_dirs[account.source_email], account)
+        statuses = [row["status"] for row in journal]
+        journal_statuses.extend(statuses)
+        assert statuses[0] == "pending"
+        assert statuses[-1] == "committed"
+    # Two crash-origin pending rows, plus one write-ahead retry row for the
+    # source that performed the single APPEND.
+    assert journal_statuses.count("pending") == 3
+    assert journal_statuses.count("committed") == 2
+
+
+def _many_to_one_same_source_pending_duplicates_fixture(
+    tmp_path: Path,
+    target_mode: str,
+) -> tuple[ProviderMigrationConfig, MigrationAccount, Path, bytes]:
+    config = _many_to_one_config(target_mode=target_mode)
+    duplicate_account, peer_account = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    duplicate_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=duplicate_account.source_email,
+        target=duplicate_account.target_email,
+        canonical_id="pending-a-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    _append_identical_provider_fixture_row(duplicate_dir, "pending-a-two")
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-b",
+        message_id="<peer@example.com>",
+        body=b"Message-ID: <peer@example.com>\r\n\r\npeer",
+    )
+    duplicate_rows = load_manifest(duplicate_dir)
+    (duplicate_dir / "import-merged@example.com.journal.jsonl").write_text(
+        "".join(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": row["canonical_id"],
+                "target_account": duplicate_account.target_email,
+                "target_mailbox": "Archive",
+                "status": "pending",
+            }, account=duplicate_account)) + "\n"
+            for row in duplicate_rows
+        )
+    )
+    return config, duplicate_account, duplicate_dir, shared_body
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_same_source_pending_duplicates_remain_distinct(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config, duplicate_account, duplicate_dir, shared_body = (
+        _many_to_one_same_source_pending_duplicates_fixture(tmp_path, target_mode)
+    )
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, duplicate_account, tmp_path)
+
+    assert fake.appended == ["Archive", "Archive"]
+    assert fake.bodies_by_mailbox["Archive"] == [shared_body, shared_body]
+    assert [
+        row["status"]
+        for row in load_import_journal(duplicate_dir, duplicate_account)
+    ] == ["pending", "pending", "pending", "committed", "pending", "committed"]
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_reserved_exact_does_not_mask_wrong_date_ambiguity(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config, duplicate_account, duplicate_dir, shared_body = (
+        _many_to_one_same_source_pending_duplicates_fixture(tmp_path, target_mode)
+    )
+    journal_path = duplicate_dir / "import-merged@example.com.journal.jsonl"
+    original_journal = journal_path.read_bytes()
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = [
+        "01-Jan-2024 00:00:00 +0000",
+        "02-Jan-2024 00:00:00 +0000",
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="cannot confirm pending append recovery"):
+            provider_import_account(config, duplicate_account, tmp_path)
 
     assert fake.appended == []
+    assert fake.stored_flags == []
+    assert fake.subscribed == []
+    assert journal_path.read_bytes() == original_journal
+
+
+def test_provider_import_many_to_one_same_source_pending_duplicates_accept_two_exact_dates(
+    tmp_path: Path,
+) -> None:
+    config, duplicate_account, duplicate_dir, shared_body = (
+        _many_to_one_same_source_pending_duplicates_fixture(tmp_path, "merge")
+    )
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, duplicate_account, tmp_path)
+
+    assert fake.appended == []
+    journal = load_import_journal(duplicate_dir, duplicate_account)
+    assert [row["status"] for row in journal].count("committed") == 2
+
+
+def test_provider_import_many_to_one_same_source_pending_duplicate_appends_when_no_unreserved_candidate(
+    tmp_path: Path,
+) -> None:
+    config, duplicate_account, duplicate_dir, shared_body = (
+        _many_to_one_same_source_pending_duplicates_fixture(tmp_path, "merge")
+    )
+    fake = StoredMessageTarget({"Archive": [shared_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, duplicate_account, tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert fake.bodies_by_mailbox["Archive"] == [shared_body, shared_body]
+    journal = load_import_journal(duplicate_dir, duplicate_account)
+    assert [row["status"] for row in journal].count("committed") == 2
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_pending_internaldate_ambiguity_blocks_other_source_mutation(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    pending_account, ordinary_account = config.accounts
+    pending_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    pending_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=pending_account.source_email,
+        target=pending_account.target_email,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=pending_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=ordinary_account.source_email,
+        target=ordinary_account.target_email,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+    pending_row = json.loads((pending_dir / "manifest.jsonl").read_text())
+    (pending_dir / "import-merged@example.com.journal.jsonl").write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, pending_row, {
+            "canonical_id": "physical-a",
+            "target_account": pending_account.target_email,
+            "target_mailbox": "Archive",
+            "status": "pending",
+        }, account=pending_account)) + "\n"
+    )
+    fake = StoredMessageTarget({"Archive": [pending_body]})
+    fake.internaldates_by_mailbox["Archive"] = ["02-Jan-2024 00:00:00 +0000"]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="cannot confirm pending append recovery"):
+            provider_import_account(config, ordinary_account, tmp_path)
+
+    assert fake.appended == []
+    assert [row["status"] for row in load_import_journal(pending_dir, pending_account)] == ["pending"]
+
+
+def test_provider_import_many_to_one_gmail_recovers_pending_with_exact_target_id(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    pending_account = config.accounts[0]
+    pending_body = b"Message-ID: <a@example.com>\r\n\r\nfrom-a"
+    pending_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=pending_account.source_email,
+        target=pending_account.target_email,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=pending_body,
+        primary_mailbox="Archive",
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=config.accounts[1].source_email,
+        target=config.accounts[1].target_email,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+    pending_row = json.loads((pending_dir / "manifest.jsonl").read_text())
+    (pending_dir / "import-merged@gmail.com.journal.jsonl").write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, pending_row, {
+            "canonical_id": "physical-a",
+            "target_account": pending_account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "pending",
+        }, account=pending_account)) + "\n"
+    )
+    fake = FakeGmailTargetImap(
+        has_existing=True,
+        existing_message_id="<a@example.com>",
+        existing_body=pending_body,
+        existing_mailbox="[Gmail]/All Mail",
+        messages_by_mailbox={"[Gmail]/All Mail": 1},
+        gmail_msgid="9001",
+    )
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, pending_account, tmp_path)
+
+    journal = load_import_journal(pending_dir, pending_account)
+    assert journal[-1]["status"] == "committed"
+    assert journal[-1]["target_gmail_msgid"] == "9001"
+    assert fake.appended == []
+
+
+def test_provider_import_many_to_one_gmail_pending_sources_reuse_recovery_created_message(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    first, second = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    account_dirs = {}
+    for account, canonical_id in ((first, "pending-a"), (second, "pending-b")):
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=canonical_id,
+            message_id="<shared@example.com>",
+            body=shared_body,
+            primary_mailbox="Archive",
+        )
+        row = load_manifest(account_dir)[0]
+        (account_dir / "import-merged@gmail.com.journal.jsonl").write_text(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": canonical_id,
+                "target_account": account.target_email,
+                "target_mailbox": "[Gmail]/All Mail",
+                "status": "pending",
+            }, account=account)) + "\n"
+        )
+        account_dirs[account.source_email] = account_dir
+
+    class RecoveryStoredGmailTarget(StoredMessageTarget):
+        def __init__(self) -> None:
+            super().__init__({"[Gmail]/All Mail": []})
+            self.gmail_ids: List[str] = []
+
+        def capability(self):
+            return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
+
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+            ]
+
+        def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+            result = super().append(mailbox, flags, date_time, data)
+            self.gmail_ids.append(str(9000 + len(self.gmail_ids) + 1))
+            return result
+
+        def fetch(self, num: bytes, query: str):
+            if "X-GM-MSGID" in query:
+                gmail_id = self.gmail_ids[int(num) - 1]
+                return "OK", [num + b" (X-GM-MSGID " + gmail_id.encode("ascii") + b")"]
+            if "X-GM-LABELS" in query:
+                return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS ())"]
+            return super().fetch(num, query)
+
+    fake = RecoveryStoredGmailTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[RecoveryStoredGmailTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, first, tmp_path)
+
+    assert fake.appended == ["[Gmail]/All Mail"]
+    for account in (first, second):
+        journal = load_import_journal(account_dirs[account.source_email], account)
+        assert journal[-1]["status"] == "committed"
+        assert journal[-1]["target_gmail_msgid"] == "9001"
+
+
+def test_provider_import_many_to_one_gmail_rejects_pending_content_with_incompatible_dates(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    first, second = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    account_dirs = {}
+    for account, canonical_id, internaldate in (
+        (first, "pending-a", "01-Jan-2024 00:00:00 +0000"),
+        (second, "pending-b", "02-Jan-2024 00:00:00 +0000"),
+    ):
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=canonical_id,
+            message_id="<shared@example.com>",
+            body=shared_body,
+            primary_mailbox="Archive",
+        )
+        row = _set_single_provider_fixture_internaldate(account_dir, internaldate)
+        (account_dir / "import-merged@gmail.com.journal.jsonl").write_text(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": canonical_id,
+                "target_account": account.target_email,
+                "target_mailbox": "[Gmail]/All Mail",
+                "status": "pending",
+            }, account=account)) + "\n"
+        )
+        account_dirs[account.source_email] = account_dir
+    original_journals = {
+        account.source_email: account_dirs[account.source_email]
+        .joinpath("import-merged@gmail.com.journal.jsonl")
+        .read_bytes()
+        for account in (first, second)
+    }
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="incompatible INTERNALDATE values"):
+            provider_import_account(config, first, tmp_path)
+
+    assert fake.appended == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.subscribed == []
+    for account in (first, second):
+        journal_path = account_dirs[account.source_email] / "import-merged@gmail.com.journal.jsonl"
+        assert journal_path.read_bytes() == original_journals[account.source_email]
+
+
+_PENDING_CAPACITY_DATES = (
+    "01-Jan-2024 00:00:00 +0000",
+    "02-Jan-2024 00:00:00 +0000",
+    "03-Jan-2024 00:00:00 +0000",
+)
+
+
+def _many_to_one_pending_capacity_fixture(
+    tmp_path: Path,
+    *,
+    target_mode: str,
+    source_date_indexes: tuple[tuple[Optional[int], ...], ...],
+    target_provider: str = "imap",
+    primary_mailboxes: Optional[tuple[str, ...]] = None,
+    committed_coordinates: frozenset[tuple[int, int]] = frozenset(),
+    reverse_config: bool = False,
+    reverse_manifest: bool = False,
+) -> tuple[
+    ProviderMigrationConfig,
+    tuple[MigrationAccount, ...],
+    dict[str, Path],
+    bytes,
+]:
+    config = (
+        _many_to_one_gmail_config(target_mode=target_mode)
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode=target_mode)
+    )
+    target_email = config.accounts[0].target_email
+    while len(config.accounts) < len(source_date_indexes):
+        source_index = len(config.accounts)
+        source_email = f"{chr(ord('a') + source_index)}@example.com"
+        config.accounts.append(MigrationAccount(
+            source_email=source_email,
+            target_email=target_email,
+            source_auth=AuthConfig(
+                method="password",
+                username=source_email,
+                password=f"source-{source_index}",
+            ),
+        ))
+    accounts = tuple(config.accounts[:len(source_date_indexes)])
+    shared_body = b"Message-ID: <capacity-shared@example.com>\r\n\r\nshared"
+    account_dirs: dict[str, Path] = {}
+    primary_mailboxes = primary_mailboxes or tuple(
+        "Archive" for _source_dates in source_date_indexes
+    )
+
+    for source_index, (account, date_indexes, primary_mailbox) in enumerate(
+        zip(accounts, source_date_indexes, primary_mailboxes)
+    ):
+        source_letter = chr(ord("a") + source_index)
+        account_dir = _write_provider_account_fixture(
+            tmp_path,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id=f"capacity-{source_letter}-1",
+            message_id="<capacity-shared@example.com>",
+            body=shared_body,
+            primary_mailbox=primary_mailbox,
+        )
+        for row_index in range(1, len(date_indexes)):
+            _append_identical_provider_fixture_row(
+                account_dir,
+                f"capacity-{source_letter}-{row_index + 1}",
+            )
+        rows = load_manifest(account_dir)
+        for row_index, (row, date_index) in enumerate(zip(rows, date_indexes)):
+            row["internaldate"] = (
+                "" if date_index is None else _PENDING_CAPACITY_DATES[date_index]
+            )
+            row["primary_mailbox"] = primary_mailbox
+            if target_provider == "gmail":
+                row["gmail_labels"] = [f"Team {source_letter.upper()}"]
+            row["capacity_source_index"] = source_index
+            row["capacity_row_index"] = row_index
+        if reverse_manifest:
+            rows.reverse()
+        _write_provider_fixture_manifest_rows(account_dir, rows)
+
+        target_mailbox = (
+            "[Gmail]/All Mail"
+            if target_provider == "gmail" and primary_mailbox == "Archive"
+            else primary_mailbox
+        )
+        journal_rows = []
+        for row in rows:
+            coordinate = (
+                int(row.pop("capacity_source_index")),
+                int(row.pop("capacity_row_index")),
+            )
+            # The temporary coordinates are test-construction metadata only;
+            # remove them from the persisted manifest and refresh its binding.
+            _refresh_provider_binding(row)
+            status = "committed" if coordinate in committed_coordinates else "pending"
+            journal_rows.append(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": row["canonical_id"],
+                "target_account": account.target_email,
+                "target_mailbox": target_mailbox,
+                "status": status,
+                "action": "appended" if status == "committed" else "append-started",
+            }, account=account))
+        _write_provider_fixture_manifest_rows(account_dir, rows)
+        journal_path = account_dir / f"import-{target_email}.journal.jsonl"
+        journal_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in journal_rows)
+        )
+        account_dirs[account.source_email] = account_dir
+
+    if reverse_config:
+        config.accounts = list(reversed(config.accounts))
+    return config, accounts, account_dirs, shared_body
+
+
+def _write_provider_overlap_fixture(
+    tmp_path: Path,
+    account: MigrationAccount,
+    *,
+    reverse_manifest: bool,
+) -> tuple[Path, dict[str, dict], bytes, bytes]:
+    lf_body = b"Message-ID: <overlap@example.com>\nFrom: a@example.com\n\nbody\n"
+    crlf_body = b"Message-ID: <overlap@example.com>\r\nFrom: a@example.com\r\n\r\nbody\r\n"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="a-broad-lf",
+        message_id="<overlap@example.com>",
+        body=lf_body,
+    )
+    broad = load_manifest(account_dir)[0]
+    narrow = dict(broad)
+    narrow.update({
+        "canonical_id": "z-narrow-crlf",
+        "content_sha256": hashlib.sha256(crlf_body).hexdigest(),
+        "rfc822_size": len(crlf_body),
+        "eml_path": "messages/z-narrow-crlf.eml",
+        "metadata_path": "metadata/z-narrow-crlf.json",
+    })
+    (account_dir / narrow["eml_path"]).write_bytes(crlf_body)
+    rows = [broad, narrow]
+    if reverse_manifest:
+        rows.reverse()
+    _write_provider_fixture_manifest_rows(account_dir, rows)
+    return account_dir, {row["canonical_id"]: row for row in rows}, lf_body, crlf_body
+
+
+class OverlapStoredGmailTarget(StoredMessageTarget):
+    def __init__(self, bodies: List[bytes]) -> None:
+        super().__init__({"[Gmail]/All Mail": bodies})
+        self.gmail_ids = [str(9001 + index) for index in range(len(bodies))]
+        self.stored_labels: List[tuple[bytes, str, str]] = []
+
+    def capability(self):
+        return "OK", [b"IMAP4rev1 X-GM-EXT-1"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+            b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+        ]
+
+    def append(self, mailbox: str, flags: str, date_time: str, data: bytes):
+        result = super().append(mailbox, flags, date_time, data)
+        self.gmail_ids.append(str(9001 + len(self.gmail_ids)))
+        return result
+
+    def fetch(self, num: bytes, query: str):
+        if "X-GM-MSGID" in query:
+            gmail_id = self.gmail_ids[int(num) - 1]
+            return "OK", [num + b" (X-GM-MSGID " + gmail_id.encode("ascii") + b")"]
+        if "X-GM-LABELS" in query:
+            return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS ())"]
+        return super().fetch(num, query)
+
+    def store(self, num: bytes, command: str, value: str):
+        if "X-GM-LABELS" in command:
+            self.stored_labels.append((num, command, value))
+            return "OK", [b""]
+        return super().store(num, command, value)
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+@pytest.mark.parametrize("reverse_config", [False, True])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+@pytest.mark.parametrize("reverse_target", [False, True])
+def test_provider_overlap_allocator_is_order_independent_across_recovery_import_and_validation(
+    tmp_path: Path,
+    target_mode: str,
+    target_provider: str,
+    reverse_config: bool,
+    reverse_manifest: bool,
+    reverse_target: bool,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode=target_mode)
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode=target_mode)
+    )
+    overlap_account, peer_account = config.accounts
+    account_dir, rows_by_id, lf_body, crlf_body = _write_provider_overlap_fixture(
+        tmp_path,
+        overlap_account,
+        reverse_manifest=reverse_manifest,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-distinct",
+        message_id="<peer-distinct@example.com>",
+        body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+    )
+    target_mailbox = "[Gmail]/All Mail" if target_provider == "gmail" else "Archive"
+    initial_status_by_id = (
+        {"a-broad-lf": "pending", "z-narrow-crlf": "pending"}
+        if target_provider == "gmail"
+        else {"a-broad-lf": "committed", "z-narrow-crlf": "pending"}
+    )
+    journal_rows = [
+        _journal_fixture_for_manifest_row(config, row, {
+            "canonical_id": row["canonical_id"],
+            "target_account": overlap_account.target_email,
+            "target_mailbox": target_mailbox,
+            "status": initial_status_by_id[row["canonical_id"]],
+            "action": (
+                "appended"
+                if initial_status_by_id[row["canonical_id"]] == "committed"
+                else "append-started"
+            ),
+        }, account=overlap_account)
+        for row in rows_by_id.values()
+    ]
+    journal_path = account_dir / f"import-{overlap_account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in journal_rows)
+    )
+    target_bodies = [crlf_body, lf_body]
+    if reverse_target:
+        target_bodies.reverse()
+    fake: StoredMessageTarget
+    if target_provider == "gmail":
+        fake = OverlapStoredGmailTarget(target_bodies)
+    else:
+        fake = StoredMessageTarget({"Archive": target_bodies})
+    if reverse_config:
+        config.accounts = list(reversed(config.accounts))
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, overlap_account, tmp_path)
+        provider_import_account(config, overlap_account, tmp_path)
+        _name, report = provider_validate_account(
+            config,
+            overlap_account,
+            tmp_path,
+            check_target=True,
+        )
+
+    assert fake.appended == []
+    assert len(fake.bodies_by_mailbox[target_mailbox]) == 2
+    assert sorted(fake.bodies_by_mailbox[target_mailbox]) == sorted([lf_body, crlf_body])
+    assert report["ok"], report
+    assert report["remote_missing"] == []
+    assert report["duplicates"] == []
+    final_journal = load_import_journal(account_dir, overlap_account)
+    assert {row["canonical_id"] for row in final_journal if row["status"] == "committed"} == {
+        "a-broad-lf",
+        "z-narrow-crlf",
+    }
+
+
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+@pytest.mark.parametrize("reverse_config", [False, True])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+@pytest.mark.parametrize("reverse_target", [False, True])
+def test_provider_overlap_allocator_reuses_all_unjournaled_merge_rows_without_append(
+    tmp_path: Path,
+    target_provider: str,
+    reverse_config: bool,
+    reverse_manifest: bool,
+    reverse_target: bool,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode="merge")
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode="merge")
+    )
+    overlap_account, peer_account = config.accounts
+    account_dir, _rows_by_id, lf_body, crlf_body = _write_provider_overlap_fixture(
+        tmp_path,
+        overlap_account,
+        reverse_manifest=reverse_manifest,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-distinct",
+        message_id="<peer-distinct@example.com>",
+        body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+    )
+    target_mailbox = "[Gmail]/All Mail" if target_provider == "gmail" else "Archive"
+    target_bodies = [crlf_body, lf_body]
+    if reverse_target:
+        target_bodies.reverse()
+    fake: StoredMessageTarget
+    if target_provider == "gmail":
+        fake = OverlapStoredGmailTarget(target_bodies)
+    else:
+        fake = StoredMessageTarget({"Archive": target_bodies})
+    if reverse_config:
+        config.accounts = list(reversed(config.accounts))
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, overlap_account, tmp_path)
+        provider_import_account(config, overlap_account, tmp_path)
+
+    assert fake.appended == []
+    assert len(fake.bodies_by_mailbox[target_mailbox]) == 2
+    committed_rows = [
+        row
+        for row in load_import_journal(account_dir, overlap_account)
+        if row["status"] == "committed"
+    ]
+    assert {row["canonical_id"] for row in committed_rows} == {
+        "a-broad-lf",
+        "z-narrow-crlf",
+    }
+    assert {row["action"] for row in committed_rows} == {"existing"}
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+def test_provider_overlap_capacity_preflight_rejects_unusable_dated_occurrence_without_mutation(
+    tmp_path: Path,
+    target_mode: str,
+    target_provider: str,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode=target_mode)
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode=target_mode)
+    )
+    overlap_account, peer_account = config.accounts
+    account_dir, rows_by_id, lf_body, _crlf_body = _write_provider_overlap_fixture(
+        tmp_path,
+        overlap_account,
+        reverse_manifest=False,
+    )
+    rows_by_id["z-narrow-crlf"]["internaldate"] = "02-Jan-2024 00:00:00 +0000"
+    _write_provider_fixture_manifest_rows(account_dir, list(rows_by_id.values()))
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-distinct",
+        message_id="<peer-distinct@example.com>",
+        body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+    )
+    target_mailbox = "[Gmail]/All Mail" if target_provider == "gmail" else "Archive"
+    journal_path = account_dir / f"import-{overlap_account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": row["canonical_id"],
+                "target_account": overlap_account.target_email,
+                "target_mailbox": target_mailbox,
+                "status": "pending",
+                "action": "append-started",
+            }, account=overlap_account)) + "\n"
+            for row in rows_by_id.values()
+        )
+    )
+    original_journal = journal_path.read_bytes()
+    fake: StoredMessageTarget
+    if target_provider == "gmail":
+        fake = OverlapStoredGmailTarget([lf_body])
+    else:
+        fake = StoredMessageTarget({"Archive": [lf_body]})
+    fake.internaldates_by_mailbox[target_mailbox] = [
+        "02-Jan-2024 00:00:00 +0000",
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="exceeding physical content capacity"):
+            provider_import_account(config, overlap_account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.subscribed == []
+    if isinstance(fake, OverlapStoredGmailTarget):
+        assert fake.stored_labels == []
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+@pytest.mark.parametrize("pending_present", [False, True])
+def test_provider_empty_target_preflight_rejects_unrelated_message_before_pending_recovery(
+    tmp_path: Path,
+    target_provider: str,
+    pending_present: bool,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode="empty")
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode="empty")
+    )
+    pending_account, peer_account = config.accounts
+    pending_body = b"Message-ID: <pending-extra@example.com>\r\n\r\npending"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=pending_account.source_email,
+        target=pending_account.target_email,
+        canonical_id="pending-extra",
+        message_id="<pending-extra@example.com>",
+        body=pending_body,
+    )
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-distinct",
+        message_id="<peer-distinct@example.com>",
+        body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+    )
+    row = load_manifest(account_dir)[0]
+    target_mailbox = "[Gmail]/All Mail" if target_provider == "gmail" else "Archive"
+    journal_path = account_dir / f"import-{pending_account.target_email}.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": pending_account.target_email,
+        "target_mailbox": target_mailbox,
+        "status": "pending",
+        "action": "append-started",
+    }, account=pending_account)) + "\n")
+    original_journal = journal_path.read_bytes()
+    unrelated_body = b"Message-ID: <unrelated@example.com>\r\n\r\nunrelated"
+    target_bodies = ([pending_body] if pending_present else []) + [unrelated_body]
+    fake: StoredMessageTarget
+    if target_provider == "gmail":
+        fake = OverlapStoredGmailTarget(target_bodies)
+    else:
+        fake = StoredMessageTarget({"Archive": target_bodies})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="target_mode=empty"):
+            provider_import_account(config, pending_account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.subscribed == []
+    if isinstance(fake, OverlapStoredGmailTarget):
+        assert fake.stored_labels == []
+    assert journal_path.read_bytes() == original_journal
+
+
+def test_provider_gmail_capacity_preflight_precedes_legacy_msgid_repair(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account, peer_account = config.accounts
+    committed_body = b"Message-ID: <legacy-repair@example.com>\r\n\r\ncommitted"
+    pending_body = b"Message-ID: <repair-pending@example.com>\r\n\r\npending"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="legacy-repair",
+        message_id="<legacy-repair@example.com>",
+        body=committed_body,
+    )
+    committed_row = load_manifest(account_dir)[0]
+    pending_row = dict(committed_row)
+    pending_row.update({
+        "canonical_id": "repair-pending",
+        "message_id_header": "<repair-pending@example.com>",
+        "content_sha256": hashlib.sha256(pending_body).hexdigest(),
+        "rfc822_size": len(pending_body),
+        "eml_path": "messages/repair-pending.eml",
+        "metadata_path": "metadata/repair-pending.json",
+    })
+    (account_dir / pending_row["eml_path"]).write_bytes(pending_body)
+    _write_provider_fixture_manifest_rows(account_dir, [committed_row, pending_row])
+    _write_provider_account_fixture(
+        tmp_path,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-distinct",
+        message_id="<peer-distinct@example.com>",
+        body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+    )
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, committed_row, {
+            "canonical_id": committed_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+        }, account=account))
+        + "\n"
+        + json.dumps(_journal_fixture_for_manifest_row(config, pending_row, {
+            "canonical_id": pending_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "pending",
+            "action": "append-started",
+        }, account=account))
+        + "\n"
+    )
+    original_journal = journal_path.read_bytes()
+    fake = OverlapStoredGmailTarget([committed_body, pending_body])
+    fake.internaldates_by_mailbox["[Gmail]/All Mail"] = [
+        "01-Jan-2024 00:00:00 +0000",
+        "02-Jan-2024 00:00:00 +0000",
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="exceeding physical content capacity"):
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_labels == []
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("many_to_one", [False, True])
+@pytest.mark.parametrize("target_count", [1, 2])
+def test_provider_gmail_legacy_msgid_repair_reserves_pinned_physical_messages_transactionally(
+    tmp_path: Path,
+    many_to_one: bool,
+    target_count: int,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account, peer_account = config.accounts
+    if not many_to_one:
+        config.accounts = [account]
+        config.migration.account_merge_mode = "one_to_one"
+    shared_body = b"Message-ID: <repair-allocation@example.com>\r\n\r\nshared"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="repair-pinned",
+        message_id="<repair-allocation@example.com>",
+        body=shared_body,
+    )
+    pinned_row = load_manifest(account_dir)[0]
+    legacy_row = dict(pinned_row)
+    legacy_row.update({
+        "canonical_id": "repair-legacy",
+        "eml_path": "messages/repair-legacy.eml",
+        "metadata_path": "metadata/repair-legacy.json",
+    })
+    (account_dir / legacy_row["eml_path"]).write_bytes(shared_body)
+    _write_provider_fixture_manifest_rows(account_dir, [pinned_row, legacy_row])
+    if many_to_one:
+        _write_provider_account_fixture(
+            tmp_path,
+            source=peer_account.source_email,
+            target=peer_account.target_email,
+            canonical_id="peer-distinct",
+            message_id="<peer-distinct@example.com>",
+            body=b"Message-ID: <peer-distinct@example.com>\r\n\r\npeer",
+        )
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, pinned_row, {
+            "canonical_id": pinned_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+            "target_gmail_msgid": "9001",
+        }, account=account))
+        + "\n"
+        + json.dumps(_journal_fixture_for_manifest_row(config, legacy_row, {
+            "canonical_id": legacy_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+        }, account=account))
+        + "\n"
+    )
+    original_journal = journal_path.read_bytes()
+    fake = OverlapStoredGmailTarget([shared_body] * target_count)
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        if target_count == 1:
+            with pytest.raises(ProviderImportIntegrityGateError):
+                provider_import_account(config, account, tmp_path)
+        else:
+            provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    if target_count == 1:
+        assert fake.subscribed == []
+        assert fake.stored_labels == []
+        assert journal_path.read_bytes() == original_journal
+    else:
+        repaired = load_import_journal(account_dir, account)[-1]
+        assert repaired["canonical_id"] == "repair-legacy"
+        assert repaired["action"] == "verified"
+        assert repaired["target_gmail_msgid"] == "9002"
+
+
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_gmail_repair_allocation_collision_is_rc4_without_mutation(
+    tmp_path: Path,
+    ignore_errors: bool,
+) -> None:
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <repair-classification@example.com>\r\n\r\nsame"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="repair-pinned",
+        message_id="<repair-classification@example.com>",
+        body=body,
+    )
+    _append_identical_provider_fixture_row(account_dir, "repair-legacy")
+    pinned_row, legacy_row = load_manifest(account_dir)
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        json.dumps(_journal_fixture_for_manifest_row(config, pinned_row, {
+            "canonical_id": pinned_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+            "target_gmail_msgid": "9001",
+        }, account=account))
+        + "\n"
+        + json.dumps(_journal_fixture_for_manifest_row(config, legacy_row, {
+            "canonical_id": legacy_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+        }, account=account))
+        + "\n"
+    )
+    original_journal = journal_path.read_bytes()
+    fake = OverlapStoredGmailTarget([body])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox == {"[Gmail]/All Mail": [body]}
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("reverse_rows", [False, True])
+@pytest.mark.parametrize("reverse_target", [False, True])
+def test_real_cli_committed_preflight_precedes_gmail_msgid_repair(
+    tmp_path: Path,
+    reverse_rows: bool,
+    reverse_target: bool,
+) -> None:
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <preflight-repair@example.com>\r\n\r\nsame"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="a-legacy-repair",
+        message_id="<preflight-repair@example.com>",
+        body=body,
+    )
+    _append_identical_provider_fixture_row(account_dir, "z-pinned-missing")
+    rows = load_manifest(account_dir)
+    if reverse_rows:
+        rows.reverse()
+        _write_provider_fixture_manifest_rows(account_dir, rows)
+    row_by_id = {row["canonical_id"]: row for row in rows}
+    journal_rows = [
+        _journal_fixture_for_manifest_row(config, row_by_id["a-legacy-repair"], {
+            "canonical_id": "a-legacy-repair",
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+        }, account=account),
+        _journal_fixture_for_manifest_row(config, row_by_id["z-pinned-missing"], {
+            "canonical_id": "z-pinned-missing",
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail",
+            "status": "committed",
+            "action": "appended",
+            "target_gmail_msgid": "9999",
+        }, account=account),
+    ]
+    if reverse_rows:
+        journal_rows.reverse()
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(json.dumps(journal_row) + "\n" for journal_row in journal_rows)
+    )
+    original_journal = journal_path.read_bytes()
+    fake = OverlapStoredGmailTarget([body, body])
+    if reverse_target:
+        fake.gmail_ids.reverse()
+    original_target = list(fake.bodies_by_mailbox["[Gmail]/All Mail"])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox["[Gmail]/All Mail"] == original_target
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_rows_and_target", [False, True])
+def test_one_to_one_committed_preflight_joint_allocation_success_controls(
+    tmp_path: Path,
+    target_provider: str,
+    target_mode: str,
+    reverse_rows_and_target: bool,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode=target_mode)
+        if target_provider == "gmail"
+        else _generic_target_config(target_mode=target_mode)
+    )
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <joint-control@example.com>\r\n\r\nsame"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="a-pinned",
+        message_id="<joint-control@example.com>",
+        body=body,
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    _append_identical_provider_fixture_row(account_dir, "z-unpinned")
+    rows = load_manifest(account_dir)
+    if reverse_rows_and_target:
+        rows.reverse()
+        _write_provider_fixture_manifest_rows(account_dir, rows)
+    row_by_id = {row["canonical_id"]: row for row in rows}
+    pinned_values = {
+        "canonical_id": "a-pinned",
+        "target_account": account.target_email,
+        "target_mailbox": "[Gmail]/All Mail" if target_provider == "gmail" else "Archive",
+        "status": "committed",
+        "action": "appended",
+    }
+    if target_provider == "gmail":
+        pinned_values["target_gmail_msgid"] = "9001"
+    journal_rows = [
+        _journal_fixture_for_manifest_row(
+            config,
+            row_by_id["a-pinned"],
+            pinned_values,
+            account=account,
+        ),
+        _journal_fixture_for_manifest_row(config, row_by_id["z-unpinned"], {
+            "canonical_id": "z-unpinned",
+            "target_account": account.target_email,
+            "target_mailbox": "[Gmail]/All Mail" if target_provider == "gmail" else "Archive",
+            "status": "committed",
+            "action": "appended",
+        }, account=account),
+    ]
+    if reverse_rows_and_target:
+        journal_rows.reverse()
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(json.dumps(journal_row) + "\n" for journal_row in journal_rows)
+    )
+    if target_provider == "gmail":
+        fake: StoredMessageTarget = OverlapStoredGmailTarget([body, body])
+        if reverse_rows_and_target:
+            fake.gmail_ids.reverse()
+    else:
+        fake = StoredMessageTarget({"Archive": [body, body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+
+    assert fake.appended == []
+    if target_provider == "gmail":
+        repaired = load_import_journal(account_dir, account)[-1]
+        assert repaired["canonical_id"] == "z-unpinned"
+        assert repaired["target_gmail_msgid"] == "9002"
+    else:
+        assert journal_path.read_text().count("\n") == 2
+
+
+def test_real_cli_committed_preflight_precedes_pending_recovery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "staged"
+    config = _generic_target_config(target_mode="empty")
+    config.limits.retry_max_attempts = 1
+    account = config.accounts[0]
+    stale_body = b"Message-ID: <stale-commit@example.com>\r\n\r\nstale"
+    pending_body = b"Message-ID: <pending-recovery@example.com>\r\n\r\npending"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="stale-commit",
+        message_id="<stale-commit@example.com>",
+        body=stale_body,
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    stale_row = load_manifest(account_dir)[0]
+    pending_row = dict(stale_row)
+    pending_row.update({
+        "canonical_id": "pending-recovery",
+        "message_id_header": "<pending-recovery@example.com>",
+        "content_sha256": hashlib.sha256(pending_body).hexdigest(),
+        "rfc822_size": len(pending_body),
+        "eml_path": "messages/pending-recovery.eml",
+        "metadata_path": "metadata/pending-recovery.json",
+    })
+    (account_dir / pending_row["eml_path"]).write_bytes(pending_body)
+    _write_provider_fixture_manifest_rows(account_dir, [stale_row, pending_row])
+    journal_rows = [
+        _journal_fixture_for_manifest_row(config, stale_row, {
+            "canonical_id": stale_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "committed",
+            "action": "appended",
+        }, account=account),
+        _journal_fixture_for_manifest_row(config, pending_row, {
+            "canonical_id": pending_row["canonical_id"],
+            "target_account": account.target_email,
+            "target_mailbox": "Archive",
+            "status": "pending",
+            "action": "append-started",
+        }, account=account),
+    ]
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(json.dumps(journal_row) + "\n" for journal_row in journal_rows)
+    )
+    original_journal = journal_path.read_bytes()
+    fake = StoredMessageTarget({"Archive": [pending_body]})
+    original_target = list(fake.bodies_by_mailbox["Archive"])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox["Archive"] == original_target
+    assert journal_path.read_bytes() == original_journal
+
+
+def test_real_cli_gmail_repair_remote_fetch_failure_remains_rc1(
+    tmp_path: Path,
+) -> None:
+    class FailingGmailMsgidFetchTarget(OverlapStoredGmailTarget):
+        def fetch(self, num: bytes, query: str):
+            if "X-GM-MSGID" in query:
+                raise RuntimeError("Gmail X-GM-MSGID fetch failed")
+            return super().fetch(num, query)
+
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <repair-operation@example.com>\r\n\r\nbody"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="repair-operation",
+        message_id="<repair-operation@example.com>",
+        body=body,
+    )
+    row = load_manifest(account_dir)[0]
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+        "action": "appended",
+    }, account=account)) + "\n")
+    original_journal = journal_path.read_bytes()
+    fake = FailingGmailMsgidFetchTarget([body])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 1
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_empty_committed_message_missing_from_target_is_rc4_without_mutation(
+    tmp_path: Path,
+    ignore_errors: bool,
+) -> None:
+    root = tmp_path / "staged"
+    config = _generic_target_config(target_mode="empty")
+    config.limits.retry_max_attempts = 1
+    account = config.accounts[0]
+    body = b"Message-ID: <missing-committed@example.com>\r\n\r\nbody"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="missing-committed",
+        message_id="<missing-committed@example.com>",
+        body=body,
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    row = load_manifest(account_dir)[0]
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "action": "appended",
+    }, account=account)) + "\n")
+    original_journal = journal_path.read_bytes()
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox == {}
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_gmail_pinned_commit_missing_exact_target_is_rc4_without_mutation(
+    tmp_path: Path,
+    ignore_errors: bool,
+) -> None:
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <missing-gmail-id@example.com>\r\n\r\nbody"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="missing-gmail-id",
+        message_id="<missing-gmail-id@example.com>",
+        body=body,
+    )
+    row = load_manifest(account_dir)[0]
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "[Gmail]/All Mail",
+        "status": "committed",
+        "action": "appended",
+        "target_gmail_msgid": "9001",
+    }, account=account)) + "\n")
+    original_journal = journal_path.read_bytes()
+    fake = OverlapStoredGmailTarget([body])
+    fake.gmail_ids = ["9002"]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox == {"[Gmail]/All Mail": [body]}
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("target_provider", ["imap", "gmail"])
+@pytest.mark.parametrize("initial_target", ["empty", "d2"])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+def test_provider_one_to_one_pending_dates_are_recovered_as_one_batch(
+    tmp_path: Path,
+    target_mode: str,
+    target_provider: str,
+    initial_target: str,
+    reverse_manifest: bool,
+) -> None:
+    config = (
+        _many_to_one_gmail_config(target_mode=target_mode)
+        if target_provider == "gmail"
+        else _many_to_one_config(target_mode=target_mode)
+    )
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    shared_body = b"Message-ID: <one-to-one-dates@example.com>\r\n\r\nshared"
+    account_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="pending-d1",
+        message_id="<one-to-one-dates@example.com>",
+        body=shared_body,
+    )
+    d1_row = load_manifest(account_dir)[0]
+    d2_row = dict(d1_row)
+    d2_row.update({
+        "canonical_id": "pending-d2",
+        "internaldate": "02-Jan-2024 00:00:00 +0000",
+        "eml_path": "messages/pending-d2.eml",
+        "metadata_path": "metadata/pending-d2.json",
+    })
+    (account_dir / d2_row["eml_path"]).write_bytes(shared_body)
+    rows = [d1_row, d2_row]
+    if reverse_manifest:
+        rows.reverse()
+    _write_provider_fixture_manifest_rows(account_dir, rows)
+    target_mailbox = "[Gmail]/All Mail" if target_provider == "gmail" else "Archive"
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": row["canonical_id"],
+                "target_account": account.target_email,
+                "target_mailbox": target_mailbox,
+                "status": "pending",
+                "action": "append-started",
+            }, account=account)) + "\n"
+            for row in rows
+        )
+    )
+    initial_bodies = [shared_body] if initial_target == "d2" else []
+    fake: StoredMessageTarget
+    if target_provider == "gmail":
+        fake = OverlapStoredGmailTarget(initial_bodies)
+    else:
+        fake = StoredMessageTarget({"Archive": initial_bodies})
+    if initial_target == "d2":
+        fake.internaldates_by_mailbox[target_mailbox] = [
+            "02-Jan-2024 00:00:00 +0000",
+        ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, account, tmp_path)
+        first_run_append_count = len(fake.appended)
+        provider_import_account(config, account, tmp_path)
+        _name, report = provider_validate_account(
+            config,
+            account,
+            tmp_path,
+            check_target=True,
+        )
+
+    assert first_run_append_count == (2 if initial_target == "empty" else 1)
+    assert len(fake.appended) == first_run_append_count
+    assert sorted(fake.internaldates_by_mailbox[target_mailbox]) == [
+        "01-Jan-2024 00:00:00 +0000",
+        "02-Jan-2024 00:00:00 +0000",
+    ]
+    assert report["ok"], report
+    assert {
+        row["canonical_id"]
+        for row in load_import_journal(account_dir, account)
+        if row["status"] == "committed"
+    } == {"pending-d1", "pending-d2"}
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize(
+    ("source_date_indexes", "committed_coordinates", "initial_target_dates"),
+    [
+        (((0,), (0,)), frozenset(), ()),
+        (((0, 1), (0,)), frozenset(), ()),
+        (((0, 1), (0, 1)), frozenset(), ()),
+        (((0, 1), (0,), (1,)), frozenset(), ()),
+        (((0, 1), (0,)), frozenset({(0, 0)}), (0,)),
+    ],
+    ids=[
+        "a-d1-b-d1",
+        "a-d1-d2-b-d1",
+        "a-d1-d2-b-d1-d2",
+        "a-d1-d2-b-d1-c-d2",
+        "a-committed-d1-pending-d2-b-pending-d1",
+    ],
+)
+def test_provider_import_many_to_one_pending_capacity_pass_matrix(
+    tmp_path: Path,
+    target_mode: str,
+    source_date_indexes: tuple[tuple[Optional[int], ...], ...],
+    committed_coordinates: frozenset[tuple[int, int]],
+    initial_target_dates: tuple[int, ...],
+) -> None:
+    config, accounts, account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=source_date_indexes,
+        committed_coordinates=committed_coordinates,
+    )
+    fake = StoredMessageTarget({
+        "Archive": [shared_body for _date_index in initial_target_dates],
+    })
+    fake.internaldates_by_mailbox["Archive"] = [
+        _PENDING_CAPACITY_DATES[index] for index in initial_target_dates
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    expected_date_indexes = sorted({
+        date_index
+        for dates in source_date_indexes
+        for date_index in dates
+        if date_index is not None
+    })
+    assert sorted(fake.internaldates_by_mailbox["Archive"]) == sorted(
+        _PENDING_CAPACITY_DATES[index] for index in expected_date_indexes
+    )
+    assert len(fake.bodies_by_mailbox["Archive"]) == max(map(len, source_date_indexes))
+    for account in accounts:
+        journal = load_import_journal(account_dirs[account.source_email], account)
+        assert len([row for row in journal if row.get("status") == "committed"]) == len(
+            load_manifest(account_dirs[account.source_email])
+        )
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_reserves_all_same_source_exact_dates_before_wrong_date_diagnosis(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config, accounts, account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=((0, 1), (0,)),
+    )
+    fake = StoredMessageTarget({"Archive": [shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = [_PENDING_CAPACITY_DATES[1]]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.appended == ["Archive"]
+    assert sorted(fake.internaldates_by_mailbox["Archive"]) == list(
+        _PENDING_CAPACITY_DATES[:2]
+    )
+    for account in accounts:
+        journal = load_import_journal(account_dirs[account.source_email], account)
+        assert journal[-1]["status"] == "committed"
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize("reverse_config", [False, True])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+@pytest.mark.parametrize("reverse_target", [False, True])
+def test_provider_import_many_to_one_pending_capacity_is_order_independent(
+    tmp_path: Path,
+    target_mode: str,
+    reverse_config: bool,
+    reverse_manifest: bool,
+    reverse_target: bool,
+) -> None:
+    config, accounts, account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=((0, 1), (0, 1)),
+        reverse_config=reverse_config,
+        reverse_manifest=reverse_manifest,
+    )
+    target_date_indexes = [1, 0]
+    if reverse_target:
+        target_date_indexes.reverse()
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = [
+        _PENDING_CAPACITY_DATES[index] for index in target_date_indexes
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.appended == []
+    for account in accounts:
+        journal = load_import_journal(account_dirs[account.source_email], account)
+        assert [row["status"] for row in journal].count("committed") == 2
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_validation_allocates_committed_rows_by_effective_date_before_content(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    all_committed = frozenset({(0, 0), (0, 1), (1, 0), (1, 1)})
+    config, accounts, _account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=((0, 1), (0, 1)),
+        committed_coordinates=all_committed,
+    )
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = [
+        _PENDING_CAPACITY_DATES[1],
+        _PENDING_CAPACITY_DATES[0],
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(
+            config,
+            accounts[0],
+            tmp_path,
+            check_target=True,
+        )
+
+    assert report["ok"], report
+    assert report["remote_missing"] == []
+    assert not any("INTERNALDATE mismatch" in failure for failure in report["failed"])
+
+
+def test_provider_validation_allocation_uses_existing_reuse_target_date_evidence(
+    tmp_path: Path,
+) -> None:
+    all_committed = frozenset({(0, 0), (0, 1), (1, 0), (1, 1)})
+    config, accounts, account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode="merge",
+        source_date_indexes=((0, 0), (0, 0)),
+        committed_coordinates=all_committed,
+    )
+    for account in accounts:
+        journal_path = account_dirs[account.source_email] / f"import-{account.target_email}.journal.jsonl"
+        journal_rows = [
+            json.loads(line) for line in journal_path.read_text().splitlines() if line
+        ]
+        journal_rows[1].update({
+            "action": "existing",
+            "internaldate": _PENDING_CAPACITY_DATES[0],
+            "source_internaldate": _PENDING_CAPACITY_DATES[0],
+            "target_internaldate": _PENDING_CAPACITY_DATES[1],
+            "internaldate_provenance": "existing-content-reuse",
+            "internaldate_origin_action": "existing",
+        })
+        journal_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in journal_rows)
+        )
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = [
+        _PENDING_CAPACITY_DATES[1],
+        _PENDING_CAPACITY_DATES[0],
+    ]
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, report = provider_validate_account(
+            config,
+            accounts[0],
+            tmp_path,
+            check_target=True,
+        )
+
+    assert report["ok"], report
+    assert report["remote_missing"] == []
+    assert any(
+        warning.get("target_internaldate") == _PENDING_CAPACITY_DATES[1]
+        for warning in report["warnings"]
+    )
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+@pytest.mark.parametrize(
+    ("source_date_indexes", "error_match"),
+    [
+        (((0,), (1,)), "incompatible INTERNALDATE values"),
+        (((0, 0), (0, 1)), "incompatible INTERNALDATE values"),
+        (((0,), (1,), (2,)), "incompatible INTERNALDATE values"),
+        (((None,), (0,)), "missing or unconfirmable INTERNALDATE values"),
+    ],
+    ids=[
+        "singleton-d1-d2",
+        "a-d1-d1-b-d1-d2",
+        "three-singleton-dates",
+        "single-missing-date",
+    ],
+)
+def test_provider_import_many_to_one_pending_capacity_fail_matrix_is_pre_mutation(
+    tmp_path: Path,
+    target_mode: str,
+    source_date_indexes: tuple[tuple[Optional[int], ...], ...],
+    error_match: str,
+) -> None:
+    config, accounts, account_dirs, _shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=source_date_indexes,
+    )
+    original_journals = {
+        account.source_email: account_dirs[account.source_email]
+        .joinpath(f"import-{account.target_email}.journal.jsonl")
+        .read_bytes()
+        for account in accounts
+    }
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match=error_match):
+            provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.appended == []
+    assert fake.stored_flags == []
+    assert fake.subscribed == []
+    assert fake.bodies_by_mailbox == {}
+    for account in accounts:
+        journal_path = account_dirs[account.source_email] / f"import-{account.target_email}.journal.jsonl"
+        assert journal_path.read_bytes() == original_journals[account.source_email]
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_generic_capacity_is_per_physical_mailbox(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config, accounts, account_dirs, shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode=target_mode,
+        source_date_indexes=((0,), (1,)),
+        primary_mailboxes=("Archive", "INBOX"),
+    )
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.bodies_by_mailbox["Archive"] == [shared_body]
+    assert fake.bodies_by_mailbox["INBOX"] == [shared_body]
+    assert fake.internaldates_by_mailbox["Archive"] == [_PENDING_CAPACITY_DATES[0]]
+    assert fake.internaldates_by_mailbox["INBOX"] == [_PENDING_CAPACITY_DATES[1]]
+    for account in accounts:
+        assert load_import_journal(account_dirs[account.source_email], account)[-1]["status"] == "committed"
+
+
+def test_provider_pending_capacity_is_gmail_global_across_target_labels(
+    tmp_path: Path,
+) -> None:
+    config, accounts, account_dirs, _shared_body = _many_to_one_pending_capacity_fixture(
+        tmp_path,
+        target_mode="merge",
+        target_provider="gmail",
+        source_date_indexes=((0,), (1,)),
+        primary_mailboxes=("Team A", "Team B"),
+    )
+    original_journals = {
+        account.source_email: account_dirs[account.source_email]
+        .joinpath(f"import-{account.target_email}.journal.jsonl")
+        .read_bytes()
+        for account in accounts
+    }
+    fake = FakeGmailTargetImap()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[FakeGmailTargetImap]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="incompatible INTERNALDATE values"):
+            provider_import_account(config, config.accounts[0], tmp_path)
+
+    assert fake.appended == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.subscribed == []
+    for account in accounts:
+        journal_path = account_dirs[account.source_email] / f"import-{account.target_email}.journal.jsonl"
+        assert journal_path.read_bytes() == original_journals[account.source_email]
+
+
+@pytest.mark.parametrize("reverse_stages", [False, True])
+@pytest.mark.parametrize("reverse_rows", [False, True])
+def test_provider_pending_capacity_unions_overlapping_content_identity_sets_deterministically(
+    tmp_path: Path,
+    reverse_stages: bool,
+    reverse_rows: bool,
+) -> None:
+    first = MigrationAccount(source_email="a@example.com", target_email="merged@example.com")
+    second = MigrationAccount(source_email="b@example.com", target_email="merged@example.com")
+    first_rows = [
+        {"canonical_id": "overlap-a-1", "primary_mailbox": "Archive", "internaldate": _PENDING_CAPACITY_DATES[0]},
+        {"canonical_id": "overlap-a-2", "primary_mailbox": "Archive", "internaldate": _PENDING_CAPACITY_DATES[1]},
+    ]
+    second_rows = [
+        {"canonical_id": "overlap-b-1", "primary_mailbox": "Archive", "internaldate": _PENDING_CAPACITY_DATES[0]},
+    ]
+    if reverse_rows:
+        first_rows.reverse()
+    stages = [
+        (first, tmp_path / "a", first_rows, [
+            {"canonical_id": row["canonical_id"], "target_mailbox": "Archive", "status": "pending"}
+            for row in first_rows
+        ]),
+        (second, tmp_path / "b", second_rows, [
+            {"canonical_id": row["canonical_id"], "target_mailbox": "Archive", "status": "pending"}
+            for row in second_rows
+        ]),
+    ]
+    if reverse_stages:
+        stages.reverse()
+    digest_a = "a" * 64
+    digest_b = "b" * 64
+    classes = require_merge_group_pending_internaldates_compatible(
+        [MailboxInfo("Archive", "/", ("\\Archive",))],
+        stages,
+        target_provider="imap",
+        expected_content_identities_by_id={
+            "overlap-a-1": {(10, digest_a)},
+            "overlap-a-2": {(10, digest_b)},
+            "overlap-b-1": {(10, digest_a), (10, digest_b)},
+        },
+    )
+
+    assert len(classes) == 1
+    assert classes[0]["capacity"] == 2
+    assert sorted(classes[0]["required_by_date"].values()) == [1, 1]
+
+
+def test_provider_pending_capacity_normalizes_utc_equivalent_date_buckets(
+    tmp_path: Path,
+) -> None:
+    accounts = (
+        MigrationAccount(source_email="a@example.com", target_email="merged@example.com"),
+        MigrationAccount(source_email="b@example.com", target_email="merged@example.com"),
+    )
+    rows = (
+        {"canonical_id": "utc-a", "primary_mailbox": "Archive", "internaldate": "01-Jan-2024 02:00:00 +0200"},
+        {"canonical_id": "utc-b", "primary_mailbox": "Archive", "internaldate": "01-Jan-2024 00:00:00 +0000"},
+    )
+    stages = [
+        (
+            account,
+            tmp_path / account.source_email,
+            [row],
+            [{"canonical_id": row["canonical_id"], "target_mailbox": "Archive", "status": "pending"}],
+        )
+        for account, row in zip(accounts, rows)
+    ]
+    shared_identity = {(10, "a" * 64)}
+
+    classes = require_merge_group_pending_internaldates_compatible(
+        [MailboxInfo("Archive", "/", ("\\Archive",))],
+        stages,
+        target_provider="imap",
+        expected_content_identities_by_id={
+            row["canonical_id"]: shared_identity for row in rows
+        },
+    )
+
+    assert len(classes) == 1
+    assert classes[0]["capacity"] == 1
+    assert list(classes[0]["required_by_date"].values()) == [1]
 
 
 def test_provider_import_many_to_one_rejects_cross_source_canonical_id_collision_before_target_contact(
@@ -6632,8 +10064,126 @@ def test_provider_validation_many_to_one_rejects_missing_group_committed_target(
     assert any("merge group journal says physical-a" in item for item in report["failed"])
 
 
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_import_many_to_one_group_pregate_consumes_committed_occurrences_per_source(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    ordinary_account, committed_account = config.accounts
+    _write_provider_account_fixture(
+        tmp_path,
+        source=ordinary_account.source_email,
+        target=ordinary_account.target_email,
+        canonical_id="ordinary-a",
+        message_id="<ordinary@example.com>",
+        body=b"Message-ID: <ordinary@example.com>\r\n\r\nordinary",
+    )
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    committed_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=committed_account.source_email,
+        target=committed_account.target_email,
+        canonical_id="committed-b-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    _append_identical_provider_fixture_row(committed_dir, "committed-b-two")
+    committed_rows = load_manifest(committed_dir)
+    (committed_dir / "import-merged@example.com.journal.jsonl").write_text(
+        "".join(
+            json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                "canonical_id": row["canonical_id"],
+                "target_account": committed_account.target_email,
+                "target_mailbox": "Archive",
+                "status": "committed",
+            }, account=committed_account)) + "\n"
+            for row in committed_rows
+        )
+    )
+    fake = StoredMessageTarget({"Archive": [shared_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        with pytest.raises(RuntimeError, match="committed-b-two"):
+            provider_import_account(config, ordinary_account, tmp_path)
+
+    assert fake.appended == []
+    assert not (tmp_path / ordinary_account.source_email / "import-merged@example.com.journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("target_mode", ["empty", "merge"])
+def test_provider_validation_many_to_one_uses_max_source_duplicate_capacity(
+    tmp_path: Path,
+    target_mode: str,
+) -> None:
+    config = _many_to_one_config(target_mode=target_mode)
+    two_copy_account, one_copy_account = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    two_copy_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=two_copy_account.source_email,
+        target=two_copy_account.target_email,
+        canonical_id="a-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    _append_identical_provider_fixture_row(two_copy_dir, "a-two")
+    one_copy_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=one_copy_account.source_email,
+        target=one_copy_account.target_email,
+        canonical_id="b-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+    )
+    for account, account_dir in (
+        (two_copy_account, two_copy_dir),
+        (one_copy_account, one_copy_dir),
+    ):
+        (account_dir / "import-merged@example.com.journal.jsonl").write_text(
+            "".join(
+                json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                    "canonical_id": row["canonical_id"],
+                    "target_account": account.target_email,
+                    "target_mailbox": "Archive",
+                    "status": "committed",
+                }, account=account)) + "\n"
+                for row in load_manifest(account_dir)
+            )
+        )
+    fake = StoredMessageTarget({"Archive": [shared_body, shared_body]})
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, two_copy_report = provider_validate_account(
+            config,
+            two_copy_account,
+            tmp_path,
+            check_target=True,
+        )
+        _name, one_copy_report = provider_validate_account(
+            config,
+            one_copy_account,
+            tmp_path,
+            check_target=True,
+        )
+        all_ok, issues = provider_validate_all(config, tmp_path, max_workers=1)
+
+    assert two_copy_report["ok"], two_copy_report
+    assert one_copy_report["ok"], one_copy_report
+    assert all_ok, issues
+    assert issues == []
+
+
 def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_path: Path) -> None:
-    config = _many_to_one_config()
+    config = _many_to_one_config(target_mode="merge")
     first, second = config.accounts
     target = first.target_email
     shared_body = b"Message-ID: <shared@example.com>\r\n\r\nsame-body"
@@ -6653,27 +10203,35 @@ def test_provider_import_many_to_one_deduplicates_existing_group_message(tmp_pat
         message_id="<shared@example.com>",
         body=shared_body,
     )
-    first_row = json.loads((first_dir / "manifest.jsonl").read_text())
-    (first_dir / "import-merged@example.com.journal.jsonl").write_text(json.dumps(_journal_fixture_for_manifest_row(config, first_row, {
-        "canonical_id": "physical-a",
-        "target_account": target,
-        "target_mailbox": "Archive",
-        "status": "committed",
-    }, account=first)) + "\n")
     fake = StoredMessageTarget({"Archive": [shared_body]})
+    fake.internaldates_by_mailbox["Archive"] = ["02-Jan-2024 00:00:00 +0000"]
 
     @contextlib.contextmanager
     def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        provider_import_account(config, first, tmp_path)
         provider_import_account(config, second, tmp_path)
         _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
+        first_journal_before_rerun = load_import_journal(first_dir, first)
+        second_journal_before_rerun = load_import_journal(second_dir, second)
+        provider_import_account(config, first, tmp_path)
+        provider_import_account(config, second, tmp_path)
 
     assert fake.appended == []
     assert report["ok"]
-    second_journal = (second_dir / "import-merged@example.com.journal.jsonl").read_text()
-    assert '"action": "existing"' in second_journal
+    assert report["warnings"][0]["canonical_id"] == "physical-b"
+    assert report["warnings"][0]["target_internaldate"] == "02-Jan-2024 00:00:00 +0000"
+    first_journal = load_import_journal(first_dir, first)
+    second_journal = load_import_journal(second_dir, second)
+    assert first_journal == first_journal_before_rerun
+    assert second_journal == second_journal_before_rerun
+    for journal_rows in (first_journal, second_journal):
+        assert journal_rows[-1]["action"] == "existing"
+        assert journal_rows[-1]["source_internaldate"] == "01-Jan-2024 00:00:00 +0000"
+        assert journal_rows[-1]["target_internaldate"] == "02-Jan-2024 00:00:00 +0000"
+        assert journal_rows[-1]["internaldate_provenance"] == "existing-content-reuse"
 
 
 @pytest.mark.parametrize(
@@ -6737,6 +10295,46 @@ def test_provider_many_to_one_rejects_peer_stage_artifact_defects(
 
     assert not report["ok"]
     assert any(needle in item for item in report["failed"])
+
+
+def test_provider_many_to_one_import_pregate_repairs_torn_peer_journal_first_run(
+    tmp_path: Path,
+) -> None:
+    from components.main import _provider_cli_staged_validation_issues
+
+    config = _many_to_one_config()
+    first, second = config.accounts
+    _write_provider_account_fixture(
+        tmp_path,
+        source=first.source_email,
+        target=first.target_email,
+        canonical_id="physical-a",
+        message_id="<a@example.com>",
+        body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+    )
+    second_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=second.source_email,
+        target=second.target_email,
+        canonical_id="physical-b",
+        message_id="<b@example.com>",
+        body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+    )
+    peer_journal = second_dir / "import-merged@example.com.journal.jsonl"
+    peer_journal.write_bytes(b'{"canonical_id":"physical-b","status":"pending"')
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("pre-gate must repair before connectivity"),
+    ):
+        issues = _provider_cli_staged_validation_issues(
+            tmp_path,
+            config,
+            mode="import",
+        )
+
+    assert issues == []
+    assert peer_journal.read_bytes() == b""
 
 
 def test_provider_import_all_many_to_one_serializes_same_target_group(tmp_path: Path) -> None:
@@ -6817,6 +10415,272 @@ def test_provider_import_all_hybrid_many_to_one_keeps_distinct_target_groups(tmp
     assert (tmp_path / "c@example.com" / "import-a@example.com.journal.jsonl").exists()
     assert (tmp_path / "d@example.com" / "import-d@example.com.journal.jsonl").exists()
     assert (tmp_path / "e@example.com" / "import-e@example.com.journal.jsonl").exists()
+
+
+def test_provider_import_all_many_to_one_runs_distinct_targets_concurrently_with_group_order(
+    tmp_path: Path,
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.limits.retry_max_attempts = 1
+    guard = threading.Lock()
+    release_first_wave = threading.Event()
+    active = 0
+    peak_active = 0
+    active_targets: set[str] = set()
+    calls_by_target: dict[str, List[str]] = {}
+
+    def recording_import(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        nonlocal active, peak_active
+        target_key = target_merge_group_key(config, account)[0]
+        with guard:
+            assert target_key not in active_targets
+            active_targets.add(target_key)
+            active += 1
+            peak_active = max(peak_active, active)
+            calls_by_target.setdefault(target_key, []).append(account.source_email)
+            if active == 3:
+                release_first_wave.set()
+        try:
+            assert release_first_wave.wait(5), "distinct target groups did not overlap"
+        finally:
+            with guard:
+                active -= 1
+                active_targets.remove(target_key)
+
+    with mock.patch("components.provider_ops.provider_import_account", recording_import):
+        provider_import_all(config, tmp_path, max_workers=3, ignore_errors=False)
+
+    assert peak_active == 3
+    assert calls_by_target["a@example.com"] == [
+        "a@example.com",
+        "b@example.com",
+        "c@example.com",
+    ]
+    assert calls_by_target["d@example.com"] == ["d@example.com"]
+    assert calls_by_target["e@example.com"] == ["e@example.com"]
+
+
+def test_provider_import_all_many_to_one_ignore_errors_skips_only_failed_target_group(
+    tmp_path: Path,
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.limits.retry_max_attempts = 1
+    called: List[str] = []
+    guard = threading.Lock()
+
+    def failing_import(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        with guard:
+            called.append(account.source_email)
+        if account.source_email == "a@example.com":
+            raise RuntimeError("group-a failed")
+
+    with mock.patch("components.provider_ops.provider_import_account", failing_import):
+        with pytest.raises(RuntimeError) as exc_info:
+            provider_import_all(config, tmp_path, max_workers=3, ignore_errors=True)
+
+    assert type(exc_info.value) is RuntimeError
+    message = str(exc_info.value)
+    assert "a@example.com->a@example.com: group-a failed" in message
+    assert "b@example.com->a@example.com: skipped because an earlier source" in message
+    assert "c@example.com->a@example.com: skipped because an earlier source" in message
+    assert "a@example.com" in called
+    assert "b@example.com" not in called
+    assert "c@example.com" not in called
+    assert "d@example.com" in called
+    assert "e@example.com" in called
+
+
+def test_provider_import_all_many_to_one_preserves_integrity_gate_type_with_ignore_errors(
+    tmp_path: Path,
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.limits.retry_max_attempts = 1
+    called: List[str] = []
+
+    def gated_import(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        called.append(account.source_email)
+        if account.source_email == "a@example.com":
+            raise ProviderImportIntegrityGateError("group-a integrity gate failed")
+
+    with mock.patch("components.provider_ops.provider_import_account", gated_import):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match="provider-import integrity gate failed",
+        ):
+            provider_import_all(config, tmp_path, max_workers=3, ignore_errors=True)
+
+    assert "a@example.com" in called
+    assert "b@example.com" not in called
+    assert "c@example.com" not in called
+    assert "d@example.com" in called
+    assert "e@example.com" in called
+
+
+@pytest.mark.parametrize("account_merge_mode", ["one_to_one", "many_to_one"])
+@pytest.mark.parametrize(
+    ("first_failure_kind", "drained_failure_kind", "expected_failure_type"),
+    [
+        ("integrity", "integrity", ProviderImportIntegrityGateError),
+        ("operational", "operational", RuntimeError),
+        ("integrity", "operational", RuntimeError),
+        ("operational", "integrity", RuntimeError),
+    ],
+    ids=("integrity-only", "operational-only", "integrity-first-mixed", "operational-first-mixed"),
+)
+def test_provider_import_all_fail_fast_classifies_after_running_workers_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    account_merge_mode: str,
+    first_failure_kind: str,
+    drained_failure_kind: str,
+    expected_failure_type: type[RuntimeError],
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.migration.account_merge_mode = account_merge_mode
+    config.limits.retry_max_attempts = 1
+    config.accounts = [config.accounts[index] for index in (0, 3, 4)]
+    first_account, drained_account, queued_account = config.accounts
+    workers_entered = threading.Barrier(2)
+    release_drained_worker = threading.Event()
+    drain_started = threading.Event()
+    called: List[str] = []
+    called_lock = threading.Lock()
+
+    def failure(kind: str, account: MigrationAccount) -> RuntimeError:
+        if kind == "integrity":
+            return ProviderImportIntegrityGateError(f"{account.source_email} integrity gate")
+        return RuntimeError(f"{account.source_email} operational failure")
+
+    def ordered_failures(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        with called_lock:
+            called.append(account.source_email)
+        assert account is not queued_account, "fail-fast scheduler started queued work"
+        workers_entered.wait(5)
+        if account is first_account:
+            raise failure(first_failure_kind, account)
+        assert account is drained_account
+        assert release_drained_worker.wait(5), "scheduler never entered its worker-drain path"
+        raise failure(drained_failure_kind, account)
+
+    if account_merge_mode == "one_to_one":
+        from components import executor as account_executor
+
+        original_as_completed = account_executor.concurrent.futures.as_completed
+
+        def release_on_drain(futures):
+            drain_started.set()
+            release_drained_worker.set()
+            return original_as_completed(futures)
+
+        monkeypatch.setattr(account_executor.concurrent.futures, "as_completed", release_on_drain)
+    else:
+        import concurrent.futures
+
+        original_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+        def release_on_shutdown(executor, *args, **kwargs):
+            drain_started.set()
+            release_drained_worker.set()
+            return original_shutdown(executor, *args, **kwargs)
+
+        monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", release_on_shutdown)
+
+    with mock.patch("components.provider_ops.provider_import_account", ordered_failures):
+        with pytest.raises(expected_failure_type) as exc_info:
+            provider_import_all(config, tmp_path, max_workers=2, ignore_errors=False)
+
+    assert drain_started.is_set()
+    assert set(called) == {first_account.source_email, drained_account.source_email}
+    if expected_failure_type is RuntimeError:
+        assert type(exc_info.value) is RuntimeError
+
+
+@pytest.mark.parametrize("account_merge_mode", ["one_to_one", "many_to_one"])
+def test_provider_import_all_ignore_errors_mixed_failures_remain_operational(
+    tmp_path: Path,
+    account_merge_mode: str,
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.migration.account_merge_mode = account_merge_mode
+    config.limits.retry_max_attempts = 1
+    config.accounts = [config.accounts[index] for index in (0, 3, 4)]
+    first_account, second_account, queued_account = config.accounts
+    workers_entered = threading.Barrier(2)
+    called: List[str] = []
+    called_lock = threading.Lock()
+
+    def mixed_failures(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        with called_lock:
+            called.append(account.source_email)
+        if account is queued_account:
+            return
+        workers_entered.wait(5)
+        if account is first_account:
+            raise ProviderImportIntegrityGateError("integrity gate")
+        assert account is second_account
+        raise RuntimeError("operational failure")
+
+    with mock.patch("components.provider_ops.provider_import_account", mixed_failures):
+        with pytest.raises(RuntimeError) as exc_info:
+            provider_import_all(config, tmp_path, max_workers=2, ignore_errors=True)
+
+    assert type(exc_info.value) is RuntimeError
+    assert set(called) == {account.source_email for account in config.accounts}
+
+
+def test_provider_import_all_many_to_one_stop_prevents_later_group_submission(
+    tmp_path: Path,
+) -> None:
+    config = _hybrid_many_to_one_config()
+    config.limits.retry_max_attempts = 1
+    stop_event = threading.Event()
+    called: List[str] = []
+
+    def stopping_import(
+        _config: ProviderMigrationConfig,
+        account: MigrationAccount,
+        _root: Path,
+        **_kwargs,
+    ) -> None:
+        called.append(account.source_email)
+        stop_event.set()
+
+    with mock.patch("components.provider_ops.provider_import_account", stopping_import):
+        with pytest.raises(RuntimeError, match="stop requested"):
+            provider_import_all(
+                config,
+                tmp_path,
+                max_workers=1,
+                ignore_errors=False,
+                stop_event=stop_event,
+            )
+
+    assert called == ["a@example.com"]
 
 
 def test_provider_validation_hybrid_many_to_one_checks_distinct_target_groups(tmp_path: Path) -> None:
@@ -6915,11 +10779,427 @@ def test_provider_import_and_validation_many_to_one_reject_cross_source_folder_c
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match="target mailbox translation collision",
+        ):
             provider_import_account(config, second, tmp_path)
         _name, report = provider_validate_account(config, second, tmp_path, check_target=True)
 
     assert any("target mailbox translation collision" in item for item in report["failed"])
+
+
+@pytest.mark.parametrize("account_merge_mode", ["one_to_one", "many_to_one"])
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_target_translation_collision_is_rc4_without_mutation(
+    tmp_path: Path,
+    account_merge_mode: str,
+    ignore_errors: bool,
+) -> None:
+    root = tmp_path / "staged"
+    config = _many_to_one_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    journal_paths: List[Path] = []
+    if account_merge_mode == "many_to_one":
+        first_account, second_account = config.accounts
+        first_dir = _write_provider_account_fixture(
+            root,
+            source=first_account.source_email,
+            target=first_account.target_email,
+            canonical_id="physical-a",
+            message_id="<a@example.com>",
+            body=b"Message-ID: <a@example.com>\r\n\r\nfrom-a",
+            primary_mailbox="Projects/Foo",
+        )
+        second_dir = _write_provider_account_fixture(
+            root,
+            source=second_account.source_email,
+            target=second_account.target_email,
+            canonical_id="physical-b",
+            message_id="<b@example.com>",
+            body=b"Message-ID: <b@example.com>\r\n\r\nfrom-b",
+            primary_mailbox="Projects/Foo",
+        )
+        first_row = load_manifest(first_dir)[0]
+        first_row["source_mailboxes"] = ["Projects/Foo"]
+        first_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects", "Foo"]}
+        _write_single_manifest_row(first_dir, first_row)
+        _write_provider_export_state(
+            first_dir,
+            source=first_account.source_email,
+            target=first_account.target_email,
+            source_endpoint=ProviderEndpoint(provider="imap", host="mail.source.example.com"),
+        )
+        second_row = load_manifest(second_dir)[0]
+        second_row["source_mailboxes"] = ["Projects/Foo"]
+        second_row["source_mailbox_paths"] = {"Projects/Foo": ["Projects/Foo"]}
+        _write_single_manifest_row(second_dir, second_row)
+        _write_provider_export_state(
+            second_dir,
+            source=second_account.source_email,
+            target=second_account.target_email,
+            source_endpoint=ProviderEndpoint(provider="imap", host="mail.source.example.com"),
+        )
+        journal_paths = [
+            first_dir / f"import-{first_account.target_email}.journal.jsonl",
+            second_dir / f"import-{second_account.target_email}.journal.jsonl",
+        ]
+    else:
+        account = config.accounts[0]
+        config.accounts = [account]
+        config.migration.account_merge_mode = "one_to_one"
+        account_dir = _write_provider_account_fixture(
+            root,
+            source=account.source_email,
+            target=account.target_email,
+            canonical_id="physical-a",
+            message_id="<translation@example.com>",
+            body=b"Message-ID: <translation@example.com>\r\n\r\nbody",
+            primary_mailbox="A/B.C",
+        )
+        _append_identical_provider_fixture_row(account_dir, "physical-b")
+        first_row, second_row = load_manifest(account_dir)
+        first_row["primary_mailbox"] = "A/B.C"
+        first_row["source_mailboxes"] = ["A/B.C"]
+        first_row["source_mailbox_paths"] = {"A/B.C": ["A/B", "C"]}
+        second_row["primary_mailbox"] = "A.B/C"
+        second_row["source_mailboxes"] = ["A.B/C"]
+        second_row["source_mailbox_paths"] = {"A.B/C": ["A", "B/C"]}
+        _write_provider_fixture_manifest_rows(account_dir, [first_row, second_row])
+        journal_paths = [account_dir / f"import-{account.target_email}.journal.jsonl"]
+    fake = StoredMessageTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox == {}
+    assert all(not journal_path.exists() for journal_path in journal_paths)
+
+
+@pytest.mark.parametrize("status", ["committed", "pending"])
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_live_special_use_journal_mailbox_mismatch_is_rc4_without_mutation(
+    tmp_path: Path,
+    status: str,
+    ignore_errors: bool,
+) -> None:
+    class AmbiguousTrashTarget(StoredMessageTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\Trash) "/" "Deleted Messages"',
+                b'(\\HasNoChildren \\Trash) "/" "Trash"',
+            ]
+
+    root = tmp_path / "staged"
+    config = _generic_target_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    account = config.accounts[0]
+    body = b"Message-ID: <special-use-mismatch@example.com>\r\n\r\nbody"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="special-use-mismatch",
+        message_id="<special-use-mismatch@example.com>",
+        body=body,
+        primary_mailbox="Deleted Messages",
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    row = load_manifest(account_dir)[0]
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(json.dumps(_journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "Trash",
+        "status": status,
+        "action": "appended" if status == "committed" else "append-started",
+    }, account=account)) + "\n")
+    original_journal = journal_path.read_bytes()
+    fake = AmbiguousTrashTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox == {}
+    assert journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize("status", ["committed", "pending"])
+@pytest.mark.parametrize("reverse_sources", [False, True])
+def test_real_cli_many_to_one_peer_live_journal_binding_gate_precedes_mutation(
+    tmp_path: Path,
+    status: str,
+    reverse_sources: bool,
+) -> None:
+    class AmbiguousTrashTarget(StoredMessageTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren) "/" "Archive"',
+                b'(\\HasNoChildren \\Trash) "/" "Deleted Messages"',
+                b'(\\HasNoChildren \\Trash) "/" "Trash"',
+            ]
+
+    root = tmp_path / "staged"
+    config = _many_to_one_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    first_account, peer_account = config.accounts
+    first_dir = _write_provider_account_fixture(
+        root,
+        source=first_account.source_email,
+        target=first_account.target_email,
+        canonical_id="fresh-first",
+        message_id="<fresh-first@example.com>",
+        body=b"Message-ID: <fresh-first@example.com>\r\n\r\nfresh",
+    )
+    peer_body = b"Message-ID: <peer-binding@example.com>\r\n\r\npeer"
+    peer_dir = _write_provider_account_fixture(
+        root,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-binding",
+        message_id="<peer-binding@example.com>",
+        body=peer_body,
+        primary_mailbox="Deleted Messages",
+    )
+    peer_row = load_manifest(peer_dir)[0]
+    peer_journal = peer_dir / f"import-{peer_account.target_email}.journal.jsonl"
+    peer_journal.write_text(json.dumps(_journal_fixture_for_manifest_row(config, peer_row, {
+        "canonical_id": peer_row["canonical_id"],
+        "target_account": peer_account.target_email,
+        "target_mailbox": "Trash",
+        "status": status,
+        "action": "appended" if status == "committed" else "append-started",
+    }, account=peer_account)) + "\n")
+    original_peer_journal = peer_journal.read_bytes()
+    first_journal = first_dir / f"import-{first_account.target_email}.journal.jsonl"
+    if reverse_sources:
+        config.accounts.reverse()
+    fake = AmbiguousTrashTarget({"Trash": [peer_body]})
+    original_target = list(fake.bodies_by_mailbox["Trash"])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox["Trash"] == original_target
+    assert not first_journal.exists()
+    assert peer_journal.read_bytes() == original_peer_journal
+
+
+@pytest.mark.parametrize("reverse_sources", [False, True])
+def test_real_cli_many_to_one_peer_live_content_gate_precedes_mutation(
+    tmp_path: Path,
+    reverse_sources: bool,
+) -> None:
+    class DuplicateSentAliasTarget(OverlapStoredGmailTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "Gesendet"',
+            ]
+
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    first_account, peer_account = config.accounts
+    first_dir = _write_provider_account_fixture(
+        root,
+        source=first_account.source_email,
+        target=first_account.target_email,
+        canonical_id="fresh-first",
+        message_id="<fresh-first@example.com>",
+        body=b"Message-ID: <fresh-first@example.com>\r\n\r\nfresh",
+    )
+    peer_body = b"Message-ID: <peer-content@example.com>\r\n\r\npeer"
+    peer_dir = _write_provider_account_fixture(
+        root,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-content",
+        message_id="<peer-content@example.com>",
+        body=peer_body,
+        primary_mailbox="Sent",
+    )
+    peer_row = load_manifest(peer_dir)[0]
+    evidence_commit = _journal_fixture_for_manifest_row(config, peer_row, {
+        "canonical_id": peer_row["canonical_id"],
+        "target_account": peer_account.target_email,
+        "target_mailbox": "[Gmail]/Sent Mail",
+        "status": "committed",
+        "action": "existing",
+        "internaldate": peer_row["internaldate"],
+        "source_internaldate": peer_row["internaldate"],
+        "target_internaldate": "02-Jan-2024 00:00:00 +0000",
+        "internaldate_provenance": "existing-content-reuse",
+        "internaldate_origin_action": "existing",
+    }, account=peer_account)
+    downgraded_commit = _journal_fixture_for_manifest_row(config, peer_row, {
+        "canonical_id": peer_row["canonical_id"],
+        "target_account": peer_account.target_email,
+        "target_mailbox": "Gesendet",
+        "status": "committed",
+        "action": "labels-reconciled",
+    }, account=peer_account)
+    peer_journal_rows = [evidence_commit, downgraded_commit]
+    assert committed_journal_manifest_content_issues(
+        peer_journal_rows,
+        [peer_row],
+        target_provider="gmail",
+    ) == []
+    peer_journal = peer_dir / f"import-{peer_account.target_email}.journal.jsonl"
+    peer_journal.write_text(
+        "".join(json.dumps(journal_row) + "\n" for journal_row in peer_journal_rows)
+    )
+    original_peer_journal = peer_journal.read_bytes()
+    first_journal = first_dir / f"import-{first_account.target_email}.journal.jsonl"
+    if reverse_sources:
+        config.accounts.reverse()
+    fake = DuplicateSentAliasTarget([])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox == {"[Gmail]/All Mail": []}
+    assert not first_journal.exists()
+    assert peer_journal.read_bytes() == original_peer_journal
+
+
+@pytest.mark.parametrize("reverse_sources", [False, True])
+def test_real_cli_many_to_one_peer_gmail_topology_gate_precedes_mutation(
+    tmp_path: Path,
+    reverse_sources: bool,
+) -> None:
+    class MissingSentTarget(OverlapStoredGmailTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+            ]
+
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    first_account, peer_account = config.accounts
+    first_dir = _write_provider_account_fixture(
+        root,
+        source=first_account.source_email,
+        target=first_account.target_email,
+        canonical_id="fresh-first",
+        message_id="<fresh-first@example.com>",
+        body=b"Message-ID: <fresh-first@example.com>\r\n\r\nfresh",
+    )
+    peer_dir = _write_provider_account_fixture(
+        root,
+        source=peer_account.source_email,
+        target=peer_account.target_email,
+        canonical_id="peer-sent",
+        message_id="<peer-sent@example.com>",
+        body=b"Message-ID: <peer-sent@example.com>\r\n\r\npeer",
+        primary_mailbox="Sent",
+    )
+    first_journal = first_dir / f"import-{first_account.target_email}.journal.jsonl"
+    peer_journal = peer_dir / f"import-{peer_account.target_email}.journal.jsonl"
+    if reverse_sources:
+        config.accounts.reverse()
+    fake = MissingSentTarget([])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox == {"[Gmail]/All Mail": []}
+    assert not first_journal.exists()
+    assert not peer_journal.exists()
+
+
+def test_real_cli_target_list_failure_remains_rc1(
+    tmp_path: Path,
+) -> None:
+    class FailingListTarget(StoredMessageTarget):
+        def list(self):
+            raise RuntimeError("target LIST failed")
+
+    root = tmp_path / "staged"
+    config = _generic_target_config(target_mode="merge")
+    config.limits.retry_max_attempts = 1
+    account = config.accounts[0]
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="list-operation",
+        message_id="<list-operation@example.com>",
+        body=b"Message-ID: <list-operation@example.com>\r\n\r\nbody",
+        source_provider=config.source.provider,
+        source_host=config.source.host,
+    )
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    fake = FailingListTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(config, tmp_path, root, fake_target_connection)
+
+    assert rc == 1
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.bodies_by_mailbox == {}
+    assert not journal_path.exists()
 
 
 def test_provider_import_many_to_one_rejects_gmail_group_journal_missing_msgid(tmp_path: Path) -> None:
@@ -7063,6 +11343,112 @@ def test_provider_import_many_to_one_gmail_rejects_stale_group_target_msgid(tmp_
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
         with pytest.raises(RuntimeError, match="Gmail target message 9001"):
             provider_import_account(config, second, tmp_path)
+
+
+def test_provider_validation_many_to_one_gmail_uses_max_source_duplicate_capacity(
+    tmp_path: Path,
+) -> None:
+    config = _many_to_one_gmail_config(target_mode="merge")
+    two_copy_account, one_copy_account = config.accounts
+    shared_body = b"Message-ID: <shared@example.com>\r\n\r\nshared"
+    two_copy_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=two_copy_account.source_email,
+        target=two_copy_account.target_email,
+        canonical_id="a-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+        primary_mailbox="INBOX",
+    )
+    _append_identical_provider_fixture_row(two_copy_dir, "a-two")
+    one_copy_dir = _write_provider_account_fixture(
+        tmp_path,
+        source=one_copy_account.source_email,
+        target=one_copy_account.target_email,
+        canonical_id="b-one",
+        message_id="<shared@example.com>",
+        body=shared_body,
+        primary_mailbox="INBOX",
+    )
+    gmail_ids_by_source = {
+        two_copy_account.source_email: ["9001", "9002"],
+        one_copy_account.source_email: ["9001"],
+    }
+    for account, account_dir in (
+        (two_copy_account, two_copy_dir),
+        (one_copy_account, one_copy_dir),
+    ):
+        rows = load_manifest(account_dir)
+        (account_dir / "import-merged@gmail.com.journal.jsonl").write_text(
+            "".join(
+                json.dumps(_journal_fixture_for_manifest_row(config, row, {
+                    "canonical_id": row["canonical_id"],
+                    "target_account": account.target_email,
+                    "target_mailbox": "INBOX",
+                    "target_gmail_msgid": gmail_id,
+                    "status": "committed",
+                }, account=account)) + "\n"
+                for row, gmail_id in zip(rows, gmail_ids_by_source[account.source_email])
+            )
+        )
+
+    class TwoPhysicalGmailTarget(FakeGmailTargetImap):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+            ]
+
+        def _message_count(self, mailbox: str) -> int:
+            return 2 if mailbox in {"INBOX", "[Gmail]/All Mail"} else 0
+
+        def search(self, charset: Optional[str], *criteria):
+            self.search_queries.append(criteria)
+            if criteria == ("ALL",):
+                count = self._message_count(self.selected_mailbox)
+                return "OK", [b"1 2" if count else b""]
+            if criteria == ("HEADER", "Message-ID", "<shared@example.com>"):
+                return "OK", [b"1 2"]
+            return "OK", [b""]
+
+        def fetch(self, num: bytes, query: str):
+            if "X-GM-MSGID" in query:
+                gmail_id = b"9001" if num == b"1" else b"9002"
+                return "OK", [num + b" (X-GM-MSGID " + gmail_id + b")"]
+            if "X-GM-LABELS" in query:
+                return "OK", [num + b" (FLAGS (\\Seen) X-GM-LABELS (\\Inbox))"]
+            if "INTERNALDATE" in query:
+                return "OK", [num + b' (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
+            return "OK", [(
+                num + f" (RFC822.SIZE {len(shared_body)} BODY[] {{{len(shared_body)}}}".encode("ascii"),
+                shared_body,
+            )]
+
+    fake = TwoPhysicalGmailTarget()
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[TwoPhysicalGmailTarget]:
+        yield fake
+
+    with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
+        _name, two_copy_report = provider_validate_account(
+            config,
+            two_copy_account,
+            tmp_path,
+            check_target=True,
+        )
+        _name, one_copy_report = provider_validate_account(
+            config,
+            one_copy_account,
+            tmp_path,
+            check_target=True,
+        )
+
+    assert two_copy_report["ok"], two_copy_report
+    assert one_copy_report["ok"], one_copy_report
+    assert two_copy_report["duplicates"] == []
+    assert one_copy_report["duplicates"] == []
 
 
 def test_provider_import_inbox_to_generic_imap_appends_to_inbox(tmp_path: Path) -> None:
@@ -7271,11 +11657,79 @@ def test_provider_import_to_gmail_requires_important_and_starred_system_mailboxe
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match=f"missing required {system_key} system mailbox"):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match=f"missing required {system_key} system mailbox",
+        ):
             provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
     assert not (account_dir / "import-target@gmail.com.journal.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_rc"),
+    [("system-topology", 4), ("capability", 1), ("all-mail-select", 1)],
+)
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_gmail_system_topology_is_rc4_but_readiness_failures_remain_rc1(
+    tmp_path: Path,
+    failure_kind: str,
+    expected_rc: int,
+    ignore_errors: bool,
+) -> None:
+    class MissingSentTarget(OverlapStoredGmailTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+            ]
+
+    class MissingCapabilityTarget(MissingSentTarget):
+        def capability(self):
+            return "OK", [b"IMAP4rev1"]
+
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    primary_mailbox = "Sent" if failure_kind == "system-topology" else "INBOX"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="gmail-readiness",
+        message_id="<gmail-readiness@example.com>",
+        body=b"Message-ID: <gmail-readiness@example.com>\r\n\r\nbody",
+        primary_mailbox=primary_mailbox,
+    )
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    if failure_kind == "capability":
+        fake = MissingCapabilityTarget([])
+    elif failure_kind == "all-mail-select":
+        fake = FakeGmailTargetAllMailNotSelectable()
+    else:
+        fake = MissingSentTarget([])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs):
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == expected_rc
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert not journal_path.exists()
 
 
 def test_provider_import_to_gmail_maps_flagged_primary_to_starred_system_mailbox(tmp_path: Path) -> None:
@@ -7645,7 +12099,10 @@ def test_provider_import_rejects_ambiguous_translated_folder_collision(tmp_path:
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match="target mailbox translation collision",
+        ):
             provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
@@ -7702,7 +12159,10 @@ def test_provider_import_rejects_gmail_collision_before_label_mutation(tmp_path:
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="target mailbox translation collision"):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match="target mailbox translation collision",
+        ):
             provider_import_account(config, account, tmp_path)
 
     assert fake.appended == []
@@ -8224,7 +12684,7 @@ def test_target_gmail_label_state_ignores_unsolicited_fetch_for_other_sequence()
 
     labels, flags = _target_gmail_label_and_flag_keys(UnsolicitedFetchGmailTarget(), b"2")
 
-    assert labels == {"label:\\seen"}
+    assert labels == set()
     assert flags == {"\\SEEN"}
 
 
@@ -8806,6 +13266,7 @@ def test_provider_import_merge_reuses_committed_wrong_target_internaldate(tmp_pa
         "target_account": "target@icloud.com",
         "target_mailbox": "Archive",
         "status": "committed",
+        "action": "existing",
     })) + "\n")
     body = (account_dir / "messages" / "gmail-123.eml").read_bytes()
     fake = StoredMessageTarget({"Archive": [body]})
@@ -8824,8 +13285,150 @@ def test_provider_import_merge_reuses_committed_wrong_target_internaldate(tmp_pa
         json.loads(line)
         for line in (account_dir / "import-target@icloud.com.journal.jsonl").read_text().splitlines()
     ]
-    assert len(journal_rows) == 1
-    assert journal_rows[0]["status"] == "committed"
+    assert len(journal_rows) == 2
+    assert journal_rows[-1]["status"] == "committed"
+    assert journal_rows[-1]["action"] == "existing"
+    assert journal_rows[-1]["source_internaldate"] == "01-Jan-2024 00:00:00 +0000"
+    assert journal_rows[-1]["target_internaldate"] == "02-Jan-2024 00:00:00 +0000"
+
+
+@pytest.mark.parametrize("later_action", ["existing", "labels-reconciled"])
+def test_provider_import_rejects_existing_content_provenance_downgrade(
+    tmp_path: Path,
+    later_action: str,
+) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = load_manifest(account_dir)[0]
+    evidence_commit = _journal_fixture_for_manifest_row(
+        config,
+        row,
+        {
+            "canonical_id": row["canonical_id"],
+            "target_account": account.target_email,
+            "status": "committed",
+            "action": "existing",
+            "target_mailbox": "Archive",
+            "internaldate": row["internaldate"],
+            "source_internaldate": "01-Jan-2024 00:00:00 +0000",
+            "target_internaldate": "02-Jan-2024 00:00:00 +0000",
+            "internaldate_provenance": "existing-content-reuse",
+            "internaldate_origin_action": "existing",
+        },
+    )
+    downgraded_commit = _journal_fixture_for_manifest_row(
+        config,
+        row,
+        {
+            "canonical_id": row["canonical_id"],
+            "target_account": account.target_email,
+            "status": "committed",
+            "action": later_action,
+            "target_mailbox": "Archive",
+            "internaldate": row["internaldate"],
+        },
+    )
+    journal_rows = [evidence_commit, downgraded_commit]
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in journal_rows)
+    )
+
+    issues = committed_journal_manifest_content_issues(journal_rows, [row])
+    assert len(issues) == 1
+    assert "INTERNALDATE provenance downgrade" in issues[0]
+    assert f"action {later_action!r}" in issues[0]
+
+    with mock.patch(
+        "components.provider_ops.imap_connection",
+        side_effect=AssertionError("corrupt provenance must fail before target contact"),
+    ):
+        with pytest.raises(RuntimeError, match="INTERNALDATE provenance downgrade"):
+            provider_import_account(config, account, tmp_path)
+
+
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_real_cli_live_gmail_alias_canonicalization_provenance_downgrade_is_rc4(
+    tmp_path: Path,
+    ignore_errors: bool,
+) -> None:
+    class DuplicateSentAliasTarget(OverlapStoredGmailTarget):
+        def list(self):
+            return "OK", [
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+                b'(\\HasNoChildren \\Sent) "/" "Gesendet"',
+            ]
+
+    root = tmp_path / "staged"
+    config = _many_to_one_gmail_config(target_mode="merge")
+    account = config.accounts[0]
+    config.accounts = [account]
+    config.migration.account_merge_mode = "one_to_one"
+    config.limits.retry_max_attempts = 1
+    body = b"Message-ID: <alias-provenance@example.com>\r\n\r\nbody"
+    account_dir = _write_provider_account_fixture(
+        root,
+        source=account.source_email,
+        target=account.target_email,
+        canonical_id="alias-provenance",
+        message_id="<alias-provenance@example.com>",
+        body=body,
+        primary_mailbox="Sent",
+    )
+    row = load_manifest(account_dir)[0]
+    evidence_commit = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "[Gmail]/Sent Mail",
+        "status": "committed",
+        "action": "existing",
+        "internaldate": row["internaldate"],
+        "source_internaldate": row["internaldate"],
+        "target_internaldate": "02-Jan-2024 00:00:00 +0000",
+        "internaldate_provenance": "existing-content-reuse",
+        "internaldate_origin_action": "existing",
+    }, account=account)
+    downgraded_commit = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": row["canonical_id"],
+        "target_account": account.target_email,
+        "target_mailbox": "Gesendet",
+        "status": "committed",
+        "action": "labels-reconciled",
+    }, account=account)
+    journal_rows = [evidence_commit, downgraded_commit]
+    assert committed_journal_manifest_content_issues(
+        journal_rows,
+        [row],
+        target_provider="gmail",
+    ) == []
+    journal_path = account_dir / f"import-{account.target_email}.journal.jsonl"
+    journal_path.write_text(
+        "".join(json.dumps(journal_row) + "\n" for journal_row in journal_rows)
+    )
+    original_journal = journal_path.read_bytes()
+    fake = DuplicateSentAliasTarget([body])
+
+    @contextlib.contextmanager
+    def fake_target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield fake
+
+    rc = _run_real_provider_import_cli(
+        config,
+        tmp_path,
+        root,
+        fake_target_connection,
+        ignore_errors=ignore_errors,
+    )
+
+    assert rc == 4
+    assert fake.appended == []
+    assert fake.subscribed == []
+    assert fake.stored_flags == []
+    assert fake.stored_labels == []
+    assert fake.bodies_by_mailbox == {"[Gmail]/All Mail": [body]}
+    assert journal_path.read_bytes() == original_journal
 
 
 def test_provider_import_empty_mode_permits_journaled_generic_all_view(tmp_path: Path) -> None:
@@ -11348,6 +15951,8 @@ def test_provider_validation_rejects_single_gmail_message_for_two_physical_sourc
                 return "OK", [b"1 (X-GM-MSGID 9001)"]
             if "X-GM-LABELS" in query:
                 return "OK", [b"1 (FLAGS (\\Seen) X-GM-LABELS ())"]
+            if "INTERNALDATE" in query:
+                return "OK", [b'1 (INTERNALDATE "01-Jan-2024 00:00:00 +0000")']
             return "OK", [(b"1 (RFC822.SIZE 36 BODY[] {36}", self.body)]
 
     config = ProviderMigrationConfig(
@@ -11570,6 +16175,7 @@ def test_provider_validation_rejects_wrong_target_internaldate(tmp_path: Path) -
         "target_account": "target@icloud.com",
         "target_mailbox": "Archive",
         "status": "committed",
+        "action": "appended",
     })) + "\n")
     wrong_date = FakeTargetImap(
         has_existing=True,
@@ -11585,12 +16191,80 @@ def test_provider_validation_rejects_wrong_target_internaldate(tmp_path: Path) -
         _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
 
     assert not report["ok"]
+    assert report["warnings"] == []
     assert any(
         "target INTERNALDATE mismatch for gmail-123 in Archive" in item
         and "'01-Jan-2024 00:00:00 +0000'" in item
         and "'02-Jan-2024 00:00:00 +0000'" in item
         for item in report["failed"]
     )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing-target-date",
+        "source-date",
+        "target-date",
+        "provenance",
+        "origin-action",
+        "current-action",
+        "legacy-date",
+    ],
+)
+def test_provider_validation_rejects_tampered_existing_internaldate_evidence(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    config = _provider_config(target_mode="merge")
+    account = config.accounts[0]
+    account_dir = _write_manifest_fixture(tmp_path)
+    row = json.loads((account_dir / "manifest.jsonl").read_text())
+    journal_row = _journal_fixture_for_manifest_row(config, row, {
+        "canonical_id": "gmail-123",
+        "target_account": "target@icloud.com",
+        "target_mailbox": "Archive",
+        "status": "committed",
+        "action": "existing",
+        "internaldate": "01-Jan-2024 00:00:00 +0000",
+        "source_internaldate": "01-Jan-2024 00:00:00 +0000",
+        "target_internaldate": "02-Jan-2024 00:00:00 +0000",
+        "internaldate_provenance": "existing-content-reuse",
+        "internaldate_origin_action": "existing",
+    })
+    if tamper == "missing-target-date":
+        journal_row.pop("target_internaldate")
+    elif tamper == "source-date":
+        journal_row["source_internaldate"] = "03-Jan-2024 00:00:00 +0000"
+    elif tamper == "target-date":
+        journal_row["target_internaldate"] = "03-Jan-2024 00:00:00 +0000"
+    elif tamper == "provenance":
+        journal_row["internaldate_provenance"] = "operator-override"
+    elif tamper == "origin-action":
+        journal_row["internaldate_origin_action"] = "appended"
+    elif tamper == "current-action":
+        journal_row["action"] = "appended"
+    elif tamper == "legacy-date":
+        journal_row["internaldate"] = "03-Jan-2024 00:00:00 +0000"
+    else:  # pragma: no cover - keeps the parametrization exhaustive
+        raise AssertionError(tamper)
+    (account_dir / "import-target@icloud.com.journal.jsonl").write_text(
+        json.dumps(journal_row) + "\n"
+    )
+    body = (account_dir / row["eml_path"]).read_bytes()
+    target = StoredMessageTarget({"Archive": [body]})
+    target.internaldates_by_mailbox["Archive"] = ["02-Jan-2024 00:00:00 +0000"]
+
+    @contextlib.contextmanager
+    def target_connection(*_args, **_kwargs) -> Iterator[StoredMessageTarget]:
+        yield target
+
+    with mock.patch("components.provider_ops.imap_connection", target_connection):
+        _name, report = provider_validate_account(config, account, tmp_path, check_target=True)
+
+    assert not report["ok"]
+    assert report["warnings"] == []
+    assert any("INTERNALDATE" in issue for issue in report["failed"])
 
 
 def test_provider_validation_rejects_wrong_gmail_target_internaldate(tmp_path: Path) -> None:
@@ -11982,7 +16656,10 @@ def test_provider_import_rejects_ambiguous_missing_journaled_gmail_target_msgid(
         yield fake
 
     with mock.patch("components.provider_ops.imap_connection", fake_target_connection):
-        with pytest.raises(RuntimeError, match="matched multiple target Gmail messages"):
+        with pytest.raises(
+            ProviderImportIntegrityGateError,
+            match="matched multiple target Gmail messages",
+        ):
             provider_import_account(config, account, tmp_path)
 
     journal = load_import_journal(account_dir, account)
@@ -14218,7 +18895,7 @@ def test_main_allows_provider_import_missing_gmail_msgid_to_repair_path(tmp_path
     assert events == ["connectivity", "import"]
 
 
-def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path) -> None:
+def test_main_repairs_provider_import_trailing_journal_before_connectivity(tmp_path: Path) -> None:
     from components.main import main
 
     config_path = _write_provider_config_file(tmp_path)
@@ -14237,6 +18914,7 @@ def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path
     events: List[str] = []
 
     def record_connectivity(*_args, **_kwargs) -> None:
+        assert json.loads(journal.read_text(encoding="utf-8")) == valid
         events.append("connectivity")
 
     def record_import(*_args, **_kwargs) -> None:
@@ -14257,7 +18935,90 @@ def test_main_allows_provider_import_trailing_journal_repair_path(tmp_path: Path
 
     assert rc == 0
     assert events == ["connectivity", "import"]
-    assert json.loads(journal.read_text()) == valid
+    assert json.loads(journal.read_text(encoding="utf-8")) == valid
+    assert journal.read_bytes().endswith(b"\n")
+
+
+def test_main_provider_import_waits_for_workflow_lock_before_journal_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import provider_ops
+    from components.main import main
+
+    config_path = _write_provider_config_file(tmp_path)
+    config = load_config_file(config_path)
+    assert isinstance(config, ProviderMigrationConfig)
+    account = config.accounts[0]
+    root = tmp_path / "provider-root-concurrent-import"
+    account_dir = _write_manifest_fixture(root)
+    journal = account_dir / "import-target@icloud.com.journal.jsonl"
+    valid = _journal_fixture(config, {
+        "canonical_id": "gmail-123",
+        "target_account": account.target_email,
+        "target_mailbox": "Archive",
+        "status": "pending",
+    })
+    original = json.dumps(valid) + "\n" + '{"canonical_id": '
+    journal.write_text(original, encoding="utf-8")
+
+    lock_contended = threading.Event()
+    import_called = threading.Event()
+    results: queue.Queue[int] = queue.Queue()
+    real_flock = provider_ops.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def locked_import(*_args, **_kwargs) -> None:
+        rows = provider_ops.load_import_journal(
+            account_dir,
+            account,
+            repair_trailing=True,
+        )
+        assert rows == [valid]
+        import_called.set()
+
+    def run_main() -> None:
+        results.put(main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(root),
+            "--log-dir", str(tmp_path / "logs-provider-concurrent-import"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+            "--no-connectivity-test",
+        ]))
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.provider_import_all", locked_import):
+        with provider_ops.provider_workflow_lock(root, stop_event=None):
+            monkeypatch.setattr(provider_ops.fcntl, "flock", recording_flock)
+            worker = threading.Thread(target=run_main, name="second-provider-cli")
+            worker.start()
+            assert lock_contended.wait(5), "second provider CLI did not wait on workflow lock"
+            assert not import_called.is_set()
+            assert journal.read_text(encoding="utf-8") == original
+
+            # Simulate the first lock holder completing its journal repair.
+            assert provider_ops.load_import_journal(
+                account_dir,
+                account,
+                repair_trailing=True,
+            ) == [valid]
+
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert results.get_nowait() == 0
+    assert import_called.is_set()
+    assert json.loads(journal.read_text(encoding="utf-8")) == valid
 
 
 def test_provider_import_repairs_many_to_one_peer_trailing_journal_before_target_contact(

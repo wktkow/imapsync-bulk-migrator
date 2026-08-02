@@ -20,6 +20,7 @@ from .imap_ops import (
     _legacy_symlink_component,
     _legacy_hierarchy_metadata,
     _legacy_internaldates_equal,
+    _load_legacy_import_journal_complete_prefix,
     _legacy_missing_target_flags,
     _legacy_search_target_uids,
     _legacy_source_attributes_key,
@@ -39,6 +40,7 @@ from .imap_ops import (
     _validate_legacy_sidecar_integrity,
     imap_connection,
     legacy_reserved_mailbox_path_issue,
+    legacy_journal_recovery_artifact_issues,
     legacy_server_endpoint,
     legacy_server_endpoint_digest,
     quote_mailbox_name,
@@ -518,6 +520,20 @@ def audit_account(
     if not account_dir.is_dir():
         issues.append(f"{account.email}: account path is not a directory: {account_dir}")
         return account.email, issues
+    try:
+        journal_rows = _load_legacy_import_journal_complete_prefix(account_dir)
+    except Exception as exc:
+        issues.append(f"{account.email}: import journal load failed: {exc}")
+        remote_safe = False
+    else:
+        issues.extend(
+            f"{account.email}: {issue}"
+            for issue in legacy_journal_recovery_artifact_issues(
+                account_dir,
+                journal_rows,
+                account_email=account.email,
+            )
+        )
     provider_manifest = account_dir / "manifest.jsonl"
     if provider_manifest.exists() or provider_manifest.is_symlink():
         issues.append(f"{account.email}: provider manifest present in legacy account directory: {provider_manifest}")
