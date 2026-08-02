@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import dataclasses
 import errno
+import fcntl
 import hashlib
 import imaplib
+import itertools
 import json
 import logging
 import os
@@ -11,6 +15,7 @@ import re
 import socket
 import ssl
 import stat
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -36,7 +41,24 @@ from .imap_ops import (
     _valid_legacy_flag_token,
     _valid_legacy_internaldate,
 )
-from .models import AuthConfig, MigrationAccount, ProviderEndpoint, ProviderMigrationConfig, auth_username_identity
+from .models import (
+    AuthConfig,
+    MigrationAccount,
+    ProviderEndpoint,
+    ProviderMigrationConfig,
+    auth_username_identity,
+)
+from .routing import (
+    CUSTOM_LABEL,
+    GENERIC_MAILBOX,
+    GMAIL_EXCLUSIVE_PRIMARY_ROLES,
+    GMAIL_SYSTEM,
+    RoutingPlan,
+    SourceFolder,
+    TargetLabel,
+    gmail_incompatible_system_roles,
+    resolve_routing_plan,
+)
 from .secret_files import read_secret_file_no_links
 from .utils import (
     decode_imap_utf7,
@@ -50,6 +72,21 @@ from .utils import (
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+ROUTING_PLAN_FILENAME = "routing-plan.json"
+_ROUTING_EXACT_TARGET_MAILBOX_FIELD = "routing_exact_target_mailbox"
+IMPORT_LOCK_DIRNAME = ".import-locks"
+PROVIDER_WORKFLOW_LOCK_FILENAME = "provider-workflow.lock"
+IMPORT_LOCK_WAIT_SECONDS = 0.1
+EXISTING_CONTENT_REUSE_INTERNALDATE_PROVENANCE = "existing-content-reuse"
+_EXISTING_CONTENT_REUSE_INTERNALDATE_FIELDS = (
+    "source_internaldate",
+    "target_internaldate",
+    "internaldate_provenance",
+    "internaldate_origin_action",
+)
+_EXISTING_CONTENT_REUSE_FOLLOWUP_ACTIONS = frozenset(
+    {"existing", "labels-reconciled", "route-verified", "verified"}
+)
 _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
 _HAS_DESCRIPTOR_RELATIVE_MKDIR = _HAS_DESCRIPTOR_RELATIVE_OPEN and os.mkdir in os.supports_dir_fd
 _PROVIDER_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
@@ -66,6 +103,10 @@ class MailboxInfo:
     name: str
     delimiter: str
     attributes: Tuple[str, ...]
+
+
+class ProviderImportIntegrityGateError(RuntimeError):
+    """A read-only provider import evidence gate rejected target progression."""
 
 
 class RateLimiter:
@@ -144,15 +185,57 @@ def effective_auth(endpoint: ProviderEndpoint, account: MigrationAccount, *, rol
 def ensure_private_dir(path: Path) -> None:
     dir_fd, dir_path = _open_or_create_provider_dir(path, "directory")
     try:
-        stat_result = os.fstat(dir_fd)
-        if not stat.S_ISDIR(stat_result.st_mode):
-            raise RuntimeError(f"provider directory path is not a directory: {path}")
         _raise_if_provider_parent_replaced(dir_path, dir_fd, "directory")
-        with contextlib.suppress(Exception):
-            os.fchmod(dir_fd, PRIVATE_DIR_MODE)
+        _secure_provider_private_dir_fd(dir_fd, dir_path, "directory")
         _raise_if_provider_parent_replaced(dir_path, dir_fd, "directory")
     finally:
         os.close(dir_fd)
+
+
+def _provider_effective_uid() -> int:
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        raise RuntimeError("platform does not expose an effective UID for provider artifact ownership checks")
+    try:
+        return int(get_effective_uid())
+    except OSError as exc:
+        raise RuntimeError("unable to determine effective UID for provider artifact ownership checks") from exc
+
+
+def _secure_provider_private_dir_fd(dir_fd: int, path: Path, label: str) -> None:
+    if path == Path(path.anchor):
+        raise RuntimeError(f"refusing to secure provider {label} filesystem root: {path}")
+    stat_result = os.fstat(dir_fd)
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise RuntimeError(f"provider {label} path is not a directory: {path}")
+    effective_uid = _provider_effective_uid()
+    if stat_result.st_uid != effective_uid:
+        raise RuntimeError(
+            f"refusing to secure provider {label} not owned by effective UID {effective_uid}: "
+            f"{path} (owner UID {stat_result.st_uid})"
+        )
+    mode = stat.S_IMODE(stat_result.st_mode)
+    unsafe_shared_bits = stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    if mode & unsafe_shared_bits:
+        raise RuntimeError(f"refusing to secure shared provider {label} directory: {path} (mode {mode:#05o})")
+    try:
+        os.fchmod(dir_fd, PRIVATE_DIR_MODE)
+    except OSError as exc:
+        raise RuntimeError(f"unable to set private permissions on provider {label} directory: {path}") from exc
+    final_stat = os.fstat(dir_fd)
+    final_mode = stat.S_IMODE(final_stat.st_mode)
+    if not stat.S_ISDIR(final_stat.st_mode):
+        raise RuntimeError(f"provider {label} path is no longer a directory: {path}")
+    if final_stat.st_uid != effective_uid:
+        raise RuntimeError(
+            f"provider {label} ownership changed while securing {path}: "
+            f"expected UID {effective_uid}, found {final_stat.st_uid}"
+        )
+    if final_mode != PRIVATE_DIR_MODE:
+        raise RuntimeError(
+            f"provider {label} directory permissions are not private: "
+            f"{path} (expected {PRIVATE_DIR_MODE:#05o}, found {final_mode:#05o})"
+        )
 
 
 def _raise_if_provider_path_symlink(path: Path, label: str) -> None:
@@ -671,6 +754,31 @@ def _is_non_gmail_flagged_mailbox(provider_key: str, mailbox: MailboxInfo) -> bo
     return provider_key != "gmail" and "\\flagged" in _mailbox_attrs(mailbox)
 
 
+def _non_gmail_foldable_virtual_membership(
+    provider_key: str,
+    mailbox: MailboxInfo,
+    *,
+    routed_memberships: bool,
+) -> str:
+    """Return the generic virtual-view kind that may fold into a real row.
+
+    ``\\Flagged`` folding predates routing plans.  ``\\Starred`` and
+    ``\\Important`` are folded only for routing-plan v2 exports, where every
+    selectable source membership is part of the frozen routing contract.
+    """
+
+    if provider_key == "gmail":
+        return ""
+    attributes = _mailbox_attrs(mailbox)
+    if "\\flagged" in attributes:
+        return "flagged"
+    if routed_memberships and "\\starred" in attributes:
+        return "starred"
+    if routed_memberships and "\\important" in attributes:
+        return "important"
+    return ""
+
+
 def _is_icloud_vip_mailbox(provider_key: str, mailbox: MailboxInfo) -> bool:
     return provider_key == "icloud" and mailbox.name.lower() == "vip"
 
@@ -688,12 +796,21 @@ def should_skip_source_mailbox(provider: str, mailbox: MailboxInfo, mailboxes: L
     return False
 
 
-def _source_mailbox_scan_order(provider_key: str, mailboxes: List[MailboxInfo]) -> List[MailboxInfo]:
+def _source_mailbox_scan_order(
+    provider_key: str,
+    mailboxes: List[MailboxInfo],
+    *,
+    routed_virtual_memberships: bool = False,
+) -> List[MailboxInfo]:
     indexed = list(enumerate(mailboxes))
     indexed.sort(
         key=lambda item: (
             2
-            if _is_non_gmail_flagged_mailbox(provider_key, item[1])
+            if _non_gmail_foldable_virtual_membership(
+                provider_key,
+                item[1],
+                routed_memberships=routed_virtual_memberships,
+            )
             else 1
             if _is_non_gmail_all_mailbox(provider_key, item[1])
             else 0,
@@ -718,6 +835,17 @@ def target_hierarchy_delimiter(mailboxes: List[MailboxInfo]) -> str:
         if mailbox.delimiter:
             return mailbox.delimiter
     return ""
+
+
+def _routing_exact_target_mailbox(row: Dict[str, Any]) -> Optional[str]:
+    """Return the frozen generic mailbox target carried by a routed row."""
+
+    if row.get("routing_active") is not True:
+        return None
+    target = row.get(_ROUTING_EXACT_TARGET_MAILBOX_FIELD)
+    if not isinstance(target, str) or not target:
+        return None
+    return target
 
 
 def translate_source_mailbox_for_target(
@@ -1391,7 +1519,7 @@ def _provider_fetch_response_for_uid(fetch_response: Iterable[Any], expected_uid
 
 
 def _valid_gmail_uint64(value: Optional[str]) -> str:
-    if not value or not value.isdecimal():
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]*", value):
         return ""
     try:
         number = int(value)
@@ -1601,7 +1729,9 @@ def _message_id_header(msg_bytes: bytes) -> str:
 
 
 def gmail_canonical_identity(gmail_msgid: object, *, source_account: str = "", scope_source: bool = False) -> str:
-    msgid = str(gmail_msgid or "").strip()
+    if not isinstance(gmail_msgid, str):
+        return ""
+    msgid = _valid_gmail_uint64(gmail_msgid)
     if not msgid:
         return ""
     if not scope_source:
@@ -1626,7 +1756,13 @@ def canonical_identity(
     scope_gmail_source: bool = False,
 ) -> Tuple[str, str, str]:
     sha256 = hashlib.sha256(msg_bytes).hexdigest()
-    gmail_msgid = str(parsed.get("gmail_msgid") or "") if use_gmail_msgid else ""
+    raw_gmail_msgid = parsed.get("gmail_msgid") if use_gmail_msgid else None
+    gmail_msgid = (
+        raw_gmail_msgid
+        if isinstance(raw_gmail_msgid, str)
+        and _valid_gmail_uint64(raw_gmail_msgid) == raw_gmail_msgid
+        else ""
+    )
     if gmail_msgid:
         return (
             gmail_canonical_identity(gmail_msgid, source_account=source_account, scope_source=scope_gmail_source),
@@ -1769,6 +1905,140 @@ def _safe_identity(identity: str) -> str:
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
     _atomic_bytes(path, (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _atomic_json_create_once(path: Path, payload: Dict[str, Any]) -> bool:
+    return _atomic_bytes_create_once(
+        path,
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+    )
+
+
+def _rename_provider_entry_create_once(parent_fd: int, source: str, destination: str) -> bool:
+    """Atomically rename within ``parent_fd`` without replacing a winner."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename_no_replace = getattr(libc, "renameatx_np", None)
+        no_replace_flag = 0x00000004  # RENAME_EXCL
+    else:
+        rename_no_replace = getattr(libc, "renameat2", None)
+        no_replace_flag = 1  # RENAME_NOREPLACE
+    if rename_no_replace is None:
+        raise RuntimeError(
+            "platform does not support atomic no-replace rename for create-once publication"
+        )
+    rename_no_replace.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename_no_replace.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename_no_replace(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        no_replace_flag,
+    )
+    if result == 0:
+        return True
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        return False
+    if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise RuntimeError(
+            "platform or filesystem does not support atomic no-replace rename "
+            "for create-once publication"
+        )
+    raise OSError(error, os.strerror(error), destination)
+
+
+def _atomic_bytes_create_once(path: Path, payload: bytes) -> bool:
+    """Publish a complete private file only when the destination is absent.
+
+    Atomic no-replace rename selects one concurrent winner and publishes its
+    fully synced temporary inode.  Unlike link-based publication, the final
+    pathname is therefore never observable with ``st_nlink == 2``.
+    """
+
+    ensure_private_dir(path.parent)
+    parent_fd, name, parent_path = _open_provider_parent_dir(path, "file")
+    tmp_name = f".{name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    tmp_stat: Optional[os.stat_result] = None
+    published = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            fd = os.open(tmp_name, flags, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise RuntimeError(
+                    f"refusing to use unsafe provider temporary file: {path.with_name(tmp_name)}"
+                ) from exc
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise RuntimeError(
+                    f"refusing to use symlinked provider temporary file: {path.with_name(tmp_name)}"
+                ) from exc
+            if exc.errno == errno.ENXIO:
+                raise RuntimeError(
+                    f"refusing to use non-regular provider temporary file: {path.with_name(tmp_name)}"
+                ) from exc
+            raise
+        try:
+            with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), PRIVATE_FILE_MODE)
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+                tmp_stat = os.fstat(f.fileno())
+            if tmp_stat is None or not stat.S_ISREG(tmp_stat.st_mode):
+                raise RuntimeError(f"refusing to publish non-regular provider file: {path}")
+            if getattr(tmp_stat, "st_nlink", 1) != 1:
+                raise RuntimeError(f"refusing to publish hard-linked provider file: {path}")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            if not _rename_provider_entry_create_once(parent_fd, tmp_name, name):
+                _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
+                tmp_name = ""
+                _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+                return False
+            tmp_name = ""
+            published = True
+            final_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(final_stat.st_mode)
+                or final_stat.st_dev != tmp_stat.st_dev
+                or final_stat.st_ino != tmp_stat.st_ino
+                or getattr(final_stat, "st_nlink", 1) != 1
+                or stat.S_IMODE(final_stat.st_mode) != PRIVATE_FILE_MODE
+            ):
+                raise RuntimeError(f"refusing to use unsafe published provider file: {path}")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            _fsync_provider_directory_fd(parent_fd, parent_path, "file")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "file")
+            return True
+        except Exception:
+            if published:
+                with contextlib.suppress(OSError):
+                    final_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (
+                        tmp_stat is not None
+                        and final_stat.st_dev == tmp_stat.st_dev
+                        and final_stat.st_ino == tmp_stat.st_ino
+                    ):
+                        _unlink_provider_entry_and_fsync(parent_fd, name, parent_path, "file")
+            if tmp_name:
+                _unlink_provider_entry_and_fsync(parent_fd, tmp_name, parent_path, "file")
+            raise
+    finally:
+        os.close(parent_fd)
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
@@ -2013,6 +2283,8 @@ def provider_export_state_issues(
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
     target_endpoint: Optional[ProviderEndpoint] = None,
+    routing_plan_sha256: Optional[str] = None,
+    routing_enabled: Optional[bool] = None,
 ) -> List[str]:
     state_path = account_dir / "export-state.json"
     try:
@@ -2031,6 +2303,8 @@ def provider_export_state_issues(
             target_provider=target_provider,
             source_endpoint=source_endpoint,
             target_endpoint=target_endpoint,
+            routing_plan_sha256=routing_plan_sha256,
+            routing_enabled=routing_enabled,
         )
     )
     if state.get("complete") is not True:
@@ -2071,6 +2345,8 @@ def provider_export_state_contract_issues(
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
     target_endpoint: Optional[ProviderEndpoint] = None,
+    routing_plan_sha256: Optional[str] = None,
+    routing_enabled: Optional[bool] = None,
 ) -> List[str]:
     issues: List[str] = []
     if account is not None:
@@ -2150,6 +2426,18 @@ def provider_export_state_contract_issues(
             expected_target_endpoint_sha,
         ):
             issues.append("export-state target_endpoint_sha256 does not match config target endpoint")
+    state_routing_digest = state.get("routing_plan_sha256")
+    if routing_enabled is False and state_routing_digest is not None:
+        issues.append(
+            "export-state is bound to a routing plan but migration.routing is disabled; "
+            "consume this staged export with routing enabled and its persisted plan"
+        )
+    if routing_plan_sha256 is not None:
+        if state_routing_digest != routing_plan_sha256:
+            issues.append(
+                "export-state routing_plan_sha256 does not match the persisted routing plan: "
+                f"{state_routing_digest or '<missing>'} != {routing_plan_sha256}"
+            )
     return issues
 
 
@@ -2162,6 +2450,8 @@ def require_complete_export_state(
     target_provider: Optional[str] = None,
     source_endpoint: Optional[ProviderEndpoint] = None,
     target_endpoint: Optional[ProviderEndpoint] = None,
+    routing_plan_sha256: Optional[str] = None,
+    routing_enabled: Optional[bool] = None,
 ) -> None:
     issues = provider_export_state_issues(
         account_dir,
@@ -2171,6 +2461,8 @@ def require_complete_export_state(
         target_provider=target_provider,
         source_endpoint=source_endpoint,
         target_endpoint=target_endpoint,
+        routing_plan_sha256=routing_plan_sha256,
+        routing_enabled=routing_enabled,
     )
     if issues:
         raise RuntimeError("; ".join(issues))
@@ -2417,6 +2709,49 @@ def merge_group_payload_content_identities(
     for _group_account, account_dir, manifest_rows, _journal_rows in stages:
         identities_by_id.update(manifest_payload_content_identities(account_dir, manifest_rows))
     return identities_by_id
+
+
+def merge_group_expected_identity_sets_by_target(
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+) -> Dict[str, List[List[set[Tuple[int, str]]]]]:
+    """Return expected content multiplicities grouped by source and target.
+
+    Generic IMAP messages are physical per mailbox.  Gmail message identity is
+    physical across labels, so all Gmail target mailboxes share one capacity
+    bucket.
+    """
+
+    grouped: Dict[str, List[List[set[Tuple[int, str]]]]] = {}
+    for _group_account, _account_dir, manifest_rows, _journal_rows in stages:
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider=target_provider,
+        )
+        source_sets_by_target: Dict[str, List[set[Tuple[int, str]]]] = {}
+        for row in manifest_rows:
+            identity = str(row.get("canonical_id") or "")
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not identity or not target_mailbox:
+                continue
+            target_key = (
+                "gmail-physical-message"
+                if target_provider == "gmail"
+                else _target_mailbox_lookup_key(target_mailbox, target_provider)
+            )
+            source_sets_by_target.setdefault(target_key, []).append(
+                _expected_content_identities(
+                    row,
+                    expected_content_identities_by_id.get(identity),
+                )
+            )
+        for target_key, expected_sets in source_sets_by_target.items():
+            grouped.setdefault(target_key, []).append(expected_sets)
+    return grouped
 
 
 def metadata_manifest_issues(account_dir: Path, rows: List[Dict[str, Any]], *, require_present: bool = True) -> List[str]:
@@ -2704,7 +3039,14 @@ def _target_mailbox_matches_expected(
 ) -> bool:
     if target_mailbox == expected_target:
         return True
-    if (target_provider or "").lower() == "gmail":
+    provider = (target_provider or "").lower()
+    if (
+        provider in {"imap", "icloud"}
+        and target_mailbox.upper() == "INBOX"
+        and expected_target.upper() == "INBOX"
+    ):
+        return True
+    if provider == "gmail":
         expected_key = (
             _gmail_target_system_key(expected_target, target_mailboxes)
             or _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(expected_target.strip().lower(), "")
@@ -2766,6 +3108,7 @@ def committed_journal_target_mailbox_issues(
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
     defer_unknown_hierarchy_delimiter_ids: Optional[set[str]] = None,
+    exact_target_ids: Optional[set[str]] = None,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -2787,16 +3130,23 @@ def committed_journal_target_mailbox_issues(
             target_provider=target_provider,
             target_mailboxes=target_mailboxes,
         ):
-            if defer_unknown_hierarchy_delimiter_ids and identity in defer_unknown_hierarchy_delimiter_ids:
+            may_defer = not exact_target_ids or identity not in exact_target_ids
+            if (
+                may_defer
+                and defer_unknown_hierarchy_delimiter_ids
+                and identity in defer_unknown_hierarchy_delimiter_ids
+            ):
                 continue
             if (
-                defer_generic_special_use
+                may_defer
+                and defer_generic_special_use
                 and provider in {"imap", "icloud"}
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
             if (
-                defer_gmail_special_use
+                may_defer
+                and defer_gmail_special_use
                 and provider == "gmail"
                 and _gmail_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
@@ -2817,6 +3167,7 @@ def pending_journal_target_mailbox_issues(
     defer_generic_special_use: bool = False,
     defer_gmail_special_use: bool = False,
     defer_unknown_hierarchy_delimiter_ids: Optional[set[str]] = None,
+    exact_target_ids: Optional[set[str]] = None,
 ) -> List[str]:
     issues: List[str] = []
     provider = (target_provider or "imap").lower()
@@ -2836,16 +3187,23 @@ def pending_journal_target_mailbox_issues(
             target_provider=target_provider,
             target_mailboxes=target_mailboxes,
         ):
-            if defer_unknown_hierarchy_delimiter_ids and identity in defer_unknown_hierarchy_delimiter_ids:
+            may_defer = not exact_target_ids or identity not in exact_target_ids
+            if (
+                may_defer
+                and defer_unknown_hierarchy_delimiter_ids
+                and identity in defer_unknown_hierarchy_delimiter_ids
+            ):
                 continue
             if (
-                defer_generic_special_use
+                may_defer
+                and defer_generic_special_use
                 and provider in {"imap", "icloud"}
                 and _generic_imap_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
                 continue
             if (
-                defer_gmail_special_use
+                may_defer
+                and defer_gmail_special_use
                 and provider == "gmail"
                 and _gmail_offline_target_requires_live_special_use(target_mailbox, expected_target)
             ):
@@ -2880,6 +3238,10 @@ def offline_target_mailboxes_for_rows(
         identity = str(row.get("canonical_id") or "")
         if not identity:
             continue
+        exact_target = _routing_exact_target_mailbox(row)
+        if exact_target is not None:
+            expected[identity] = exact_target
+            continue
         desired = str(row.get("primary_mailbox") or "Archive")
         translated = translate_source_mailbox_for_target(
             row,
@@ -2896,6 +3258,8 @@ def offline_hierarchy_delimiter_dependent_ids(rows: List[Dict[str, Any]]) -> set
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         if not identity:
+            continue
+        if _routing_exact_target_mailbox(row) is not None:
             continue
         desired = str(row.get("primary_mailbox") or "Archive")
         source_paths = row.get("source_mailbox_paths")
@@ -2918,6 +3282,12 @@ def offline_journal_target_mailbox_issues(
 ) -> List[str]:
     expected = offline_target_mailboxes_for_rows(manifest_rows, target_provider=target_provider)
     hierarchy_delimiter_dependent_ids = offline_hierarchy_delimiter_dependent_ids(manifest_rows)
+    exact_target_ids = {
+        str(row.get("canonical_id") or "")
+        for row in manifest_rows
+        if row.get("canonical_id")
+        and _routing_exact_target_mailbox(row) is not None
+    }
     issues = committed_journal_target_mailbox_issues(
         journal_rows,
         expected,
@@ -2925,6 +3295,7 @@ def offline_journal_target_mailbox_issues(
         defer_generic_special_use=True,
         defer_gmail_special_use=True,
         defer_unknown_hierarchy_delimiter_ids=hierarchy_delimiter_dependent_ids,
+        exact_target_ids=exact_target_ids,
     )
     issues.extend(
         pending_journal_target_mailbox_issues(
@@ -2934,6 +3305,7 @@ def offline_journal_target_mailbox_issues(
             defer_generic_special_use=True,
             defer_gmail_special_use=True,
             defer_unknown_hierarchy_delimiter_ids=hierarchy_delimiter_dependent_ids,
+            exact_target_ids=exact_target_ids,
         )
     )
     return issues
@@ -2952,6 +3324,51 @@ def committed_journal_manifest_content_issues(
         if row.get("canonical_id")
     }
     issues: List[str] = []
+    existing_reuse_evidence_by_key: Dict[Tuple[str, str], bool] = {}
+    for row_index, journal_row in enumerate(rows, 1):
+        if journal_row.get("status") != "committed":
+            continue
+        key = journal_row_target_key(
+            journal_row,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        identity, target_mailbox = key
+        if not identity or not target_mailbox:
+            continue
+        manifest_row = manifest_by_id.get(identity)
+        if manifest_row is None:
+            continue
+        label = f"{identity} in {target_mailbox or '<missing>'}"
+        has_evidence = _existing_content_reuse_internaldate_evidence_present(
+            journal_row
+        )
+        if has_evidence:
+            evidence_issue = _existing_content_reuse_internaldate_evidence_issue(
+                manifest_row,
+                journal_row,
+            )
+            if evidence_issue:
+                issues.append(
+                    f"journal committed INTERNALDATE evidence is invalid for {label} "
+                    f"at row {row_index}: {evidence_issue}"
+                )
+            else:
+                existing_reuse_evidence_by_key[key] = True
+            continue
+        action = str(journal_row.get("action") or "")
+        if action == "appended":
+            existing_reuse_evidence_by_key.pop(key, None)
+            continue
+        if (
+            existing_reuse_evidence_by_key.get(key)
+            and action in _EXISTING_CONTENT_REUSE_FOLLOWUP_ACTIONS
+        ):
+            issues.append(
+                f"journal committed INTERNALDATE provenance downgrade for {label} "
+                f"at row {row_index}: action {action!r} omitted previously established "
+                "existing-content reuse evidence"
+            )
     for (identity, target_mailbox), journal_row in latest_committed_journal_rows(
         rows,
         target_provider=target_provider,
@@ -2969,9 +3386,102 @@ def committed_journal_manifest_content_issues(
             issues.append(f"journal committed content_sha256 does not match manifest: {label}")
         if type(journal_size) is not int or journal_size != manifest_row.get("rfc822_size"):
             issues.append(f"journal committed rfc822_size does not match manifest: {label}")
-        if not isinstance(journal_binding, str) or not provider_content_binding_matches(manifest_row, journal_binding):
+        if manifest_row.get("routing_active"):
+            binding_matches = (
+                isinstance(journal_binding, str)
+                and journal_binding == manifest_row.get(CONTENT_BINDING_FIELD)
+            )
+        else:
+            binding_matches = (
+                isinstance(journal_binding, str)
+                and provider_content_binding_matches(manifest_row, journal_binding)
+            )
+        if not binding_matches:
             issues.append(f"journal committed {CONTENT_BINDING_FIELD} does not match manifest: {label}")
-    return issues
+    return list(dict.fromkeys(issues))
+
+
+def pending_journal_manifest_content_issues(
+    rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+    *,
+    target_provider: str = "imap",
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> List[str]:
+    """Validate that every latest pending APPEND still has its exact snapshot.
+
+    A pending row is the durable record written immediately before APPEND.  It
+    is useful for safe recovery only while the manifest row and its payload are
+    still the exact ones whose content binding was journaled.
+    """
+
+    manifest_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    issues: List[str] = []
+    latest = latest_journal_rows(
+        rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    )
+    for (identity, target_mailbox), journal_row in latest.items():
+        if journal_row.get("status") != "pending":
+            continue
+        manifest_row = manifest_by_id.get(identity)
+        label = f"{identity or '<missing>'} in {target_mailbox or '<missing>'}"
+        if manifest_row is None:
+            issues.append(f"journal pending identity not in manifest: {identity or '<missing>'}")
+            continue
+        journal_content_sha256 = journal_row.get("content_sha256")
+        journal_size = journal_row.get("rfc822_size")
+        journal_binding = journal_row.get(CONTENT_BINDING_FIELD)
+        if (
+            not isinstance(journal_content_sha256, str)
+            or journal_content_sha256 != manifest_row.get("content_sha256")
+        ):
+            issues.append(f"journal pending content_sha256 does not match manifest: {label}")
+        if type(journal_size) is not int or journal_size != manifest_row.get("rfc822_size"):
+            issues.append(f"journal pending rfc822_size does not match manifest: {label}")
+        if manifest_row.get("routing_active"):
+            binding_matches = (
+                isinstance(journal_binding, str)
+                and journal_binding == manifest_row.get(CONTENT_BINDING_FIELD)
+            )
+        else:
+            binding_matches = (
+                isinstance(journal_binding, str)
+                and provider_content_binding_matches(manifest_row, journal_binding)
+            )
+        if not binding_matches:
+            issues.append(
+                f"journal pending {CONTENT_BINDING_FIELD} does not match manifest: {label}"
+            )
+        if "pre_append_gmail_msgids" in journal_row:
+            raw_baseline = journal_row.get("pre_append_gmail_msgids")
+            canonical_baseline = (
+                sorted(
+                    {
+                        str(value)
+                        for value in raw_baseline
+                        if is_valid_gmail_msgid(value)
+                    },
+                    key=lambda value: (len(value), value),
+                )
+                if isinstance(raw_baseline, list)
+                else []
+            )
+            if (
+                target_provider != "gmail"
+                or not isinstance(raw_baseline, list)
+                or any(not is_valid_gmail_msgid(value) for value in raw_baseline)
+                or raw_baseline != canonical_baseline
+            ):
+                issues.append(
+                    f"journal pending pre-APPEND Gmail-ID baseline is invalid: {label}"
+                )
+    return list(dict.fromkeys(issues))
 
 
 def journal_target_endpoint_issues(
@@ -3006,13 +3516,11 @@ def journal_target_endpoint_issues(
 
 
 def is_valid_gmail_msgid(value: Any) -> bool:
-    text = str(value or "")
-    if not re.fullmatch(r"\d+", text):
-        return False
-    try:
-        return 0 <= int(text) <= (2**64 - 1)
-    except ValueError:
-        return False
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and _valid_gmail_uint64(value) == value
+    )
 
 
 def invalid_journal_target_gmail_msgid_issues(
@@ -3131,11 +3639,20 @@ def repair_missing_journal_target_gmail_msgids(
     }
     repaired_rows = list(rows)
     issues: List[str] = []
-    for (identity, _target_mailbox_key), journal_row in latest_committed_journal_rows(
+    latest_committed = latest_committed_journal_rows(
         repaired_rows,
         target_provider="gmail",
         target_mailboxes=target_mailboxes,
-    ).items():
+    )
+    reserved_gmail_msgids = {
+        str(journal_row.get("target_gmail_msgid") or "")
+        for journal_row in latest_committed.values()
+        if journal_row.get("target_gmail_msgid")
+    }
+    repair_candidates: Dict[str, Dict[str, Any]] = {}
+    for (identity, _target_mailbox_key), journal_row in sorted(
+        latest_committed.items()
+    ):
         if not identity or identity not in manifest_by_id or journal_row.get("target_gmail_msgid"):
             continue
         target_mailbox = str(journal_row.get("target_mailbox") or "")
@@ -3153,46 +3670,159 @@ def repair_missing_journal_target_gmail_msgids(
             continue
         search_mailbox = expected_target_mailbox or target_mailbox
         manifest_row = manifest_by_id[identity]
-        matches: Dict[str, bytes] = {}
-        for num in target_matching_message_nums(
+        match_row = _committed_target_match_row(manifest_row, journal_row)
+        expected_date_key = _legacy_internaldate_utc_key(
+            match_row.get("internaldate")
+        )
+        matches: Dict[str, Dict[str, Any]] = {}
+        for occurrence in _target_physical_occurrences_for_row(
             imap,
-            search_mailbox,
             manifest_row,
-            create_if_missing=False,
+            search_mailbox,
+            target_mailboxes or [],
+            target_provider="gmail",
             expected_content_identities=(
                 expected_content_identities_by_id.get(identity)
                 if expected_content_identities_by_id
                 else None
             ),
         ):
-            gmail_msgid = _target_gmail_msgid(imap, num)
-            if gmail_msgid:
-                matches.setdefault(gmail_msgid, num)
+            gmail_msgid = str(occurrence.get("gmail_msgid") or "")
+            if not gmail_msgid:
+                continue
+            if (
+                expected_date_key
+                and _legacy_internaldate_utc_key(
+                    occurrence.get("internaldate")
+                )
+                != expected_date_key
+            ):
+                continue
+            if manifest_row.get("routing_active") or manifest_row.get(
+                "_gmail_duplicate_allocation"
+            ):
+                if _gmail_destination_profile_conflicts(
+                    (
+                        _gmail_required_destination_profile_for_row(
+                            manifest_row
+                        ),
+                        _gmail_destination_profile_for_target_candidate(
+                            manifest_row,
+                            occurrence.get("gmail_label_keys") or (),
+                            occurrence.get("gmail_flags") or (),
+                            str(occurrence.get("mailbox") or ""),
+                            gmail_msgid,
+                        ),
+                    )
+                ):
+                    continue
+            matches.setdefault(gmail_msgid, occurrence)
         if not matches:
             issues.append(
                 f"journal committed Gmail target row missing target_gmail_msgid and target message was not found: "
                 f"{identity} in {search_mailbox or '<missing>'}"
             )
             continue
-        if len(matches) > 1:
-            issues.append(
-                f"journal committed Gmail target row missing target_gmail_msgid and matched multiple target Gmail messages: "
-                f"{identity} in {search_mailbox}: " + ", ".join(sorted(matches))
+        repair_candidates[identity] = {
+            "journal_row": journal_row,
+            "manifest_row": manifest_row,
+            "search_mailbox": search_mailbox,
+            "matches": matches,
+        }
+
+    planned_target_by_identity: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    unresolved = set(repair_candidates)
+    while unresolved:
+        progress = False
+        available_by_identity = {
+            identity: {
+                gmail_msgid: target_num
+                for gmail_msgid, target_num in repair_candidates[identity]["matches"].items()
+                if gmail_msgid not in reserved_gmail_msgids
+            }
+            for identity in unresolved
+        }
+        for identity in sorted(
+            unresolved,
+            key=lambda value: (len(available_by_identity[value]), value),
+        ):
+            available = available_by_identity[identity]
+            if not available:
+                details = repair_candidates[identity]
+                issues.append(
+                    "journal committed Gmail target row missing target_gmail_msgid and "
+                    "has no unreserved target message: "
+                    f"{identity} in {details['search_mailbox'] or '<missing>'}"
+                )
+                unresolved.remove(identity)
+                progress = True
+                continue
+            if len(available) != 1:
+                continue
+            target_gmail_msgid, target_occurrence = next(iter(available.items()))
+            planned_target_by_identity[identity] = (
+                target_gmail_msgid,
+                target_occurrence,
             )
-            continue
-        target_gmail_msgid = next(iter(matches))
-        repaired = _journal_row(
+            reserved_gmail_msgids.add(target_gmail_msgid)
+            unresolved.remove(identity)
+            progress = True
+        if not progress:
+            break
+    for identity in sorted(unresolved):
+        details = repair_candidates[identity]
+        available = sorted(
+            set(details["matches"]) - reserved_gmail_msgids,
+        )
+        issues.append(
+            "journal committed Gmail target row missing target_gmail_msgid and matched multiple target Gmail messages: "
+            f"{identity} in {details['search_mailbox']}: " + ", ".join(available)
+        )
+    if issues:
+        raise ProviderImportIntegrityGateError(
+            "invalid import journal: " + "; ".join(issues)
+        )
+
+    planned_repairs: List[Dict[str, Any]] = []
+    for identity in sorted(planned_target_by_identity):
+        details = repair_candidates[identity]
+        journal_row = details["journal_row"]
+        manifest_row = details["manifest_row"]
+        search_mailbox = details["search_mailbox"]
+        target_gmail_msgid, target_occurrence = planned_target_by_identity[identity]
+        target_num = target_occurrence["num"]
+        matched_mailbox = str(target_occurrence["mailbox"])
+        actual_target_internaldate: Optional[str] = None
+        internaldate_origin_action = ""
+        if (
+            not _existing_content_reuse_internaldate_evidence_present(journal_row)
+            and journal_row.get("action") == "existing"
+        ):
+            status, _response = select_mailbox(
+                imap,
+                matched_mailbox,
+                readonly=True,
+            )
+            if status != "OK":
+                raise RuntimeError(
+                    f"cannot select target mailbox {search_mailbox!r} while repairing {identity}"
+                )
+            actual_target_internaldate = target_message_internaldate(imap, target_num)
+            internaldate_origin_action = "existing"
+        planned_repairs.append(_journal_row(
             manifest_row,
             search_mailbox,
             "committed",
             "verified",
             target_binding=target_binding,
             target_gmail_msgid=target_gmail_msgid,
-        )
+            internaldate_evidence_from=journal_row,
+            actual_target_internaldate=actual_target_internaldate,
+            internaldate_origin_action=internaldate_origin_action,
+        ))
+    for repaired in planned_repairs:
         append_journal(account_dir, account, repaired)
         repaired_rows.append(repaired)
-    if issues:
-        raise RuntimeError("invalid import journal: " + "; ".join(issues))
     return repaired_rows
 
 
@@ -3258,7 +3888,10 @@ def load_import_journal(
     account: MigrationAccount,
     *,
     repair_trailing: bool = False,
+    defer_trailing_repair: bool = False,
 ) -> List[Dict[str, Any]]:
+    if repair_trailing and defer_trailing_repair:
+        raise ValueError("journal trailing repair cannot be both applied and deferred")
     path = _journal_path(account_dir, account)
     rows: List[Dict[str, Any]] = []
     _raise_if_provider_path_symlink(path, "file")
@@ -3270,17 +3903,19 @@ def load_import_journal(
     needs_rewrite = False
     for line_no, raw_line in enumerate(lines, 1):
         if trailing_row_unterminated and line_no == len(lines):
-            if repair_trailing:
-                logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
-                needs_rewrite = True
+            if repair_trailing or defer_trailing_repair:
+                if repair_trailing:
+                    logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
+                    needs_rewrite = True
                 break
             raise ValueError(f"{path}: journal row {line_no} is not newline-terminated")
         try:
             line = raw_line.decode("utf-8")
         except UnicodeDecodeError:
-            if repair_trailing and line_no == len(lines):
-                logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
-                needs_rewrite = True
+            if (repair_trailing or defer_trailing_repair) and line_no == len(lines):
+                if repair_trailing:
+                    logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
+                    needs_rewrite = True
                 break
             raise
         line = line.strip()
@@ -3289,9 +3924,10 @@ def load_import_journal(
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            if repair_trailing and line_no == len(lines):
-                logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
-                needs_rewrite = True
+            if (repair_trailing or defer_trailing_repair) and line_no == len(lines):
+                if repair_trailing:
+                    logging.warning("[provider-import] ignoring incomplete trailing journal row: %s", path)
+                    needs_rewrite = True
                 break
             raise
         if not isinstance(row, dict):
@@ -3425,8 +4061,17 @@ def _finalize_export_record(record: Dict[str, Any], folder_map: Dict[str, str]) 
     )
 
 
-def persist_export_records(account_dir: Path, records: Dict[str, Dict[str, Any]], folder_map: Dict[str, str]) -> None:
-    for record in records.values():
+def persist_export_records(
+    account_dir: Path,
+    records: Dict[str, Dict[str, Any]],
+    folder_map: Dict[str, str],
+    *,
+    preserve_exact_identities: Optional[set[str]] = None,
+) -> None:
+    preserve_exact_identities = preserve_exact_identities or set()
+    for identity, record in records.items():
+        if identity in preserve_exact_identities:
+            continue
         _finalize_export_record(record, folder_map)
         record[CONTENT_BINDING_FIELD] = provider_content_binding_sha256(record)
         _atomic_json(account_dir / str(record["metadata_path"]), record)
@@ -3520,7 +4165,14 @@ def provider_export_account(
     *,
     stop_event: Optional[object] = None,
     limiter: Optional[RateLimiter] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> None:
+    if config.migration.routing.enabled:
+        if routing_plan is None:
+            raise RuntimeError("routing-enabled export requires a resolved preflight routing plan")
+        validate_provider_routing_plan(config, routing_plan)
+    elif routing_plan is not None:
+        raise RuntimeError("routing plan supplied for a migration with routing disabled")
     _raise_if_provider_path_symlink(out_root, "export root")
     account_dir = account_export_dir(out_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
@@ -3534,13 +4186,61 @@ def provider_export_account(
     preserve_complete_state_until_ready = False
     trusted_payload_identities: set[str] = set()
     active_identities: set[str] = set()
+    retained_committed_identities: set[str] = set()
+    retained_pending_identities: set[str] = set()
+    retained_recovery_identities: set[str] = set()
+    recovery_snapshot_by_identity: Dict[str, Dict[str, Any]] = {}
+    source_drift_warnings_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_rows_by_identity: Dict[str, Dict[str, Any]] = {}
     previous_uidvalidities_by_mailbox: Dict[str, set[str]] = {}
     ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
     ordinary_delivery_remaining_for_all: Dict[Tuple[int, str], Dict[_ProviderVirtualDeliveryKey, int]] = {}
+    ordinary_delivery_identities_for_all: Dict[
+        Tuple[int, str],
+        Dict[_ProviderVirtualDeliveryKey, List[str]],
+    ] = {}
     mergeable_provider_records_by_content: Dict[Tuple[int, str], List[Tuple[str, str]]] = {}
+    routed_virtual_membership_consumed_by_mailbox: Dict[str, set[str]] = {}
     scanned_uidvalidity_by_mailbox: Dict[str, str] = {}
     exported_delivery_by_mailbox_uid: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    existing_journal_rows: List[Dict[str, Any]] = []
+    if account_dir.exists():
+        try:
+            existing_journal_rows = load_import_journal(
+                account_dir,
+                account,
+                repair_trailing=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"cannot validate committed export evidence because the import journal is invalid: {exc}"
+            ) from exc
+        require_valid_import_journal(existing_journal_rows, account)
+        journal_target_issues = journal_target_endpoint_issues(
+            existing_journal_rows,
+            config=config,
+            account=account,
+        )
+        if journal_target_issues:
+            raise RuntimeError("invalid import journal: " + "; ".join(journal_target_issues))
+        journal_requires_manifest = bool(
+            latest_committed_journal_rows(
+                existing_journal_rows,
+                target_provider=config.target.provider,
+            )
+            or any(
+                row.get("status") == "pending"
+                for row in latest_journal_rows(
+                    existing_journal_rows,
+                    target_provider=config.target.provider,
+                ).values()
+            )
+        )
+        if not manifest_path.exists() and journal_requires_manifest:
+            raise RuntimeError(
+                "invalid recovery export evidence: import journal contains committed or pending rows "
+                "but the manifest is missing"
+            )
     if manifest_path.exists():
         existing_rows = load_manifest(account_dir)
         require_unique_manifest_identities(existing_rows)
@@ -3572,6 +4272,8 @@ def provider_export_account(
             target_provider=config.target.provider,
             source_endpoint=config.source,
             target_endpoint=config.target,
+            routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+            routing_enabled=config.migration.routing.enabled,
         )
         if state_contract_issues:
             raise RuntimeError("; ".join(state_contract_issues))
@@ -3596,11 +4298,108 @@ def provider_export_account(
                 target_provider=config.target.provider,
                 source_endpoint=config.source,
                 target_endpoint=config.target,
+                routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+                routing_enabled=config.migration.routing.enabled,
             )
             if state_issues:
                 raise RuntimeError("; ".join(state_issues))
             preserve_complete_state_until_ready = True
             trusted_payload_identities.update(messages)
+
+        retained_committed_identities = {
+            identity
+            for identity, _target_mailbox in latest_committed_journal_rows(
+                existing_journal_rows,
+                target_provider=config.target.provider,
+            )
+            if identity
+        }
+        retained_pending_identities = {
+            identity
+            for (identity, _target_mailbox), row in latest_journal_rows(
+                existing_journal_rows,
+                target_provider=config.target.provider,
+            ).items()
+            if identity and row.get("status") == "pending"
+        }
+        retained_recovery_identities = (
+            retained_committed_identities | retained_pending_identities
+        )
+        retained_rows = [
+            row
+            for row in existing_rows
+            if str(row.get("canonical_id") or "") in retained_recovery_identities
+        ]
+        retained_evidence_rows = retained_rows
+        retained_evidence_issues: List[str] = []
+        retained_evidence_issues.extend(manifest_schema_issues(retained_rows))
+        retained_evidence_issues.extend(manifest_integrity_issues(retained_rows))
+        retained_evidence_issues.extend(provider_delivery_metadata_issues(retained_rows))
+        retained_evidence_issues.extend(metadata_manifest_issues(account_dir, retained_rows))
+        retained_evidence_issues.extend(manifest_payload_issues(account_dir, retained_rows))
+        if routing_plan is not None and retained_recovery_identities:
+            try:
+                retained_evidence_rows, _excluded = routed_manifest_rows(
+                    config,
+                    account,
+                    retained_rows,
+                    routing_plan,
+                )
+            except Exception as exc:
+                retained_evidence_issues.append(
+                    f"committed routing evidence is invalid: {exc}"
+                )
+            else:
+                retained_evidence_issues.extend(
+                    routing_committed_journal_issues(
+                        existing_journal_rows,
+                        retained_evidence_rows,
+                        target_provider=config.target.provider,
+                    )
+                )
+        retained_evidence_issues.extend(
+            committed_journal_manifest_content_issues(
+                existing_journal_rows,
+                retained_evidence_rows,
+                target_provider=config.target.provider,
+            )
+        )
+        retained_evidence_issues.extend(
+            pending_journal_manifest_content_issues(
+                existing_journal_rows,
+                retained_evidence_rows,
+                target_provider=config.target.provider,
+            )
+        )
+        if config.target.provider == "gmail":
+            retained_evidence_issues.extend(
+                invalid_journal_target_gmail_msgid_issues(
+                    existing_journal_rows,
+                    manifest_ids=retained_committed_identities,
+                )
+            )
+            retained_evidence_issues.extend(
+                issue
+                for issue in duplicate_journal_target_gmail_msgid_issues(
+                    existing_journal_rows,
+                    manifest_ids=retained_committed_identities,
+                )
+            )
+        if retained_evidence_issues:
+            evidence_kind = (
+                "committed"
+                if retained_committed_identities and not retained_pending_identities
+                else "recovery"
+            )
+            raise RuntimeError(
+                f"invalid {evidence_kind} export evidence: "
+                + "; ".join(str(issue) for issue in retained_evidence_issues)
+            )
+        recovery_snapshot_by_identity = {
+            identity: dict(previous_rows_by_identity[identity])
+            for identity in retained_recovery_identities
+            if identity in previous_rows_by_identity
+        }
 
     def write_in_progress_state() -> None:
         _atomic_json(
@@ -3619,6 +4418,11 @@ def provider_export_account(
                 else None,
                 "complete": False,
                 "started_at": _utc_now(),
+                **(
+                    {"routing_plan_sha256": routing_plan.mapping_digest}
+                    if routing_plan is not None
+                    else {}
+                ),
             },
         )
 
@@ -3628,6 +4432,9 @@ def provider_export_account(
     scope_gmail_source_identity = provider_account_merge_enabled(config)
 
     def update_membership(identity: str, mailbox: MailboxInfo, uid: int, uidvalidity: str, parsed: Dict[str, Any]) -> None:
+        if identity in recovery_snapshot_by_identity:
+            active_identities.add(identity)
+            return
         record = messages[identity]
         record.setdefault("source_mailboxes", [])
         record.setdefault("source_mailbox_attributes", {})
@@ -3648,11 +4455,92 @@ def provider_export_account(
         active_identities.add(identity)
 
     def active_export_records() -> Dict[str, Dict[str, Any]]:
-        return {
+        records = {
             identity: messages[identity]
             for identity in sorted(active_identities)
             if identity in messages
         }
+        for identity, recovery_snapshot in sorted(
+            recovery_snapshot_by_identity.items()
+        ):
+            records[identity] = recovery_snapshot
+        return records
+
+    def persist_active_export_records() -> None:
+        persist_export_records(
+            account_dir,
+            active_export_records(),
+            config.migration.folder_map,
+            preserve_exact_identities=retained_recovery_identities,
+        )
+
+    def record_committed_source_drift(
+        identity: str,
+        parsed: Dict[str, Any],
+        *,
+        content_sha256: Optional[str] = None,
+        rfc822_size: Optional[int] = None,
+    ) -> None:
+        snapshot = recovery_snapshot_by_identity.get(identity)
+        if snapshot is None:
+            return
+        if rfc822_size is None and type(parsed.get("rfc822_size")) is int:
+            rfc822_size = int(parsed["rfc822_size"])
+        changed_fields: List[str] = []
+        if (
+            content_sha256 is not None
+            and content_sha256 != snapshot.get("content_sha256")
+        ):
+            changed_fields.append("content_sha256")
+        if (
+            rfc822_size is not None
+            and rfc822_size != snapshot.get("rfc822_size")
+        ):
+            changed_fields.append("rfc822_size")
+        if _provider_export_flag_set(parsed.get("flags")) != _provider_export_flag_set(
+            snapshot.get("flags")
+        ):
+            changed_fields.append("flags")
+        source_internaldate = _normalized_provider_internaldate(
+            parsed.get("internaldate")
+        )
+        snapshot_internaldate = _normalized_provider_internaldate(
+            snapshot.get("internaldate")
+        )
+        if (
+            source_internaldate
+            and snapshot_internaldate
+            and not _legacy_internaldates_equal(
+                source_internaldate,
+                snapshot_internaldate,
+            )
+        ):
+            changed_fields.append("internaldate")
+        if not changed_fields:
+            return
+        fields = sorted(set(changed_fields))
+        committed_snapshot = identity in retained_committed_identities
+        message = (
+            f"Source data for committed message {identity} changed in "
+            f"{', '.join(fields)}; the exact committed export snapshot was retained."
+            if committed_snapshot
+            else f"Source data for pending APPEND recovery message {identity} changed in "
+            f"{', '.join(fields)}; the exact pending recovery snapshot was retained."
+        )
+        warning = {
+            "code": "committed-source-drift" if committed_snapshot else "pending-source-drift",
+            "canonical_id": identity,
+            "fields": fields,
+            "message": message,
+        }
+        previous_warning = source_drift_warnings_by_identity.get(identity)
+        source_drift_warnings_by_identity[identity] = warning
+        if previous_warning != warning:
+            logging.warning(
+                "[provider-export] %s: %s",
+                account.source_email,
+                warning["message"],
+            )
 
     def remember_provider_mergeable_record(identity: str, content_identity: Tuple[int, str]) -> None:
         record = messages.get(identity)
@@ -3663,8 +4551,9 @@ def provider_export_account(
             return
         entries.append((identity, str(record.get("internaldate") or "")))
 
-    def merge_covered_provider_flagged_flags(
+    def merge_covered_provider_virtual_membership(
         content_identity: Tuple[int, str],
+        virtual_kind: str,
         flags: str,
         internaldate: str,
         mailbox: MailboxInfo,
@@ -3675,23 +4564,100 @@ def provider_export_account(
         flagged_internaldate = _normalized_provider_internaldate(internaldate)
         if not flagged_internaldate:
             return False
+        already_consumed = (
+            routed_virtual_membership_consumed_by_mailbox.setdefault(
+                mailbox.name,
+                set(),
+            )
+            if routing_plan is not None
+            else set()
+        )
         same_date_identities = [
             identity
             for identity, candidate_internaldate in mergeable_provider_records_by_content.get(content_identity, [])
             if _legacy_internaldates_equal(candidate_internaldate, flagged_internaldate)
+            and identity not in already_consumed
         ]
         if len(same_date_identities) != 1:
             return False
         target_identity = same_date_identities[0]
+        if routing_plan is not None:
+            already_consumed.add(target_identity)
         record = messages[target_identity]
-        merged_flags = _merge_provider_export_flag_strings(record.get("flags"), flags)
-        if merged_flags != str(record.get("flags") or ""):
-            record["flags"] = merged_flags
+        if virtual_kind != "important":
+            merged_flags = _merge_provider_export_flag_strings(
+                record.get("flags"),
+                flags,
+            )
+            if merged_flags != str(record.get("flags") or ""):
+                record["flags"] = merged_flags
         update_membership(target_identity, mailbox, uid, uidvalidity, parsed)
-        persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+        persist_active_export_records()
         previous_rows_by_identity[target_identity] = dict(messages[target_identity])
         trusted_payload_identities.add(target_identity)
         return True
+
+    def bind_covered_routed_all_memberships(
+        content_identity: Tuple[int, str],
+        pending_items: List[
+            Tuple[str, str, str, Dict[str, Any], bytes, MailboxInfo, int, str]
+        ],
+        *,
+        remaining_ordinary: int,
+    ) -> Tuple[
+        List[Tuple[str, str, str, Dict[str, Any], bytes, MailboxInfo, int, str]],
+        int,
+    ]:
+        """Bind covered ``\\All`` deliveries to ordinary physical rows.
+
+        This path is routing-v2-only.  Each exact content/delivery occurrence
+        consumes one ordinary identity in deterministic source scan order and
+        records the virtual mailbox membership without writing another
+        payload.  The legacy/non-routing covered-marker behavior remains in
+        ``_uncovered_provider_virtual_items``.
+        """
+
+        kept: List[
+            Tuple[str, str, str, Dict[str, Any], bytes, MailboxInfo, int, str]
+        ] = []
+        consumed = 0
+        identities_by_delivery = ordinary_delivery_identities_for_all.get(
+            content_identity,
+            {},
+        )
+        consumed_by_delivery: Dict[_ProviderVirtualDeliveryKey, int] = {}
+        changed_identities: set[str] = set()
+        for item in pending_items:
+            parsed = item[3]
+            delivery_key = _provider_virtual_delivery_key(parsed)
+            candidate_identities = identities_by_delivery.get(delivery_key, [])
+            delivery_index = consumed_by_delivery.get(delivery_key, 0)
+            if (
+                consumed < remaining_ordinary
+                and delivery_index < len(candidate_identities)
+            ):
+                target_identity = candidate_identities[delivery_index]
+                consumed_by_delivery[delivery_key] = delivery_index + 1
+                update_membership(
+                    target_identity,
+                    item[5],
+                    item[6],
+                    item[7],
+                    parsed,
+                )
+                changed_identities.add(target_identity)
+                consumed += 1
+            else:
+                kept.append(item)
+        if changed_identities:
+            persist_active_export_records()
+            for target_identity in sorted(changed_identities):
+                if target_identity in messages:
+                    previous_rows_by_identity[target_identity] = dict(
+                        messages[target_identity]
+                    )
+                    trusted_payload_identities.add(target_identity)
+        return kept, consumed
 
     def record_export_delivery_snapshot(mailbox_name: str, uid: int, parsed: Dict[str, Any]) -> None:
         exported_delivery_by_mailbox_uid.setdefault(mailbox_name, {})[int(uid)] = {
@@ -3739,6 +4705,17 @@ def provider_export_account(
         uidvalidity: str,
     ) -> None:
         safe_id = _safe_identity(identity)
+        if identity in recovery_snapshot_by_identity:
+            record_committed_source_drift(
+                identity,
+                parsed,
+                content_sha256=sha256,
+                rfc822_size=int(parsed.get("rfc822_size") or len(msg_bytes)),
+            )
+            trusted_payload_identities.add(identity)
+            update_membership(identity, mailbox, uid, uidvalidity, parsed)
+            persist_active_export_records()
+            return
         if identity not in messages:
             eml_rel = f"messages/{safe_id}.eml"
             meta_rel = f"metadata/{safe_id}.json"
@@ -3806,7 +4783,7 @@ def provider_export_account(
             record.setdefault("exported_at", _utc_now())
         trusted_payload_identities.add(identity)
         update_membership(identity, mailbox, uid, uidvalidity, parsed)
-        persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
+        persist_active_export_records()
         previous_rows_by_identity[identity] = dict(messages[identity])
 
     with imap_connection(config.source, account, role="source") as imap:
@@ -3814,6 +4791,29 @@ def provider_export_account(
         use_gmail_metadata = config.source.provider == "gmail"
         gmail_extensions = use_gmail_metadata and "X-GM-EXT-1" in capabilities
         mailboxes = list_mailboxes(imap)
+        if routing_plan is not None:
+            actual_source_folders = _routing_source_folders(
+                account,
+                mailboxes,
+                source_provider=config.source.provider,
+            )
+            expected_source_folders = sorted(
+                (
+                    entry.source
+                    for entry in routing_plan.entries
+                    if entry.source.source_account.casefold() == account.source_email.casefold()
+                ),
+                key=lambda folder: (folder.name.casefold(), folder.name),
+            )
+            actual_source_folders = sorted(
+                actual_source_folders,
+                key=lambda folder: (folder.name.casefold(), folder.name),
+            )
+            if actual_source_folders != expected_source_folders:
+                raise RuntimeError(
+                    f"source folder discovery changed for {account.source_email} after routing preflight; "
+                    "rerun preflight and review the new plan before exporting"
+                )
         _atomic_json(
             account_dir / "source-summary.json",
             {
@@ -3822,6 +4822,11 @@ def provider_export_account(
                 "capabilities": capabilities,
                 "mailboxes": [m.__dict__ for m in mailboxes],
                 "exported_at": _utc_now(),
+                **(
+                    {"routing_plan_sha256": routing_plan.mapping_digest}
+                    if routing_plan is not None
+                    else {}
+                ),
             },
         )
         if config.source.provider == "gmail":
@@ -3833,7 +4838,11 @@ def provider_export_account(
         if preserve_complete_state_until_ready:
             write_in_progress_state()
         provider_key = config.source.provider.lower()
-        for mailbox in _source_mailbox_scan_order(provider_key, mailboxes):
+        for mailbox in _source_mailbox_scan_order(
+            provider_key,
+            mailboxes,
+            routed_virtual_memberships=routing_plan is not None,
+        ):
             if is_noselect(mailbox):
                 logging.info("[provider-export] %s: skipping non-selectable mailbox %s", account.source_email, mailbox.name)
                 continue
@@ -3896,11 +4905,22 @@ def provider_export_account(
                                     exc,
                                 )
                             else:
-                                _refresh_export_delivery_metadata(messages[identity_hint], pre_parsed)
+                                record_committed_source_drift(
+                                    identity_hint,
+                                    pre_parsed,
+                                )
+                                if identity_hint not in recovery_snapshot_by_identity:
+                                    _refresh_export_delivery_metadata(
+                                        messages[identity_hint],
+                                        pre_parsed,
+                                    )
                                 update_membership(identity_hint, mailbox, uid, uidvalidity, pre_parsed)
                                 record_export_delivery_snapshot(mailbox.name, int(uid), pre_parsed)
-                                persist_export_records(account_dir, active_export_records(), config.migration.folder_map)
-                                previous_rows_by_identity[identity_hint] = dict(messages[identity_hint])
+                                persist_active_export_records()
+                                if identity_hint not in recovery_snapshot_by_identity:
+                                    previous_rows_by_identity[identity_hint] = dict(
+                                        messages[identity_hint]
+                                    )
                                 continue
                 _provider_throttle_wait(
                     limiter,
@@ -3942,16 +4962,38 @@ def provider_export_account(
                 size = int(parsed.get("rfc822_size") or len(msg_bytes))
                 content_identity = (size, sha256)
                 non_gmail_all_source = _is_non_gmail_all_mailbox(provider_key, mailbox)
-                non_gmail_flagged_source = _is_non_gmail_flagged_mailbox(provider_key, mailbox)
+                non_gmail_virtual_source = _non_gmail_foldable_virtual_membership(
+                    provider_key,
+                    mailbox,
+                    routed_memberships=routing_plan is not None,
+                )
                 if non_gmail_all_source:
+                    if routing_plan is not None:
+                        pending_all_messages_by_content.setdefault(
+                            content_identity,
+                            [],
+                        ).append(
+                            (
+                                identity,
+                                sha256,
+                                message_id,
+                                parsed,
+                                msg_bytes,
+                                mailbox,
+                                uid,
+                                uidvalidity,
+                            )
+                        )
+                        continue
                     remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                     if remaining_ordinary > 0:
                         pending_all_messages_by_content.setdefault(content_identity, []).append(
                             (identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
                         )
                         continue
-                if non_gmail_flagged_source and merge_covered_provider_flagged_flags(
+                if non_gmail_virtual_source and merge_covered_provider_virtual_membership(
                     content_identity,
+                    non_gmail_virtual_source,
                     str(parsed.get("flags") or ""),
                     str(parsed.get("internaldate") or ""),
                     mailbox,
@@ -3961,24 +5003,49 @@ def provider_export_account(
                 ):
                     continue
                 persist_fetched_message(identity, sha256, message_id, parsed, msg_bytes, mailbox, uid, uidvalidity)
-                if provider_key != "gmail" and not non_gmail_all_source and not non_gmail_flagged_source:
+                if provider_key != "gmail" and not non_gmail_all_source and not non_gmail_virtual_source:
                     ordinary_content_remaining_for_all[content_identity] = (
                         ordinary_content_remaining_for_all.get(content_identity, 0) + 1
                     )
                     delivery_key = _provider_virtual_delivery_key(parsed)
                     delivery_remaining = ordinary_delivery_remaining_for_all.setdefault(content_identity, {})
                     delivery_remaining[delivery_key] = delivery_remaining.get(delivery_key, 0) + 1
-                if not non_gmail_flagged_source:
+                    if routing_plan is not None:
+                        ordinary_delivery_identities_for_all.setdefault(
+                            content_identity,
+                            {},
+                        ).setdefault(delivery_key, []).append(identity)
+                if not non_gmail_virtual_source:
                     remember_provider_mergeable_record(identity, content_identity)
             for content_identity, pending_messages in pending_all_messages_by_content.items():
                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
-                pending_messages, consumed_ordinary = _uncovered_provider_virtual_items(
-                    pending_messages,
-                    remaining_ordinary=remaining_ordinary,
-                    ordinary_delivery_remaining=ordinary_delivery_remaining_for_all.get(content_identity, {}),
-                    delivery_key=lambda item: _provider_virtual_delivery_key(item[3]),
-                )
-                ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - consumed_ordinary
+                if routing_plan is not None:
+                    remaining_ordinary = sum(
+                        len(identities)
+                        for identities in ordinary_delivery_identities_for_all.get(
+                            content_identity,
+                            {},
+                        ).values()
+                    )
+                    (
+                        pending_messages,
+                        consumed_ordinary,
+                    ) = bind_covered_routed_all_memberships(
+                        content_identity,
+                        pending_messages,
+                        remaining_ordinary=remaining_ordinary,
+                    )
+                else:
+                    pending_messages, consumed_ordinary = _uncovered_provider_virtual_items(
+                        pending_messages,
+                        remaining_ordinary=remaining_ordinary,
+                        ordinary_delivery_remaining=ordinary_delivery_remaining_for_all.get(content_identity, {}),
+                        delivery_key=lambda item: _provider_virtual_delivery_key(item[3]),
+                    )
+                if routing_plan is None:
+                    ordinary_content_remaining_for_all[content_identity] = (
+                        remaining_ordinary - consumed_ordinary
+                    )
                 if not pending_messages:
                     continue
                 for (
@@ -4002,6 +5069,12 @@ def provider_export_account(
                         pending_uidvalidity,
                     )
                     remember_provider_mergeable_record(identity, content_identity)
+                    if routing_plan is not None:
+                        delivery_key = _provider_virtual_delivery_key(parsed)
+                        ordinary_delivery_identities_for_all.setdefault(
+                            content_identity,
+                            {},
+                        ).setdefault(delivery_key, []).append(identity)
             status, response = select_mailbox(imap, mailbox.name, readonly=True)
             if status != "OK":
                 raise RuntimeError(f"failed to reselect mailbox {mailbox.name} after export: {response}")
@@ -4028,7 +5101,12 @@ def provider_export_account(
             )
 
     final_records = active_export_records()
-    persist_export_records(account_dir, final_records, config.migration.folder_map)
+    persist_export_records(
+        account_dir,
+        final_records,
+        config.migration.folder_map,
+        preserve_exact_identities=retained_recovery_identities,
+    )
     _prune_provider_artifact_orphans(account_dir, list(final_records.values()))
     final_manifest_rows = load_manifest(account_dir)
     _atomic_json(
@@ -4050,6 +5128,21 @@ def provider_export_account(
             "manifest_sha256": provider_manifest_digest(final_manifest_rows),
             "scanned_uidvalidity_by_mailbox": scanned_uidvalidity_by_mailbox,
             "completed_at": _utc_now(),
+            **(
+                {
+                    "warnings": [
+                        source_drift_warnings_by_identity[identity]
+                        for identity in sorted(source_drift_warnings_by_identity)
+                    ]
+                }
+                if source_drift_warnings_by_identity
+                else {}
+            ),
+            **(
+                {"routing_plan_sha256": routing_plan.mapping_digest}
+                if routing_plan is not None
+                else {}
+            ),
         },
     )
     logging.info("[provider-export] %s: completed with %d canonical messages", account.source_email, len(final_records))
@@ -4062,6 +5155,7 @@ def provider_export_all(
     max_workers: int,
     ignore_errors: bool,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> None:
     max_workers = _require_max_workers(max_workers)
     root_fd, root_path = _open_or_create_provider_dir(out_root, "export root")
@@ -4069,12 +5163,25 @@ def provider_export_all(
         _raise_if_provider_parent_replaced(root_path, root_fd, "export root")
     finally:
         os.close(root_fd)
+    routing_plan = _effective_provider_routing_plan(
+        config,
+        out_root,
+        routing_plan,
+        persist=True,
+    )
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
 
     def worker(acc: MigrationAccount) -> None:
         _raise_if_stopped(stop_event, f"provider export {acc.source_email}")
         with_retry(
-            lambda: provider_export_account(config, acc, out_root, stop_event=stop_event, limiter=limiter),
+            lambda: provider_export_account(
+                config,
+                acc,
+                out_root,
+                stop_event=stop_event,
+                limiter=limiter,
+                routing_plan=routing_plan,
+            ),
             attempts=config.limits.retry_max_attempts,
             label=f"provider export {acc.source_email}",
             stop_event=stop_event,
@@ -4104,11 +5211,20 @@ def _target_mailboxes_by_name(mailboxes: List[MailboxInfo], *, target_provider: 
     return {_target_mailbox_lookup_key(m.name, target_provider): m for m in mailboxes}
 
 
-def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target_provider: str = "imap") -> str:
+def resolve_target_mailbox(
+    desired: str,
+    mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str = "imap",
+    exact: bool = False,
+) -> str:
     provider = (target_provider or "imap").lower()
     by_name = _target_mailboxes_by_name(mailboxes, target_provider=provider)
     desired_name = str(desired)
     desired_key = _target_mailbox_lookup_key(desired, provider)
+    if exact:
+        mailbox = by_name.get(desired_key)
+        return mailbox.name if mailbox is not None else desired_name
     special_key_by_name = {
         "Sent": "sent",
         "Drafts": "drafts",
@@ -4173,6 +5289,33 @@ def resolve_target_mailbox(desired: str, mailboxes: List[MailboxInfo], *, target
         if candidate_key in by_name:
             return by_name[candidate_key].name
     return desired
+
+
+def _resolved_target_mailbox_for_row(
+    row: Dict[str, Any],
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> str:
+    exact_target = _routing_exact_target_mailbox(row)
+    if exact_target is not None:
+        return resolve_target_mailbox(
+            exact_target,
+            target_mailboxes,
+            target_provider=target_provider,
+            exact=True,
+        )
+    desired = translate_source_mailbox_for_target(
+        row,
+        str(row.get("primary_mailbox") or "Archive"),
+        target_mailboxes,
+        target_provider=target_provider,
+    )
+    return resolve_target_mailbox(
+        desired,
+        target_mailboxes,
+        target_provider=target_provider,
+    )
 
 
 def ensure_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
@@ -4337,6 +5480,191 @@ def target_message_internaldate(imap: imaplib.IMAP4, num: bytes) -> str:
     return _normalized_provider_internaldate(parsed.get("internaldate"))
 
 
+def _existing_content_reuse_internaldate_evidence_present(
+    journal_row: Dict[str, Any],
+) -> bool:
+    return any(field in journal_row for field in _EXISTING_CONTENT_REUSE_INTERNALDATE_FIELDS)
+
+
+def _existing_content_reuse_internaldate_evidence_issue(
+    manifest_row: Dict[str, Any],
+    journal_row: Dict[str, Any],
+) -> Optional[str]:
+    """Validate the narrow metadata exception for a content-first reuse."""
+
+    if not _existing_content_reuse_internaldate_evidence_present(journal_row):
+        return None
+    if journal_row.get("status") != "committed":
+        return "existing-content INTERNALDATE evidence is present on a non-committed row"
+    action = journal_row.get("action")
+    if action not in _EXISTING_CONTENT_REUSE_FOLLOWUP_ACTIONS:
+        return f"existing-content INTERNALDATE evidence has invalid action {action!r}"
+    if journal_row.get("internaldate_origin_action") != "existing":
+        return "existing-content INTERNALDATE evidence is missing origin action 'existing'"
+    if (
+        journal_row.get("internaldate_provenance")
+        != EXISTING_CONTENT_REUSE_INTERNALDATE_PROVENANCE
+    ):
+        return "existing-content INTERNALDATE evidence has invalid provenance"
+
+    source_internaldate = journal_row.get("source_internaldate")
+    target_internaldate = journal_row.get("target_internaldate")
+    if not isinstance(source_internaldate, str) or not _valid_legacy_internaldate(
+        source_internaldate
+    ):
+        return "existing-content INTERNALDATE evidence has invalid source_internaldate"
+    if not isinstance(target_internaldate, str) or not _valid_legacy_internaldate(
+        target_internaldate
+    ):
+        return "existing-content INTERNALDATE evidence has invalid target_internaldate"
+
+    manifest_internaldate = manifest_row.get("internaldate")
+    if not _legacy_internaldates_equal(source_internaldate, manifest_internaldate):
+        return "existing-content source_internaldate does not match manifest"
+    if not _legacy_internaldates_equal(journal_row.get("internaldate"), manifest_internaldate):
+        return "existing-content journal internaldate does not match manifest"
+    if _legacy_internaldates_equal(source_internaldate, target_internaldate):
+        return "existing-content INTERNALDATE evidence does not record a divergence"
+    return None
+
+
+def _existing_content_reuse_target_internaldate(
+    manifest_row: Dict[str, Any],
+    journal_row: Dict[str, Any],
+) -> Optional[str]:
+    if not _existing_content_reuse_internaldate_evidence_present(journal_row):
+        return None
+    if _existing_content_reuse_internaldate_evidence_issue(manifest_row, journal_row):
+        return None
+    return _normalized_provider_internaldate(journal_row.get("target_internaldate"))
+
+
+def _committed_target_match_row(
+    manifest_row: Dict[str, Any],
+    journal_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    target_internaldate = _existing_content_reuse_target_internaldate(
+        manifest_row,
+        journal_row,
+    )
+    if not target_internaldate:
+        return manifest_row
+    match_row = dict(manifest_row)
+    match_row["internaldate"] = target_internaldate
+    return match_row
+
+
+def _existing_content_reuse_internaldate_fields(
+    manifest_row: Dict[str, Any],
+    actual_target_internaldate: str,
+) -> Dict[str, str]:
+    source_internaldate = _normalized_provider_internaldate(
+        manifest_row.get("internaldate")
+    )
+    target_internaldate = _normalized_provider_internaldate(actual_target_internaldate)
+    if not source_internaldate:
+        return {}
+    if not _valid_legacy_internaldate(source_internaldate):
+        raise RuntimeError("invalid source INTERNALDATE for existing-content reuse")
+    if not target_internaldate:
+        raise RuntimeError("missing target INTERNALDATE for existing-content reuse")
+    if not _valid_legacy_internaldate(target_internaldate):
+        raise RuntimeError("invalid target INTERNALDATE for existing-content reuse")
+    if _legacy_internaldates_equal(source_internaldate, target_internaldate):
+        return {}
+    return {
+        "source_internaldate": source_internaldate,
+        "target_internaldate": target_internaldate,
+        "internaldate_provenance": EXISTING_CONTENT_REUSE_INTERNALDATE_PROVENANCE,
+        "internaldate_origin_action": "existing",
+    }
+
+
+def _existing_content_reuse_internaldate_warning(
+    *,
+    identity: str,
+    target_mailbox: str,
+    manifest_row: Dict[str, Any],
+    journal_row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    target_internaldate = _existing_content_reuse_target_internaldate(
+        manifest_row,
+        journal_row,
+    )
+    if not target_internaldate:
+        return None
+    source_internaldate = _normalized_provider_internaldate(
+        manifest_row.get("internaldate")
+    )
+    message = (
+        f"Existing byte-identical target message reused for {identity} in {target_mailbox}; "
+        f"target INTERNALDATE {target_internaldate!r} differs from source "
+        f"{source_internaldate!r}, so source date metadata was not preserved and no "
+        "duplicate was appended."
+    )
+    return {
+        "code": "existing-target-internaldate-differs",
+        "canonical_id": identity,
+        "target_mailbox": target_mailbox,
+        "source_internaldate": source_internaldate,
+        "target_internaldate": target_internaldate,
+        "provenance": EXISTING_CONTENT_REUSE_INTERNALDATE_PROVENANCE,
+        "message": message,
+    }
+
+
+def existing_content_reuse_internaldate_warnings(
+    journal_rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+    *,
+    target_provider: str,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> List[Dict[str, Any]]:
+    manifest_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    warnings: List[Dict[str, Any]] = []
+    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(
+        journal_rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    ).items():
+        manifest_row = manifest_by_id.get(identity)
+        if manifest_row is None:
+            continue
+        warning = _existing_content_reuse_internaldate_warning(
+            identity=identity,
+            target_mailbox=str(journal_row.get("target_mailbox") or target_mailbox),
+            manifest_row=manifest_row,
+            journal_row=journal_row,
+        )
+        if warning is not None:
+            warnings.append(warning)
+    return warnings
+
+
+def _deduplicate_report_warnings(warnings: Iterable[Any]) -> List[Any]:
+    deduplicated: List[Any] = []
+    seen: set[str] = set()
+    for warning in warnings:
+        try:
+            key = json.dumps(
+                warning,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            key = repr(warning)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(warning)
+    return deduplicated
+
+
 def append_target_internaldate_failure(
     failures: List[str],
     *,
@@ -4344,15 +5672,32 @@ def append_target_internaldate_failure(
     target_mailbox: str,
     row: Dict[str, Any],
     actual_internaldate: str,
+    journal_row: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     expected_internaldate = _normalized_provider_internaldate(row.get("internaldate"))
     if not expected_internaldate:
         return
-    if not _legacy_internaldates_equal(actual_internaldate, expected_internaldate):
-        failures.append(
-            f"target INTERNALDATE mismatch for {identity} in {target_mailbox}: "
-            f"expected {expected_internaldate!r} got {(actual_internaldate or '<missing>')!r}"
+    if _legacy_internaldates_equal(actual_internaldate, expected_internaldate):
+        return
+    if journal_row is not None:
+        warning = _existing_content_reuse_internaldate_warning(
+            identity=identity,
+            target_mailbox=target_mailbox,
+            manifest_row=row,
+            journal_row=journal_row,
         )
+        if warning is not None and _legacy_internaldates_equal(
+            actual_internaldate,
+            warning["target_internaldate"],
+        ):
+            if warnings is not None and warning not in warnings:
+                warnings.append(warning)
+            return
+    failures.append(
+        f"target INTERNALDATE mismatch for {identity} in {target_mailbox}: "
+        f"expected {expected_internaldate!r} got {(actual_internaldate or '<missing>')!r}"
+    )
 
 
 def _target_internaldate_matches_row(imap: imaplib.IMAP4, num: bytes, row: Dict[str, Any]) -> bool:
@@ -4557,15 +5902,822 @@ def _gmail_label_key(label: str) -> str:
 
 
 def row_has_gmail_important(row: Dict[str, Any]) -> bool:
+    if row.get("routing_active"):
+        return "important" in {
+            str(value).strip().lower()
+            for value in (row.get("routing_system_destinations") or [])
+        }
     labels = {_gmail_label_key(str(label)) for label in (row.get("gmail_labels") or [])}
     flags = {_gmail_label_key(token) for token in str(row.get("flags") or "").split()}
     return "important" in labels or "important" in flags
 
 
 def row_has_gmail_starred(row: Dict[str, Any]) -> bool:
+    if row.get("routing_active"):
+        explicit = "starred" in {
+            str(value).strip().lower()
+            for value in (row.get("routing_system_destinations") or [])
+        }
+        portable_flags = {
+            token.strip().upper() for token in str(row.get("flags") or "").split()
+        }
+        return explicit or "\\FLAGGED" in portable_flags
     labels = {_gmail_label_key(str(label)) for label in (row.get("gmail_labels") or [])}
     flags = {_gmail_label_key(token) for token in str(row.get("flags") or "").split()}
     return "starred" in labels or "starred" in flags
+
+
+def gmail_draft_combination_issues(rows: List[Dict[str, Any]]) -> List[str]:
+    """Reject label sets Gmail cannot safely apply to a Draft message."""
+
+    issues: List[str] = []
+    for row in rows:
+        desired = str(row.get("primary_mailbox") or "Archive")
+        desired_key = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(desired.strip().lower(), "")
+        routing_systems = {
+            str(value).strip().lower()
+            for value in (row.get("routing_system_destinations") or [])
+            if isinstance(value, str) and value.strip()
+        }
+        source_tokens: List[str] = []
+        if not row.get("routing_active"):
+            for field in ("gmail_labels", "source_mailboxes"):
+                values = row.get(field) or []
+                if isinstance(values, list):
+                    source_tokens.extend(
+                        str(value).strip()
+                        for value in values
+                        if isinstance(value, str) and value.strip()
+                    )
+            source_attributes = row.get("source_mailbox_attributes")
+            if isinstance(source_attributes, dict):
+                for values in source_attributes.values():
+                    if isinstance(values, list):
+                        source_tokens.extend(
+                            str(value).strip()
+                            for value in values
+                            if isinstance(value, str) and value.strip()
+                        )
+        draft_present = desired_key == "drafts" or "drafts" in routing_systems
+        if not draft_present:
+            draft_present = any(
+                _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(token.lower(), "") == "drafts"
+                or _gmail_label_key(token) == "drafts"
+                for token in source_tokens
+            )
+        if not draft_present:
+            continue
+        incompatible: set[str] = set()
+        if row.get("routing_active"):
+            incompatible.update(
+                value
+                for value in (row.get("routing_target_labels") or [])
+                if isinstance(value, str) and value
+            )
+            incompatible.update(routing_systems - {"all", "drafts"})
+        else:
+            for token in source_tokens:
+                key = (
+                    _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(token.lower(), "")
+                    or _gmail_label_key(token)
+                )
+                if key in {"all", "drafts"}:
+                    continue
+                if key.startswith("label:") and token.startswith("\\"):
+                    # Structural IMAP attributes are not Gmail labels.
+                    continue
+                incompatible.add(token if key.startswith("label:") else key)
+        if desired_key not in {"", "all", "drafts"}:
+            incompatible.add(desired_key)
+        elif not desired_key and desired.strip().lower() not in {"archive", "all mail"}:
+            incompatible.add(desired)
+        if row_has_gmail_important(row):
+            incompatible.add("important")
+        if row_has_gmail_starred(row):
+            incompatible.add("starred")
+        if incompatible:
+            issues.append(
+                f"{row.get('canonical_id') or '<unknown>'}: Gmail Drafts cannot be combined "
+                "with non-draft label/location(s): "
+                + ", ".join(
+                    sorted(incompatible, key=lambda value: (value.casefold(), value))
+                )
+            )
+    return issues
+
+
+_GMAIL_ROUTING_LOCATION_ROLES = frozenset(
+    {"all", "drafts", "important", "inbox", "sent", "spam", "starred", "trash"}
+)
+
+_GMAIL_DUPLICATE_ALLOCATION_FAMILIES: Tuple[
+    Tuple[str, frozenset[str], bool],
+    ...,
+] = (
+    ("draft", frozenset({"all", "drafts"}), False),
+    (
+        "sent",
+        frozenset({"all", "inbox", "important", "starred", "sent"}),
+        True,
+    ),
+    ("spam", frozenset({"important", "starred", "spam"}), True),
+    ("trash", frozenset({"important", "starred", "trash"}), True),
+    (
+        "neutral",
+        frozenset({"all", "inbox", "important", "starred"}),
+        True,
+    ),
+)
+_GMAIL_DUPLICATE_ALLOCATION_FAMILY_NAMES = tuple(
+    family[0] for family in _GMAIL_DUPLICATE_ALLOCATION_FAMILIES
+)
+GMAIL_DUPLICATE_ALLOCATION_MAX_FAMILY_GROUPS = 256
+GMAIL_DUPLICATE_ALLOCATION_MAX_SEARCH_STATES = 1_000_000
+
+
+def _gmail_duplicate_profile_families(
+    profile: Tuple[frozenset[str], frozenset[str]],
+) -> Tuple[str, ...]:
+    systems, custom_labels = profile
+    return tuple(
+        name
+        for name, allowed_systems, allows_custom in (
+            _GMAIL_DUPLICATE_ALLOCATION_FAMILIES
+        )
+        if systems <= allowed_systems
+        and (not custom_labels or allows_custom)
+    )
+
+
+def _gmail_destination_profile_for_row(
+    row: Dict[str, Any],
+) -> Tuple[frozenset[str], frozenset[str]]:
+    """Return immutable Gmail system/custom requirements for one source record."""
+
+    systems: set[str] = set()
+    custom_labels: set[str] = set()
+    desired = str(row.get("primary_mailbox") or "Archive")
+    desired_key = _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(
+        desired.strip().lower(),
+        "",
+    )
+
+    if row.get("routing_active"):
+        systems.update(
+            str(value).strip().lower()
+            for value in (row.get("routing_system_destinations") or [])
+            if isinstance(value, str) and value.strip()
+        )
+        custom_labels.update(
+            str(value).casefold()
+            for value in (row.get("routing_target_labels") or [])
+            if isinstance(value, str) and value
+        )
+        if desired_key and (desired_key != "all" or not systems):
+            # Archive is also the neutral IMAP append anchor for label-only
+            # system views such as Important/Starred.  It is a destination
+            # requirement only when no explicit system view was requested.
+            systems.add(desired_key)
+    else:
+        if desired_key:
+            systems.add(desired_key)
+        for field in ("gmail_labels", "source_mailboxes"):
+            values = row.get(field) or []
+            if not isinstance(values, list):
+                continue
+            for raw_value in values:
+                if not isinstance(raw_value, str) or not raw_value.strip():
+                    continue
+                value = raw_value.strip()
+                key = (
+                    _GMAIL_DESIRED_MAILBOX_SYSTEM_KEYS.get(value.lower(), "")
+                    or _gmail_label_key(value)
+                )
+                if key in _GMAIL_ROUTING_LOCATION_ROLES:
+                    systems.add(key)
+                elif key.startswith("label:") and not value.startswith("\\"):
+                    custom_labels.add(key.removeprefix("label:"))
+
+    if row_has_gmail_important(row):
+        systems.add("important")
+    if row_has_gmail_starred(row):
+        systems.add("starred")
+    return frozenset(systems), frozenset(custom_labels)
+
+
+def _gmail_required_destination_profile_for_row(
+    row: Dict[str, Any],
+) -> Tuple[frozenset[str], frozenset[str]]:
+    allocation = row.get("_gmail_duplicate_allocation")
+    if not isinstance(allocation, dict):
+        return _gmail_destination_profile_for_row(row)
+    raw_systems = allocation.get("systems")
+    raw_custom_labels = allocation.get("custom_labels")
+    if not isinstance(raw_systems, list) or not isinstance(raw_custom_labels, list):
+        return _gmail_destination_profile_for_row(row)
+    if any(not isinstance(value, str) or not value for value in raw_systems):
+        return _gmail_destination_profile_for_row(row)
+    if any(not isinstance(value, str) or not value for value in raw_custom_labels):
+        return _gmail_destination_profile_for_row(row)
+    return (
+        frozenset(value.strip().lower() for value in raw_systems),
+        frozenset(value.casefold() for value in raw_custom_labels),
+    )
+
+
+def _gmail_pending_needs_neutral_anchor_evidence(
+    row: Dict[str, Any],
+) -> bool:
+    own_systems, _own_custom_labels = _gmail_destination_profile_for_row(row)
+    required_systems, _required_custom_labels = (
+        _gmail_required_destination_profile_for_row(row)
+    )
+    return bool(
+        required_systems & {"spam", "trash"}
+        and not own_systems & {"spam", "trash"}
+        and "all" not in required_systems
+    )
+
+
+def _gmail_destination_profile_for_target_state(
+    label_keys: Iterable[str],
+    flags: Iterable[str],
+    mailbox: str,
+) -> Tuple[frozenset[str], frozenset[str]]:
+    systems: set[str] = set()
+    custom_labels: set[str] = set()
+    mailbox_key = _gmail_target_system_key(mailbox)
+    if mailbox_key:
+        systems.add(mailbox_key)
+    for raw_key in label_keys:
+        key = str(raw_key).strip().lower()
+        if key in _GMAIL_ROUTING_LOCATION_ROLES:
+            systems.add(key)
+        elif key.startswith("label:"):
+            custom_labels.add(key.removeprefix("label:"))
+    if any(str(flag).strip().upper() == "\\FLAGGED" for flag in flags):
+        systems.add("starred")
+    return frozenset(systems), frozenset(custom_labels)
+
+
+def _gmail_destination_profile_for_target_candidate(
+    row: Dict[str, Any],
+    label_keys: Iterable[str],
+    flags: Iterable[str],
+    mailbox: str,
+    target_gmail_msgid: str,
+    *,
+    fresh_neutral_anchor_msgids: Optional[set[str]] = None,
+) -> Tuple[frozenset[str], frozenset[str]]:
+    systems, custom_labels = _gmail_destination_profile_for_target_state(
+        label_keys,
+        flags,
+        mailbox,
+    )
+    allocation = row.get("_gmail_duplicate_allocation")
+    if not isinstance(allocation, dict):
+        return systems, custom_labels
+    bound_msgids = allocation.get("target_gmail_msgids")
+    exact_slot_bound = bool(
+        isinstance(bound_msgids, list) and target_gmail_msgid in bound_msgids
+    )
+    proven_fresh_anchor = bool(
+        fresh_neutral_anchor_msgids
+        and target_gmail_msgid in fresh_neutral_anchor_msgids
+    )
+    if not exact_slot_bound and not proven_fresh_anchor:
+        return systems, custom_labels
+    required_systems, _required_custom_labels = (
+        _gmail_required_destination_profile_for_row(row)
+    )
+    if (
+        "all" in systems
+        and "all" not in required_systems
+        and required_systems & {"spam", "trash"}
+    ):
+        # A prior row assigned to this exact migration slot, or the one
+        # physical ID uniquely proven to have appeared after this APPEND, may
+        # temporarily be visible through All Mail only because Archive was its
+        # append anchor. Spam/Trash later replaces that neutral anchor. Never
+        # make this relaxation for an unrelated target Gmail ID or an explicit
+        # All route.
+        systems = frozenset(set(systems) - {"all"})
+    return systems, custom_labels
+
+
+def _gmail_destination_profile_conflicts(
+    profiles: Iterable[Tuple[frozenset[str], frozenset[str]]],
+) -> Tuple[str, ...]:
+    systems: set[str] = set()
+    custom_labels: set[str] = set()
+    for profile_systems, profile_custom_labels in profiles:
+        systems.update(profile_systems)
+        custom_labels.update(profile_custom_labels)
+    conflicts: set[str] = set(gmail_incompatible_system_roles(systems))
+    if "drafts" in systems:
+        conflicts.update(systems - {"all", "drafts"})
+        conflicts.update(f"label:{label}" for label in custom_labels)
+    return tuple(
+        sorted(conflicts, key=lambda value: (value.casefold(), value))
+    )
+
+
+def _gmail_duplicate_effective_date_and_msgid(
+    row: Dict[str, Any],
+    journal_rows: List[Dict[str, Any]],
+) -> Tuple[str, str]:
+    identity = str(row.get("canonical_id") or "")
+    latest_committed: Optional[Dict[str, Any]] = None
+    latest_status: Optional[Dict[str, Any]] = None
+    target_gmail_msgid = ""
+    for journal_row in journal_rows:
+        if str(journal_row.get("canonical_id") or "") != identity:
+            continue
+        if journal_row.get("status") in {"committed", "failed", "pending"}:
+            latest_status = journal_row
+        if journal_row.get("status") == "committed":
+            latest_committed = journal_row
+            candidate_msgid = str(journal_row.get("target_gmail_msgid") or "")
+            if candidate_msgid:
+                target_gmail_msgid = candidate_msgid
+    effective_row = row
+    if latest_committed is not None:
+        effective_row = _committed_target_match_row(row, latest_committed)
+    elif latest_status is not None and latest_status.get("status") == "pending":
+        effective_row = row
+    normalized_date = _normalized_provider_internaldate(
+        effective_row.get("internaldate")
+    )
+    return _legacy_internaldate_utc_key(normalized_date), target_gmail_msgid
+
+
+def require_merge_group_gmail_destination_allocations_compatible(
+    stages: List[
+        Tuple[
+            MigrationAccount,
+            Path,
+            List[Dict[str, Any]],
+            List[Dict[str, Any]],
+        ]
+    ],
+    *,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+    stop_event: Optional[object] = None,
+) -> List[Dict[str, Any]]:
+    """Prove strong duplicates fit compatible Gmail physical-message slots.
+
+    Each content/effective-date class has the maximum multiplicity exported by
+    any one source.  Rows from one source occupy distinct slots; rows from
+    different sources may share a slot only when their combined Gmail
+    destinations are representable.  Existing committed Gmail IDs bind rows
+    to the same physical slot before any target or journal mutation occurs.
+    """
+
+    entries: List[Dict[str, Any]] = []
+    missing_payloads: List[str] = []
+    for group_account, _account_dir, manifest_rows, journal_rows in stages:
+        _raise_if_stopped(
+            stop_event,
+            "Gmail duplicate destination allocation",
+        )
+        for row in manifest_rows:
+            identity = str(row.get("canonical_id") or "")
+            content_identities = expected_content_identities_by_id.get(identity)
+            if not identity or not content_identities:
+                missing_payloads.append(
+                    f"{group_account.source_email}/{identity or '<missing>'}"
+                )
+                continue
+            date_key, target_gmail_msgid = _gmail_duplicate_effective_date_and_msgid(
+                row,
+                journal_rows,
+            )
+            entries.append(
+                {
+                    "source_email": group_account.source_email,
+                    "identity": identity,
+                    "content_identities": frozenset(content_identities),
+                    "date_key": date_key or "<missing>",
+                    "target_gmail_msgid": target_gmail_msgid,
+                    "profile": _gmail_destination_profile_for_row(row),
+                }
+            )
+    if missing_payloads:
+        raise ProviderImportIntegrityGateError(
+            "cannot prove Gmail duplicate destination allocation because verified payload "
+            "identity is missing for: " + "; ".join(sorted(missing_payloads))
+        )
+
+    entries.sort(
+        key=lambda entry: (
+            entry["date_key"],
+            entry["source_email"].casefold(),
+            entry["source_email"],
+            entry["identity"],
+        )
+    )
+    parents = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        if left_root < right_root:
+            parents[right_root] = left_root
+        else:
+            parents[left_root] = right_root
+
+    first_by_dated_content: Dict[Tuple[str, Tuple[int, str]], int] = {}
+    first_by_gmail_msgid: Dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        for content_identity in sorted(entry["content_identities"]):
+            key = (entry["date_key"], content_identity)
+            previous = first_by_dated_content.setdefault(key, index)
+            union(index, previous)
+        if entry["target_gmail_msgid"]:
+            previous = first_by_gmail_msgid.setdefault(
+                entry["target_gmail_msgid"],
+                index,
+            )
+            union(index, previous)
+
+    entries_by_class: Dict[int, List[Dict[str, Any]]] = {}
+    for index, entry in enumerate(entries):
+        entries_by_class.setdefault(find(index), []).append(entry)
+
+    allocation_classes: List[Dict[str, Any]] = []
+    allocation_conflicts: List[str] = []
+    for class_entries in entries_by_class.values():
+        _raise_if_stopped(
+            stop_event,
+            "Gmail duplicate destination allocation",
+        )
+        class_entries.sort(
+            key=lambda entry: (
+                entry["source_email"].casefold(),
+                entry["source_email"],
+                entry["identity"],
+            )
+        )
+        count_by_source: Dict[str, int] = {}
+        for entry in class_entries:
+            source_key = entry["source_email"].casefold()
+            count_by_source[source_key] = count_by_source.get(source_key, 0) + 1
+        capacity = max(count_by_source.values(), default=0)
+
+        empty_slot = (
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            "",
+            tuple(),
+        )
+        initial_slots = [empty_slot for _ in range(capacity)]
+        fixed_groups: Dict[str, List[int]] = {}
+        for entry_index, entry in enumerate(class_entries):
+            target_gmail_msgid = entry["target_gmail_msgid"]
+            if target_gmail_msgid:
+                fixed_groups.setdefault(target_gmail_msgid, []).append(entry_index)
+
+        fixed_failure = ""
+        assigned_indices: set[int] = set()
+        allocation_by_index: Dict[int, int] = {}
+        if len(fixed_groups) > capacity:
+            fixed_failure = (
+                f"{len(fixed_groups)} committed Gmail physical IDs exceed capacity {capacity}"
+            )
+        else:
+            for slot_index, (target_gmail_msgid, group_indices) in enumerate(
+                sorted(fixed_groups.items())
+            ):
+                group_entries = [class_entries[index] for index in group_indices]
+                group_sources = {
+                    entry["source_email"].casefold() for entry in group_entries
+                }
+                if len(group_sources) != len(group_entries):
+                    fixed_failure = (
+                        f"committed Gmail physical ID {target_gmail_msgid} binds multiple "
+                        "records from one source"
+                    )
+                    break
+                group_conflicts = _gmail_destination_profile_conflicts(
+                    entry["profile"] for entry in group_entries
+                )
+                if group_conflicts:
+                    fixed_failure = (
+                        f"committed Gmail physical ID {target_gmail_msgid} has incompatible "
+                        f"destinations ({', '.join(group_conflicts)})"
+                    )
+                    break
+                group_systems = frozenset().union(
+                    *(entry["profile"][0] for entry in group_entries)
+                )
+                group_labels = frozenset().union(
+                    *(entry["profile"][1] for entry in group_entries)
+                )
+                initial_slots[slot_index] = (
+                    frozenset(group_sources),
+                    group_systems,
+                    group_labels,
+                    target_gmail_msgid,
+                    tuple(sorted(group_indices)),
+                )
+                for entry_index in group_indices:
+                    assigned_indices.add(entry_index)
+                    allocation_by_index[entry_index] = slot_index
+
+        pending_indices = tuple(
+            index
+            for index in range(len(class_entries))
+            if index not in assigned_indices
+        )
+        allocation_search_states = 0
+        aggregate_conflicts = _gmail_destination_profile_conflicts(
+            entry["profile"] for entry in class_entries
+        )
+        allocation: Optional[Dict[int, int]] = None
+        entry_families = {
+            entry_index: _gmail_duplicate_profile_families(
+                class_entries[entry_index]["profile"]
+            )
+            for entry_index in range(len(class_entries))
+        }
+        if not fixed_failure:
+            invalid_entries = [
+                entry_index
+                for entry_index, families in entry_families.items()
+                if not families
+            ]
+            if invalid_entries:
+                fixed_failure = (
+                    "one or more rows has no representable Gmail destination family"
+                )
+
+        pending_by_source: Dict[str, List[int]] = {}
+        for entry_index in pending_indices:
+            source_key = class_entries[entry_index]["source_email"].casefold()
+            pending_by_source.setdefault(source_key, []).append(entry_index)
+        for source_entries in pending_by_source.values():
+            source_entries.sort(
+                key=lambda index: (
+                    len(entry_families[index]),
+                    class_entries[index]["identity"],
+                )
+            )
+
+        slot_domains: List[Tuple[str, ...]] = []
+        for sources, systems, custom_labels, _fixed_id, members in initial_slots:
+            if members:
+                slot_domains.append(
+                    _gmail_duplicate_profile_families(
+                        (systems, custom_labels)
+                    )
+                )
+            else:
+                slot_domains.append(
+                    _GMAIL_DUPLICATE_ALLOCATION_FAMILY_NAMES
+                )
+        if not fixed_failure and any(not domain for domain in slot_domains):
+            fixed_failure = "a committed Gmail physical slot has no destination family"
+
+        slot_groups_by_signature: Dict[
+            Tuple[Tuple[str, ...], Tuple[str, ...]],
+            List[int],
+        ] = {}
+        for slot_index, slot in enumerate(initial_slots):
+            sources = tuple(sorted(slot[0]))
+            signature = (slot_domains[slot_index], sources)
+            slot_groups_by_signature.setdefault(signature, []).append(slot_index)
+        slot_groups = sorted(
+            slot_groups_by_signature.items(),
+            key=lambda item: (
+                len(item[0][0]),
+                item[0][0],
+                item[0][1],
+                item[1],
+            ),
+        )
+        if (
+            not fixed_failure
+            and len(slot_groups)
+            > GMAIL_DUPLICATE_ALLOCATION_MAX_FAMILY_GROUPS
+        ):
+            raise ProviderImportIntegrityGateError(
+                "Gmail duplicate destination allocation proof is indeterminate: "
+                "family-group resource bound exceeded "
+                f"({len(slot_groups)} > "
+                f"{GMAIL_DUPLICATE_ALLOCATION_MAX_FAMILY_GROUPS})"
+            )
+        family_by_slot: List[Optional[str]] = [None] * capacity
+
+        def source_family_matching(
+            source_key: str,
+            *,
+            allow_unassigned: bool,
+        ) -> Optional[Dict[int, int]]:
+            source_entries = pending_by_source.get(source_key, [])
+            slot_by_entry: Dict[int, List[int]] = {}
+            for entry_index in source_entries:
+                allowed_families = set(entry_families[entry_index])
+                candidates: List[int] = []
+                for slot_index, slot in enumerate(initial_slots):
+                    _raise_if_stopped(
+                        stop_event,
+                        "Gmail duplicate destination allocation",
+                    )
+                    if source_key in slot[0]:
+                        continue
+                    family = family_by_slot[slot_index]
+                    if family is not None:
+                        if family in allowed_families:
+                            candidates.append(slot_index)
+                        continue
+                    if allow_unassigned and allowed_families.intersection(
+                        slot_domains[slot_index]
+                    ):
+                        candidates.append(slot_index)
+                slot_by_entry[entry_index] = candidates
+
+            entry_by_slot: Dict[int, int] = {}
+            slot_by_matched_entry: Dict[int, int] = {}
+            for entry_index in source_entries:
+                queue = [entry_index]
+                queue_index = 0
+                seen_entries = {entry_index}
+                parent_entry_by_slot: Dict[int, int] = {}
+                free_slot: Optional[int] = None
+                while queue_index < len(queue) and free_slot is None:
+                    current_entry = queue[queue_index]
+                    queue_index += 1
+                    for slot_index in slot_by_entry[current_entry]:
+                        _raise_if_stopped(
+                            stop_event,
+                            "Gmail duplicate destination allocation",
+                        )
+                        if slot_index in parent_entry_by_slot:
+                            continue
+                        parent_entry_by_slot[slot_index] = current_entry
+                        owner = entry_by_slot.get(slot_index)
+                        if owner is None:
+                            free_slot = slot_index
+                            break
+                        if owner not in seen_entries:
+                            seen_entries.add(owner)
+                            queue.append(owner)
+                if free_slot is None:
+                    return None
+                current_slot = free_slot
+                while True:
+                    current_entry = parent_entry_by_slot[current_slot]
+                    previous_slot = slot_by_matched_entry.get(current_entry)
+                    entry_by_slot[current_slot] = current_entry
+                    slot_by_matched_entry[current_entry] = current_slot
+                    if previous_slot is None:
+                        break
+                    current_slot = previous_slot
+            return {
+                entry_index: slot_index
+                for entry_index, slot_index in slot_by_matched_entry.items()
+            }
+
+        def allocate_slot_families(
+            group_index: int,
+        ) -> Optional[Dict[int, int]]:
+            nonlocal allocation_search_states
+            _raise_if_stopped(
+                stop_event,
+                "Gmail duplicate destination allocation",
+            )
+            if group_index == len(slot_groups):
+                combined: Dict[int, int] = {}
+                for source_key in sorted(pending_by_source):
+                    source_allocation = source_family_matching(
+                        source_key,
+                        allow_unassigned=False,
+                    )
+                    if source_allocation is None:
+                        return None
+                    combined.update(source_allocation)
+                return combined
+
+            (domain, _occupied_sources), slot_indices = slot_groups[group_index]
+            for family_multiset in itertools.combinations_with_replacement(
+                domain,
+                len(slot_indices),
+            ):
+                if (
+                    allocation_search_states
+                    >= GMAIL_DUPLICATE_ALLOCATION_MAX_SEARCH_STATES
+                ):
+                    raise ProviderImportIntegrityGateError(
+                        "Gmail duplicate destination allocation proof is "
+                        "indeterminate: search-state resource bound exceeded "
+                        f"({GMAIL_DUPLICATE_ALLOCATION_MAX_SEARCH_STATES})"
+                    )
+                allocation_search_states += 1
+                _raise_if_stopped(
+                    stop_event,
+                    "Gmail duplicate destination allocation",
+                )
+                for slot_index, family in zip(slot_indices, family_multiset):
+                    family_by_slot[slot_index] = family
+                if all(
+                    source_family_matching(
+                        source_key,
+                        allow_unassigned=True,
+                    )
+                    is not None
+                    for source_key in sorted(pending_by_source)
+                ):
+                    result = allocate_slot_families(group_index + 1)
+                    if result is not None:
+                        return result
+                for slot_index in slot_indices:
+                    family_by_slot[slot_index] = None
+            return None
+
+        if not fixed_failure:
+            allocation = allocate_slot_families(0)
+        if fixed_failure or allocation is None:
+            rows = ", ".join(
+                f"{entry['source_email']}/{entry['identity']}"
+                for entry in class_entries
+            )
+            detail = fixed_failure or "no compatible slot assignment exists"
+            if not fixed_failure and aggregate_conflicts:
+                detail += " (combined requirements include " + ", ".join(
+                    aggregate_conflicts
+                ) + ")"
+            allocation_conflicts.append(
+                f"strong duplicate class with capacity {capacity} ({rows}): {detail}"
+            )
+            continue
+        allocation_by_index.update(allocation)
+        slot_profiles: Dict[int, Dict[str, List[str]]] = {}
+        for entry_index, slot_index in allocation_by_index.items():
+            profile = slot_profiles.setdefault(
+                slot_index,
+                {
+                    "systems": [],
+                    "custom_labels": [],
+                    "target_gmail_msgids": [],
+                },
+            )
+            systems = set(profile["systems"])
+            systems.update(class_entries[entry_index]["profile"][0])
+            profile["systems"] = sorted(systems)
+            custom_labels = set(profile["custom_labels"])
+            custom_labels.update(class_entries[entry_index]["profile"][1])
+            profile["custom_labels"] = sorted(
+                custom_labels,
+                key=lambda value: (value.casefold(), value),
+            )
+            target_gmail_msgids = set(profile["target_gmail_msgids"])
+            target_gmail_msgid = class_entries[entry_index]["target_gmail_msgid"]
+            if target_gmail_msgid:
+                target_gmail_msgids.add(target_gmail_msgid)
+            profile["target_gmail_msgids"] = sorted(
+                target_gmail_msgids,
+                key=lambda value: (len(value), value),
+            )
+        allocation_classes.append(
+            {
+                "capacity": capacity,
+                "content_identities": set().union(
+                    *(entry["content_identities"] for entry in class_entries)
+                ),
+                "date_keys": sorted({entry["date_key"] for entry in class_entries}),
+                "allocations": {
+                    (
+                        class_entries[index]["source_email"],
+                        class_entries[index]["identity"],
+                    ): slot_index
+                    for index, slot_index in sorted(allocation_by_index.items())
+                },
+                "slot_profiles": slot_profiles,
+                "allocation_search_states": allocation_search_states,
+            }
+        )
+
+    if allocation_conflicts:
+        raise ProviderImportIntegrityGateError(
+            "incompatible Gmail destinations for cross-source strong duplicates: "
+            + "; ".join(sorted(allocation_conflicts))
+        )
+    allocation_classes.sort(
+        key=lambda item: (
+            item["date_keys"],
+            sorted(item["content_identities"]),
+        )
+    )
+    return allocation_classes
 
 
 def gmail_labels_for_restore(
@@ -4620,26 +6772,56 @@ def gmail_labels_for_restore(
     desired_restore = desired_restore_labels.get(desired_system_key)
     if desired_restore and desired_system_key != target_system_key:
         labels.append(desired_restore)
-    for raw in row.get("gmail_labels") or []:
-        label = str(raw).strip()
-        lower = label.lower()
-        system_restore = system_restore_labels.get(lower)
-        if system_restore:
-            key, restore_label = system_restore
-            if key != target_system_key and restore_label not in labels:
-                labels.append(restore_label)
-            continue
-        if (
-            not label
-            or lower in system_labels
-            or lower.startswith("[gmail]/")
-            or lower.startswith("[googlemail]/")
-            or lower == target_mailbox.lower()
+    if row.get("routing_active"):
+        routing_labels = row.get("routing_target_labels")
+        if not isinstance(routing_labels, list) or any(
+            not isinstance(value, str) or not value for value in routing_labels
         ):
-            continue
-        if label not in labels:
-            labels.append(label)
-    if row_has_gmail_important(row) and target_mailbox.lower() not in {"[gmail]/important", "[googlemail]/important", "important"}:
+            raise RuntimeError(
+                f"routing metadata for {row.get('canonical_id') or '<unknown>'} has invalid routing_target_labels"
+            )
+        for label in routing_labels:
+            if label not in labels:
+                labels.append(label)
+        routing_systems = {
+            str(value).strip().lower()
+            for value in (row.get("routing_system_destinations") or [])
+            if str(value).strip()
+        }
+        for key, restore_label in (
+            ("inbox", "\\Inbox"),
+            ("trash", "\\Trash"),
+            ("spam", "\\Junk"),
+        ):
+            if key in routing_systems and key != target_system_key and restore_label not in labels:
+                labels.append(restore_label)
+        if "important" in routing_systems and "Important" not in labels:
+            labels.append("Important")
+    else:
+        for raw in row.get("gmail_labels") or []:
+            label = str(raw).strip()
+            lower = label.lower()
+            system_restore = system_restore_labels.get(lower)
+            if system_restore:
+                key, restore_label = system_restore
+                if key != target_system_key and restore_label not in labels:
+                    labels.append(restore_label)
+                continue
+            if (
+                not label
+                or lower in system_labels
+                or lower.startswith("[gmail]/")
+                or lower.startswith("[googlemail]/")
+                or lower == target_mailbox.lower()
+            ):
+                continue
+            if label not in labels:
+                labels.append(label)
+    if (
+        row_has_gmail_important(row)
+        and "Important" not in labels
+        and target_mailbox.lower() not in {"[gmail]/important", "[googlemail]/important", "important"}
+    ):
         labels.append("Important")
     return sorted(labels, key=str.lower)
 
@@ -4659,7 +6841,7 @@ def restore_gmail_labels(
     target_num: Optional[bytes] = None,
     target_mailboxes: Optional[List[MailboxInfo]] = None,
     desired_target_mailbox: Optional[str] = None,
-) -> None:
+) -> List[str]:
     labels = gmail_labels_for_restore(
         row,
         target_mailbox,
@@ -4667,15 +6849,39 @@ def restore_gmail_labels(
         desired_target_mailbox=desired_target_mailbox,
     )
     if not labels:
-        return
+        return []
     num = target_num or _first_target_match_num(imap, target_mailbox, row)
+    labels_to_add = list(labels)
+    if row.get("routing_active"):
+        status, _ = select_mailbox(imap, target_mailbox)
+        if status != "OK":
+            raise RuntimeError(
+                f"cannot select target mailbox {target_mailbox!r} to verify Gmail labels"
+            )
+        actual_keys = _target_gmail_label_keys(imap, num)
+        labels_to_add = [
+            label for label in labels if _gmail_label_key(label) not in actual_keys
+        ]
+        if not labels_to_add:
+            return []
     status, _ = select_mailbox(imap, target_mailbox)
     if status != "OK":
         raise RuntimeError(f"cannot select target mailbox {target_mailbox!r} to restore Gmail labels")
-    label_list = "(" + " ".join(_quote_gmail_label(label) for label in labels) + ")"
+    label_list = "(" + " ".join(_quote_gmail_label(label) for label in labels_to_add) + ")"
     status, response = _target_store(imap, num, "+X-GM-LABELS", label_list)
     if status != "OK":
         raise RuntimeError(f"failed to restore Gmail labels for {row.get('canonical_id')}: {response}")
+    if row.get("routing_active"):
+        verified_keys = _target_gmail_label_keys(imap, num)
+        missing = [
+            label for label in labels if _gmail_label_key(label) not in verified_keys
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Gmail labels missing after restore for {row.get('canonical_id')}: "
+                + ", ".join(missing)
+            )
+    return labels_to_add
 
 
 def restore_gmail_starred_flag(imap: imaplib.IMAP4, target_mailbox: str, row: Dict[str, Any], *, target_num: Optional[bytes] = None) -> None:
@@ -4688,6 +6894,10 @@ def restore_gmail_starred_flag(imap: imaplib.IMAP4, target_mailbox: str, row: Di
     status, response = _target_store(imap, num, "+FLAGS", "(\\Flagged)")
     if status != "OK":
         raise RuntimeError(f"failed to restore Gmail starred flag for {row.get('canonical_id')}: {response}")
+    if row.get("routing_active") and "starred" not in _target_gmail_label_keys(imap, num):
+        raise RuntimeError(
+            f"Gmail starred membership missing after restore for {row.get('canonical_id')}"
+        )
 
 
 def _target_uid_command_available(imap: imaplib.IMAP4) -> bool:
@@ -4940,6 +7150,39 @@ def _max_expected_content_identity_matches(
     return len(assigned_identity_by_expected)
 
 
+def _max_group_expected_content_identity_matches(
+    target_content_identities: List[Tuple[int, str]],
+    expected_identity_sets_by_source: List[List[set[Tuple[int, str]]]],
+) -> int:
+    return max(
+        (
+            _max_expected_content_identity_matches(
+                target_content_identities,
+                expected_identity_sets,
+            )
+            for expected_identity_sets in expected_identity_sets_by_source
+        ),
+        default=0,
+    )
+
+
+def _max_group_expected_content_identity_intersections(
+    current_content_identities: set[Tuple[int, str]],
+    expected_identity_sets_by_source: List[List[set[Tuple[int, str]]]],
+) -> int:
+    return max(
+        (
+            sum(
+                1
+                for expected_identities in expected_identity_sets
+                if expected_identities & current_content_identities
+            )
+            for expected_identity_sets in expected_identity_sets_by_source
+        ),
+        default=0,
+    )
+
+
 def target_has_message(
     imap: imaplib.IMAP4,
     mailbox: str,
@@ -5005,6 +7248,27 @@ def consume_target_match_num(
                 continue
             if used_gmail_msgids is not None:
                 gmail_msgid = _target_gmail_msgid(imap, num)
+                if manifest_row.get("routing_active") or manifest_row.get(
+                    "_gmail_duplicate_allocation"
+                ):
+                    label_keys, flags, _actual_internaldate = (
+                        _target_gmail_label_flag_internaldate(imap, num)
+                    )
+                    if _gmail_destination_profile_conflicts(
+                        (
+                            _gmail_required_destination_profile_for_row(
+                                manifest_row
+                            ),
+                            _gmail_destination_profile_for_target_candidate(
+                                manifest_row,
+                                label_keys,
+                                flags,
+                                mailbox,
+                                gmail_msgid,
+                            ),
+                        )
+                    ):
+                        continue
                 if gmail_msgid and gmail_msgid in used_gmail_msgids:
                     continue
                 if gmail_msgid:
@@ -5115,24 +7379,37 @@ def consume_target_match(
 
 
 def _target_gmail_label_and_flag_keys(imap: imaplib.IMAP4, num: bytes) -> Tuple[set[str], set[str]]:
+    def parsed_keys(parsed: Dict[str, Any]) -> Tuple[set[str], set[str]]:
+        labels = {
+            _gmail_label_key(str(label))
+            for label in (parsed.get("gmail_labels") or [])
+        }
+        flags = {
+            token.upper()
+            for token in str(parsed.get("flags") or "").split()
+        }
+        # Portable IMAP state is not a Gmail custom-label namespace. Only the
+        # two flags with an actual Gmail destination meaning participate in
+        # allocation compatibility; \Seen, \Answered, \Deleted, and other
+        # ordinary flags remain ordinary message state.
+        if "\\FLAGGED" in flags:
+            labels.add("starred")
+        if "\\DRAFT" in flags:
+            labels.add("drafts")
+        return {label for label in labels if label}, flags
+
     if _target_uid_command_available(imap):
         uid = parse_imap_uid_token(num, label="target UID")
         status, fetched = imap.uid("fetch", num, "(UID X-GM-LABELS FLAGS)")
         if status != "OK":
             raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
         parsed = parse_provider_fetch_response(fetched or [], expected_uid=uid)
-        labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
-        flags = {token.upper() for token in str(parsed.get("flags") or "").split()}
-        labels.update(_gmail_label_key(token) for token in flags)
-        return {label for label in labels if label}, flags
+        return parsed_keys(parsed)
     status, fetched = imap.fetch(num, "(X-GM-LABELS FLAGS)")
     if status != "OK":
         raise RuntimeError(f"failed to fetch Gmail labels for target message {num!r}")
     parsed = parse_provider_fetch_response(_provider_fetch_response_for_sequence(fetched or [], num))
-    labels = {_gmail_label_key(str(label)) for label in (parsed.get("gmail_labels") or [])}
-    flags = {token.upper() for token in str(parsed.get("flags") or "").split()}
-    labels.update(_gmail_label_key(token) for token in flags)
-    return {label for label in labels if label}, flags
+    return parsed_keys(parsed)
 
 
 def _target_gmail_label_flag_internaldate(imap: imaplib.IMAP4, num: bytes) -> Tuple[set[str], set[str], str]:
@@ -5154,6 +7431,7 @@ def consume_target_match_with_gmail_state(
     create_if_missing: bool = True,
     used_gmail_msgids: Optional[set[str]] = None,
     expected_content_identities: Optional[Iterable[Tuple[int, str]]] = None,
+    require_internaldate_match: bool = False,
 ) -> Optional[Tuple[set[str], set[str], str]]:
     mailbox_key = _target_mailbox_lookup_key(mailbox)
     used = used_by_mailbox.setdefault(mailbox_key, set())
@@ -5165,6 +7443,12 @@ def consume_target_match_with_gmail_state(
         expected_content_identities=expected_content_identities,
     ):
         if num in used:
+            continue
+        if require_internaldate_match and not _target_internaldate_matches_row(
+            imap,
+            num,
+            manifest_row,
+        ):
             continue
         if used_gmail_msgids is not None:
             gmail_msgid = _target_gmail_msgid(imap, num)
@@ -5195,6 +7479,15 @@ def gmail_expected_target_mailboxes_for_row(
         add(name)
     for name in gmail_system_view_mailboxes_for_row(row, target_mailboxes):
         add(name)
+    allocation = row.get("_gmail_duplicate_allocation")
+    if isinstance(allocation, dict):
+        allocation_systems = allocation.get("systems")
+        if isinstance(allocation_systems, list):
+            for system_key in allocation_systems:
+                if not isinstance(system_key, str):
+                    continue
+                for name in system_by_key.get(system_key.strip().lower(), []):
+                    add(name)
     for label in gmail_labels_for_restore(row, target_mailbox, target_mailboxes):
         system_key = _gmail_system_key_for_label(label)
         if system_key in system_by_key:
@@ -5359,13 +7652,11 @@ def enforce_empty_target(
     gmail_journal_msgids = gmail_journal_msgids or {}
     for row in manifest_rows:
         identity = str(row.get("canonical_id") or "")
-        desired = translate_source_mailbox_for_target(
+        target_mailbox = _resolved_target_mailbox_for_row(
             row,
-            str(row.get("primary_mailbox") or "Archive"),
             target_mailboxes,
             target_provider=target_provider,
         )
-        target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
         key = journal_target_key(
             identity,
             target_mailbox,
@@ -5402,9 +7693,8 @@ def enforce_empty_target(
         count = target_message_count(imap, mailbox.name)
         if count <= 0:
             continue
-        verified = 0
-        used: Dict[str, set[bytes]] = {}
         mailbox_key = _target_mailbox_lookup_key(mailbox.name, target_provider)
+        candidates_by_row: Dict[str, List[Dict[str, Any]]] = {}
         for permitted_row, journal_key in permitted_by_mailbox.get(mailbox_key, []):
             identity = str(permitted_row.get("canonical_id") or "")
             expected_content_identities = (
@@ -5413,32 +7703,46 @@ def enforce_empty_target(
                 else None
             )
             target_gmail_msgid = gmail_journal_msgids.get(journal_key, "") if target_provider == "gmail" else ""
-            if target_gmail_msgid:
-                matched = consume_target_gmail_msgid_match_num(
-                    imap,
-                    mailbox.name,
-                    permitted_row,
-                    target_gmail_msgid,
-                    used,
-                    create_if_missing=False,
-                    expected_content_identities=expected_content_identities,
-                    require_internaldate_match=True,
-                )
-                if matched is not None:
-                    verified += 1
-                continue
-            if consume_target_match(
+            expected_date_key = _legacy_internaldate_utc_key(
+                permitted_row.get("internaldate")
+            )
+            candidates: List[Dict[str, Any]] = []
+            for target_num in target_matching_message_nums(
                 imap,
                 mailbox.name,
                 permitted_row,
-                used,
                 create_if_missing=False,
                 expected_content_identities=expected_content_identities,
-                require_internaldate_match=True,
             ):
-                verified += 1
+                actual_internaldate = target_message_internaldate(imap, target_num)
+                if (
+                    expected_date_key
+                    and _legacy_internaldate_utc_key(actual_internaldate)
+                    != expected_date_key
+                ):
+                    continue
+                gmail_msgid = _target_gmail_msgid(imap, target_num) if target_provider == "gmail" else ""
+                if target_gmail_msgid and gmail_msgid != target_gmail_msgid:
+                    continue
+                physical_key: Tuple[Any, ...] = (
+                    ("gmail", gmail_msgid)
+                    if target_provider == "gmail"
+                    else ("imap", mailbox_key, target_num)
+                )
+                candidates.append({
+                    "physical_key": physical_key,
+                    "mailbox": mailbox.name,
+                    "num": target_num,
+                    "gmail_msgid": gmail_msgid,
+                    "internaldate": actual_internaldate,
+                })
+            candidates_by_row[identity] = candidates
+        verified = len(_maximum_target_candidate_assignments(
+            candidates_by_row,
+            required_row_keys=set(candidates_by_row),
+        ))
         if count > verified:
-            raise RuntimeError(
+            raise ProviderImportIntegrityGateError(
                 f"target_mode=empty but target mailbox {mailbox.name!r} contains "
                 f"{count} message(s), only {verified} matching journaled message(s) from this migration"
             )
@@ -5450,29 +7754,60 @@ def translated_target_mailboxes_for_rows(
     *,
     target_provider: str,
 ) -> Dict[str, str]:
-    translated_sources_by_target: Dict[str, Tuple[str, ...]] = {}
+    translated_sources_by_target: Dict[str, Tuple[Tuple[str, ...], Dict[str, Any]]] = {}
     result: Dict[str, str] = {}
     for row in rows:
         identity = str(row.get("canonical_id") or "")
         source_desired = str(row.get("primary_mailbox") or "Archive")
-        desired = translate_source_mailbox_for_target(
+        target_mailbox = _resolved_target_mailbox_for_row(
             row,
-            source_desired,
             target_mailboxes,
             target_provider=target_provider,
         )
-        target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=target_provider)
         source_paths = row.get("source_mailbox_paths")
         source_key = (source_desired,)
-        if isinstance(source_paths, dict) and isinstance(source_paths.get(source_desired), list):
+        routing_sources = row.get("routing_source_folders")
+        if row.get("routing_active") and isinstance(routing_sources, list) and routing_sources:
+            source_key = (
+                str(row.get("source_account") or "<unknown-source-account>"),
+                *(str(value) for value in routing_sources),
+            )
+        elif isinstance(source_paths, dict) and isinstance(source_paths.get(source_desired), list):
             source_key = tuple(str(segment) for segment in source_paths[source_desired])
         target_mailbox_key = _target_mailbox_lookup_key(target_mailbox, target_provider)
-        previous_source = translated_sources_by_target.setdefault(target_mailbox_key, source_key)
+        previous = translated_sources_by_target.setdefault(
+            target_mailbox_key,
+            (source_key, row),
+        )
+        previous_source, previous_row = previous
         if previous_source != source_key:
-            raise RuntimeError(
-                f"target mailbox translation collision for {target_mailbox!r}: "
-                f"{previous_source!r} and {source_key!r}"
+            same_frozen_plan = bool(
+                row.get("routing_active")
+                and previous_row.get("routing_active")
+                and row.get("routing_plan_sha256")
+                and row.get("routing_plan_sha256") == previous_row.get("routing_plan_sha256")
             )
+            intentional = same_frozen_plan and target_provider == "gmail"
+            if same_frozen_plan and target_provider != "gmail":
+                current_shared = {
+                    str(value).casefold()
+                    for value in (row.get("routing_shared_destinations") or [])
+                    if str(value)
+                }
+                previous_shared = {
+                    str(value).casefold()
+                    for value in (previous_row.get("routing_shared_destinations") or [])
+                    if str(value)
+                }
+                intentional = (
+                    target_mailbox.casefold() in current_shared
+                    and target_mailbox.casefold() in previous_shared
+                )
+            if not intentional:
+                raise ProviderImportIntegrityGateError(
+                    f"target mailbox translation collision for {target_mailbox!r}: "
+                    f"{previous_source!r} and {source_key!r}"
+                )
         if identity:
             result[identity] = target_mailbox
     return result
@@ -5489,6 +7824,236 @@ def target_merge_group_key(config: ProviderMigrationConfig, account: MigrationAc
         normalized_username,
         provider_endpoint_state_digest(config.target, username=normalized_username),
     )
+
+
+def _provider_import_lock_path(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    in_root: Path,
+) -> Path:
+    lock_seed = json.dumps(
+        target_merge_group_key(config, account),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lock_key = hashlib.sha256(lock_seed).hexdigest()
+    return in_root / IMPORT_LOCK_DIRNAME / f"provider-{lock_key}.lock"
+
+
+def _provider_workflow_lock_path(root: Path) -> Path:
+    return Path(root) / IMPORT_LOCK_DIRNAME / PROVIDER_WORKFLOW_LOCK_FILENAME
+
+
+def _secure_existing_provider_import_root(in_root: Path) -> None:
+    root_fd, root_path = _open_provider_dir(in_root, "import root")
+    try:
+        _raise_if_provider_parent_replaced(root_path, root_fd, "import root")
+        _secure_provider_private_dir_fd(root_fd, root_path, "import root")
+        _raise_if_provider_parent_replaced(root_path, root_fd, "import root")
+    finally:
+        os.close(root_fd)
+
+
+def _provider_import_lock_stat_issue(stat_result: os.stat_result, effective_uid: int) -> Optional[str]:
+    if not stat.S_ISREG(stat_result.st_mode):
+        return "is not a regular file"
+    if getattr(stat_result, "st_nlink", 1) != 1:
+        return f"has {getattr(stat_result, 'st_nlink', 0)} hard links"
+    if stat_result.st_uid != effective_uid:
+        return f"is owned by UID {stat_result.st_uid}, not effective UID {effective_uid}"
+    mode = stat.S_IMODE(stat_result.st_mode)
+    if mode != PRIVATE_FILE_MODE:
+        return f"has unsafe mode {mode:#05o}, expected {PRIVATE_FILE_MODE:#05o}"
+    return None
+
+
+def _require_provider_import_lock_visible(
+    lock_fd: int,
+    parent_fd: int,
+    name: str,
+    lock_path: Path,
+    effective_uid: int,
+) -> None:
+    lock_stat = os.fstat(lock_fd)
+    issue = _provider_import_lock_stat_issue(lock_stat, effective_uid)
+    if issue:
+        raise RuntimeError(f"refusing to use provider import lock {lock_path}: {issue}")
+    try:
+        visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"provider import lock changed while in use: {lock_path}") from exc
+    visible_issue = _provider_import_lock_stat_issue(visible_stat, effective_uid)
+    if visible_issue:
+        raise RuntimeError(f"refusing to use provider import lock {lock_path}: {visible_issue}")
+    if visible_stat.st_dev != lock_stat.st_dev or visible_stat.st_ino != lock_stat.st_ino:
+        raise RuntimeError(f"provider import lock changed while in use: {lock_path}")
+
+
+def _open_provider_import_lock(lock_path: Path) -> Tuple[int, int, Path, str]:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("platform cannot safely open provider import lock files without O_NOFOLLOW")
+    parent_fd, name, parent_path = _open_provider_parent_dir(lock_path, "import lock")
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    created = False
+    try:
+        try:
+            lock_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            lock_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        os.close(parent_fd)
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
+            raise RuntimeError(f"refusing to use symlinked provider import lock: {lock_path}") from exc
+        if exc.errno in {errno.EISDIR, errno.ENXIO}:
+            raise RuntimeError(f"refusing to use non-regular provider import lock: {lock_path}") from exc
+        raise RuntimeError(f"unable to open provider import lock: {lock_path}") from exc
+    try:
+        effective_uid = _provider_effective_uid()
+        initial_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            raise RuntimeError(f"refusing to use non-regular provider import lock: {lock_path}")
+        if getattr(initial_stat, "st_nlink", 1) != 1:
+            raise RuntimeError(f"refusing to use hard-linked provider import lock: {lock_path}")
+        if initial_stat.st_uid != effective_uid:
+            raise RuntimeError(
+                f"refusing to use provider import lock not owned by effective UID {effective_uid}: "
+                f"{lock_path} (owner UID {initial_stat.st_uid})"
+            )
+        if created:
+            try:
+                os.fchmod(lock_fd, PRIVATE_FILE_MODE)
+            except OSError as exc:
+                raise RuntimeError(f"unable to set private permissions on provider import lock: {lock_path}") from exc
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "import lock")
+        _require_provider_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        if created:
+            os.fsync(lock_fd)
+            _fsync_provider_directory_fd(parent_fd, parent_path, "import lock")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "import lock")
+            _require_provider_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        return lock_fd, parent_fd, parent_path, name
+    except Exception:
+        os.close(lock_fd)
+        os.close(parent_fd)
+        raise
+
+
+@contextlib.contextmanager
+def _provider_import_lock(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    in_root: Path,
+    *,
+    stop_event: Optional[object],
+) -> Iterator[None]:
+    _raise_if_provider_path_symlink(in_root, "import root")
+    _secure_existing_provider_import_root(in_root)
+    lock_path = _provider_import_lock_path(config, account, in_root)
+    ensure_private_dir(lock_path.parent)
+    lock_fd, parent_fd, parent_path, name = _open_provider_import_lock(lock_path)
+    try:
+        effective_uid = _provider_effective_uid()
+        while True:
+            _raise_if_stopped(stop_event, f"provider import {account.target_email} lock wait")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "import lock")
+            _require_provider_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise RuntimeError(f"unable to acquire provider import lock: {lock_path}") from exc
+            wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+            if callable(wait):
+                if wait(IMPORT_LOCK_WAIT_SECONDS):
+                    raise RuntimeError(
+                        f"provider import {account.target_email} lock wait: stop requested before completion"
+                    )
+            else:
+                time.sleep(IMPORT_LOCK_WAIT_SECONDS)
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "import lock")
+        _require_provider_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        _raise_if_stopped(stop_event, f"provider import {account.target_email} lock wait")
+        yield
+    finally:
+        try:
+            os.close(lock_fd)
+        finally:
+            os.close(parent_fd)
+
+
+@contextlib.contextmanager
+def provider_workflow_lock(
+    root: Path,
+    *,
+    stop_event: Optional[object],
+) -> Iterator[None]:
+    """Serialize one complete provider workflow for a staging root.
+
+    This fixed root-wide lock is deliberately distinct from per-target import
+    locks, so a workflow may safely acquire those narrower locks while this
+    one remains held.  The persistent inode makes process crashes release the
+    advisory lock without creating an unlink/recreate race on normal reruns.
+    """
+
+    root = Path(root)
+    _raise_if_provider_path_symlink(root, "workflow root")
+    ensure_private_dir(root)
+    lock_path = _provider_workflow_lock_path(root)
+    ensure_private_dir(lock_path.parent)
+    lock_fd, parent_fd, parent_path, name = _open_provider_import_lock(lock_path)
+    try:
+        effective_uid = _provider_effective_uid()
+        while True:
+            _raise_if_stopped(stop_event, "provider workflow lock wait")
+            _raise_if_provider_parent_replaced(parent_path, parent_fd, "workflow lock")
+            _require_provider_import_lock_visible(
+                lock_fd,
+                parent_fd,
+                name,
+                lock_path,
+                effective_uid,
+            )
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise RuntimeError(
+                        f"unable to acquire provider workflow lock: {lock_path}"
+                    ) from exc
+            wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+            if callable(wait):
+                if wait(IMPORT_LOCK_WAIT_SECONDS):
+                    raise RuntimeError(
+                        "provider workflow lock wait: stop requested before completion"
+                    )
+            else:
+                time.sleep(IMPORT_LOCK_WAIT_SECONDS)
+        _raise_if_provider_parent_replaced(parent_path, parent_fd, "workflow lock")
+        _require_provider_import_lock_visible(
+            lock_fd,
+            parent_fd,
+            name,
+            lock_path,
+            effective_uid,
+        )
+        _raise_if_stopped(stop_event, "provider workflow lock wait")
+        yield
+    finally:
+        try:
+            os.close(lock_fd)
+        finally:
+            os.close(parent_fd)
 
 
 def same_target_accounts(config: ProviderMigrationConfig, account: MigrationAccount) -> List[MigrationAccount]:
@@ -5509,6 +8074,9 @@ def _validated_group_stage(
     current_journal_rows: List[Dict[str, Any]],
     *,
     repair_trailing_journal: bool = False,
+    defer_trailing_journal_repair: bool = False,
+    routing_plan_sha256: Optional[str] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> Tuple[Path, List[Dict[str, Any]], List[Dict[str, Any]]]:
     if account is current_account or account.source_email == current_account.source_email:
         account_dir = account_export_dir(in_root, current_account)
@@ -5531,6 +8099,8 @@ def _validated_group_stage(
         target_provider=config.target.provider,
         source_endpoint=config.source,
         target_endpoint=config.target,
+        routing_plan_sha256=routing_plan_sha256,
+        routing_enabled=config.migration.routing.enabled,
     )
     metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
     if metadata_issues:
@@ -5556,7 +8126,12 @@ def _validated_group_stage(
             f"invalid provider account layout for merge source {account.source_email}: "
             + "; ".join(mixed_layout_issues)
         )
-    journal_rows = load_import_journal(account_dir, account, repair_trailing=repair_trailing_journal)
+    journal_rows = load_import_journal(
+        account_dir,
+        account,
+        repair_trailing=repair_trailing_journal,
+        defer_trailing_repair=defer_trailing_journal_repair,
+    )
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
     if journal_target_issues:
@@ -5569,14 +8144,29 @@ def _validated_group_stage(
         manifest_rows,
         target_provider=config.target.provider,
     )
+    journal_content_issues.extend(
+        pending_journal_manifest_content_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+        )
+    )
     if journal_content_issues:
         raise RuntimeError(
             f"invalid import journal for merge source {account.source_email}: "
             + "; ".join(journal_content_issues)
         )
+    mailbox_validation_rows = manifest_rows
+    if routing_plan is not None:
+        mailbox_validation_rows = routed_manifest_rows(
+            config,
+            account,
+            manifest_rows,
+            routing_plan,
+        )[0]
     journal_mailbox_issues = offline_journal_target_mailbox_issues(
         journal_rows,
-        manifest_rows,
+        mailbox_validation_rows,
         target_provider=config.target.provider,
     )
     if journal_mailbox_issues:
@@ -5606,6 +8196,9 @@ def validated_merge_group_stages(
     current_journal_rows: List[Dict[str, Any]],
     *,
     repair_trailing_journal: bool = False,
+    defer_trailing_journal_repair: bool = False,
+    routing_plan_sha256: Optional[str] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]:
     stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]] = []
     for group_account in same_target_accounts(config, account):
@@ -5617,6 +8210,9 @@ def validated_merge_group_stages(
             current_manifest_rows,
             current_journal_rows,
             repair_trailing_journal=repair_trailing_journal,
+            defer_trailing_journal_repair=defer_trailing_journal_repair,
+            routing_plan_sha256=routing_plan_sha256,
+            routing_plan=routing_plan,
         )
         stages.append((group_account, account_dir, manifest_rows, journal_rows))
     return stages
@@ -5638,7 +8234,9 @@ def require_merge_group_unique_manifest_identities(
             elif previous_owner != group_account.source_email:
                 collisions.append(f"{identity} in {previous_owner} and {group_account.source_email}")
     if collisions:
-        raise RuntimeError("merge group canonical_id collision: " + "; ".join(collisions))
+        raise ProviderImportIntegrityGateError(
+            "merge group canonical_id collision: " + "; ".join(collisions)
+        )
 
 
 def require_merge_group_target_translation_safe(
@@ -5657,6 +8255,606 @@ def require_merge_group_target_translation_safe(
     )
 
 
+def _target_physical_occurrences_for_row(
+    imap: imaplib.IMAP4,
+    manifest_row: Dict[str, Any],
+    target_mailbox: str,
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]],
+) -> List[Dict[str, Any]]:
+    search_mailboxes = [target_mailbox]
+    if target_provider == "gmail":
+        search_mailboxes = gmail_expected_target_mailboxes_for_row(
+            manifest_row,
+            target_mailbox,
+            target_mailboxes,
+        )
+    occurrences: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for search_mailbox in search_mailboxes:
+        for target_num in target_matching_message_nums(
+            imap,
+            search_mailbox,
+            manifest_row,
+            create_if_missing=False,
+            expected_content_identities=expected_content_identities,
+        ):
+            target_gmail_msgid = ""
+            target_gmail_label_keys: set[str] = set()
+            target_gmail_flags: set[str] = set()
+            if target_provider == "gmail":
+                target_gmail_msgid = _target_gmail_msgid(imap, target_num)
+                physical_key: Tuple[Any, ...] = ("gmail", target_gmail_msgid)
+                if manifest_row.get("routing_active") or manifest_row.get(
+                    "_gmail_duplicate_allocation"
+                ):
+                    (
+                        target_gmail_label_keys,
+                        target_gmail_flags,
+                        actual_internaldate,
+                    ) = _target_gmail_label_flag_internaldate(imap, target_num)
+                else:
+                    actual_internaldate = target_message_internaldate(imap, target_num)
+            else:
+                physical_key = (
+                    "imap",
+                    _target_mailbox_lookup_key(search_mailbox, target_provider),
+                    target_num,
+                )
+                actual_internaldate = target_message_internaldate(imap, target_num)
+            candidate = {
+                "physical_key": physical_key,
+                "mailbox": search_mailbox,
+                "num": target_num,
+                "gmail_msgid": target_gmail_msgid,
+                "internaldate": actual_internaldate,
+                "gmail_label_keys": target_gmail_label_keys,
+                "gmail_flags": target_gmail_flags,
+            }
+            # Gmail exposes one physical message through several label views.
+            # Keep the first view returned by gmail_expected_target_mailboxes_for_row:
+            # the row's primary target mailbox is deliberately first so metadata
+            # restoration and validation operate on that view when it exists.
+            if physical_key not in occurrences:
+                occurrences[physical_key] = candidate
+    return sorted(
+        occurrences.values(),
+        key=lambda item: repr(item["physical_key"]),
+    )
+
+
+def _maximum_target_candidate_assignments(
+    candidates_by_row: Dict[str, List[Dict[str, Any]]],
+    *,
+    required_row_keys: Optional[set[str]] = None,
+    unavailable_physical_keys: Optional[set[Tuple[Any, ...]]] = None,
+    stop_event: Optional[object] = None,
+) -> Dict[str, Dict[str, Any]]:
+    required = required_row_keys or set()
+    unavailable = unavailable_physical_keys or set()
+    candidate_by_row_and_key = {
+        (row_key, candidate["physical_key"]): candidate
+        for row_key, candidates in candidates_by_row.items()
+        for candidate in candidates
+        if candidate["physical_key"] not in unavailable
+    }
+    keys_by_row = {
+        row_key: sorted(
+            {
+                candidate["physical_key"]
+                for candidate in candidates
+                if candidate["physical_key"] not in unavailable
+            },
+            key=repr,
+        )
+        for row_key, candidates in candidates_by_row.items()
+    }
+    row_by_candidate: Dict[Tuple[Any, ...], str] = {}
+    visited_edges = 0
+
+    def assign_iteratively(root_row_key: str) -> bool:
+        """Emulate the former recursive Kuhn DFS without Python stack use."""
+
+        nonlocal visited_edges
+        seen: set[Tuple[Any, ...]] = set()
+        # Each frame is [row key, next candidate index, incoming candidate].
+        # ``incoming candidate`` is the parent edge whose previous owner is
+        # this frame's row.  On success it is reassigned while unwinding.
+        frames: List[List[Any]] = [[root_row_key, 0, None]]
+        while frames:
+            row_key = str(frames[-1][0])
+            candidate_index = int(frames[-1][1])
+            if candidate_index >= len(keys_by_row[row_key]):
+                frames.pop()
+                continue
+            candidate_key = keys_by_row[row_key][candidate_index]
+            frames[-1][1] = candidate_index + 1
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            visited_edges += 1
+            if visited_edges % 256 == 0:
+                _raise_if_stopped(stop_event, "target candidate assignment")
+            previous_row = row_by_candidate.get(candidate_key)
+            if previous_row is not None:
+                frames.append([previous_row, 0, candidate_key])
+                continue
+
+            # The deepest row takes the free edge.  Reassign each displaced
+            # edge to its parent row in the same order as recursive unwind.
+            row_by_candidate[candidate_key] = row_key
+            while len(frames) > 1:
+                child_frame = frames.pop()
+                incoming_candidate = child_frame[2]
+                parent_row = str(frames[-1][0])
+                row_by_candidate[incoming_candidate] = parent_row
+            return True
+        return False
+
+    for row_key in sorted(
+        keys_by_row,
+        key=lambda value: (
+            0 if value in required else 1,
+            len(keys_by_row[value]),
+            value,
+        ),
+    ):
+        _raise_if_stopped(stop_event, "target candidate assignment")
+        assign_iteratively(row_key)
+    return {
+        row_key: candidate_by_row_and_key[(row_key, candidate_key)]
+        for candidate_key, row_key in row_by_candidate.items()
+    }
+
+
+def _target_row_assignments(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    row_specs: Dict[str, Dict[str, Any]],
+    *,
+    target_provider: str,
+    required_row_keys: Optional[set[str]] = None,
+    unavailable_physical_keys: Optional[set[Tuple[Any, ...]]] = None,
+    stop_event: Optional[object] = None,
+) -> Dict[str, Dict[str, Any]]:
+    candidates_by_row: Dict[str, List[Dict[str, Any]]] = {}
+    fresh_evidence_rows: set[str] = set()
+    for row_key, spec in row_specs.items():
+        match_row = spec.get("match_row") or spec["manifest_row"]
+        expected_date_key = ""
+        if spec.get("require_internaldate_match"):
+            expected_date_key = _legacy_internaldate_utc_key(
+                match_row.get("internaldate")
+            )
+        raw_target_gmail_msgid = spec.get("target_gmail_msgid")
+        target_gmail_msgid = str(raw_target_gmail_msgid or "")
+        required_mailbox = str(spec.get("required_mailbox") or "")
+        raw_pre_append_gmail_msgids = spec.get("pre_append_gmail_msgids")
+        pre_append_gmail_msgids: Optional[set[str]] = None
+        if (
+            target_provider == "gmail"
+            and raw_target_gmail_msgid not in (None, "")
+            and not is_valid_gmail_msgid(raw_target_gmail_msgid)
+        ):
+            raise ProviderImportIntegrityGateError(
+                f"invalid canonical Gmail target message ID for {row_key}: "
+                f"{raw_target_gmail_msgid!r}"
+            )
+        if isinstance(raw_pre_append_gmail_msgids, (list, tuple, set, frozenset)):
+            invalid_baseline = [
+                value
+                for value in raw_pre_append_gmail_msgids
+                if not is_valid_gmail_msgid(value)
+            ]
+            if invalid_baseline:
+                raise ProviderImportIntegrityGateError(
+                    f"invalid canonical pre-APPEND Gmail-ID evidence for {row_key}: "
+                    + ", ".join(sorted(repr(value) for value in invalid_baseline))
+                )
+            pre_append_gmail_msgids = {
+                value for value in raw_pre_append_gmail_msgids
+            }
+        elif raw_pre_append_gmail_msgids is not None:
+            raise ProviderImportIntegrityGateError(
+                f"invalid pre-APPEND Gmail-ID evidence collection for {row_key}"
+            )
+        candidate_occurrences = _target_physical_occurrences_for_row(
+            imap,
+            spec["manifest_row"],
+            spec["target_mailbox"],
+            target_mailboxes,
+            target_provider=target_provider,
+            expected_content_identities=spec.get("expected_content_identities"),
+        )
+        if target_provider == "gmail" and (
+            spec["manifest_row"].get("routing_active")
+            or spec["manifest_row"].get("_gmail_duplicate_allocation")
+        ):
+            desired_profile = _gmail_required_destination_profile_for_row(
+                spec["manifest_row"]
+            )
+            candidate_occurrences = [
+                occurrence
+                for occurrence in candidate_occurrences
+                if not _gmail_destination_profile_conflicts(
+                    (
+                        desired_profile,
+                        _gmail_destination_profile_for_target_candidate(
+                            spec["manifest_row"],
+                            occurrence.get("gmail_label_keys") or (),
+                            occurrence.get("gmail_flags") or (),
+                            str(occurrence.get("mailbox") or ""),
+                            str(occurrence.get("gmail_msgid") or ""),
+                            fresh_neutral_anchor_msgids=(
+                                {
+                                    str(occurrence.get("gmail_msgid") or "")
+                                }
+                                if pre_append_gmail_msgids is not None
+                                and str(occurrence.get("gmail_msgid") or "")
+                                not in pre_append_gmail_msgids
+                                else None
+                            ),
+                        ),
+                    )
+                )
+            ]
+        candidates_by_row[row_key] = [
+            occurrence
+            for occurrence in candidate_occurrences
+            if (
+                not expected_date_key
+                or _legacy_internaldate_utc_key(occurrence["internaldate"])
+                == expected_date_key
+            )
+            and (
+                not target_gmail_msgid
+                or occurrence["gmail_msgid"] == target_gmail_msgid
+            )
+            and (
+                pre_append_gmail_msgids is None
+                or occurrence["gmail_msgid"] not in pre_append_gmail_msgids
+            )
+            and (
+                not required_mailbox
+                or spec["manifest_row"].get("_gmail_duplicate_allocation")
+                or _target_mailbox_lookup_key(
+                    occurrence["mailbox"],
+                    target_provider,
+                )
+                == _target_mailbox_lookup_key(required_mailbox, target_provider)
+            )
+        ]
+        if spec.get("require_unique_fresh_append") and candidates_by_row[row_key]:
+            fresh_evidence_rows.add(row_key)
+
+    effective_required = set(required_row_keys or set()) | fresh_evidence_rows
+    assignments = _maximum_target_candidate_assignments(
+        candidates_by_row,
+        required_row_keys=effective_required,
+        unavailable_physical_keys=unavailable_physical_keys,
+        stop_event=stop_event,
+    )
+    missing_fresh = sorted(fresh_evidence_rows - set(assignments))
+    if missing_fresh:
+        raise ProviderImportIntegrityGateError(
+            "cannot confirm pending/fresh Gmail APPENDs one-to-one from "
+            "post-APPEND evidence: " + ", ".join(missing_fresh)
+        )
+    for row_key in sorted(fresh_evidence_rows):
+        chosen_key = assignments[row_key]["physical_key"]
+        candidates_without_chosen_edge = {
+            candidate_row_key: [
+                candidate
+                for candidate in candidates
+                if candidate_row_key != row_key
+                or candidate["physical_key"] != chosen_key
+            ]
+            for candidate_row_key, candidates in candidates_by_row.items()
+        }
+        alternative = _maximum_target_candidate_assignments(
+            candidates_without_chosen_edge,
+            required_row_keys=effective_required,
+            unavailable_physical_keys=unavailable_physical_keys,
+            stop_event=stop_event,
+        )
+        if effective_required <= set(alternative):
+            raise ProviderImportIntegrityGateError(
+                f"cannot uniquely confirm fresh Gmail APPEND for {row_key}: "
+                "multiple one-to-one post-APPEND physical allocations remain"
+            )
+    return assignments
+
+
+def _gmail_pre_append_message_ids(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    row: Dict[str, Any],
+    target_mailbox: str,
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]],
+) -> List[str]:
+    """Snapshot every dated physical content candidate before one APPEND."""
+
+    expected_date_key = _legacy_internaldate_utc_key(row.get("internaldate"))
+    return sorted(
+        {
+            str(occurrence.get("gmail_msgid") or "")
+            for occurrence in _target_physical_occurrences_for_row(
+                imap,
+                row,
+                target_mailbox,
+                target_mailboxes,
+                target_provider="gmail",
+                expected_content_identities=expected_content_identities,
+            )
+            if occurrence.get("gmail_msgid")
+            and (
+                not expected_date_key
+                or _legacy_internaldate_utc_key(occurrence.get("internaldate"))
+                == expected_date_key
+            )
+        },
+        key=lambda value: (len(value), value),
+    )
+
+
+def _gmail_confirmed_fresh_append_occurrence(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    row: Dict[str, Any],
+    target_mailbox: str,
+    pre_append_gmail_msgids: Iterable[str],
+    *,
+    expected_content_identities: Optional[Iterable[Tuple[int, str]]],
+) -> Optional[Dict[str, Any]]:
+    """Return only a uniquely proven post-APPEND Gmail physical message."""
+
+    row_key = str(row.get("canonical_id") or "<fresh-append>")
+    assignments = _target_row_assignments(
+        imap,
+        target_mailboxes,
+        {
+            row_key: {
+                "manifest_row": row,
+                "match_row": row,
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": "",
+                "expected_content_identities": expected_content_identities,
+                "require_internaldate_match": True,
+                "pre_append_gmail_msgids": list(pre_append_gmail_msgids),
+                "require_unique_fresh_append": True,
+            }
+        },
+        target_provider="gmail",
+        required_row_keys={row_key},
+    )
+    return assignments.get(row_key)
+
+
+def require_one_to_one_committed_target_evidence(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    manifest_rows: List[Dict[str, Any]],
+    journal_rows: List[Dict[str, Any]],
+    target_mailbox_by_identity: Dict[str, str],
+    *,
+    target_provider: str,
+    target_mode: str,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+) -> None:
+    """Prove mandatory committed allocations before any recovery mutation."""
+    latest_committed = latest_committed_journal_rows(
+        journal_rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    )
+    latest_status = latest_journal_rows(
+        journal_rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    )
+    row_specs: Dict[str, Dict[str, Any]] = {}
+    required_identities: set[str] = set()
+    committed_row_by_identity: Dict[str, Dict[str, Any]] = {}
+    target_mailbox_by_required_identity: Dict[str, str] = {}
+    for manifest_row in sorted(
+        manifest_rows,
+        key=lambda row: str(row.get("canonical_id") or ""),
+    ):
+        identity = str(manifest_row.get("canonical_id") or "")
+        target_mailbox = target_mailbox_by_identity.get(identity)
+        if not identity or not target_mailbox:
+            continue
+        key = journal_target_key(
+            identity,
+            target_mailbox,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        committed_row = latest_committed.get(key)
+        if committed_row is not None:
+            target_gmail_msgid = str(
+                committed_row.get("target_gmail_msgid") or ""
+            )
+            legacy_existing_without_date_evidence = (
+                committed_row.get("action") == "existing"
+                and _existing_content_reuse_target_internaldate(
+                    manifest_row,
+                    committed_row,
+                )
+                is None
+            )
+            row_specs[identity] = {
+                "manifest_row": manifest_row,
+                "match_row": _committed_target_match_row(
+                    manifest_row,
+                    committed_row,
+                ),
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": target_gmail_msgid,
+                "expected_content_identities": expected_content_identities_by_id.get(
+                    identity
+                ),
+                "require_internaldate_match": not legacy_existing_without_date_evidence,
+            }
+            if target_mode == "empty" or (
+                target_provider == "gmail" and target_gmail_msgid
+            ):
+                required_identities.add(identity)
+                committed_row_by_identity[identity] = committed_row
+                target_mailbox_by_required_identity[identity] = target_mailbox
+            continue
+        status_row = latest_status.get(key)
+        if target_mode == "merge" or (
+            status_row is not None and status_row.get("status") == "pending"
+        ):
+            row_specs[identity] = {
+                "manifest_row": manifest_row,
+                "match_row": manifest_row,
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": "",
+                "expected_content_identities": expected_content_identities_by_id.get(
+                    identity
+                ),
+                "require_internaldate_match": bool(
+                    status_row is not None and status_row.get("status") == "pending"
+                ),
+            }
+    if not required_identities:
+        return
+    assignments = _target_row_assignments(
+        imap,
+        target_mailboxes,
+        row_specs,
+        target_provider=target_provider,
+        required_row_keys=required_identities,
+    )
+    for identity in sorted(required_identities):
+        if identity in assignments:
+            continue
+        target_mailbox = target_mailbox_by_required_identity[identity]
+        target_gmail_msgid = str(
+            committed_row_by_identity[identity].get("target_gmail_msgid") or ""
+        )
+        if target_provider == "gmail" and target_gmail_msgid:
+            raise ProviderImportIntegrityGateError(
+                f"journal says {identity} is committed to Gmail target message "
+                f"{target_gmail_msgid} in {target_mailbox!r}, but that exact "
+                "target message was not found"
+            )
+        raise ProviderImportIntegrityGateError(
+            f"journal says {identity} is committed to {target_mailbox!r}, "
+            "but the target message was not found"
+        )
+
+
+def require_recovery_stages_live_integrity(
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    target_mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> Dict[str, str]:
+    """Validate live-canonicalized stage evidence before any stage mutates."""
+    ordered_stages = sorted(
+        stages,
+        key=lambda stage: (
+            stage[0].source_email.casefold(),
+            stage[0].source_email,
+        ),
+    )
+    content_issues: List[str] = []
+    for group_account, _account_dir, manifest_rows, journal_rows in ordered_stages:
+        stage_issues = committed_journal_manifest_content_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        stage_issues.extend(
+            pending_journal_manifest_content_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=target_provider,
+                target_mailboxes=target_mailboxes,
+            )
+        )
+        content_issues.extend(
+            f"{group_account.source_email}: {issue}"
+            for issue in stage_issues
+        )
+    if content_issues:
+        raise ProviderImportIntegrityGateError(
+            "invalid import journal: " + "; ".join(content_issues)
+        )
+
+    if target_provider == "gmail":
+        system_mailbox_issues = [
+            f"{group_account.source_email}: {issue}"
+            for group_account, _account_dir, manifest_rows, _journal_rows in ordered_stages
+            for issue in gmail_target_system_mailbox_issues(
+                manifest_rows,
+                target_mailboxes,
+            )
+        ]
+        if system_mailbox_issues:
+            raise ProviderImportIntegrityGateError(
+                "Gmail target is not import-ready: "
+                + "; ".join(system_mailbox_issues)
+            )
+
+    combined_rows = [
+        row
+        for _group_account, _account_dir, manifest_rows, _journal_rows in ordered_stages
+        for row in sorted(
+            manifest_rows,
+            key=lambda manifest_row: str(
+                manifest_row.get("canonical_id") or ""
+            ),
+        )
+    ]
+    target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+        combined_rows,
+        target_mailboxes,
+        target_provider=target_provider,
+    )
+    target_binding_issues: List[str] = []
+    for group_account, _account_dir, manifest_rows, journal_rows in ordered_stages:
+        stage_identities = {
+            str(row.get("canonical_id") or "")
+            for row in manifest_rows
+            if row.get("canonical_id")
+        }
+        stage_target_mailbox_by_identity = {
+            identity: target_mailbox
+            for identity, target_mailbox in target_mailbox_by_identity.items()
+            if identity in stage_identities
+        }
+        stage_issues = committed_journal_target_mailbox_issues(
+            journal_rows,
+            stage_target_mailbox_by_identity,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        stage_issues.extend(
+            pending_journal_target_mailbox_issues(
+                journal_rows,
+                stage_target_mailbox_by_identity,
+                target_provider=target_provider,
+                target_mailboxes=target_mailboxes,
+            )
+        )
+        target_binding_issues.extend(
+            f"{group_account.source_email}: {issue}"
+            for issue in stage_issues
+        )
+    if target_binding_issues:
+        raise ProviderImportIntegrityGateError(
+            "invalid import journal: " + "; ".join(target_binding_issues)
+        )
+    return target_mailbox_by_identity
+
+
 def require_merge_group_journals_remote_complete(
     imap: imaplib.IMAP4,
     target_mailboxes: List[MailboxInfo],
@@ -5664,6 +8862,7 @@ def require_merge_group_journals_remote_complete(
     *,
     target_provider: str,
     expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+    allow_unresolved_pending: bool = False,
 ) -> None:
     for group_account, _account_dir, manifest_rows, journal_rows in stages:
         latest_committed = latest_committed_journal_rows(
@@ -5689,7 +8888,9 @@ def require_merge_group_journals_remote_complete(
             )
             if key in committed_keys:
                 continue
-            raise RuntimeError(
+            if allow_unresolved_pending:
+                continue
+            raise ProviderImportIntegrityGateError(
                 f"merge group source {group_account.source_email} has unresolved pending import journal row: "
                 f"{identity} in {target_mailbox}"
             )
@@ -5698,55 +8899,1091 @@ def require_merge_group_journals_remote_complete(
             for row in manifest_rows
             if row.get("canonical_id")
         }
-        for (identity, _target_mailbox_key), journal_row in latest_committed.items():
+        committed_specs: Dict[str, Dict[str, Any]] = {}
+        journal_row_by_identity: Dict[str, Dict[str, Any]] = {}
+        for (identity, _target_mailbox_key), journal_row in sorted(latest_committed.items()):
             target_mailbox = str(journal_row.get("target_mailbox") or "")
             manifest_row = row_by_id.get(identity)
             if manifest_row is None:
                 continue
+            committed_specs[identity] = {
+                "manifest_row": manifest_row,
+                "match_row": _committed_target_match_row(manifest_row, journal_row),
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": str(journal_row.get("target_gmail_msgid") or ""),
+                "expected_content_identities": expected_content_identities_by_id.get(identity),
+                "require_internaldate_match": True,
+            }
+            journal_row_by_identity[identity] = journal_row
+        committed_assignments = _target_row_assignments(
+            imap,
+            target_mailboxes,
+            committed_specs,
+            target_provider=target_provider,
+            required_row_keys=set(committed_specs),
+        )
+        for identity, spec in committed_specs.items():
+            if identity in committed_assignments:
+                continue
+            journal_row = journal_row_by_identity[identity]
+            target_mailbox = spec["target_mailbox"]
+            target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
+            if target_provider == "gmail" and target_gmail_msgid:
+                raise ProviderImportIntegrityGateError(
+                    f"merge group journal says {identity} from {group_account.source_email} "
+                    f"is committed to Gmail target message {target_gmail_msgid} in {target_mailbox!r}, "
+                    "but that exact target message was not found"
+                )
+            raise ProviderImportIntegrityGateError(
+                f"merge group journal says {identity} from {group_account.source_email} "
+                f"is committed to {target_mailbox!r}, but the target message was not found"
+            )
+
+
+def require_merge_group_pending_internaldates_compatible(
+    target_mailboxes: List[MailboxInfo],
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    *,
+    target_provider: str,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+) -> List[Dict[str, Any]]:
+    """Return compatible physical content classes for strict journal recovery.
+
+    A many-to-one target needs only the largest physical multiplicity exported
+    by any one source.  Sources may reuse those physical occurrences, but rows
+    within one source remain distinct.  Committed target-date evidence and
+    unresolved pending source dates reserve strict dated occurrences.  For one
+    physical mailbox/content class the invariant is therefore::
+
+        capacity = max_source(total manifest rows)
+        required = sum(max_source(strict rows at UTC-equivalent date))
+
+    Compatibility requires ``required <= capacity``.  Content identity sets
+    are unioned transitively so raw/APPEND-wire identity variants cannot make
+    the result depend on manifest or source ordering.
+    """
+
+    entries: List[Dict[str, Any]] = []
+    for group_account, _account_dir, manifest_rows, journal_rows in stages:
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider=target_provider,
+        )
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        latest_status = latest_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        for manifest_row in manifest_rows:
+            identity = str(manifest_row.get("canonical_id") or "")
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not identity or not target_mailbox:
+                continue
+            target_key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=target_provider,
+                target_mailboxes=target_mailboxes,
+            )
+            journal_row = latest_committed.get(target_key)
+            strict_status = "committed" if journal_row is not None else ""
+            if journal_row is None:
+                candidate = latest_status.get(target_key)
+                if candidate is not None and candidate.get("status") == "pending":
+                    journal_row = candidate
+                    strict_status = "pending"
+            physical_target_key = (
+                "gmail-physical-message"
+                if target_provider == "gmail"
+                else _target_mailbox_lookup_key(target_mailbox, target_provider)
+            )
+            strict_internaldate = ""
+            strict_date_key = ""
+            if strict_status == "committed" and journal_row is not None:
+                strict_internaldate = _normalized_provider_internaldate(
+                    _committed_target_match_row(manifest_row, journal_row).get("internaldate")
+                )
+                strict_date_key = _legacy_internaldate_utc_key(strict_internaldate)
+            elif strict_status == "pending":
+                strict_internaldate = _normalized_provider_internaldate(
+                    manifest_row.get("internaldate")
+                )
+                strict_date_key = _legacy_internaldate_utc_key(strict_internaldate)
+            entries.append({
+                "source_email": group_account.source_email,
+                "identity": identity,
+                "target_mailbox": target_mailbox,
+                "physical_target_key": physical_target_key,
+                "content_identities": _expected_content_identities(
+                    manifest_row,
+                    expected_content_identities_by_id.get(identity),
+                ),
+                "manifest_row": manifest_row,
+                "journal_row": journal_row,
+                "strict_status": strict_status,
+                "strict_internaldate": strict_internaldate,
+                "strict_date_key": strict_date_key,
+            })
+
+    entries.sort(
+        key=lambda item: (
+            item["physical_target_key"],
+            item["source_email"].casefold(),
+            item["source_email"],
+            item["identity"],
+        )
+    )
+    parents = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        if left_root < right_root:
+            parents[right_root] = left_root
+        else:
+            parents[left_root] = right_root
+
+    first_entry_by_content: Dict[Tuple[str, Tuple[int, str]], int] = {}
+    for index, entry in enumerate(entries):
+        for content_identity in sorted(entry["content_identities"]):
+            content_key = (entry["physical_target_key"], content_identity)
+            previous = first_entry_by_content.setdefault(content_key, index)
+            union(index, previous)
+
+    entries_by_class: Dict[int, List[Dict[str, Any]]] = {}
+    for index, entry in enumerate(entries):
+        entries_by_class.setdefault(find(index), []).append(entry)
+
+    classes: List[Dict[str, Any]] = []
+    missing_dates: List[str] = []
+    capacity_conflicts: List[str] = []
+    for class_entries in entries_by_class.values():
+        class_entries.sort(
+            key=lambda item: (
+                item["source_email"].casefold(),
+                item["source_email"],
+                item["identity"],
+            )
+        )
+        total_by_source: Dict[str, int] = {}
+        strict_by_date_source: Dict[str, Dict[str, int]] = {}
+        date_display: Dict[str, str] = {}
+        for entry in class_entries:
+            source_key = entry["source_email"].casefold()
+            total_by_source[source_key] = total_by_source.get(source_key, 0) + 1
+            strict_status = entry["strict_status"]
+            if not strict_status:
+                continue
+            date_key = entry["strict_date_key"]
+            if not date_key:
+                missing_dates.append(
+                    f"{entry['source_email']}/{entry['identity']} "
+                    f"({strict_status}) has {entry['strict_internaldate'] or '<missing>'}"
+                )
+                continue
+            date_display.setdefault(date_key, entry["strict_internaldate"])
+            by_source = strict_by_date_source.setdefault(date_key, {})
+            by_source[source_key] = by_source.get(source_key, 0) + 1
+
+        capacity = max(total_by_source.values(), default=0)
+        required_by_date = {
+            date_key: max(by_source.values(), default=0)
+            for date_key, by_source in strict_by_date_source.items()
+        }
+        required = sum(required_by_date.values())
+        target_label = (
+            "Gmail physical message"
+            if target_provider == "gmail"
+            else repr(class_entries[0]["target_mailbox"])
+        )
+        if required > capacity:
+            reservations = ", ".join(
+                f"{date_display[date_key]} x{required_by_date[date_key]}"
+                for date_key in sorted(required_by_date, key=lambda value: int(value))
+            )
+            reservation_rows = ", ".join(
+                f"{entry['source_email']}/{entry['identity']}"
+                for entry in class_entries
+                if entry["strict_status"]
+            )
+            capacity_conflicts.append(
+                f"overlapping content in {target_label} requires {required} physical "
+                f"dated occurrence(s) ({reservations}) but per-source manifest capacity is {capacity}"
+                f"; rows {reservation_rows}"
+            )
+        classes.append({
+            "physical_target_key": class_entries[0]["physical_target_key"],
+            "target_mailboxes": sorted(
+                {str(entry["target_mailbox"]) for entry in class_entries},
+                key=lambda value: (value.casefold(), value),
+            ),
+            "content_identities": set().union(
+                *(entry["content_identities"] for entry in class_entries)
+            ),
+            "entries": class_entries,
+            "capacity": capacity,
+            "required_by_date": required_by_date,
+            "date_display": date_display,
+            "has_pending": any(
+                entry["strict_status"] == "pending" for entry in class_entries
+            ),
+        })
+
+    if missing_dates:
+        raise ProviderImportIntegrityGateError(
+            "merge group unresolved pending APPENDs have missing or unconfirmable "
+            "INTERNALDATE values: " + "; ".join(sorted(missing_dates))
+        )
+    if capacity_conflicts:
+        raise ProviderImportIntegrityGateError(
+            "merge group unresolved pending APPENDs have incompatible INTERNALDATE values: "
+            + "; ".join(sorted(capacity_conflicts))
+        )
+    classes.sort(
+        key=lambda item: (
+            item["physical_target_key"],
+            tuple(item["target_mailboxes"]),
+            sorted(item["content_identities"]),
+        )
+    )
+    return classes
+
+
+def require_merge_group_pending_target_capacity_compatible(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    capacity_classes: List[Dict[str, Any]],
+    *,
+    target_provider: str,
+) -> None:
+    """Prove strict pending recovery fits before any target or journal write."""
+
+    capacity_issues: List[str] = []
+    for content_class in capacity_classes:
+        if not content_class["has_pending"]:
+            continue
+        occurrences: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for entry in content_class["entries"]:
+            for occurrence in _target_physical_occurrences_for_row(
+                imap,
+                entry["manifest_row"],
+                entry["target_mailbox"],
+                target_mailboxes,
+                target_provider=target_provider,
+                expected_content_identities=entry["content_identities"],
+            ):
+                occurrences.setdefault(occurrence["physical_key"], occurrence)
+        strict_entries_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in content_class["entries"]:
+            if entry["strict_status"]:
+                strict_entries_by_source.setdefault(
+                    entry["source_email"].casefold(),
+                    [],
+                ).append(entry)
+        unmatched_by_date_source: Dict[str, Dict[str, int]] = {}
+        for source_key, source_entries in strict_entries_by_source.items():
+            strict_specs = {
+                entry["identity"]: {
+                    "manifest_row": entry["manifest_row"],
+                    "match_row": (
+                        _committed_target_match_row(
+                            entry["manifest_row"],
+                            entry["journal_row"],
+                        )
+                        if entry["strict_status"] == "committed"
+                        else entry["manifest_row"]
+                    ),
+                    "target_mailbox": entry["target_mailbox"],
+                    "target_gmail_msgid": (
+                        str(entry["journal_row"].get("target_gmail_msgid") or "")
+                        if entry["strict_status"] == "committed"
+                        else ""
+                    ),
+                    "expected_content_identities": entry["content_identities"],
+                    "require_internaldate_match": True,
+                }
+                for entry in source_entries
+            }
+            assignments = _target_row_assignments(
+                imap,
+                target_mailboxes,
+                strict_specs,
+                target_provider=target_provider,
+                required_row_keys={
+                    entry["identity"]
+                    for entry in source_entries
+                    if entry["strict_status"] == "committed"
+                },
+            )
+            for entry in source_entries:
+                if entry["identity"] in assignments:
+                    continue
+                by_source = unmatched_by_date_source.setdefault(
+                    entry["strict_date_key"],
+                    {},
+                )
+                by_source[source_key] = by_source.get(source_key, 0) + 1
+        missing_required = sum(
+            max(by_source.values(), default=0)
+            for by_source in unmatched_by_date_source.values()
+        )
+        completed_physical_count = len(occurrences) + missing_required
+        if completed_physical_count <= content_class["capacity"]:
+            continue
+        observed_dates = ", ".join(
+            sorted(
+                {
+                    str(occurrence["internaldate"] or "<missing>")
+                    for occurrence in occurrences.values()
+                }
+            )
+        ) or "<empty target>"
+        target_label = (
+            "Gmail physical message"
+            if target_provider == "gmail"
+            else repr(content_class["target_mailboxes"][0])
+        )
+        capacity_issues.append(
+            f"overlapping content in {target_label} has {len(occurrences)} existing "
+            f"physical occurrence(s) at {observed_dates} and needs {missing_required} "
+            f"additional dated occurrence(s), exceeding manifest capacity "
+            f"{content_class['capacity']}"
+        )
+    if capacity_issues:
+        raise ProviderImportIntegrityGateError(
+            "cannot confirm pending append recovery without exceeding physical content capacity: "
+            + "; ".join(sorted(capacity_issues))
+        )
+
+
+def require_pending_gmail_append_evidence_safe(
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    stages: List[
+        Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]
+    ],
+    *,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+    stop_event: Optional[object] = None,
+) -> Dict[Tuple[int, str, str], Dict[str, Any]]:
+    """Read-only safety proof for every unresolved Gmail pending APPEND.
+
+    Baselined rows are matched in one global graph so nested fresh-candidate
+    sets cannot each claim the same physical message.  A baselined row with no
+    post-APPEND candidate remains retryable.  Legacy neutral-anchor rows cannot
+    be recovered safely and fail before missing-ID repair can write.
+    """
+
+    pending_specs: Dict[str, Dict[str, Any]] = {}
+    pending_key_by_row_key: Dict[str, Tuple[int, str, str]] = {}
+    for stage_index, (
+        group_account,
+        _account_dir,
+        manifest_rows,
+        journal_rows,
+    ) in enumerate(stages):
+        _raise_if_stopped(
+            stop_event,
+            f"provider import {group_account.target_email}",
+        )
+        manifest_by_id = {
+            str(row.get("canonical_id") or ""): row
+            for row in manifest_rows
+            if row.get("canonical_id")
+        }
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider="gmail",
+        )
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider="gmail",
+            target_mailboxes=target_mailboxes,
+        )
+        latest_status = latest_journal_rows(
+            journal_rows,
+            target_provider="gmail",
+            target_mailboxes=target_mailboxes,
+        )
+        for journal_key, pending_row in sorted(latest_status.items()):
+            if (
+                pending_row.get("status") != "pending"
+                or journal_key in latest_committed
+            ):
+                continue
+            identity = str(pending_row.get("canonical_id") or "")
+            manifest_row = manifest_by_id.get(identity)
+            if manifest_row is None:
+                raise ProviderImportIntegrityGateError(
+                    "invalid import journal: journal pending identity not in manifest: "
+                    + (identity or "<missing>")
+                )
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not target_mailbox:
+                raise ProviderImportIntegrityGateError(
+                    "invalid import journal: journal pending identity has no target mailbox: "
+                    + identity
+                )
+            raw_baseline = pending_row.get("pre_append_gmail_msgids")
+            if raw_baseline is None:
+                if _gmail_pending_needs_neutral_anchor_evidence(manifest_row):
+                    raise ProviderImportIntegrityGateError(
+                        f"cannot safely recover legacy pending Gmail APPEND {identity}: "
+                        "its allocated Spam/Trash slot may currently use an All Mail "
+                        "append anchor, but the pending journal predates durable "
+                        "pre-APPEND Gmail-ID evidence"
+                    )
+                continue
+            if not isinstance(raw_baseline, list) or any(
+                not is_valid_gmail_msgid(value) for value in raw_baseline
+            ):
+                raise ProviderImportIntegrityGateError(
+                    f"invalid canonical pre-APPEND Gmail-ID evidence for {identity}"
+                )
+            row_key = (
+                f"{stage_index:08d}\0{group_account.source_email.casefold()}\0"
+                f"{identity}"
+            )
+            pending_specs[row_key] = {
+                "manifest_row": manifest_row,
+                "match_row": manifest_row,
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": "",
+                "expected_content_identities": (
+                    expected_content_identities_by_id.get(identity)
+                ),
+                "require_internaldate_match": True,
+                "pre_append_gmail_msgids": list(raw_baseline),
+                "require_unique_fresh_append": True,
+            }
+            pending_key_by_row_key[row_key] = (
+                stage_index,
+                group_account.source_email.casefold(),
+                identity,
+            )
+
+    if pending_specs:
+        assignments = _target_row_assignments(
+            imap,
+            target_mailboxes,
+            pending_specs,
+            target_provider="gmail",
+            stop_event=stop_event,
+        )
+        return {
+            pending_key_by_row_key[row_key]: occurrence
+            for row_key, occurrence in assignments.items()
+            if row_key in pending_key_by_row_key
+        }
+    return {}
+
+
+def recover_merge_group_pending_appends(
+    config: ProviderMigrationConfig,
+    imap: imaplib.IMAP4,
+    target_mailboxes: List[MailboxInfo],
+    stages: List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]],
+    *,
+    expected_content_identities_by_id: Dict[str, set[Tuple[int, str]]],
+    limiter: RateLimiter,
+    stop_event: Optional[object] = None,
+    allow_unmatched_committed: bool = False,
+) -> None:
+    """Resolve every pending APPEND in a target group before ordinary import work.
+
+    The inspection pass is intentionally separated from the mutation pass.  A
+    byte-identical message with a different INTERNALDATE is therefore reported
+    before a retry APPEND (or another source's ordinary APPEND) can run.
+    """
+
+    target_provider = config.target.provider
+    globally_confirmed_pending: Dict[
+        Tuple[int, str, str],
+        Dict[str, Any],
+    ] = {}
+    if target_provider == "gmail":
+        globally_confirmed_pending = require_pending_gmail_append_evidence_safe(
+            imap,
+            target_mailboxes,
+            stages,
+            expected_content_identities_by_id=expected_content_identities_by_id,
+            stop_event=stop_event,
+        )
+    capacity_classes = require_merge_group_pending_internaldates_compatible(
+        target_mailboxes,
+        stages,
+        target_provider=target_provider,
+        expected_content_identities_by_id=expected_content_identities_by_id,
+    )
+    recovery_items: List[Dict[str, Any]] = []
+
+    def reject_unconfirmed_internaldate(
+        identity: str,
+        manifest_row: Dict[str, Any],
+        target_mailbox: str,
+        expected_content_identities: Optional[Iterable[Tuple[int, str]]],
+        used_target_nums: Dict[str, set[bytes]],
+        used_target_gmail_msgids: set[str],
+    ) -> None:
+        search_mailboxes = [target_mailbox]
+        if target_provider == "gmail":
+            search_mailboxes = gmail_expected_target_mailboxes_for_row(
+                manifest_row,
+                target_mailbox,
+                target_mailboxes,
+            )
+        observations: List[Tuple[str, str]] = []
+        for search_mailbox in search_mailboxes:
+            mailbox_key = _target_mailbox_lookup_key(
+                search_mailbox,
+                "gmail" if target_provider == "gmail" else "imap",
+            )
+            used_nums = used_target_nums.get(mailbox_key, set())
+            for target_num in target_matching_message_nums(
+                imap,
+                search_mailbox,
+                manifest_row,
+                create_if_missing=False,
+                expected_content_identities=expected_content_identities,
+            ):
+                if target_num in used_nums:
+                    continue
+                if target_provider == "gmail":
+                    target_gmail_msgid = _target_gmail_msgid(imap, target_num)
+                    if (
+                        target_gmail_msgid
+                        and target_gmail_msgid in used_target_gmail_msgids
+                    ):
+                        continue
+                observations.append(
+                    (search_mailbox, target_message_internaldate(imap, target_num))
+                )
+        if not observations:
+            return
+        expected_internaldate = _normalized_provider_internaldate(
+            manifest_row.get("internaldate")
+        )
+        if any(
+            _legacy_internaldates_equal(actual_internaldate, expected_internaldate)
+            for _mailbox, actual_internaldate in observations
+        ):
+            return
+        observed = ", ".join(
+            sorted(
+                {
+                    f"{mailbox}: {actual_internaldate or '<missing>'}"
+                    for mailbox, actual_internaldate in observations
+                }
+            )
+        )
+        raise RuntimeError(
+            f"cannot confirm pending append recovery for {identity} in {target_mailbox!r}: "
+            f"byte-identical target content has INTERNALDATE {observed}; expected "
+            f"{expected_internaldate or '<missing>'}; no committed journal row was written"
+        )
+
+    # Establish that completing every missing strict row cannot exceed the
+    # physical multiplicity exported by any source.  This is one global
+    # inspection before journal or target mutation.  Raw counts per date are
+    # insufficient: an LF occurrence at D2 can match a broad LF/CRLF row but
+    # not a narrow CRLF-only row reserved at D2.  Match the actual dated rows
+    # for every source so only usable occurrences reduce its missing demand.
+    capacity_class_by_source_identity = {
+        (entry["source_email"].casefold(), entry["identity"]): content_class
+        for content_class in capacity_classes
+        for entry in content_class["entries"]
+    }
+    recovery_batches: List[List[Dict[str, Any]]] = []
+
+    # Reserve committed and pending rows in one maximum matching per source.
+    # Cross-source reuse is intentional in many-to-one mode, while two rows in
+    # one source still require distinct physical occurrences.  Committed rows
+    # are processed first and remain mandatory, but may be rerouted along an
+    # augmenting path so a broad raw/wire identity does not steal the only
+    # candidate available to a narrower pending row.
+    for stage_index, (
+        group_account,
+        account_dir,
+        manifest_rows,
+        journal_rows,
+    ) in enumerate(stages):
+        _raise_if_stopped(stop_event, f"provider import {group_account.target_email}")
+        manifest_row_by_identity = {
+            str(row.get("canonical_id") or ""): row
+            for row in manifest_rows
+            if row.get("canonical_id")
+        }
+        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
+            manifest_rows,
+            target_mailboxes,
+            target_provider=target_provider,
+        )
+        pending_target_issues = pending_journal_target_mailbox_issues(
+            journal_rows,
+            target_mailbox_by_identity,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        if pending_target_issues:
+            raise ProviderImportIntegrityGateError(
+                f"invalid import journal for merge source {group_account.source_email}: "
+                + "; ".join(pending_target_issues)
+            )
+
+        latest_committed = latest_committed_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        latest_status = latest_journal_rows(
+            journal_rows,
+            target_provider=target_provider,
+            target_mailboxes=target_mailboxes,
+        )
+        committed_keys = set(latest_committed)
+        used_target_nums: Dict[str, set[bytes]] = {}
+        used_target_gmail_msgids: set[str] = set()
+        used_physical_keys: set[Tuple[Any, ...]] = set()
+        strict_specs: Dict[str, Dict[str, Any]] = {}
+        committed_items: Dict[str, Dict[str, Any]] = {}
+        for (identity, _target_mailbox_key), journal_row in sorted(latest_committed.items()):
+            manifest_row = manifest_row_by_identity.get(identity)
+            if manifest_row is None:
+                continue
+            target_mailbox = str(journal_row.get("target_mailbox") or "")
             expected_content_identities = expected_content_identities_by_id.get(identity)
-            row_used_by_mailbox: Dict[str, set[bytes]] = {}
+            committed_match_row = _committed_target_match_row(manifest_row, journal_row)
+            target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
+            committed_items[identity] = {
+                "identity": identity,
+                "journal_row": journal_row,
+            }
+            strict_specs[identity] = {
+                "manifest_row": manifest_row,
+                "match_row": committed_match_row,
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": target_gmail_msgid,
+                "expected_content_identities": expected_content_identities,
+                "require_internaldate_match": True,
+            }
+
+        pending_items: Dict[str, Dict[str, Any]] = {}
+        for key, pending_row in sorted(latest_status.items()):
+            if pending_row.get("status") != "pending" or key in committed_keys:
+                continue
+            identity = str(pending_row.get("canonical_id") or "")
+            manifest_row = manifest_row_by_identity.get(identity)
+            if manifest_row is None:
+                raise RuntimeError(
+                    "invalid import journal: journal pending identity not in manifest: "
+                    + (identity or "<missing>")
+                )
+            target_mailbox = target_mailbox_by_identity.get(identity)
+            if not target_mailbox:
+                raise RuntimeError(
+                    "invalid import journal: journal pending identity has no target mailbox: "
+                    + identity
+                )
+            expected_content_identities = expected_content_identities_by_id.get(identity)
+            raw_pre_append_gmail_msgids = pending_row.get(
+                "pre_append_gmail_msgids"
+            )
+            pre_append_gmail_msgids = (
+                list(raw_pre_append_gmail_msgids)
+                if isinstance(raw_pre_append_gmail_msgids, list)
+                else None
+            )
+            globally_confirmed = globally_confirmed_pending.get(
+                (
+                    stage_index,
+                    group_account.source_email.casefold(),
+                    identity,
+                )
+            )
+            globally_confirmed_gmail_msgid = (
+                str(globally_confirmed.get("gmail_msgid") or "")
+                if globally_confirmed is not None
+                else ""
+            )
+            if (
+                target_provider == "gmail"
+                and pre_append_gmail_msgids is None
+                and _gmail_pending_needs_neutral_anchor_evidence(manifest_row)
+            ):
+                raise ProviderImportIntegrityGateError(
+                    f"cannot safely recover legacy pending Gmail APPEND {identity}: "
+                    "its allocated Spam/Trash slot may currently use an All Mail "
+                    "append anchor, but the pending journal predates durable "
+                    "pre-APPEND Gmail-ID evidence"
+                )
+            pending_items[identity] = {
+                "account": group_account,
+                "account_dir": account_dir,
+                "journal_rows": journal_rows,
+                "manifest_row": manifest_row,
+                "identity": identity,
+                "target_mailbox": target_mailbox,
+                "expected_content_identities": expected_content_identities,
+                "pre_append_gmail_msgids": pre_append_gmail_msgids,
+                "globally_confirmed_gmail_msgid": (
+                    globally_confirmed_gmail_msgid
+                ),
+            }
+            strict_specs[identity] = {
+                "manifest_row": manifest_row,
+                "match_row": manifest_row,
+                "target_mailbox": target_mailbox,
+                "target_gmail_msgid": globally_confirmed_gmail_msgid,
+                "expected_content_identities": expected_content_identities,
+                "require_internaldate_match": True,
+                "pre_append_gmail_msgids": pre_append_gmail_msgids,
+                "require_unique_fresh_append": (
+                    pre_append_gmail_msgids is not None
+                ),
+            }
+
+        strict_assignments = _target_row_assignments(
+            imap,
+            target_mailboxes,
+            strict_specs,
+            target_provider=target_provider,
+            required_row_keys=set(committed_items),
+            stop_event=stop_event,
+        )
+        for row_key, item in committed_items.items():
+            if row_key not in strict_assignments:
+                if allow_unmatched_committed:
+                    continue
+                raise RuntimeError(
+                    "merge group journal changed while pending APPENDs were being recovered: "
+                    f"{item['identity']} from {group_account.source_email} is no longer present"
+                )
+        for occurrence in strict_assignments.values():
+            used_physical_keys.add(occurrence["physical_key"])
+            used_target_nums.setdefault(
+                _target_mailbox_lookup_key(
+                    occurrence["mailbox"],
+                    "gmail" if target_provider == "gmail" else target_provider,
+                ),
+                set(),
+            ).add(occurrence["num"])
+            if occurrence["gmail_msgid"]:
+                used_target_gmail_msgids.add(occurrence["gmail_msgid"])
+
+        recovery_batch: List[Dict[str, Any]] = []
+        for row_key, item in pending_items.items():
+            occurrence = strict_assignments.get(row_key)
+            matched_mailbox = item["target_mailbox"]
+            matched_num: Optional[bytes] = None
+            matched_gmail_msgid = ""
+            matched_internaldate = ""
+            if occurrence is not None:
+                matched_mailbox = occurrence["mailbox"]
+                matched_num = occurrence["num"]
+                matched_gmail_msgid = occurrence["gmail_msgid"]
+                matched_internaldate = str(occurrence.get("internaldate") or "")
+            recovery_item = {
+                **item,
+                "used_target_nums": used_target_nums,
+                "used_target_gmail_msgids": used_target_gmail_msgids,
+                "used_physical_keys": used_physical_keys,
+                "matched_mailbox": matched_mailbox,
+                "matched_num": matched_num,
+                "matched_gmail_msgid": matched_gmail_msgid,
+                "matched_internaldate": matched_internaldate,
+                "capacity_class": capacity_class_by_source_identity[
+                    (group_account.source_email.casefold(), row_key)
+                ],
+            }
+            recovery_items.append(recovery_item)
+            recovery_batch.append(recovery_item)
+        if recovery_batch:
+            recovery_batches.append(recovery_batch)
+
+    recovery_batch_by_first_item = {
+        id(batch[0]): batch for batch in recovery_batches
+    }
+    for item in recovery_items:
+        recovery_batch = recovery_batch_by_first_item.get(id(item))
+        if recovery_batch is not None:
+            unmatched_specs = {
+                batch_item["identity"]: {
+                    "manifest_row": batch_item["manifest_row"],
+                    "match_row": batch_item["manifest_row"],
+                    "target_mailbox": batch_item["target_mailbox"],
+                    "target_gmail_msgid": batch_item[
+                        "globally_confirmed_gmail_msgid"
+                    ],
+                    "expected_content_identities": batch_item["expected_content_identities"],
+                    "require_internaldate_match": True,
+                    "pre_append_gmail_msgids": batch_item[
+                        "pre_append_gmail_msgids"
+                    ],
+                    "require_unique_fresh_append": (
+                        batch_item["pre_append_gmail_msgids"] is not None
+                    ),
+                }
+                for batch_item in recovery_batch
+                if batch_item["matched_num"] is None
+            }
+            if unmatched_specs:
+                close_assignments = _target_row_assignments(
+                    imap,
+                    target_mailboxes,
+                    unmatched_specs,
+                    target_provider=target_provider,
+                    unavailable_physical_keys=item["used_physical_keys"],
+                    stop_event=stop_event,
+                )
+                for batch_item in recovery_batch:
+                    occurrence = close_assignments.get(batch_item["identity"])
+                    if occurrence is None:
+                        continue
+                    batch_item["matched_mailbox"] = occurrence["mailbox"]
+                    batch_item["matched_num"] = occurrence["num"]
+                    batch_item["matched_gmail_msgid"] = occurrence["gmail_msgid"]
+                    batch_item["matched_internaldate"] = str(
+                        occurrence.get("internaldate") or ""
+                    )
+                    batch_item["used_physical_keys"].add(occurrence["physical_key"])
+                    batch_item["used_target_nums"].setdefault(
+                        _target_mailbox_lookup_key(
+                            occurrence["mailbox"],
+                            "gmail" if target_provider == "gmail" else target_provider,
+                        ),
+                        set(),
+                    ).add(occurrence["num"])
+                    if occurrence["gmail_msgid"]:
+                        batch_item["used_target_gmail_msgids"].add(
+                            occurrence["gmail_msgid"]
+                        )
+        group_account = item["account"]
+        account_dir = item["account_dir"]
+        journal_rows = item["journal_rows"]
+        manifest_row = item["manifest_row"]
+        identity = item["identity"]
+        target_mailbox = item["target_mailbox"]
+        expected_content_identities = item["expected_content_identities"]
+        used_target_nums = item["used_target_nums"]
+        used_target_gmail_msgids = item["used_target_gmail_msgids"]
+        matched_mailbox = item["matched_mailbox"]
+        matched_num = item["matched_num"]
+        matched_gmail_msgid = item["matched_gmail_msgid"]
+        matched_internaldate = item["matched_internaldate"]
+        target_binding = provider_target_journal_binding(config, group_account)
+        _raise_if_stopped(stop_event, f"provider import {group_account.target_email}")
+
+        if matched_num is None:
+            content_class = item["capacity_class"]
+            current_occurrences: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+            for class_entry in content_class["entries"]:
+                for occurrence in _target_physical_occurrences_for_row(
+                    imap,
+                    class_entry["manifest_row"],
+                    class_entry["target_mailbox"],
+                    target_mailboxes,
+                    target_provider=target_provider,
+                    expected_content_identities=class_entry["content_identities"],
+                ):
+                    current_occurrences.setdefault(
+                        occurrence["physical_key"],
+                        occurrence,
+                    )
+            if len(current_occurrences) >= content_class["capacity"]:
+                raise RuntimeError(
+                    f"cannot append pending recovery for {identity} in {target_mailbox!r}: "
+                    f"physical content capacity {content_class['capacity']} is already full"
+                )
+            data = _read_provider_artifact_bytes(
+                _manifest_path(account_dir, manifest_row, "eml_path"),
+                "provider message artifact",
+            )
+            ensure_mailbox(imap, target_mailbox)
+            retry_pre_append_gmail_msgids: Optional[List[str]] = None
             if target_provider == "gmail":
-                row_used_gmail_msgids: set[str] = set()
-                target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
-                matching_mailboxes = gmail_expected_target_mailboxes_for_row(
+                retry_pre_append_gmail_msgids = _gmail_pre_append_message_ids(
+                    imap,
+                    target_mailboxes,
                     manifest_row,
                     target_mailbox,
-                    target_mailboxes,
-                )
-                matched = consume_target_gmail_match_in_mailboxes(
-                    imap,
-                    matching_mailboxes,
-                    manifest_row,
-                    row_used_by_mailbox,
-                    target_gmail_msgid=target_gmail_msgid,
-                    used_gmail_msgids=row_used_gmail_msgids,
                     expected_content_identities=expected_content_identities,
-                    require_internaldate_match=True,
                 )
-                if matched is not None:
-                    continue
-                if target_gmail_msgid:
-                    raise RuntimeError(
-                        f"merge group journal says {identity} from {group_account.source_email} "
-                        f"is committed to Gmail target message {target_gmail_msgid} in {target_mailbox!r}, "
-                        "but that exact target message was not found"
+            append_flags = _flags_for_provider_append(
+                str(manifest_row.get("flags") or ""),
+                target_provider=target_provider,
+                permanent_flags=target_permanent_flags(imap),
+            )
+            _provider_throttle_wait(
+                limiter,
+                len(data),
+                stop_event=stop_event,
+                label=f"provider import {group_account.target_email}",
+            )
+            retry_pending = _journal_row(
+                manifest_row,
+                target_mailbox,
+                "pending",
+                "append-started",
+                target_binding=target_binding,
+                pre_append_gmail_msgids=retry_pre_append_gmail_msgids,
+            )
+            append_journal(account_dir, group_account, retry_pending)
+            journal_rows.append(retry_pending)
+            status, response = append_message(
+                imap,
+                target_mailbox,
+                append_flags,
+                _internaldate_for_append(str(manifest_row.get("internaldate") or "")),
+                data,
+            )
+            if status != "OK":
+                failed_row = _journal_row(
+                    manifest_row,
+                    target_mailbox,
+                    "failed",
+                    "append-failed",
+                    target_binding=target_binding,
+                )
+                append_journal(account_dir, group_account, failed_row)
+                journal_rows.append(failed_row)
+                raise RuntimeError(f"append failed for {identity}: {response}")
+            if target_provider == "gmail":
+                fresh_occurrence = _gmail_confirmed_fresh_append_occurrence(
+                    imap,
+                    target_mailboxes,
+                    manifest_row,
+                    target_mailbox,
+                    retry_pre_append_gmail_msgids or (),
+                    expected_content_identities=expected_content_identities,
+                )
+                matched_num = (
+                    fresh_occurrence["num"]
+                    if fresh_occurrence is not None
+                    else None
+                )
+                if fresh_occurrence is not None:
+                    matched_mailbox = str(fresh_occurrence["mailbox"])
+                    matched_gmail_msgid = str(
+                        fresh_occurrence["gmail_msgid"]
                     )
+                    matched_internaldate = str(
+                        fresh_occurrence.get("internaldate") or ""
+                    )
+                    used_target_nums.setdefault(
+                        _target_mailbox_lookup_key(matched_mailbox, "gmail"),
+                        set(),
+                    ).add(matched_num)
+                    used_target_gmail_msgids.add(matched_gmail_msgid)
             else:
                 matched_num = consume_target_match_num(
                     imap,
                     target_mailbox,
                     manifest_row,
-                    row_used_by_mailbox,
+                    used_target_nums,
                     create_if_missing=False,
                     expected_content_identities=expected_content_identities,
                     require_internaldate_match=True,
                 )
-                if matched_num is not None:
-                    continue
+            if matched_num is None:
+                reject_unconfirmed_internaldate(
+                    identity,
+                    manifest_row,
+                    target_mailbox,
+                    expected_content_identities,
+                    used_target_nums,
+                    used_target_gmail_msgids,
+                )
+                raise RuntimeError(
+                    f"appended target message not found for {identity} in {target_mailbox!r}"
+                )
+            if target_provider != "gmail":
+                matched_mailbox = target_mailbox
+
+        actual_target_internaldate = (
+            matched_internaldate
+            or target_message_internaldate(imap, matched_num)
+        )
+        expected_source_internaldate = _normalized_provider_internaldate(
+            manifest_row.get("internaldate")
+        )
+        if not _legacy_internaldates_equal(
+            actual_target_internaldate,
+            expected_source_internaldate,
+        ):
             raise RuntimeError(
-                f"merge group journal says {identity} from {group_account.source_email} "
-                f"is committed to {target_mailbox!r}, but the target message was not found"
+                f"cannot confirm pending append recovery for {identity} in {target_mailbox!r}: "
+                f"target INTERNALDATE {actual_target_internaldate or '<missing>'!r} does not "
+                f"match source {expected_source_internaldate or '<missing>'!r}; no committed "
+                "journal row was written"
             )
+
+        subscribe_mailbox(imap, target_mailbox)
+        labels_applied: List[str] = []
+        if target_provider == "gmail":
+            target_gmail_msgid = matched_gmail_msgid or _target_gmail_msgid(imap, matched_num)
+            labels_applied = restore_gmail_labels(
+                imap,
+                matched_mailbox,
+                manifest_row,
+                target_num=matched_num,
+                target_mailboxes=target_mailboxes,
+                desired_target_mailbox=target_mailbox,
+            )
+            restore_gmail_starred_flag(
+                imap,
+                matched_mailbox,
+                manifest_row,
+                target_num=matched_num,
+            )
+            restore_imap_flags(
+                imap,
+                matched_mailbox,
+                manifest_row,
+                target_num=matched_num,
+                target_provider=target_provider,
+            )
+        else:
+            target_gmail_msgid = ""
+            restore_imap_flags(
+                imap,
+                target_mailbox,
+                manifest_row,
+                target_num=matched_num,
+                target_provider=target_provider,
+            )
+        committed_row = _journal_row(
+            manifest_row,
+            target_mailbox,
+            "committed",
+            "appended",
+            target_binding=target_binding,
+            target_gmail_msgid=target_gmail_msgid,
+            labels_applied=labels_applied,
+            actual_target_internaldate=actual_target_internaldate,
+        )
+        append_journal(account_dir, group_account, committed_row)
+        journal_rows.append(committed_row)
+        logging.info(
+            "[provider-import] %s: resolved pending APPEND for %s in %s",
+            group_account.source_email,
+            identity,
+            target_mailbox,
+        )
 
 
 def merge_group_empty_target_context(
@@ -5766,8 +10003,8 @@ def merge_group_empty_target_context(
         journaled = set(latest_committed)
         if config.target.provider == "gmail":
             for key, journal_row in latest_committed.items():
-                target_gmail_msgid = str(journal_row.get("target_gmail_msgid") or "")
-                if target_gmail_msgid:
+                target_gmail_msgid = journal_row.get("target_gmail_msgid")
+                if is_valid_gmail_msgid(target_gmail_msgid):
                     gmail_journal_msgids[key] = target_gmail_msgid
         journaled.update(
             key
@@ -5791,13 +10028,11 @@ def merge_group_empty_target_context(
                 continue
             target_mailbox = target_mailbox_by_identity.get(identity)
             if not target_mailbox:
-                desired = translate_source_mailbox_for_target(
+                target_mailbox = _resolved_target_mailbox_for_row(
                     row,
-                    str(row.get("primary_mailbox") or "Archive"),
                     target_mailboxes,
                     target_provider=config.target.provider,
                 )
-                target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
             key = journal_target_key(
                 identity,
                 target_mailbox,
@@ -5811,6 +10046,383 @@ def merge_group_empty_target_context(
     return permitted_rows, permitted_keys, gmail_journal_msgids
 
 
+def provider_routing_plan_path(root: Path) -> Path:
+    return root / ROUTING_PLAN_FILENAME
+
+
+def _routing_source_discovery_snapshot(plan: RoutingPlan) -> Tuple[Tuple[Any, ...], ...]:
+    return tuple(
+        (
+            entry.source.source_account,
+            entry.source.name,
+            entry.source.delimiter,
+            tuple(entry.source.attributes),
+        )
+        for entry in plan.entries
+    )
+
+
+def _routing_plans_have_same_reviewed_mapping(
+    left: RoutingPlan,
+    right: RoutingPlan,
+) -> bool:
+    return bool(
+        left.mapping_digest == right.mapping_digest
+        and _routing_source_discovery_snapshot(left)
+        == _routing_source_discovery_snapshot(right)
+    )
+
+
+def save_provider_routing_plan(root: Path, plan: RoutingPlan) -> Path:
+    """Persist the exact reviewed plan once, without silently replacing it."""
+
+    if not plan.ok:
+        raise RuntimeError("refusing to persist an unresolved routing plan")
+    _raise_if_provider_path_symlink(root, "routing plan root")
+    ensure_private_dir(root)
+    path = provider_routing_plan_path(root)
+    if _atomic_json_create_once(path, plan.to_dict()):
+        return path
+    try:
+        existing_payload = json.loads(_read_provider_private_file(path))
+        existing = RoutingPlan.from_dict(existing_payload)
+    except Exception as exc:
+        raise RuntimeError(
+            f"refusing to replace invalid existing routing plan {path}: {exc}"
+        ) from exc
+    if not existing.ok:
+        raise RuntimeError(
+            f"existing {ROUTING_PLAN_FILENAME} is unresolved; use a new export directory"
+        )
+    if not _routing_plans_have_same_reviewed_mapping(existing, plan):
+        raise RuntimeError(
+            f"refusing to replace existing {ROUTING_PLAN_FILENAME} with a different plan; "
+            "use a new export directory after reviewing changed mapping or source discovery"
+        )
+    return path
+
+
+def validate_provider_routing_plan(
+    config: ProviderMigrationConfig,
+    plan: RoutingPlan,
+) -> None:
+    routing = config.migration.routing
+    if not routing.enabled:
+        raise RuntimeError("a routing plan was supplied but migration.routing is disabled")
+    if not plan.ok:
+        details = list(plan.conflicts)
+        details.extend(
+            f"{entry.source.source_account}/{entry.source.name}: {issue}"
+            for entry in plan.entries
+            for issue in entry.ambiguities
+        )
+        raise RuntimeError("routing plan is unresolved: " + "; ".join(details))
+    replay = resolve_routing_plan(
+        routing,
+        (entry.source for entry in plan.entries),
+        plan.discovered_target_labels,
+    )
+    if replay.mapping_digest != plan.mapping_digest:
+        raise RuntimeError(
+            "persisted routing plan no longer matches migration.routing configuration; "
+            "run preflight again and review the new mapping before importing"
+        )
+    if replay.to_dict() != plan.to_dict():
+        raise RuntimeError(
+            "persisted routing plan is not the canonical result for migration.routing and its "
+            "recorded discovery; run preflight again and review the new plan"
+        )
+
+
+def load_provider_routing_plan(
+    root: Path,
+    config: ProviderMigrationConfig,
+) -> RoutingPlan:
+    _raise_if_provider_path_symlink(root, "routing plan root")
+    path = provider_routing_plan_path(root)
+    try:
+        payload = json.loads(_read_provider_private_file(path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"routing-enabled migration requires a valid {ROUTING_PLAN_FILENAME}; "
+            "rerun provider export or the end-to-end migrate mode with routing enabled: "
+            f"{exc}"
+        ) from exc
+    try:
+        plan = RoutingPlan.from_dict(payload)
+    except Exception as exc:
+        raise RuntimeError(f"invalid persisted routing plan {path}: {exc}") from exc
+    validate_provider_routing_plan(config, plan)
+    return plan
+
+
+def _effective_provider_routing_plan(
+    config: ProviderMigrationConfig,
+    root: Path,
+    supplied: Optional[RoutingPlan],
+    *,
+    persist: bool,
+) -> Optional[RoutingPlan]:
+    """Resolve the one immutable plan artifact used by an execution phase."""
+
+    if not config.migration.routing.enabled:
+        if supplied is not None:
+            raise RuntimeError("routing plan supplied for a migration with routing disabled")
+        return None
+
+    if persist:
+        if supplied is None:
+            supplied = load_provider_routing_plan(root, config)
+        else:
+            validate_provider_routing_plan(config, supplied)
+        save_provider_routing_plan(root, supplied)
+        return load_provider_routing_plan(root, config)
+
+    persisted = load_provider_routing_plan(root, config)
+    if supplied is not None:
+        validate_provider_routing_plan(config, supplied)
+        if not _routing_plans_have_same_reviewed_mapping(supplied, persisted):
+            raise RuntimeError(
+                "supplied routing plan does not match the immutable plan persisted with this export"
+            )
+    return persisted
+
+
+_ROUTING_GMAIL_PRIMARY_NAMES = {
+    "all": "Archive",
+    "inbox": "INBOX",
+    "sent": "Sent",
+    "drafts": "Drafts",
+    "trash": "Trash",
+    "spam": "Spam",
+}
+def _routing_plan_entries_for_account(
+    plan: RoutingPlan,
+    account: MigrationAccount,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    inbox_entry: Optional[Any] = None
+    for entry in plan.entries:
+        if entry.source.source_account.casefold() != account.source_email.casefold():
+            continue
+        if entry.source.name.upper() == "INBOX":
+            if inbox_entry is not None:
+                raise RuntimeError(f"routing plan has duplicate INBOX entries for {account.source_email}")
+            inbox_entry = entry
+            continue
+        if entry.source.name in result:
+            raise RuntimeError(
+                f"routing plan has duplicate source folder {entry.source.name!r} for {account.source_email}"
+            )
+        result[entry.source.name] = entry
+    if inbox_entry is not None:
+        result["INBOX"] = inbox_entry
+    return result
+
+
+def _routing_entry_for_folder(entries: Dict[str, Any], folder: str) -> Optional[Any]:
+    if folder.upper() == "INBOX":
+        return entries.get("INBOX")
+    return entries.get(folder)
+
+
+def routed_manifest_rows(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    manifest_rows: List[Dict[str, Any]],
+    plan: RoutingPlan,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Apply the frozen per-folder plan to staged message memberships.
+
+    Returned rows are ephemeral copies.  Their original content bindings stay
+    valid because routing is separately bound by ``routing_plan_sha256`` in the
+    import journal and export state.
+    """
+
+    validate_provider_routing_plan(config, plan)
+    entries = _routing_plan_entries_for_account(plan, account)
+    if not entries:
+        raise RuntimeError(
+            f"routing plan contains no discovered source folders for {account.source_email}; "
+            "rerun preflight/export with the complete account configuration"
+        )
+    routed: List[Dict[str, Any]] = []
+    excluded_identities: List[str] = []
+    for row in manifest_rows:
+        identity = str(row.get("canonical_id") or "<missing>")
+        raw_memberships = row.get("source_mailboxes")
+        if not isinstance(raw_memberships, list) or not raw_memberships or any(
+            not isinstance(value, str) or not value for value in raw_memberships
+        ):
+            raise RuntimeError(
+                f"routing-enabled staged message {identity} lacks complete source_mailboxes metadata; "
+                "rerun provider export with routing enabled"
+            )
+        membership_entries: List[Tuple[str, Any]] = []
+        for folder in raw_memberships:
+            entry = _routing_entry_for_folder(entries, folder)
+            if entry is None:
+                raise RuntimeError(
+                    f"routing plan has no entry for staged source folder "
+                    f"{account.source_email}/{folder}; rerun preflight/export to resolve discovery drift"
+                )
+            if entry.ambiguous:
+                raise RuntimeError(
+                    f"routing plan entry {account.source_email}/{folder} is ambiguous: "
+                    + "; ".join(entry.ambiguities)
+                )
+            membership_entries.append((folder, entry))
+
+        custom_labels: set[str] = set()
+        system_destinations: set[str] = set()
+        mailbox_destinations: set[str] = set()
+        included_folders: List[str] = []
+        excluded_folders: List[str] = []
+        shared_destinations: set[str] = set()
+        for folder, entry in membership_entries:
+            if entry.excluded:
+                excluded_folders.append(folder)
+                continue
+            included_folders.append(folder)
+            for destination in entry.destinations:
+                if destination.status in {"conflict", "missing_system"}:
+                    raise RuntimeError(
+                        f"routing destination for {account.source_email}/{folder} is unresolved: "
+                        f"{destination.name!r} ({destination.status})"
+                    )
+                if destination.merged:
+                    shared_destinations.add(destination.name)
+                if destination.kind == CUSTOM_LABEL:
+                    custom_labels.add(destination.name)
+                elif destination.kind == GMAIL_SYSTEM:
+                    system_destinations.add(destination.name)
+                elif destination.kind == GENERIC_MAILBOX:
+                    mailbox_destinations.add(destination.name)
+                else:
+                    raise RuntimeError(
+                        f"unsupported routing destination type {destination.kind!r} for {identity}"
+                    )
+
+        if not custom_labels and not system_destinations and not mailbox_destinations:
+            excluded_identities.append(identity)
+            continue
+
+        updated = dict(row)
+        updated.pop(_ROUTING_EXACT_TARGET_MAILBOX_FIELD, None)
+        updated["routing_active"] = True
+        updated["routing_plan_sha256"] = plan.mapping_digest
+        updated["routing_source_folders"] = sorted(
+            set(included_folders),
+            key=lambda value: (value.casefold(), value),
+        )
+        updated["routing_excluded_source_folders"] = sorted(
+            set(excluded_folders),
+            key=lambda value: (value.casefold(), value),
+        )
+        updated["routing_shared_destinations"] = sorted(
+            shared_destinations,
+            key=lambda value: (value.casefold(), value),
+        )
+
+        if config.target.provider == "gmail":
+            if mailbox_destinations:
+                raise RuntimeError("Gmail routing cannot use generic mailbox destinations")
+            if "drafts" in system_destinations and (
+                custom_labels or system_destinations - {"all", "drafts"}
+            ):
+                incompatible = sorted(
+                    custom_labels,
+                    key=lambda value: (value.casefold(), value),
+                )
+                incompatible.extend(
+                    sorted(system_destinations - {"all", "drafts"})
+                )
+                raise RuntimeError(
+                    f"staged message {identity} resolves to Gmail Drafts plus incompatible "
+                    "label/location(s): "
+                    + ", ".join(incompatible)
+                )
+            incompatible_roles = gmail_incompatible_system_roles(system_destinations)
+            if incompatible_roles:
+                raise RuntimeError(
+                    f"staged message {identity} resolves to incompatible Gmail system locations: "
+                    + ", ".join(incompatible_roles)
+                )
+            exclusive = system_destinations & GMAIL_EXCLUSIVE_PRIMARY_ROLES
+            primary_role = next(iter(exclusive), "")
+            if not primary_role:
+                primary_role = "inbox" if "inbox" in system_destinations else "all"
+            updated["primary_mailbox"] = _ROUTING_GMAIL_PRIMARY_NAMES[primary_role]
+            updated["routing_target_labels"] = sorted(
+                custom_labels,
+                key=lambda value: (value.casefold(), value),
+            )
+            updated["routing_system_destinations"] = sorted(system_destinations)
+        else:
+            if custom_labels or system_destinations or len(mailbox_destinations) != 1:
+                raise RuntimeError(
+                    f"non-Gmail staged message {identity} must resolve to exactly one mailbox"
+                )
+            exact_target_mailbox = next(iter(mailbox_destinations))
+            updated["primary_mailbox"] = exact_target_mailbox
+            updated[_ROUTING_EXACT_TARGET_MAILBOX_FIELD] = exact_target_mailbox
+            updated["routing_target_labels"] = []
+            updated["routing_system_destinations"] = []
+        routed.append(updated)
+    return routed, excluded_identities
+
+
+def routing_journal_membership_complete(
+    journal_row: Dict[str, Any],
+    manifest_row: Dict[str, Any],
+) -> bool:
+    if not manifest_row.get("routing_active"):
+        return True
+    required_labels = sorted(
+        {str(value) for value in (manifest_row.get("routing_target_labels") or []) if str(value)},
+        key=lambda value: (value.casefold(), value),
+    )
+    required_systems = sorted(
+        {str(value) for value in (manifest_row.get("routing_system_destinations") or []) if str(value)}
+    )
+    return bool(
+        journal_row.get("routing_plan_sha256") == manifest_row.get("routing_plan_sha256")
+        and journal_row.get("required_gmail_labels") == required_labels
+        and journal_row.get("required_gmail_system_destinations") == required_systems
+        and journal_row.get("label_membership_verified") is True
+    )
+
+
+def routing_committed_journal_issues(
+    journal_rows: List[Dict[str, Any]],
+    manifest_rows: List[Dict[str, Any]],
+    *,
+    target_provider: str,
+    target_mailboxes: Optional[List[MailboxInfo]] = None,
+) -> List[str]:
+    manifest_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    issues: List[str] = []
+    for (identity, target_mailbox), journal_row in latest_committed_journal_rows(
+        journal_rows,
+        target_provider=target_provider,
+        target_mailboxes=target_mailboxes,
+    ).items():
+        manifest_row = manifest_by_id.get(identity)
+        if manifest_row is None or not manifest_row.get("routing_active"):
+            continue
+        if not routing_journal_membership_complete(journal_row, manifest_row):
+            issues.append(
+                f"journal route membership is not verified for {identity} in "
+                f"{target_mailbox or '<missing>'} under routing plan "
+                f"{manifest_row.get('routing_plan_sha256') or '<missing>'}"
+            )
+    return issues
+
+
 def provider_import_account(
     config: ProviderMigrationConfig,
     account: MigrationAccount,
@@ -5818,8 +10430,40 @@ def provider_import_account(
     *,
     stop_event: Optional[object] = None,
     limiter: Optional[RateLimiter] = None,
+    routing_plan: Optional[RoutingPlan] = None,
+) -> None:
+    with _provider_import_lock(
+        config,
+        account,
+        in_root,
+        stop_event=stop_event,
+    ):
+        _provider_import_account_unlocked(
+            config,
+            account,
+            in_root,
+            stop_event=stop_event,
+            limiter=limiter,
+            routing_plan=routing_plan,
+        )
+
+
+def _provider_import_account_unlocked(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    in_root: Path,
+    *,
+    stop_event: Optional[object] = None,
+    limiter: Optional[RateLimiter] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> None:
     _raise_if_provider_path_symlink(in_root, "import root")
+    routing_plan = _effective_provider_routing_plan(
+        config,
+        in_root,
+        routing_plan,
+        persist=False,
+    )
     account_dir = account_export_dir(in_root, account)
     _raise_if_provider_path_symlink(account_dir, "account directory")
     manifest_rows = load_manifest(account_dir)
@@ -5837,6 +10481,8 @@ def provider_import_account(
         target_provider=config.target.provider,
         source_endpoint=config.source,
         target_endpoint=config.target,
+        routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+        routing_enabled=config.migration.routing.enabled,
     )
     metadata_issues = metadata_manifest_issues(account_dir, manifest_rows)
     if metadata_issues:
@@ -5858,7 +10504,33 @@ def provider_import_account(
     mixed_layout_issues = provider_mixed_legacy_layout_issues(account_dir)
     if mixed_layout_issues:
         raise RuntimeError("invalid provider account layout: " + "; ".join(mixed_layout_issues))
-    journal_rows = load_import_journal(account_dir, account, repair_trailing=True)
+    if routing_plan is not None:
+        manifest_rows, excluded_identities = routed_manifest_rows(
+            config,
+            account,
+            manifest_rows,
+            routing_plan,
+        )
+        if excluded_identities:
+            logging.info(
+                "[provider-import] %s: excluding %d staged message(s) whose source memberships are all excluded",
+                account.source_email,
+                len(excluded_identities),
+            )
+    if config.target.provider == "gmail":
+        draft_issues = gmail_draft_combination_issues(manifest_rows)
+        if draft_issues:
+            raise RuntimeError("invalid Gmail Drafts routing/labels: " + "; ".join(draft_issues))
+    # Gmail tail repair is initially read-only.  Many-to-one allocation and,
+    # when present, live pending-APPEND evidence must be proven from the
+    # original bytes before an incomplete crash tail may be removed.
+    defer_gmail_journal_tail_repair = config.target.provider == "gmail"
+    journal_rows = load_import_journal(
+        account_dir,
+        account,
+        repair_trailing=not defer_gmail_journal_tail_repair,
+        defer_trailing_repair=defer_gmail_journal_tail_repair,
+    )
     require_valid_import_journal(journal_rows, account)
     journal_target_issues = journal_target_endpoint_issues(journal_rows, config=config, account=account)
     if journal_target_issues:
@@ -5868,6 +10540,13 @@ def provider_import_account(
         journal_rows,
         manifest_rows,
         target_provider=config.target.provider,
+    )
+    journal_content_issues.extend(
+        pending_journal_manifest_content_issues(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+        )
     )
     if journal_content_issues:
         raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
@@ -5889,16 +10568,187 @@ def provider_import_account(
     used_target_gmail_msgids: set[str] = set()
     target_binding = provider_target_journal_binding(config, account)
     merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
+    merge_group_expected_content_identities_by_id: Dict[
+        str, set[Tuple[int, str]]
+    ] = {}
     if provider_account_merge_enabled(config):
-        merge_group_stages = validated_merge_group_stages(
-            config,
-            in_root,
-            account,
-            manifest_rows,
+        def prepare_merge_group(
+            current_journal_rows: List[Dict[str, Any]],
+            *,
+            repair_trailing_journal: bool,
+            defer_trailing_journal_repair: bool,
+        ) -> Tuple[
+            List[
+                Tuple[
+                    MigrationAccount,
+                    Path,
+                    List[Dict[str, Any]],
+                    List[Dict[str, Any]],
+                ]
+            ],
+            Dict[str, set[Tuple[int, str]]],
+        ]:
+            stages = validated_merge_group_stages(
+                config,
+                in_root,
+                account,
+                manifest_rows,
+                current_journal_rows,
+                repair_trailing_journal=repair_trailing_journal,
+                defer_trailing_journal_repair=defer_trailing_journal_repair,
+                routing_plan_sha256=(
+                    routing_plan.mapping_digest if routing_plan is not None else None
+                ),
+                routing_plan=routing_plan,
+            )
+            require_merge_group_unique_manifest_identities(stages)
+            content_identities_by_id = {
+                **merge_group_payload_content_identities(stages),
+                **expected_content_identities_by_id,
+            }
+            if routing_plan is not None:
+                stages = [
+                    (
+                        group_account,
+                        group_dir,
+                        routed_manifest_rows(
+                            config,
+                            group_account,
+                            group_rows,
+                            routing_plan,
+                        )[0],
+                        group_journal,
+                    )
+                    for group_account, group_dir, group_rows, group_journal in stages
+                ]
+            if config.target.provider == "gmail":
+                merge_draft_issues = [
+                    f"{group_account.source_email}: {issue}"
+                    for group_account, _group_dir, group_rows, _group_journal in stages
+                    for issue in gmail_draft_combination_issues(group_rows)
+                ]
+                if merge_draft_issues:
+                    raise RuntimeError(
+                        "invalid Gmail Drafts routing/labels in merge group: "
+                        + "; ".join(merge_draft_issues)
+                    )
+            if config.target.provider == "gmail":
+                allocation_classes = (
+                    require_merge_group_gmail_destination_allocations_compatible(
+                        stages,
+                        expected_content_identities_by_id=content_identities_by_id,
+                        stop_event=stop_event,
+                    )
+                )
+                allocation_by_source_identity: Dict[
+                    Tuple[str, str], Dict[str, Any]
+                ] = {}
+                for class_index, allocation_class in enumerate(allocation_classes):
+                    for (
+                        source_email,
+                        identity,
+                    ), slot_index in allocation_class["allocations"].items():
+                        slot_profile = allocation_class["slot_profiles"][slot_index]
+                        allocation_by_source_identity[
+                            (source_email.casefold(), identity)
+                        ] = {
+                            "class": class_index,
+                            "slot": slot_index,
+                            "systems": list(slot_profile["systems"]),
+                            "custom_labels": list(slot_profile["custom_labels"]),
+                            "target_gmail_msgids": list(
+                                slot_profile["target_gmail_msgids"]
+                            ),
+                        }
+
+                def apply_allocation_metadata(
+                    source_email: str,
+                    rows: List[Dict[str, Any]],
+                ) -> List[Dict[str, Any]]:
+                    annotated: List[Dict[str, Any]] = []
+                    for row in rows:
+                        identity = str(row.get("canonical_id") or "")
+                        allocation = allocation_by_source_identity.get(
+                            (source_email.casefold(), identity)
+                        )
+                        if allocation is None:
+                            annotated.append(row)
+                            continue
+                        updated = dict(row)
+                        updated["_gmail_duplicate_allocation"] = dict(allocation)
+                        annotated.append(updated)
+                    return annotated
+
+                stages = [
+                    (
+                        group_account,
+                        group_dir,
+                        apply_allocation_metadata(
+                            group_account.source_email,
+                            group_rows,
+                        ),
+                        group_journal,
+                    )
+                    for group_account, group_dir, group_rows, group_journal in stages
+                ]
+                current_rows = apply_allocation_metadata(
+                    account.source_email,
+                    manifest_rows,
+                )
+                for original, annotated in zip(manifest_rows, current_rows):
+                    allocation = annotated.get("_gmail_duplicate_allocation")
+                    if allocation is not None:
+                        original["_gmail_duplicate_allocation"] = allocation
+            return stages, content_identities_by_id
+
+        (
+            merge_group_stages,
+            merge_group_expected_content_identities_by_id,
+        ) = prepare_merge_group(
             journal_rows,
-            repair_trailing_journal=True,
+            repair_trailing_journal=not defer_gmail_journal_tail_repair,
+            defer_trailing_journal_repair=defer_gmail_journal_tail_repair,
         )
-        require_merge_group_unique_manifest_identities(merge_group_stages)
+
+    deferred_gmail_pending_tail_repair = False
+    if defer_gmail_journal_tail_repair:
+        offline_recovery_stages = merge_group_stages or [
+            (account, account_dir, manifest_rows, journal_rows)
+        ]
+        offline_has_unresolved_pending = any(
+            status_row.get("status") == "pending"
+            for (
+                _stage_account,
+                _stage_dir,
+                _stage_rows,
+                stage_journal,
+            ) in offline_recovery_stages
+            for status_row in latest_journal_rows(
+                stage_journal,
+                target_provider="gmail",
+            ).values()
+        )
+        if offline_has_unresolved_pending:
+            # Keep every current/peer journal byte untouched until the target
+            # has supplied one global, read-only pending-APPEND proof.
+            deferred_gmail_pending_tail_repair = True
+        else:
+            # The immutable many-to-one allocation gate (when applicable) has
+            # passed and there is no unresolved pending recovery to protect.
+            journal_rows = load_import_journal(
+                account_dir,
+                account,
+                repair_trailing=True,
+            )
+            if merge_group_stages is not None:
+                (
+                    merge_group_stages,
+                    merge_group_expected_content_identities_by_id,
+                ) = prepare_merge_group(
+                    journal_rows,
+                    repair_trailing_journal=True,
+                    defer_trailing_journal_repair=False,
+                )
 
     with imap_connection(config.target, account, role="target") as imap:
         capabilities: List[str] = []
@@ -5910,60 +10760,399 @@ def provider_import_account(
                     "IMAP server did not advertise X-GM-EXT-1"
                 )
         target_mailboxes = list_mailboxes(imap)
-        journal_content_issues = committed_journal_manifest_content_issues(
-            journal_rows,
-            manifest_rows,
-            target_provider=config.target.provider,
-            target_mailboxes=target_mailboxes,
-        )
-        if journal_content_issues:
-            raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
-        pending = {
-            key
-            for key, row in latest_journal_rows(
-                journal_rows,
-                target_provider=config.target.provider,
-                target_mailboxes=target_mailboxes,
-            ).items()
-            if row.get("status") == "pending"
-        }
-        if merge_group_stages is not None:
-            require_merge_group_target_translation_safe(
-                merge_group_stages,
+        if config.target.provider == "gmail":
+            target_issues = gmail_target_readiness_issues(
+                capabilities,
                 target_mailboxes,
-                target_provider=config.target.provider,
             )
-        merge_group_expected_content_identities_by_id = expected_content_identities_by_id
-        if merge_group_stages is not None:
-            merge_group_expected_content_identities_by_id = merge_group_payload_content_identities(merge_group_stages)
-        target_mailbox_by_identity = translated_target_mailboxes_for_rows(
-            manifest_rows,
+            target_issues.extend(
+                gmail_all_mail_select_issues(
+                    imap,
+                    target_mailboxes,
+                    role="target",
+                )
+            )
+            target_issues.extend(
+                gmail_target_decommission_issues(config.target, account)
+            )
+            if target_issues:
+                raise RuntimeError(
+                    "Gmail target is not import-ready: "
+                    + "; ".join(target_issues)
+                )
+        recovery_stages = merge_group_stages or [
+            (account, account_dir, manifest_rows, journal_rows)
+        ]
+        target_mailbox_by_identity = require_recovery_stages_live_integrity(
+            recovery_stages,
             target_mailboxes,
             target_provider=config.target.provider,
         )
-        committed_target_issues = committed_journal_target_mailbox_issues(
-            journal_rows,
-            target_mailbox_by_identity,
-            target_provider=config.target.provider,
-            target_mailboxes=target_mailboxes,
+        recovery_expected_content_identities_by_id = expected_content_identities_by_id
+        recovery_capacity_classes: List[Dict[str, Any]] = []
+        has_unresolved_pending = any(
+            status_row.get("status") == "pending"
+            for _stage_account, _stage_dir, _stage_rows, stage_journal in recovery_stages
+            for status_row in latest_journal_rows(
+                stage_journal,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            ).values()
         )
-        if committed_target_issues:
-            raise RuntimeError("invalid import journal: " + "; ".join(committed_target_issues))
-        pending_target_issues = pending_journal_target_mailbox_issues(
-            journal_rows,
-            target_mailbox_by_identity,
-            target_provider=config.target.provider,
-            target_mailboxes=target_mailboxes,
-        )
-        if pending_target_issues:
-            raise RuntimeError("invalid import journal: " + "; ".join(pending_target_issues))
+        if merge_group_stages is not None:
+            recovery_expected_content_identities_by_id = (
+                merge_group_expected_content_identities_by_id
+            )
+        if merge_group_stages is not None or has_unresolved_pending:
+            # This gate is manifest/journal-only and must precede Gmail journal
+            # repair or any target mutation.  In particular, an unresolved
+            # pending row without a confirmable date leaves every journal byte
+            # untouched.
+            recovery_capacity_classes = require_merge_group_pending_internaldates_compatible(
+                target_mailboxes,
+                recovery_stages,
+                target_provider=config.target.provider,
+                expected_content_identities_by_id=recovery_expected_content_identities_by_id,
+            )
+
+        def reject_unconfirmed_append_internaldate(
+            identity: str,
+            row: Dict[str, Any],
+            target_mailbox: str,
+            expected_content_identities: Optional[Iterable[Tuple[int, str]]],
+            *,
+            recovery: bool,
+        ) -> None:
+            search_mailboxes = [target_mailbox]
+            if config.target.provider == "gmail":
+                search_mailboxes = gmail_expected_target_mailboxes_for_row(
+                    row,
+                    target_mailbox,
+                    target_mailboxes,
+                )
+            observations: List[Tuple[str, str]] = []
+            for search_mailbox in search_mailboxes:
+                for target_num in target_matching_message_nums(
+                    imap,
+                    search_mailbox,
+                    row,
+                    create_if_missing=False,
+                    expected_content_identities=expected_content_identities,
+                ):
+                    observations.append(
+                        (
+                            search_mailbox,
+                            target_message_internaldate(imap, target_num),
+                        )
+                    )
+            if not observations:
+                return
+            expected_internaldate = _normalized_provider_internaldate(
+                row.get("internaldate")
+            )
+            if any(
+                _legacy_internaldates_equal(
+                    actual_internaldate,
+                    expected_internaldate,
+                )
+                for _mailbox, actual_internaldate in observations
+            ):
+                return
+            observed = ", ".join(
+                sorted(
+                    {
+                        f"{mailbox}: {actual_internaldate or '<missing>'}"
+                        for mailbox, actual_internaldate in observations
+                    }
+                )
+            )
+            phase = "pending append recovery" if recovery else "fresh append"
+            raise RuntimeError(
+                f"cannot confirm {phase} for {identity} in {target_mailbox!r}: "
+                f"byte-identical target content has INTERNALDATE {observed}; expected "
+                f"{expected_internaldate or '<missing>'}; no committed journal row was written"
+            )
+
+        if merge_group_stages is None:
+            require_one_to_one_committed_target_evidence(
+                imap,
+                target_mailboxes,
+                manifest_rows,
+                journal_rows,
+                target_mailbox_by_identity,
+                target_provider=config.target.provider,
+                target_mode=config.migration.target_mode,
+                expected_content_identities_by_id=expected_content_identities_by_id,
+            )
+
+        # One read-only gate precedes Gmail journal-ID repair, pending recovery,
+        # and every other target/journal mutation.  It validates committed
+        # physical allocation, matching-aware pending capacity, and empty-mode
+        # contents against the original journal snapshot.
+        if merge_group_stages is not None:
+            require_merge_group_journals_remote_complete(
+                imap,
+                target_mailboxes,
+                merge_group_stages,
+                target_provider=config.target.provider,
+                expected_content_identities_by_id=recovery_expected_content_identities_by_id,
+                allow_unresolved_pending=True,
+            )
+        if has_unresolved_pending:
+            require_merge_group_pending_target_capacity_compatible(
+                imap,
+                target_mailboxes,
+                recovery_capacity_classes,
+                target_provider=config.target.provider,
+            )
+        if config.migration.target_mode == "empty":
+            preflight_rows = manifest_rows
+            preflight_journaled = set(
+                latest_committed_journal_rows(
+                    journal_rows,
+                    target_provider=config.target.provider,
+                    target_mailboxes=target_mailboxes,
+                )
+            )
+            preflight_journaled.update(
+                key
+                for key, status_row in latest_journal_rows(
+                    journal_rows,
+                    target_provider=config.target.provider,
+                    target_mailboxes=target_mailboxes,
+                ).items()
+                if status_row.get("status") == "pending"
+            )
+            preflight_gmail_msgids = {
+                key: committed_row["target_gmail_msgid"]
+                for key, committed_row in latest_committed_journal_rows(
+                    journal_rows,
+                    target_provider=config.target.provider,
+                    target_mailboxes=target_mailboxes,
+                ).items()
+                if config.target.provider == "gmail"
+                and is_valid_gmail_msgid(
+                    committed_row.get("target_gmail_msgid")
+                )
+            }
+            (
+                preflight_rows,
+                preflight_journaled,
+                preflight_gmail_msgids,
+            ) = merge_group_empty_target_context(
+                config,
+                target_mailboxes,
+                recovery_stages,
+            )
+            enforce_empty_target(
+                imap,
+                target_mailboxes,
+                preflight_rows,
+                preflight_journaled,
+                target_provider=config.target.provider,
+                gmail_journal_msgids=preflight_gmail_msgids,
+                expected_content_identities_by_id=recovery_expected_content_identities_by_id,
+            )
+
         if config.target.provider == "gmail":
-            target_issues = gmail_target_readiness_issues(capabilities, target_mailboxes)
-            target_issues.extend(gmail_all_mail_select_issues(imap, target_mailboxes, role="target"))
-            target_issues.extend(gmail_target_decommission_issues(config.target, account))
-            target_issues.extend(gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes))
-            if target_issues:
-                raise RuntimeError("Gmail target is not import-ready: " + "; ".join(target_issues))
+            require_pending_gmail_append_evidence_safe(
+                imap,
+                target_mailboxes,
+                recovery_stages,
+                expected_content_identities_by_id=(
+                    recovery_expected_content_identities_by_id
+                ),
+                stop_event=stop_event,
+            )
+            if deferred_gmail_pending_tail_repair:
+                # The live, global pending proof above is the first operation
+                # allowed to precede crash-tail repair.  Re-read every stage
+                # without mutation to catch replacement/racing journal state,
+                # then repair all current/peer tails and rebuild the stages from
+                # their authoritative files before recovery can write.
+                complete_journal_by_stage: Dict[
+                    Tuple[str, Path], List[Dict[str, Any]]
+                ] = {}
+                for (
+                    stage_account,
+                    stage_dir,
+                    _stage_rows,
+                    stage_journal,
+                ) in recovery_stages:
+                    stage_key = (stage_account.source_email.casefold(), stage_dir)
+                    observed_journal = load_import_journal(
+                        stage_dir,
+                        stage_account,
+                        defer_trailing_repair=True,
+                    )
+                    if observed_journal != stage_journal:
+                        raise ProviderImportIntegrityGateError(
+                            "import journal changed while pending Gmail APPEND "
+                            f"evidence was being verified: {stage_account.source_email}"
+                        )
+                    complete_journal_by_stage[stage_key] = stage_journal
+
+                repaired_journal_by_stage: Dict[
+                    Tuple[str, Path], List[Dict[str, Any]]
+                ] = {}
+                for (
+                    stage_account,
+                    stage_dir,
+                    _stage_rows,
+                    _stage_journal,
+                ) in recovery_stages:
+                    stage_key = (stage_account.source_email.casefold(), stage_dir)
+                    repaired_stage_journal = load_import_journal(
+                        stage_dir,
+                        stage_account,
+                        repair_trailing=True,
+                    )
+                    if (
+                        repaired_stage_journal
+                        != complete_journal_by_stage[stage_key]
+                    ):
+                        raise ProviderImportIntegrityGateError(
+                            "import journal changed during deferred Gmail "
+                            f"crash-tail repair: {stage_account.source_email}"
+                        )
+                    repaired_journal_by_stage[stage_key] = repaired_stage_journal
+
+                current_stage_key = (account.source_email.casefold(), account_dir)
+                journal_rows = repaired_journal_by_stage[current_stage_key]
+                require_valid_import_journal(journal_rows, account)
+                repaired_target_issues = journal_target_endpoint_issues(
+                    journal_rows,
+                    config=config,
+                    account=account,
+                )
+                if repaired_target_issues:
+                    raise ProviderImportIntegrityGateError(
+                        "invalid import journal: "
+                        + "; ".join(repaired_target_issues)
+                    )
+                repaired_content_issues = committed_journal_manifest_content_issues(
+                    journal_rows,
+                    manifest_rows,
+                    target_provider="gmail",
+                    target_mailboxes=target_mailboxes,
+                )
+                repaired_content_issues.extend(
+                    pending_journal_manifest_content_issues(
+                        journal_rows,
+                        manifest_rows,
+                        target_provider="gmail",
+                        target_mailboxes=target_mailboxes,
+                    )
+                )
+                repaired_content_issues.extend(
+                    invalid_journal_target_gmail_msgid_issues(
+                        journal_rows,
+                        manifest_ids=manifest_ids,
+                    )
+                )
+                repaired_content_issues.extend(
+                    duplicate_journal_target_gmail_msgid_issues(
+                        journal_rows,
+                        manifest_ids=manifest_ids,
+                        target_mailboxes=target_mailboxes,
+                    )
+                )
+                if repaired_content_issues:
+                    raise ProviderImportIntegrityGateError(
+                        "invalid import journal: "
+                        + "; ".join(repaired_content_issues)
+                    )
+
+                if merge_group_stages is not None:
+                    (
+                        merge_group_stages,
+                        merge_group_expected_content_identities_by_id,
+                    ) = prepare_merge_group(
+                        journal_rows,
+                        repair_trailing_journal=False,
+                        defer_trailing_journal_repair=False,
+                    )
+                    recovery_stages = merge_group_stages
+                    recovery_expected_content_identities_by_id = (
+                        merge_group_expected_content_identities_by_id
+                    )
+                else:
+                    recovery_stages = [
+                        (account, account_dir, manifest_rows, journal_rows)
+                    ]
+                    recovery_expected_content_identities_by_id = (
+                        expected_content_identities_by_id
+                    )
+
+                target_mailbox_by_identity = require_recovery_stages_live_integrity(
+                    recovery_stages,
+                    target_mailboxes,
+                    target_provider="gmail",
+                )
+                has_unresolved_pending = any(
+                    status_row.get("status") == "pending"
+                    for (
+                        _stage_account,
+                        _stage_dir,
+                        _stage_rows,
+                        stage_journal,
+                    ) in recovery_stages
+                    for status_row in latest_journal_rows(
+                        stage_journal,
+                        target_provider="gmail",
+                        target_mailboxes=target_mailboxes,
+                    ).values()
+                )
+                recovery_capacity_classes = (
+                    require_merge_group_pending_internaldates_compatible(
+                        target_mailboxes,
+                        recovery_stages,
+                        target_provider="gmail",
+                        expected_content_identities_by_id=(
+                            recovery_expected_content_identities_by_id
+                        ),
+                    )
+                )
+                if merge_group_stages is None:
+                    require_one_to_one_committed_target_evidence(
+                        imap,
+                        target_mailboxes,
+                        manifest_rows,
+                        journal_rows,
+                        target_mailbox_by_identity,
+                        target_provider="gmail",
+                        target_mode=config.migration.target_mode,
+                        expected_content_identities_by_id=(
+                            expected_content_identities_by_id
+                        ),
+                    )
+                else:
+                    require_merge_group_journals_remote_complete(
+                        imap,
+                        target_mailboxes,
+                        recovery_stages,
+                        target_provider="gmail",
+                        expected_content_identities_by_id=(
+                            recovery_expected_content_identities_by_id
+                        ),
+                        allow_unresolved_pending=True,
+                    )
+                if has_unresolved_pending:
+                    require_merge_group_pending_target_capacity_compatible(
+                        imap,
+                        target_mailboxes,
+                        recovery_capacity_classes,
+                        target_provider="gmail",
+                    )
+                require_pending_gmail_append_evidence_safe(
+                    imap,
+                    target_mailboxes,
+                    recovery_stages,
+                    expected_content_identities_by_id=(
+                        recovery_expected_content_identities_by_id
+                    ),
+                    stop_event=stop_event,
+                )
             journal_rows = repair_missing_journal_target_gmail_msgids(
                 imap,
                 account_dir,
@@ -5991,7 +11180,49 @@ def provider_import_account(
                 )
             )
             if repaired_journal_issues:
-                raise RuntimeError("invalid import journal: " + "; ".join(repaired_journal_issues))
+                raise ProviderImportIntegrityGateError(
+                    "invalid import journal: " + "; ".join(repaired_journal_issues)
+                )
+        if has_unresolved_pending:
+            # A Gmail journal repair may have returned a new list.  Keep the
+            # current stage pointed at the authoritative in-memory rows before
+            # batch recovery appends resolutions to it.
+            recovery_stages = [
+                (
+                    group_account,
+                    group_dir,
+                    group_rows,
+                    journal_rows
+                    if group_account.source_email == account.source_email
+                    else group_journal,
+                )
+                for group_account, group_dir, group_rows, group_journal in recovery_stages
+            ]
+            recover_merge_group_pending_appends(
+                config,
+                imap,
+                target_mailboxes,
+                recovery_stages,
+                expected_content_identities_by_id=recovery_expected_content_identities_by_id,
+                limiter=limiter,
+                stop_event=stop_event,
+                allow_unmatched_committed=(
+                    merge_group_stages is None
+                    and config.target.provider != "gmail"
+                    and config.migration.target_mode == "merge"
+                ),
+            )
+        latest_status_rows = latest_journal_rows(
+            journal_rows,
+            target_provider=config.target.provider,
+            target_mailboxes=target_mailboxes,
+        )
+        pending_rows = {
+            key: row
+            for key, row in latest_status_rows.items()
+            if row.get("status") == "pending"
+        }
+        pending = set(pending_rows)
         latest_committed = latest_committed_journal_rows(
             journal_rows,
             target_provider=config.target.provider,
@@ -6002,45 +11233,133 @@ def provider_import_account(
             require_merge_group_journals_remote_complete(
                 imap,
                 target_mailboxes,
-                merge_group_stages,
+                recovery_stages,
                 target_provider=config.target.provider,
-                expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
+                expected_content_identities_by_id=recovery_expected_content_identities_by_id,
             )
-        if config.migration.target_mode == "empty":
-            empty_target_rows = manifest_rows
-            empty_target_journaled = committed | pending
-            empty_target_gmail_msgids = {
-                key: str(row.get("target_gmail_msgid") or "")
-                for key, row in latest_committed.items()
-                if config.target.provider == "gmail" and row.get("target_gmail_msgid")
-            }
-            if merge_group_stages is not None:
-                empty_target_rows, empty_target_journaled, empty_target_gmail_msgids = merge_group_empty_target_context(
-                    config,
-                    target_mailboxes,
-                    merge_group_stages,
-                )
-            enforce_empty_target(
-                imap,
-                target_mailboxes,
-                empty_target_rows,
-                empty_target_journaled,
-                target_provider=config.target.provider,
-                gmail_journal_msgids=empty_target_gmail_msgids,
-                expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
-            )
-        for row in sorted(manifest_rows, key=lambda item: str(item.get("canonical_id", ""))):
-            _raise_if_stopped(stop_event, f"provider import {account.target_email}")
+        ordered_manifest_rows = sorted(
+            manifest_rows,
+            key=lambda item: str(item.get("canonical_id", "")),
+        )
+        ordinary_specs: Dict[str, Dict[str, Any]] = {}
+        priority_committed_identities: set[str] = set()
+        must_exist_committed_identities: set[str] = set()
+        ordinary_target_mailbox_by_identity: Dict[str, str] = {}
+        for row in ordered_manifest_rows:
             identity = str(row.get("canonical_id") or "")
             target_mailbox = target_mailbox_by_identity.get(identity)
             if not target_mailbox:
-                desired = translate_source_mailbox_for_target(
+                target_mailbox = _resolved_target_mailbox_for_row(
                     row,
-                    str(row.get("primary_mailbox") or "Archive"),
                     target_mailboxes,
                     target_provider=config.target.provider,
                 )
-                target_mailbox = resolve_target_mailbox(desired, target_mailboxes, target_provider=config.target.provider)
+            ordinary_target_mailbox_by_identity[identity] = target_mailbox
+            key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
+            expected_content_identities = expected_content_identities_by_id.get(identity)
+            if key in committed:
+                previous_commit = latest_committed.get(key, {})
+                legacy_existing_without_date_evidence = (
+                    previous_commit.get("action") == "existing"
+                    and _existing_content_reuse_target_internaldate(
+                        row,
+                        previous_commit,
+                    )
+                    is None
+                )
+                ordinary_specs[identity] = {
+                    "manifest_row": row,
+                    "match_row": _committed_target_match_row(row, previous_commit),
+                    "target_mailbox": target_mailbox,
+                    "target_gmail_msgid": str(previous_commit.get("target_gmail_msgid") or ""),
+                    "expected_content_identities": expected_content_identities,
+                    # A legacy `existing` commit may predate target-date
+                    # provenance.  Match it by content once so the branch below
+                    # can record the observed target date.  Every other commit
+                    # reserves its effective journal date exactly.
+                    "require_internaldate_match": not legacy_existing_without_date_evidence,
+                }
+                priority_committed_identities.add(identity)
+                if config.migration.target_mode == "empty":
+                    must_exist_committed_identities.add(identity)
+            elif (
+                config.migration.target_mode == "merge"
+                or provider_account_merge_enabled(config)
+                or key in pending
+            ):
+                pending_journal_row = pending_rows.get(key)
+                raw_pre_append_gmail_msgids = (
+                    pending_journal_row.get("pre_append_gmail_msgids")
+                    if pending_journal_row is not None
+                    else None
+                )
+                pre_append_gmail_msgids = (
+                    list(raw_pre_append_gmail_msgids)
+                    if isinstance(raw_pre_append_gmail_msgids, list)
+                    else None
+                )
+                ordinary_specs[identity] = {
+                    "manifest_row": row,
+                    "match_row": row,
+                    "target_mailbox": target_mailbox,
+                    "target_gmail_msgid": "",
+                    "expected_content_identities": expected_content_identities,
+                    "require_internaldate_match": key in pending,
+                    "pre_append_gmail_msgids": pre_append_gmail_msgids,
+                    "require_unique_fresh_append": (
+                        key in pending and pre_append_gmail_msgids is not None
+                    ),
+                }
+        ordinary_assignments = _target_row_assignments(
+            imap,
+            target_mailboxes,
+            ordinary_specs,
+            target_provider=config.target.provider,
+            required_row_keys=priority_committed_identities,
+        )
+        for identity in sorted(must_exist_committed_identities):
+            if identity in ordinary_assignments:
+                continue
+            target_mailbox = ordinary_target_mailbox_by_identity[identity]
+            key = journal_target_key(
+                identity,
+                target_mailbox,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
+            journal_target_gmail_msgid = str(
+                latest_committed.get(key, {}).get("target_gmail_msgid") or ""
+            )
+            if config.target.provider == "gmail" and journal_target_gmail_msgid:
+                raise ProviderImportIntegrityGateError(
+                    f"journal says {identity} is committed to Gmail target message "
+                    f"{journal_target_gmail_msgid} in {target_mailbox!r}, but that exact "
+                    "target message was not found"
+                )
+            raise ProviderImportIntegrityGateError(
+                f"journal says {identity} is committed to {target_mailbox!r}, "
+                "but the target message was not found"
+            )
+        for occurrence in ordinary_assignments.values():
+            used_target_nums.setdefault(
+                _target_mailbox_lookup_key(
+                    occurrence["mailbox"],
+                    "gmail" if config.target.provider == "gmail" else config.target.provider,
+                ),
+                set(),
+            ).add(occurrence["num"])
+            if occurrence["gmail_msgid"]:
+                used_target_gmail_msgids.add(occurrence["gmail_msgid"])
+
+        for row in ordered_manifest_rows:
+            _raise_if_stopped(stop_event, f"provider import {account.target_email}")
+            identity = str(row.get("canonical_id") or "")
+            target_mailbox = ordinary_target_mailbox_by_identity[identity]
             key = journal_target_key(
                 identity,
                 target_mailbox,
@@ -6050,48 +11369,84 @@ def provider_import_account(
             data = payloads_by_identity[identity]
             expected_content_identities = expected_content_identities_by_id.get(identity)
             if key in committed:
-                journal_target_gmail_msgid = str(latest_committed.get(key, {}).get("target_gmail_msgid") or "")
-                committed_mailbox = target_mailbox
-                if config.target.provider == "gmail" and journal_target_gmail_msgid:
-                    committed_match = consume_target_gmail_match_in_mailboxes(
-                        imap,
-                        gmail_expected_target_mailboxes_for_row(row, target_mailbox, target_mailboxes),
-                        row,
-                        used_target_nums,
-                        target_gmail_msgid=journal_target_gmail_msgid,
-                        used_gmail_msgids=used_target_gmail_msgids,
-                        expected_content_identities=expected_content_identities,
-                        require_internaldate_match=False,
-                    )
-                    if committed_match is None:
-                        committed_num = None
-                    else:
-                        committed_mailbox, committed_num, _committed_gmail_msgid = committed_match
-                else:
-                    committed_num = consume_target_match_num(
-                        imap,
-                        target_mailbox,
-                        row,
-                        used_target_nums,
-                        create_if_missing=False,
-                        used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
-                        expected_content_identities=expected_content_identities,
-                        require_internaldate_match=False,
-                    )
+                previous_commit = latest_committed.get(key, {})
+                journal_target_gmail_msgid = str(previous_commit.get("target_gmail_msgid") or "")
+                committed_occurrence = ordinary_assignments.get(identity)
+                committed_mailbox = (
+                    committed_occurrence["mailbox"]
+                    if committed_occurrence is not None
+                    else target_mailbox
+                )
+                committed_num = (
+                    committed_occurrence["num"]
+                    if committed_occurrence is not None
+                    else None
+                )
                 if committed_num is None and config.target.provider == "gmail" and journal_target_gmail_msgid:
-                    raise RuntimeError(
+                    raise ProviderImportIntegrityGateError(
                         f"journal says {identity} is committed to Gmail target message {journal_target_gmail_msgid} "
                         f"in {target_mailbox!r}, but that exact target message was not found"
                     )
                 if committed_num is None and config.migration.target_mode == "empty":
-                    raise RuntimeError(
+                    raise ProviderImportIntegrityGateError(
                         f"journal says {identity} is committed to {target_mailbox!r}, "
                         "but the target message was not found"
                     )
                 if committed_num is not None:
+                    actual_target_internaldate = str(
+                        committed_occurrence.get("internaldate") or ""
+                    )
+                    expected_source_internaldate = _normalized_provider_internaldate(
+                        row.get("internaldate")
+                    )
+                    if (
+                        expected_source_internaldate
+                        and not _legacy_internaldates_equal(
+                            actual_target_internaldate,
+                            expected_source_internaldate,
+                        )
+                    ):
+                        journal_target_internaldate = (
+                            _existing_content_reuse_target_internaldate(
+                                row,
+                                previous_commit,
+                            )
+                        )
+                        if journal_target_internaldate:
+                            if not _legacy_internaldates_equal(
+                                actual_target_internaldate,
+                                journal_target_internaldate,
+                            ):
+                                raise RuntimeError(
+                                    f"journal says {identity} reused an existing target message "
+                                    f"with INTERNALDATE {journal_target_internaldate!r}, but the "
+                                    f"current target has {actual_target_internaldate!r}"
+                                )
+                        elif previous_commit.get("action") == "existing":
+                            upgraded_commit = _journal_row(
+                                row,
+                                target_mailbox,
+                                "committed",
+                                "existing",
+                                target_binding=target_binding,
+                                target_gmail_msgid=journal_target_gmail_msgid,
+                                actual_target_internaldate=actual_target_internaldate,
+                            )
+                            append_journal(account_dir, account, upgraded_commit)
+                            journal_rows.append(upgraded_commit)
+                            latest_committed[key] = upgraded_commit
+                            previous_commit = upgraded_commit
+                        else:
+                            raise RuntimeError(
+                                f"journal says {identity} is committed to {target_mailbox!r}, "
+                                f"but target INTERNALDATE {actual_target_internaldate!r} does not "
+                                f"match source {expected_source_internaldate!r} and the commit is "
+                                "not an explicitly journaled existing-content reuse"
+                            )
                     subscribe_mailbox(imap, target_mailbox)
+                    labels_applied: List[str] = []
                     if config.target.provider == "gmail":
-                        restore_gmail_labels(
+                        labels_applied = restore_gmail_labels(
                             imap,
                             committed_mailbox,
                             row,
@@ -6115,37 +11470,42 @@ def provider_import_account(
                             target_num=committed_num,
                             target_provider=config.target.provider,
                         )
+                    if row.get("routing_active") and (
+                        labels_applied
+                        or not routing_journal_membership_complete(previous_commit, row)
+                    ):
+                        reconciled_row = _journal_row(
+                            row,
+                            target_mailbox,
+                            "committed",
+                            "labels-reconciled" if labels_applied else "route-verified",
+                            target_binding=target_binding,
+                            target_gmail_msgid=journal_target_gmail_msgid,
+                            labels_applied=labels_applied,
+                            internaldate_evidence_from=previous_commit,
+                        )
+                        append_journal(account_dir, account, reconciled_row)
+                        latest_committed[key] = reconciled_row
                     continue
             matched_num = None
             matched_mailbox = target_mailbox
             matched_gmail_msgid = ""
+            recovering_pending_append = key in pending
             if config.migration.target_mode == "merge" or provider_account_merge_enabled(config) or key in pending:
-                if config.target.provider == "gmail":
-                    matched = consume_target_gmail_match_in_mailboxes(
-                        imap,
-                        gmail_expected_target_mailboxes_for_row(row, target_mailbox, target_mailboxes),
-                        row,
-                        used_target_nums,
-                        used_gmail_msgids=used_target_gmail_msgids,
-                        expected_content_identities=expected_content_identities,
-                        require_internaldate_match=False,
-                    )
-                    if matched is not None:
-                        matched_mailbox, matched_num, matched_gmail_msgid = matched
-                else:
-                    matched_num = consume_target_match_num(
-                        imap,
-                        target_mailbox,
-                        row,
-                        used_target_nums,
-                        expected_content_identities=expected_content_identities,
-                        require_internaldate_match=False,
-                    )
+                matched_occurrence = ordinary_assignments.get(identity)
+                if matched_occurrence is not None:
+                    matched_mailbox = matched_occurrence["mailbox"]
+                    matched_num = matched_occurrence["num"]
+                    matched_gmail_msgid = matched_occurrence["gmail_msgid"]
             if matched_num is not None:
+                actual_target_internaldate = str(
+                    matched_occurrence.get("internaldate") or ""
+                )
                 subscribe_mailbox(imap, target_mailbox)
+                labels_applied = []
                 if config.target.provider == "gmail":
                     target_gmail_msgid = matched_gmail_msgid or _target_gmail_msgid(imap, matched_num)
-                    restore_gmail_labels(
+                    labels_applied = restore_gmail_labels(
                         imap,
                         matched_mailbox,
                         row,
@@ -6177,14 +11537,33 @@ def provider_import_account(
                         row,
                         target_mailbox,
                         "committed",
-                        "existing",
+                        "appended" if recovering_pending_append else "existing",
                         target_binding=target_binding,
                         target_gmail_msgid=target_gmail_msgid,
+                        labels_applied=labels_applied,
+                        actual_target_internaldate=actual_target_internaldate,
                     ),
                 )
                 committed.add(key)
                 continue
+            if recovering_pending_append:
+                reject_unconfirmed_append_internaldate(
+                    identity,
+                    row,
+                    target_mailbox,
+                    expected_content_identities,
+                    recovery=True,
+                )
             ensure_mailbox(imap, target_mailbox)
+            pre_append_gmail_msgids: Optional[List[str]] = None
+            if config.target.provider == "gmail":
+                pre_append_gmail_msgids = _gmail_pre_append_message_ids(
+                    imap,
+                    target_mailboxes,
+                    row,
+                    target_mailbox,
+                    expected_content_identities=expected_content_identities,
+                )
             append_flags = _flags_for_provider_append(
                 str(row.get("flags") or ""),
                 target_provider=config.target.provider,
@@ -6199,7 +11578,14 @@ def provider_import_account(
             append_journal(
                 account_dir,
                 account,
-                _journal_row(row, target_mailbox, "pending", "append-started", target_binding=target_binding),
+                _journal_row(
+                    row,
+                    target_mailbox,
+                    "pending",
+                    "append-started",
+                    target_binding=target_binding,
+                    pre_append_gmail_msgids=pre_append_gmail_msgids,
+                ),
             )
             status, response = append_message(
                 imap,
@@ -6215,24 +11601,84 @@ def provider_import_account(
                     _journal_row(row, target_mailbox, "failed", "append-failed", target_binding=target_binding),
                 )
                 raise RuntimeError(f"append failed for {identity}: {response}")
-            appended_num = consume_target_match_num(
-                imap,
-                target_mailbox,
-                row,
-                used_target_nums,
-                create_if_missing=False,
-                used_gmail_msgids=used_target_gmail_msgids if config.target.provider == "gmail" else None,
-                expected_content_identities=expected_content_identities,
-                require_internaldate_match=False,
-            )
-            if appended_num is None:
-                raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
+            appended_occurrence: Optional[Dict[str, Any]] = None
             if config.target.provider == "gmail":
-                target_gmail_msgid = _target_gmail_msgid(imap, appended_num)
-                restore_gmail_labels(imap, target_mailbox, row, target_num=appended_num, target_mailboxes=target_mailboxes)
-                restore_gmail_starred_flag(imap, target_mailbox, row, target_num=appended_num)
+                appended_occurrence = _gmail_confirmed_fresh_append_occurrence(
+                    imap,
+                    target_mailboxes,
+                    row,
+                    target_mailbox,
+                    pre_append_gmail_msgids or (),
+                    expected_content_identities=expected_content_identities,
+                )
+                appended_num = (
+                    appended_occurrence["num"]
+                    if appended_occurrence is not None
+                    else None
+                )
+            else:
+                appended_num = consume_target_match_num(
+                    imap,
+                    target_mailbox,
+                    row,
+                    used_target_nums,
+                    create_if_missing=False,
+                    expected_content_identities=expected_content_identities,
+                    require_internaldate_match=True,
+                )
+            if appended_num is None:
+                reject_unconfirmed_append_internaldate(
+                    identity,
+                    row,
+                    target_mailbox,
+                    expected_content_identities,
+                    recovery=False,
+                )
+                raise RuntimeError(f"appended target message not found for {identity} in {target_mailbox!r}")
+            actual_target_internaldate = (
+                str(appended_occurrence.get("internaldate") or "")
+                if appended_occurrence is not None
+                else target_message_internaldate(imap, appended_num)
+            )
+            expected_source_internaldate = _normalized_provider_internaldate(
+                row.get("internaldate")
+            )
+            if not _legacy_internaldates_equal(
+                actual_target_internaldate,
+                expected_source_internaldate,
+            ):
+                raise RuntimeError(
+                    f"cannot confirm fresh append for {identity} in {target_mailbox!r}: "
+                    f"target INTERNALDATE {actual_target_internaldate or '<missing>'!r} does not "
+                    f"match source {expected_source_internaldate or '<missing>'!r}; no committed "
+                    "journal row was written"
+                )
+            if config.target.provider == "gmail":
+                assert appended_occurrence is not None
+                appended_mailbox = str(appended_occurrence["mailbox"])
+                target_gmail_msgid = str(appended_occurrence["gmail_msgid"])
+                used_target_nums.setdefault(
+                    _target_mailbox_lookup_key(appended_mailbox, "gmail"),
+                    set(),
+                ).add(appended_num)
+                used_target_gmail_msgids.add(target_gmail_msgid)
+                labels_applied = restore_gmail_labels(
+                    imap,
+                    appended_mailbox,
+                    row,
+                    target_num=appended_num,
+                    target_mailboxes=target_mailboxes,
+                    desired_target_mailbox=target_mailbox,
+                )
+                restore_gmail_starred_flag(
+                    imap,
+                    appended_mailbox,
+                    row,
+                    target_num=appended_num,
+                )
             else:
                 target_gmail_msgid = ""
+                labels_applied = []
             append_journal(
                 account_dir,
                 account,
@@ -6243,6 +11689,8 @@ def provider_import_account(
                     "appended",
                     target_binding=target_binding,
                     target_gmail_msgid=target_gmail_msgid,
+                    labels_applied=labels_applied,
+                    actual_target_internaldate=actual_target_internaldate,
                 ),
             )
             committed.add(key)
@@ -6256,26 +11704,87 @@ def provider_import_all(
     max_workers: int,
     ignore_errors: bool,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> None:
     max_workers = _require_max_workers(max_workers)
     _raise_if_provider_path_symlink(in_root, "import root")
+    routing_plan = _effective_provider_routing_plan(
+        config,
+        in_root,
+        routing_plan,
+        persist=False,
+    )
     limiter = RateLimiter(config.limits.throttle.max_bytes_per_second)
+    failure_kind_lock = threading.Lock()
+    integrity_failures: List[str] = []
+    operational_failures: List[str] = []
+
+    def classified_recorded_failure(original: Exception) -> Exception:
+        """Classify only after the active worker set has finished draining."""
+        if _stop_requested(stop_event):
+            return original
+        with failure_kind_lock:
+            recorded_integrity_failures = tuple(integrity_failures)
+            recorded_operational_failures = tuple(operational_failures)
+        if recorded_operational_failures:
+            if type(original) is RuntimeError:
+                return original
+            return RuntimeError(
+                "provider-import failed for "
+                f"{len(recorded_operational_failures)} operational account(s): "
+                + "; ".join(recorded_operational_failures)
+            )
+        if recorded_integrity_failures:
+            if isinstance(original, ProviderImportIntegrityGateError):
+                return original
+            return ProviderImportIntegrityGateError(
+                "provider-import integrity gate failed for "
+                f"{len(recorded_integrity_failures)} account(s): "
+                + "; ".join(recorded_integrity_failures)
+            )
+        return original
 
     def worker(acc: MigrationAccount) -> None:
         _raise_if_stopped(stop_event, f"provider import {acc.target_email}")
-        with_retry(
-            lambda: provider_import_account(config, acc, in_root, stop_event=stop_event, limiter=limiter),
-            attempts=config.limits.retry_max_attempts,
-            label=f"provider import {acc.target_email}",
-            stop_event=stop_event,
-        )
+        try:
+            with_retry(
+                lambda: provider_import_account(
+                    config,
+                    acc,
+                    in_root,
+                    stop_event=stop_event,
+                    limiter=limiter,
+                    routing_plan=routing_plan,
+                ),
+                attempts=config.limits.retry_max_attempts,
+                label=f"provider import {acc.target_email}",
+                stop_event=stop_event,
+            )
+        except Exception as exc:
+            message = f"{acc.email}: {exc}"
+            with failure_kind_lock:
+                failures = (
+                    integrity_failures
+                    if isinstance(exc, ProviderImportIntegrityGateError)
+                    else operational_failures
+                )
+                failures.append(message)
+            raise
 
     if provider_account_merge_enabled(config):
-        errors: List[str] = []
         grouped: Dict[Tuple[str, str], List[MigrationAccount]] = {}
         for account in config.accounts:
             grouped.setdefault(target_merge_group_key(config, account), []).append(account)
-        for target_key, accounts in grouped.items():
+        group_entries = list(grouped.items())
+        group_index_by_representative = {
+            id(accounts[0]): index
+            for index, (_target_key, accounts) in enumerate(group_entries)
+        }
+
+        def group_worker(representative: MigrationAccount) -> Tuple[int, List[str]]:
+            group_index = group_index_by_representative[id(representative)]
+            target_key, accounts = group_entries[group_index]
+            group_errors: List[str] = []
             group_failed = False
             for acc in accounts:
                 if group_failed:
@@ -6284,29 +11793,65 @@ def provider_import_all(
                         f"{target_key[0]} failed"
                     )
                     logging.error("[provider-import] %s", message)
-                    errors.append(message)
+                    group_errors.append(message)
                     continue
                 try:
                     worker(acc)
                 except Exception as exc:
                     message = f"{acc.email}: {exc}"
                     logging.error("[provider-import] %s", message)
-                    errors.append(message)
+                    group_errors.append(message)
                     group_failed = True
                     if not ignore_errors:
                         raise
+            return group_index, group_errors
+
+        errors_by_group: Dict[int, List[str]] = {}
+        representatives = [accounts[0] for _target_key, accounts in group_entries]
+        try:
+            for _representative, result in _provider_account_worker_results(
+                "provider-import-group",
+                representatives,
+                max_workers,
+                group_worker,
+                stop_event,
+            ):
+                group_index, group_errors = result
+                errors_by_group[group_index] = group_errors
+        except Exception as exc:
+            classified = classified_recorded_failure(exc)
+            if classified is exc:
+                raise
+            raise classified from exc
+        errors = [
+            message
+            for group_index in range(len(group_entries))
+            for message in errors_by_group.get(group_index, [])
+        ]
         if errors:
-            raise RuntimeError(f"provider-import failed for {len(errors)} account(s): " + "; ".join(errors))
+            failure = RuntimeError(
+                f"provider-import failed for {len(errors)} account(s): " + "; ".join(errors)
+            )
+            classified = classified_recorded_failure(failure)
+            if classified is failure:
+                raise failure
+            raise classified from failure
         return
 
-    parallel_process_accounts(
-        "provider-import",
-        worker,
-        config.accounts,
-        max_workers,
-        stop_on_error=not ignore_errors,
-        stop_event=stop_event,
-    )
+    try:
+        parallel_process_accounts(
+            "provider-import",
+            worker,
+            config.accounts,
+            max_workers,
+            stop_on_error=not ignore_errors,
+            stop_event=stop_event,
+        )
+    except Exception as exc:
+        classified = classified_recorded_failure(exc)
+        if classified is exc:
+            raise
+        raise classified from exc
 
 
 def _journal_row(
@@ -6317,6 +11862,11 @@ def _journal_row(
     *,
     target_binding: Dict[str, Any],
     target_gmail_msgid: str = "",
+    labels_applied: Optional[Iterable[str]] = None,
+    actual_target_internaldate: Optional[str] = None,
+    internaldate_evidence_from: Optional[Dict[str, Any]] = None,
+    internaldate_origin_action: str = "",
+    pre_append_gmail_msgids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     journal_row = {
         "canonical_id": row.get("canonical_id"),
@@ -6333,9 +11883,736 @@ def _journal_row(
         CONTENT_BINDING_FIELD: row.get(CONTENT_BINDING_FIELD),
         "timestamp": _utc_now(),
     }
-    if target_gmail_msgid:
+    if internaldate_evidence_from is not None and _existing_content_reuse_internaldate_evidence_present(
+        internaldate_evidence_from
+    ):
+        evidence_issue = _existing_content_reuse_internaldate_evidence_issue(
+            row,
+            internaldate_evidence_from,
+        )
+        if evidence_issue:
+            raise RuntimeError(
+                "refusing to propagate invalid existing-content INTERNALDATE evidence: "
+                + evidence_issue
+            )
+        for field in _EXISTING_CONTENT_REUSE_INTERNALDATE_FIELDS:
+            journal_row[field] = internaldate_evidence_from[field]
+    elif actual_target_internaldate is not None:
+        evidence = _existing_content_reuse_internaldate_fields(
+            row,
+            actual_target_internaldate,
+        )
+        if evidence:
+            if (
+                status != "committed"
+                or (
+                    action != "existing"
+                    and internaldate_origin_action != "existing"
+                )
+            ):
+                raise RuntimeError(
+                    "existing-content INTERNALDATE divergence can only be journaled by a "
+                    "committed existing reuse"
+                )
+            journal_row.update(evidence)
+    if target_gmail_msgid not in (None, ""):
+        if not is_valid_gmail_msgid(target_gmail_msgid):
+            raise RuntimeError(
+                f"invalid canonical Gmail target message ID: {target_gmail_msgid!r}"
+            )
         journal_row["target_gmail_msgid"] = target_gmail_msgid
+    if pre_append_gmail_msgids is not None:
+        if status != "pending" or action != "append-started":
+            raise RuntimeError(
+                "pre-APPEND Gmail-ID evidence belongs only on pending append-started rows"
+            )
+        raw_baseline = list(pre_append_gmail_msgids)
+        if any(not is_valid_gmail_msgid(value) for value in raw_baseline):
+            raise RuntimeError("invalid pre-APPEND Gmail-ID evidence")
+        baseline = set(raw_baseline)
+        journal_row["pre_append_gmail_msgids"] = sorted(
+            baseline,
+            key=lambda value: (len(value), value),
+        )
+    if row.get("routing_active"):
+        journal_row["routing_plan_sha256"] = row.get("routing_plan_sha256")
+        journal_row["required_gmail_labels"] = sorted(
+            {str(value) for value in (row.get("routing_target_labels") or []) if str(value)},
+            key=lambda value: (value.casefold(), value),
+        )
+        journal_row["required_gmail_system_destinations"] = sorted(
+            {str(value) for value in (row.get("routing_system_destinations") or []) if str(value)}
+        )
+        journal_row["label_membership_verified"] = status == "committed"
+        journal_row["labels_applied"] = sorted(
+            {str(value) for value in (labels_applied or ()) if str(value)},
+            key=lambda value: (value.casefold(), value),
+        )
     return journal_row
+
+
+def _build_provider_account_routing_report(
+    config: ProviderMigrationConfig,
+    account: MigrationAccount,
+    in_root: Path,
+    plan: RoutingPlan,
+) -> Dict[str, Any]:
+    """Build one deterministic, read-only account/folder routing report."""
+
+    account_dir = account_export_dir(in_root, account)
+    _raise_if_provider_path_symlink(account_dir, "account directory")
+    staged_rows = load_manifest(account_dir)
+    require_manifest_schema(staged_rows)
+    require_unique_manifest_identities(staged_rows)
+    require_manifest_accounts(staged_rows, account)
+    require_manifest_source_provider(staged_rows, config.source.provider)
+    require_manifest_integrity_metadata(staged_rows)
+    require_complete_export_state(
+        account_dir,
+        account=account,
+        manifest_rows=staged_rows,
+        source_provider=config.source.provider,
+        target_provider=config.target.provider,
+        source_endpoint=config.source,
+        target_endpoint=config.target,
+        routing_plan_sha256=plan.mapping_digest,
+        routing_enabled=True,
+    )
+    journal_rows = load_import_journal(account_dir, account)
+    require_valid_import_journal(journal_rows, account)
+    journal_content_issues = committed_journal_manifest_content_issues(
+        journal_rows,
+        staged_rows,
+        target_provider=config.target.provider,
+    )
+    journal_content_issues.extend(
+        pending_journal_manifest_content_issues(
+            journal_rows,
+            staged_rows,
+            target_provider=config.target.provider,
+        )
+    )
+    if journal_content_issues:
+        raise RuntimeError("invalid import journal: " + "; ".join(journal_content_issues))
+    if config.target.provider == "gmail":
+        manifest_ids = {
+            str(row.get("canonical_id") or "")
+            for row in staged_rows
+            if row.get("canonical_id")
+        }
+        gmail_id_issues = invalid_journal_target_gmail_msgid_issues(
+            journal_rows,
+            manifest_ids=manifest_ids,
+        )
+        gmail_id_issues.extend(
+            duplicate_journal_target_gmail_msgid_issues(
+                journal_rows,
+                manifest_ids=manifest_ids,
+            )
+        )
+        gmail_id_issues.extend(
+            missing_journal_target_gmail_msgid_issues(
+                journal_rows,
+                manifest_ids=manifest_ids,
+            )
+        )
+        if gmail_id_issues:
+            raise RuntimeError(
+                "invalid import journal: " + "; ".join(gmail_id_issues)
+            )
+    routed_rows, fully_excluded = routed_manifest_rows(
+        config,
+        account,
+        staged_rows,
+        plan,
+    )
+    routed_by_id = {
+        str(row.get("canonical_id") or ""): row
+        for row in routed_rows
+        if row.get("canonical_id")
+    }
+    evidence_warnings = _deduplicate_report_warnings(
+        {
+            "source_account": account.source_email,
+            "target_account": account.target_email,
+            **warning,
+        }
+        for warning in existing_content_reuse_internaldate_warnings(
+            journal_rows,
+            routed_rows,
+            target_provider=config.target.provider,
+        )
+    )
+
+    latest_route_commit_by_id: Dict[str, Dict[str, Any]] = {}
+    latest_route_status_by_id: Dict[str, Dict[str, Any]] = {}
+    historical_labels_by_id: Dict[str, set[str]] = {}
+    historical_existing_labels_by_id: Dict[str, set[str]] = {}
+    origin_committed_action_by_id: Dict[str, str] = {}
+    for journal_row in journal_rows:
+        identity = str(journal_row.get("canonical_id") or "")
+        manifest_row = routed_by_id.get(identity)
+        if manifest_row is None:
+            continue
+        if journal_row.get("routing_plan_sha256") != plan.mapping_digest:
+            continue
+        if journal_row.get("status") in {"pending", "failed", "committed"}:
+            latest_route_status_by_id[identity] = journal_row
+        if journal_row.get("status") != "committed":
+            continue
+        if not routing_journal_membership_complete(journal_row, manifest_row):
+            continue
+        latest_route_commit_by_id[identity] = journal_row
+        action = str(journal_row.get("action") or "")
+        if action in {"existing", "appended"}:
+            origin_committed_action_by_id.setdefault(identity, action)
+        raw_labels = journal_row.get("labels_applied") or []
+        if not isinstance(raw_labels, list):
+            continue
+        labels = {
+            value for value in raw_labels if isinstance(value, str) and value
+        }
+        if not labels:
+            continue
+        historical_labels_by_id.setdefault(identity, set()).update(labels)
+        applied_to_existing = action == "existing" or (
+            action == "labels-reconciled"
+            and origin_committed_action_by_id.get(identity) == "existing"
+        )
+        if applied_to_existing:
+            historical_existing_labels_by_id.setdefault(identity, set()).update(labels)
+
+    committed_target_gmail_msgid_by_id = {
+        identity: target_gmail_msgid
+        for identity, journal_row in latest_route_commit_by_id.items()
+        if is_valid_gmail_msgid(
+            target_gmail_msgid := journal_row.get("target_gmail_msgid")
+        )
+    }
+
+    plan_entries = _routing_plan_entries_for_account(plan, account)
+    folder_ids: Dict[str, set[str]] = {name: set() for name in plan_entries}
+    routed_folder_ids: Dict[str, set[str]] = {name: set() for name in plan_entries}
+    excluded_folder_ids: Dict[str, set[str]] = {name: set() for name in plan_entries}
+    for staged_row in staged_rows:
+        identity = str(staged_row.get("canonical_id") or "")
+        memberships = [
+            value
+            for value in (staged_row.get("source_mailboxes") or [])
+            if isinstance(value, str) and value
+        ]
+        membership_entries = [
+            (folder, _routing_entry_for_folder(plan_entries, folder))
+            for folder in memberships
+        ]
+        membership_entries = [
+            (folder, entry) for folder, entry in membership_entries if entry is not None
+        ]
+        for _folder, entry in membership_entries:
+            folder_ids.setdefault(entry.source.name, set()).add(identity)
+        for _folder, entry in membership_entries:
+            if entry.excluded:
+                excluded_folder_ids.setdefault(entry.source.name, set()).add(identity)
+            elif entry.destinations:
+                routed_folder_ids.setdefault(entry.source.name, set()).add(identity)
+
+    folder_reports: List[Dict[str, Any]] = []
+    for folder_name, entry in sorted(
+        plan_entries.items(),
+        key=lambda item: (item[0].casefold(), item[0]),
+    ):
+        source_name = entry.source.name
+        exported_ids = folder_ids.get(source_name, set())
+        routed_ids = routed_folder_ids.get(source_name, set())
+        excluded_ids = excluded_folder_ids.get(source_name, set())
+        committed_ids = routed_ids & set(latest_route_commit_by_id)
+        appended_ids = {
+            identity
+            for identity in committed_ids
+            if origin_committed_action_by_id.get(identity) == "appended"
+        }
+        matched_existing_ids = {
+            identity
+            for identity in committed_ids
+            if origin_committed_action_by_id.get(identity) == "existing"
+        }
+        latest_actions: Dict[str, int] = {}
+        for identity in sorted(committed_ids):
+            action = str(latest_route_commit_by_id[identity].get("action") or "committed")
+            latest_actions[action] = latest_actions.get(action, 0) + 1
+        label_applications = [
+            {
+                "canonical_id": identity,
+                "target_gmail_msgid": committed_target_gmail_msgid_by_id.get(
+                    identity,
+                    "",
+                ),
+                "labels": sorted(
+                    historical_labels_by_id[identity],
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "labels_applied_to_existing_match": sorted(
+                    historical_existing_labels_by_id.get(identity, set()),
+                    key=lambda value: (value.casefold(), value),
+                ),
+            }
+            for identity in sorted(routed_ids & set(historical_labels_by_id))
+        ]
+        folder_reports.append(
+            {
+                "source_folder": entry.source.name,
+                "detected_role": entry.detected_role,
+                "assignment_source": entry.assignment_source,
+                "excluded": entry.excluded,
+                "destinations": [destination.to_dict() for destination in entry.destinations],
+                "shared_destinations": sorted(
+                    {
+                        destination.name
+                        for destination in entry.destinations
+                        if destination.merged
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "appears_in_inbox": entry.appears_in_inbox,
+                "exported_messages": len(exported_ids),
+                "routed_messages": len(routed_ids),
+                "excluded_messages": len(excluded_ids),
+                "committed_messages": len(committed_ids),
+                "appended_source_records": len(appended_ids),
+                "imported_source_records": len(appended_ids),
+                "appended_canonical_ids": sorted(appended_ids),
+                "matched_existing_source_records": len(matched_existing_ids),
+                "matched_existing_canonical_ids": sorted(matched_existing_ids),
+                "origin_unclassified_source_records": len(
+                    committed_ids - appended_ids - matched_existing_ids
+                ),
+                "missing_messages": len(routed_ids - committed_ids),
+                "latest_committed_actions": {
+                    key: latest_actions[key] for key in sorted(latest_actions)
+                },
+                "label_applications": label_applications,
+                "warnings": list(entry.warnings),
+            }
+        )
+
+    routed_ids = set(routed_by_id)
+    committed_ids = routed_ids & set(latest_route_commit_by_id)
+    appended_ids = {
+        identity
+        for identity in committed_ids
+        if origin_committed_action_by_id.get(identity) == "appended"
+    }
+    matched_existing_ids = {
+        identity
+        for identity in committed_ids
+        if origin_committed_action_by_id.get(identity) == "existing"
+    }
+    committed_records = [
+        {
+            "canonical_id": identity,
+            "target_gmail_msgid": committed_target_gmail_msgid_by_id.get(
+                identity,
+                "",
+            ),
+            "origin_action": origin_committed_action_by_id.get(
+                identity,
+                "unclassified",
+            ),
+            "required_custom_labels": sorted(
+                {
+                    str(value)
+                    for value in (
+                        routed_by_id[identity].get("routing_target_labels") or []
+                    )
+                    if str(value)
+                },
+                key=lambda value: (value.casefold(), value),
+            ),
+            "required_system_destinations": sorted(
+                {
+                    str(value)
+                    for value in (
+                        routed_by_id[identity].get(
+                            "routing_system_destinations"
+                        )
+                        or []
+                    )
+                    if str(value)
+                }
+            ),
+            "labels_applied": sorted(
+                historical_labels_by_id.get(identity, set()),
+                key=lambda value: (value.casefold(), value),
+            ),
+            "labels_applied_to_existing_match": sorted(
+                historical_existing_labels_by_id.get(identity, set()),
+                key=lambda value: (value.casefold(), value),
+            ),
+        }
+        for identity in sorted(committed_ids)
+    ]
+    physical_records_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for record in committed_records:
+        target_gmail_msgid = str(record["target_gmail_msgid"])
+        if not target_gmail_msgid:
+            continue
+        physical_records_by_id.setdefault(target_gmail_msgid, []).append(record)
+    gmail_physical_messages = []
+    for target_gmail_msgid in sorted(
+        physical_records_by_id,
+        key=lambda value: (len(value), value),
+    ):
+        records = physical_records_by_id[target_gmail_msgid]
+        gmail_physical_messages.append(
+            {
+                "target_account": account.target_email,
+                "target_gmail_msgid": target_gmail_msgid,
+                "target_gmail_msgid_ref": {
+                    "target_account": account.target_email,
+                    "target_gmail_msgid": target_gmail_msgid,
+                },
+                "source_records": len(records),
+                "appended_source_records": sum(
+                    record["origin_action"] == "appended" for record in records
+                ),
+                "matched_existing_source_records": sum(
+                    record["origin_action"] == "existing" for record in records
+                ),
+                "required_custom_labels": sorted(
+                    {
+                        label
+                        for record in records
+                        for label in record["required_custom_labels"]
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "required_system_destinations": sorted(
+                    {
+                        system
+                        for record in records
+                        for system in record["required_system_destinations"]
+                    }
+                ),
+                "labels_applied": sorted(
+                    {
+                        label
+                        for record in records
+                        for label in record["labels_applied"]
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "contributors": [
+                    {
+                        "source_account": account.source_email,
+                        "target_account": account.target_email,
+                        **record,
+                    }
+                    for record in records
+                ],
+            }
+        )
+    appended_gmail_physical_ids = sorted(
+        {
+            committed_target_gmail_msgid_by_id[identity]
+            for identity in appended_ids
+            if identity in committed_target_gmail_msgid_by_id
+        },
+        key=lambda value: (len(value), value),
+    )
+    pending_ids = {
+        identity
+        for identity, row in latest_route_status_by_id.items()
+        if identity not in committed_ids and row.get("status") == "pending"
+    }
+    failed_ids = {
+        identity
+        for identity, row in latest_route_status_by_id.items()
+        if identity not in committed_ids and row.get("status") == "failed"
+    }
+    return {
+        "source_account": account.source_email,
+        "target_account": account.target_email,
+        "routing_plan_sha256": plan.mapping_digest,
+        "ok": not (routed_ids - committed_ids) and not failed_ids and not pending_ids,
+        "exported_messages": len(
+            {
+                str(row.get("canonical_id") or "")
+                for row in staged_rows
+                if row.get("canonical_id")
+            }
+        ),
+        "routed_messages": len(routed_ids),
+        "fully_excluded_messages": len(set(fully_excluded)),
+        "committed_messages": len(committed_ids),
+        "provenance_count_semantics": (
+            "source manifest records; Gmail physical-message IDs are separately deduplicated"
+        ),
+        "appended_source_records": len(appended_ids),
+        "imported_source_records": len(appended_ids),
+        "appended_canonical_ids": sorted(appended_ids),
+        "appended_gmail_physical_messages": len(appended_gmail_physical_ids),
+        "appended_gmail_physical_message_ids": appended_gmail_physical_ids,
+        "matched_existing_source_records": len(matched_existing_ids),
+        "matched_existing_canonical_ids": sorted(matched_existing_ids),
+        "origin_unclassified_source_records": len(
+            committed_ids - appended_ids - matched_existing_ids
+        ),
+        "committed_records": committed_records,
+        "gmail_physical_messages": gmail_physical_messages,
+        "missing_messages": sorted(routed_ids - committed_ids),
+        "pending_messages": sorted(pending_ids),
+        "failed_messages": sorted(failed_ids),
+        "labels_applied": [
+            {
+                "canonical_id": identity,
+                "target_gmail_msgid": committed_target_gmail_msgid_by_id.get(
+                    identity,
+                    "",
+                ),
+                "labels": sorted(
+                    labels,
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "labels_applied_to_existing_match": sorted(
+                    historical_existing_labels_by_id.get(identity, set()),
+                    key=lambda value: (value.casefold(), value),
+                ),
+            }
+            for identity, labels in sorted(historical_labels_by_id.items())
+        ],
+        "folders": folder_reports,
+        "warnings": evidence_warnings,
+    }
+
+
+def build_provider_routing_report(
+    config: ProviderMigrationConfig,
+    in_root: Path,
+    *,
+    routing_plan: Optional[RoutingPlan] = None,
+) -> Dict[str, Any]:
+    """Build the deterministic provider portion of the final routing report."""
+
+    _raise_if_provider_path_symlink(in_root, "routing report root")
+    routing_plan = _effective_provider_routing_plan(
+        config,
+        in_root,
+        routing_plan,
+        persist=False,
+    )
+    if routing_plan is None:
+        raise RuntimeError("provider routing report requires migration.routing.enabled=true")
+    sorted_accounts = sorted(
+        config.accounts,
+        key=lambda item: (item.source_email.casefold(), item.source_email),
+    )
+    account_entries = [
+        (
+            account,
+            _build_provider_account_routing_report(
+                config,
+                account,
+                in_root,
+                routing_plan,
+            ),
+        )
+        for account in sorted_accounts
+    ]
+    accounts = [account_report for _account, account_report in account_entries]
+    aggregated_warnings = _deduplicate_report_warnings(
+        list(routing_plan.warnings)
+        + [
+            warning
+            for account in accounts
+            for warning in account.get("warnings", [])
+        ]
+    )
+    physical_contributors_by_ref: Dict[
+        Tuple[Tuple[str, str], str],
+        List[Dict[str, Any]],
+    ] = {}
+    for account, account_report in account_entries:
+        merge_group_key = target_merge_group_key(config, account)
+        for physical_record in account_report.get(
+            "gmail_physical_messages",
+            [],
+        ):
+            target_gmail_msgid = str(
+                physical_record.get("target_gmail_msgid") or ""
+            )
+            if not target_gmail_msgid:
+                continue
+            contributors = physical_record.get("contributors") or []
+            if not isinstance(contributors, list):
+                continue
+            physical_contributors_by_ref.setdefault(
+                (merge_group_key, target_gmail_msgid),
+                [],
+            ).extend(
+                contributor
+                for contributor in contributors
+                if isinstance(contributor, dict)
+            )
+    gmail_physical_messages: List[Dict[str, Any]] = []
+    for merge_group_key, target_gmail_msgid in sorted(
+        physical_contributors_by_ref,
+        key=lambda value: (
+            value[0][0].casefold(),
+            value[0][0],
+            value[0][1],
+            len(value[1]),
+            value[1],
+        ),
+    ):
+        contributors = sorted(
+            physical_contributors_by_ref[(merge_group_key, target_gmail_msgid)],
+            key=lambda item: (
+                str(item.get("source_account") or "").casefold(),
+                str(item.get("source_account") or ""),
+                str(item.get("canonical_id") or ""),
+            ),
+        )
+        gmail_physical_messages.append(
+            {
+                "target_account": merge_group_key[0],
+                "target_gmail_msgid": target_gmail_msgid,
+                "target_gmail_msgid_ref": {
+                    "target_account": merge_group_key[0],
+                    "target_gmail_msgid": target_gmail_msgid,
+                },
+                "source_records": len(contributors),
+                "source_accounts": sorted(
+                    {
+                        str(item.get("source_account") or "")
+                        for item in contributors
+                        if item.get("source_account")
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "appended_source_records": sum(
+                    item.get("origin_action") == "appended"
+                    for item in contributors
+                ),
+                "matched_existing_source_records": sum(
+                    item.get("origin_action") == "existing"
+                    for item in contributors
+                ),
+                "required_custom_labels": sorted(
+                    {
+                        str(label)
+                        for item in contributors
+                        for label in (item.get("required_custom_labels") or [])
+                        if str(label)
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "required_system_destinations": sorted(
+                    {
+                        str(system)
+                        for item in contributors
+                        for system in (
+                            item.get("required_system_destinations") or []
+                        )
+                        if str(system)
+                    }
+                ),
+                "labels_applied": sorted(
+                    {
+                        str(label)
+                        for item in contributors
+                        for label in (item.get("labels_applied") or [])
+                        if str(label)
+                    },
+                    key=lambda value: (value.casefold(), value),
+                ),
+                "contributors": contributors,
+            }
+        )
+    appended_gmail_physical_refs = sorted(
+        {
+            (target_merge_group_key(config, account), target_gmail_msgid)
+            for account, account_report in account_entries
+            for target_gmail_msgid in account_report[
+                "appended_gmail_physical_message_ids"
+            ]
+        },
+        key=lambda value: (
+            value[0][0].casefold(),
+            value[0][0],
+            value[0][1],
+            len(value[1]),
+            value[1],
+        ),
+    )
+    return {
+        "version": 1,
+        "ok": routing_plan.ok and all(account["ok"] for account in accounts),
+        "routing_plan_sha256": routing_plan.mapping_digest,
+        "labels": {
+            "planned_create": list(routing_plan.labels_to_create),
+            "planned_reuse": list(routing_plan.labels_reused),
+        },
+        "totals": {
+            "accounts": len(accounts),
+            "exported_messages": sum(account["exported_messages"] for account in accounts),
+            "routed_messages": sum(account["routed_messages"] for account in accounts),
+            "fully_excluded_messages": sum(
+                account["fully_excluded_messages"] for account in accounts
+            ),
+            "committed_messages": sum(account["committed_messages"] for account in accounts),
+            "provenance_count_semantics": (
+                "source manifest records summed across accounts; Gmail physical-message IDs "
+                "are deduplicated within each target merge group"
+            ),
+            "appended_source_records": sum(
+                account["appended_source_records"] for account in accounts
+            ),
+            "imported_source_records": sum(
+                account["imported_source_records"] for account in accounts
+            ),
+            "appended_gmail_physical_messages": len(
+                appended_gmail_physical_refs
+            ),
+            "appended_gmail_physical_message_ids": [
+                target_gmail_msgid
+                for _merge_group_key, target_gmail_msgid in appended_gmail_physical_refs
+            ],
+            "appended_gmail_physical_message_refs": [
+                {
+                    "target_account": merge_group_key[0],
+                    "target_gmail_msgid": target_gmail_msgid,
+                }
+                for merge_group_key, target_gmail_msgid in appended_gmail_physical_refs
+            ],
+            "matched_existing_source_records": sum(
+                account["matched_existing_source_records"] for account in accounts
+            ),
+            "origin_unclassified_source_records": sum(
+                account["origin_unclassified_source_records"] for account in accounts
+            ),
+            "missing_messages": sum(len(account["missing_messages"]) for account in accounts),
+            "pending_messages": sum(len(account["pending_messages"]) for account in accounts),
+            "failed_messages": sum(len(account["failed_messages"]) for account in accounts),
+            "messages_with_labels_applied": sum(
+                len(account["labels_applied"]) for account in accounts
+            ),
+            "messages_with_labels_applied_to_existing_matches": sum(
+                1
+                for account in accounts
+                for item in account["labels_applied"]
+                if item["labels_applied_to_existing_match"]
+            ),
+            "gmail_physical_messages": len(gmail_physical_messages),
+            "gmail_physical_message_merges": sum(
+                record["source_records"] > 1
+                for record in gmail_physical_messages
+            ),
+            "warnings": sum(len(account.get("warnings", [])) for account in accounts),
+        },
+        "accounts": accounts,
+        "gmail_physical_messages": gmail_physical_messages,
+        "warnings": aggregated_warnings,
+    }
 
 
 def provider_audit_account(
@@ -6344,6 +12621,7 @@ def provider_audit_account(
     in_root: Path,
     *,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> Tuple[str, List[str]]:
     issues: List[str] = []
     _raise_if_stopped(stop_event, f"provider audit {account.email}")
@@ -6351,6 +12629,15 @@ def provider_audit_account(
         _raise_if_provider_path_symlink(in_root, "audit root")
     except RuntimeError as exc:
         return account.email, [str(exc)]
+    try:
+        routing_plan = _effective_provider_routing_plan(
+            config,
+            in_root,
+            routing_plan,
+            persist=False,
+        )
+    except Exception as exc:
+        return account.email, [f"routing plan validation failed: {exc}"]
     account_dir = account_export_dir(in_root, account)
     try:
         _raise_if_provider_path_symlink(account_dir, "account directory")
@@ -6372,6 +12659,8 @@ def provider_audit_account(
             target_provider=config.target.provider,
             source_endpoint=config.source,
             target_endpoint=config.target,
+            routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+            routing_enabled=config.migration.routing.enabled,
         )
     )
     identities = set()
@@ -6385,6 +12674,7 @@ def provider_audit_account(
     issues.extend(provider_mixed_legacy_layout_issues(account_dir))
     issues.extend(gmail_target_decommission_issues(config.target, account))
     manifest_ids = {str(row.get("canonical_id") or "") for row in rows if row.get("canonical_id")}
+    routed_rows = rows
     try:
         journal_rows = load_import_journal(account_dir, account)
     except Exception as exc:
@@ -6401,15 +12691,34 @@ def provider_audit_account(
             )
         )
         issues.extend(
-            offline_journal_target_mailbox_issues(
+            pending_journal_manifest_content_issues(
                 journal_rows,
                 rows,
+                target_provider=config.target.provider,
+            )
+        )
+        if routing_plan is not None:
+            try:
+                routed_rows, _excluded_identities = routed_manifest_rows(
+                    config,
+                    account,
+                    rows,
+                    routing_plan,
+                )
+            except Exception as exc:
+                issues.append(f"routing plan application failed: {exc}")
+                routed_rows = []
+        issues.extend(
+            offline_journal_target_mailbox_issues(
+                journal_rows,
+                routed_rows,
                 target_provider=config.target.provider,
             )
         )
         if config.target.provider == "gmail":
             issues.extend(invalid_journal_target_gmail_msgid_issues(journal_rows, manifest_ids=manifest_ids))
     if config.target.provider == "gmail":
+        issues.extend(gmail_draft_combination_issues(routed_rows))
         if journal_rows is not None:
             issues.extend(
                 missing_journal_target_gmail_msgid_issues(
@@ -6564,17 +12873,33 @@ def provider_audit_all(
     *,
     max_workers: int,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     try:
         _raise_if_provider_path_symlink(in_root, "audit root")
     except RuntimeError as exc:
         return False, [str(exc)]
+    try:
+        routing_plan = _effective_provider_routing_plan(
+            config,
+            in_root,
+            routing_plan,
+            persist=False,
+        )
+    except Exception as exc:
+        return False, [f"routing plan validation failed: {exc}"]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> List[str]:
         _raise_if_stopped(stop_event, f"provider audit {acc.email}")
-        _name, account_issues = provider_audit_account(config, acc, in_root, stop_event=stop_event)
+        _name, account_issues = provider_audit_account(
+            config,
+            acc,
+            in_root,
+            stop_event=stop_event,
+            routing_plan=routing_plan,
+        )
         _raise_if_stopped(stop_event, f"provider audit {acc.email}")
         return [f"{acc.email}: {issue}" for issue in account_issues]
 
@@ -6594,7 +12919,9 @@ def provider_validate_account(
     allow_unresolved_pending: bool = False,
     repair_trailing_journal: bool = False,
     allow_missing_gmail_target_msgid: bool = False,
+    include_journal: bool = True,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     _raise_if_stopped(stop_event, f"provider validate {account.email}")
     account_dir = account_export_dir(in_root, account)
@@ -6603,10 +12930,13 @@ def provider_validate_account(
         "missing": [],
         "duplicates": [],
         "failed": [],
+        "warnings": [],
         "remote_missing": [],
         "remote_checked": 0,
         "committed": 0,
         "exported": 0,
+        "routed": 0,
+        "excluded": [],
         "ok": False,
     }
     try:
@@ -6615,8 +12945,22 @@ def provider_validate_account(
         report["failed"].append(str(exc))
         return account.email, report
     try:
+        routing_plan = _effective_provider_routing_plan(
+            config,
+            in_root,
+            routing_plan,
+            persist=False,
+        )
+    except Exception as exc:
+        report["failed"].append(f"routing plan validation failed: {exc}")
+        return account.email, report
+    try:
         _raise_if_provider_path_symlink(account_dir, "account directory")
-        journal_rows = load_import_journal(account_dir, account, repair_trailing=repair_trailing_journal)
+        journal_rows = (
+            load_import_journal(account_dir, account, repair_trailing=repair_trailing_journal)
+            if include_journal
+            else []
+        )
         manifest_rows = load_manifest(account_dir)
     except Exception as exc:
         report["failed"].append(str(exc))
@@ -6632,6 +12976,8 @@ def provider_validate_account(
             target_provider=config.target.provider,
             source_endpoint=config.source,
             target_endpoint=config.target,
+            routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+            routing_enabled=config.migration.routing.enabled,
         )
     )
 
@@ -6653,6 +12999,36 @@ def provider_validate_account(
     report["failed"].extend(journal_issues)
     report["failed"].extend(journal_target_endpoint_issues(journal_rows, config=config, account=account))
 
+    all_manifest_ids = {
+        str(row.get("canonical_id") or "")
+        for row in manifest_rows
+        if row.get("canonical_id")
+    }
+    all_identity_issues, _all_manifest_id_counts = manifest_identity_issues(manifest_rows)
+    if routing_plan is not None:
+        try:
+            manifest_rows, excluded_identities = routed_manifest_rows(
+                config,
+                account,
+                manifest_rows,
+                routing_plan,
+            )
+        except Exception as exc:
+            report["failed"].append(f"routing plan validation failed: {exc}")
+            manifest_rows = []
+            excluded_identities = sorted(all_manifest_ids)
+        report["excluded"] = sorted(excluded_identities)
+    if config.target.provider == "gmail":
+        report["failed"].extend(gmail_draft_combination_issues(manifest_rows))
+    if routing_plan is not None and manifest_rows and not allow_unresolved_pending:
+        report["failed"].extend(
+            routing_committed_journal_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=config.target.provider,
+            )
+        )
+
     journal_content_checked = False
 
     def append_journal_content_failures(
@@ -6662,6 +13038,14 @@ def provider_validate_account(
         journal_content_checked = True
         report["failed"].extend(
             committed_journal_manifest_content_issues(
+                journal_rows,
+                manifest_rows,
+                target_provider=config.target.provider,
+                target_mailboxes=target_mailboxes,
+            )
+        )
+        report["failed"].extend(
+            pending_journal_manifest_content_issues(
                 journal_rows,
                 manifest_rows,
                 target_provider=config.target.provider,
@@ -6702,6 +13086,11 @@ def provider_validate_account(
 
     if not check_target:
         append_journal_content_failures()
+        report["warnings"] = existing_content_reuse_internaldate_warnings(
+            journal_rows,
+            manifest_rows,
+            target_provider=config.target.provider,
+        )
         report["failed"].extend(
             offline_journal_target_mailbox_issues(
                 journal_rows,
@@ -6711,7 +13100,8 @@ def provider_validate_account(
         )
         append_unresolved_pending_failures()
 
-    identity_issues, manifest_id_counts = manifest_identity_issues(manifest_rows)
+    _routed_identity_issues, manifest_id_counts = manifest_identity_issues(manifest_rows)
+    identity_issues = all_identity_issues
     for issue in identity_issues:
         if issue.startswith("duplicate manifest identity:"):
             match = re.search(r"duplicate manifest identity: (.*?) \((\d+) rows\)", issue)
@@ -6727,7 +13117,7 @@ def provider_validate_account(
     expected_content_identities_by_id = manifest_payload_content_identities(account_dir, manifest_rows)
     merge_group_stages: Optional[List[Tuple[MigrationAccount, Path, List[Dict[str, Any]], List[Dict[str, Any]]]]] = None
     merge_group_stage_error: Optional[str] = None
-    if provider_account_merge_enabled(config):
+    if include_journal and provider_account_merge_enabled(config):
         try:
             merge_group_stages = validated_merge_group_stages(
                 config,
@@ -6735,8 +13125,26 @@ def provider_validate_account(
                 account,
                 manifest_rows,
                 journal_rows,
+                repair_trailing_journal=repair_trailing_journal,
+                routing_plan_sha256=(routing_plan.mapping_digest if routing_plan is not None else None),
+                routing_plan=routing_plan,
             )
             require_merge_group_unique_manifest_identities(merge_group_stages)
+            if routing_plan is not None:
+                merge_group_stages = [
+                    (
+                        group_account,
+                        group_dir,
+                        routed_manifest_rows(
+                            config,
+                            group_account,
+                            group_rows,
+                            routing_plan,
+                        )[0],
+                        group_journal,
+                    )
+                    for group_account, group_dir, group_rows, group_journal in merge_group_stages
+                ]
         except Exception as exc:
             merge_group_stage_error = str(exc)
             report["failed"].append(merge_group_stage_error)
@@ -6755,7 +13163,8 @@ def provider_validate_account(
         if config.target.provider == "gmail"
         else []
     )
-    report["exported"] = len(manifest_ids)
+    report["exported"] = len(all_manifest_ids)
+    report["routed"] = len(manifest_ids)
 
     def evaluate_journal(
         expected_target_by_id: Optional[Dict[str, str]] = None,
@@ -6843,6 +13252,15 @@ def provider_validate_account(
                     target_mailboxes,
                     target_provider=config.target.provider,
                 )
+                duplicate_capacity_stages = merge_group_stages or [
+                    (account, account_dir, manifest_rows, journal_rows)
+                ]
+                expected_identity_sets_by_target = merge_group_expected_identity_sets_by_target(
+                    duplicate_capacity_stages,
+                    target_mailboxes,
+                    target_provider=config.target.provider,
+                    expected_content_identities_by_id=merge_group_expected_content_identities_by_id,
+                )
                 if config.target.provider == "gmail":
                     report["failed"].extend(gmail_target_system_mailbox_issues(manifest_rows, target_mailboxes))
                 append_unresolved_pending_failures(target_mailboxes=target_mailboxes)
@@ -6893,9 +13311,10 @@ def provider_validate_account(
                     )
                     empty_target_journaled = set(effective_committed_rows)
                     empty_target_gmail_msgids = {
-                        key: str(row.get("target_gmail_msgid") or "")
+                        key: row["target_gmail_msgid"]
                         for key, row in effective_committed_rows.items()
-                        if config.target.provider == "gmail" and row.get("target_gmail_msgid")
+                        if config.target.provider == "gmail"
+                        and is_valid_gmail_msgid(row.get("target_gmail_msgid"))
                     }
                     if merge_group_stages is not None:
                         empty_target_rows, empty_target_journaled, empty_target_gmail_msgids = merge_group_empty_target_context(
@@ -6924,22 +13343,86 @@ def provider_validate_account(
                         target_provider=config.target.provider,
                         target_mailboxes=target_mailboxes,
                     )
+                    committed_journal_by_id = {
+                        str(committed_row.get("canonical_id") or ""): committed_row
+                        for committed_row in effective_committed_rows.values()
+                        if committed_row.get("canonical_id")
+                    }
                     target_gmail_msgid_by_id = {
-                        str(row.get("canonical_id") or ""): str(row.get("target_gmail_msgid") or "")
+                        str(row.get("canonical_id") or ""): row[
+                            "target_gmail_msgid"
+                        ]
                         for row in effective_committed_rows.values()
-                        if row.get("target_gmail_msgid")
+                        if is_valid_gmail_msgid(row.get("target_gmail_msgid"))
                     }
-                    committed_target_gmail_msgids = {
-                        target_gmail_msgid
-                        for target_gmail_msgid in target_gmail_msgid_by_id.values()
-                        if target_gmail_msgid
-                    }
+                    validation_specs: Dict[str, Dict[str, Any]] = {}
+                    for identity, row in by_id.items():
+                        target_mailbox = target_by_id.get(identity)
+                        committed_journal_row = committed_journal_by_id.get(identity)
+                        if not target_mailbox or committed_journal_row is None:
+                            continue
+                        validation_specs[identity] = {
+                            "manifest_row": row,
+                            "match_row": _committed_target_match_row(
+                                row,
+                                committed_journal_row,
+                            ),
+                            "target_mailbox": target_mailbox,
+                            "target_gmail_msgid": target_gmail_msgid_by_id.get(identity, ""),
+                            "expected_content_identities": expected_content_identities_by_id.get(identity),
+                            "require_internaldate_match": True,
+                            # A Gmail physical message in All Mail is not enough:
+                            # validation also proves its required primary-label
+                            # mailbox membership.
+                            "required_mailbox": (
+                                target_mailbox
+                                if config.target.provider == "gmail"
+                                else ""
+                            ),
+                        }
+                    validation_assignments = _target_row_assignments(
+                        imap,
+                        target_mailboxes,
+                        validation_specs,
+                        target_provider=config.target.provider,
+                        required_row_keys=set(validation_specs),
+                    )
+                    for occurrence in validation_assignments.values():
+                        used_target_nums.setdefault(
+                            _target_mailbox_lookup_key(
+                                occurrence["mailbox"],
+                                "gmail"
+                                if config.target.provider == "gmail"
+                                else config.target.provider,
+                            ),
+                            set(),
+                        ).add(occurrence["num"])
+                        if occurrence["gmail_msgid"]:
+                            used_target_gmail_msgids.add(occurrence["gmail_msgid"])
                     for identity, row in by_id.items():
                         _raise_if_stopped(stop_event, f"provider validate {account.email}")
                         target_mailbox = target_by_id.get(identity)
                         if not target_mailbox:
                             continue
+                        committed_journal_row = committed_journal_by_id.get(identity)
+                        assigned_occurrence = validation_assignments.get(identity)
                         expected_content_identities = expected_content_identities_by_id.get(identity)
+                        duplicate_capacity_target_key = (
+                            "gmail-physical-message"
+                            if config.target.provider == "gmail"
+                            else _target_mailbox_lookup_key(
+                                target_mailbox,
+                                config.target.provider,
+                            )
+                        )
+                        expected_identity_sets_by_source = expected_identity_sets_by_target.get(
+                            duplicate_capacity_target_key,
+                            [],
+                        )
+                        current_content_identities = _expected_content_identities(
+                            row,
+                            expected_content_identities,
+                        )
                         report["remote_checked"] += 1
                         if config.target.provider == "gmail":
                             expected_mailboxes = gmail_expected_target_mailboxes_for_row(
@@ -6953,58 +13436,73 @@ def provider_validate_account(
                                 expected_mailboxes,
                                 expected_content_identities=expected_content_identities,
                             )
-                            journal_target_gmail_msgid = target_gmail_msgid_by_id.get(identity, "")
-                            primary_actual_labels: Optional[set[str]] = None
-                            primary_actual_flags: Optional[set[str]] = None
-                            primary_actual_internaldate: Optional[str] = None
-                            if journal_target_gmail_msgid:
-                                if journal_target_gmail_msgid not in matching_gmail_msgids:
-                                    report["remote_missing"].append(identity)
-                                    continue
-                                primary_actual_state = target_gmail_labels_flags_internaldate_for_msgid(
-                                    imap,
-                                    row,
-                                    [target_mailbox],
-                                    journal_target_gmail_msgid,
-                                    expected_content_identities=expected_content_identities,
-                                )
-                                if primary_actual_state is None:
-                                    report["remote_missing"].append(identity)
-                                    continue
-                                (
-                                    primary_actual_labels,
-                                    primary_actual_flags,
-                                    primary_actual_internaldate,
-                                ) = primary_actual_state
-                                extra_gmail_msgids = matching_gmail_msgids - committed_target_gmail_msgids
-                            else:
-                                extra_gmail_msgids = matching_gmail_msgids if len(matching_gmail_msgids) > 1 else set()
-                            if extra_gmail_msgids:
+                            primary_matching_gmail_msgids = matching_gmail_msgids_for_row(
+                                imap,
+                                row,
+                                [target_mailbox],
+                                expected_content_identities=expected_content_identities,
+                            )
+                            expected_occurrences = _max_group_expected_content_identity_intersections(
+                                current_content_identities,
+                                expected_identity_sets_by_source,
+                            )
+                            if len(matching_gmail_msgids) > max(expected_occurrences, 1):
                                 report["duplicates"].append({
                                     "canonical_id": identity,
-                                    "count": len({journal_target_gmail_msgid} | extra_gmail_msgids)
-                                    if journal_target_gmail_msgid
-                                    else len(extra_gmail_msgids),
+                                    "count": len(matching_gmail_msgids),
                                     "source": "target",
                                 })
-                            if journal_target_gmail_msgid:
-                                actual_labels = primary_actual_labels
-                                actual_flags = primary_actual_flags
-                                actual_internaldate = primary_actual_internaldate
-                            else:
-                                actual_state = consume_target_match_with_gmail_state(
+                            actual_state = None
+                            if assigned_occurrence is not None:
+                                status, _response = select_mailbox(
                                     imap,
-                                    target_mailbox,
-                                    row,
-                                    used_target_nums,
-                                    create_if_missing=False,
-                                    used_gmail_msgids=used_target_gmail_msgids,
-                                    expected_content_identities=expected_content_identities,
+                                    assigned_occurrence["mailbox"],
+                                    readonly=True,
                                 )
-                                actual_labels = actual_state[0] if actual_state is not None else None
-                                actual_flags = actual_state[1] if actual_state is not None else None
-                                actual_internaldate = actual_state[2] if actual_state is not None else None
+                                if status == "OK":
+                                    actual_state = _target_gmail_label_flag_internaldate(
+                                        imap,
+                                        assigned_occurrence["num"],
+                                    )
+                            actual_labels = actual_state[0] if actual_state is not None else None
+                            actual_flags = actual_state[1] if actual_state is not None else None
+                            actual_internaldate = actual_state[2] if actual_state is not None else None
                             if actual_labels is None or actual_flags is None:
+                                journal_target_gmail_msgid = target_gmail_msgid_by_id.get(
+                                    identity,
+                                    "",
+                                )
+                                wrong_date_msgids = primary_matching_gmail_msgids
+                                if journal_target_gmail_msgid:
+                                    wrong_date_msgids &= {journal_target_gmail_msgid}
+                                available_wrong_date_msgids = sorted(
+                                    wrong_date_msgids - used_target_gmail_msgids,
+                                    key=lambda value: (len(value), value),
+                                )
+                                wrong_date_state = (
+                                    target_gmail_labels_flags_internaldate_for_msgid(
+                                        imap,
+                                        row,
+                                        [target_mailbox],
+                                        available_wrong_date_msgids[0],
+                                        expected_content_identities=expected_content_identities,
+                                    )
+                                    if available_wrong_date_msgids
+                                    else None
+                                )
+                                failure_count = len(report["failed"])
+                                if wrong_date_state is not None:
+                                    append_target_internaldate_failure(
+                                        report["failed"],
+                                        identity=identity,
+                                        target_mailbox=target_mailbox,
+                                        row=row,
+                                        actual_internaldate=wrong_date_state[2],
+                                        journal_row=committed_journal_row,
+                                        warnings=report["warnings"],
+                                    )
+                                if len(report["failed"]) > failure_count:
+                                    continue
                                 report["remote_missing"].append(identity)
                                 continue
                             append_target_internaldate_failure(
@@ -7013,6 +13511,8 @@ def provider_validate_account(
                                 target_mailbox=target_mailbox,
                                 row=row,
                                 actual_internaldate=actual_internaldate or "",
+                                journal_row=committed_journal_by_id.get(identity),
+                                warnings=report["warnings"],
                             )
                             expected_labels = {
                                 _gmail_label_key(label)
@@ -7049,15 +13549,6 @@ def provider_validate_account(
                                 create_if_missing=False,
                                 expected_content_identities=expected_content_identities,
                             )
-                            current_content_identities = _expected_content_identities(row, expected_content_identities)
-                            expected_identity_sets = [
-                                _expected_content_identities(
-                                    other_row,
-                                    expected_content_identities_by_id.get(other_identity),
-                                )
-                                for other_identity, other_row in by_id.items()
-                                if target_by_id.get(other_identity) == target_mailbox
-                            ]
                             matching_content_identities: List[Tuple[int, str]] = []
                             for matching_num in matching_nums:
                                 cache_key = (target_mailbox, matching_num)
@@ -7070,15 +13561,14 @@ def provider_validate_account(
                                 if target_content_identity is not None:
                                     matching_content_identities.append(target_content_identity)
                             if len(matching_content_identities) == len(matching_nums):
-                                expected_occurrences = _max_expected_content_identity_matches(
+                                expected_occurrences = _max_group_expected_content_identity_matches(
                                     matching_content_identities,
-                                    expected_identity_sets,
+                                    expected_identity_sets_by_source,
                                 )
                             else:
-                                expected_occurrences = sum(
-                                    1
-                                    for expected_identities in expected_identity_sets
-                                    if expected_identities & current_content_identities
+                                expected_occurrences = _max_group_expected_content_identity_intersections(
+                                    current_content_identities,
+                                    expected_identity_sets_by_source,
                                 )
                             if len(matching_nums) > max(expected_occurrences, 1):
                                 report["duplicates"].append({
@@ -7086,15 +13576,34 @@ def provider_validate_account(
                                     "count": len(matching_nums),
                                     "source": "target",
                                 })
-                            target_num = consume_target_match_num(
-                                imap,
-                                target_mailbox,
-                                row,
-                                used_target_nums,
-                                create_if_missing=False,
-                                expected_content_identities=expected_content_identities,
+                            target_num = (
+                                assigned_occurrence["num"]
+                                if assigned_occurrence is not None
+                                else None
                             )
                             if target_num is None:
+                                mailbox_key = _target_mailbox_lookup_key(target_mailbox)
+                                available_wrong_date_nums = [
+                                    matching_num
+                                    for matching_num in matching_nums
+                                    if matching_num not in used_target_nums.get(mailbox_key, set())
+                                ]
+                                failure_count = len(report["failed"])
+                                if available_wrong_date_nums:
+                                    append_target_internaldate_failure(
+                                        report["failed"],
+                                        identity=identity,
+                                        target_mailbox=target_mailbox,
+                                        row=row,
+                                        actual_internaldate=target_message_internaldate(
+                                            imap,
+                                            available_wrong_date_nums[0],
+                                        ),
+                                        journal_row=committed_journal_row,
+                                        warnings=report["warnings"],
+                                    )
+                                if len(report["failed"]) > failure_count:
+                                    continue
                                 report["remote_missing"].append(identity)
                                 continue
                             try:
@@ -7114,6 +13623,8 @@ def provider_validate_account(
                                 target_mailbox=target_mailbox,
                                 row=row,
                                 actual_internaldate=actual_internaldate,
+                                journal_row=committed_journal_by_id.get(identity),
+                                warnings=report["warnings"],
                             )
                             missing_flags = sorted(required_flags - actual_flags)
                             if missing_flags:
@@ -7154,21 +13665,44 @@ def provider_validate_all(
     *,
     max_workers: int,
     stop_event: Optional[object] = None,
+    routing_plan: Optional[RoutingPlan] = None,
 ) -> Tuple[bool, List[str]]:
     max_workers = _require_max_workers(max_workers)
     try:
         _raise_if_provider_path_symlink(in_root, "validate root")
     except RuntimeError as exc:
         return False, [str(exc)]
+    try:
+        routing_plan = _effective_provider_routing_plan(
+            config,
+            in_root,
+            routing_plan,
+            persist=False,
+        )
+    except Exception as exc:
+        return False, [f"routing plan validation failed: {exc}"]
     issues: List[str] = []
 
     def worker(acc: MigrationAccount) -> Dict[str, Any]:
         _raise_if_stopped(stop_event, f"provider validate {acc.email}")
-        _name, report = provider_validate_account(config, acc, in_root, check_target=True, stop_event=stop_event)
+        _name, report = provider_validate_account(
+            config,
+            acc,
+            in_root,
+            check_target=True,
+            stop_event=stop_event,
+            routing_plan=routing_plan,
+        )
         _raise_if_stopped(stop_event, f"provider validate {acc.email}")
         return report
 
     for _acc, report in _provider_account_worker_results("provider-validate", config.accounts, max_workers, worker, stop_event):
+        for warning in report.get("warnings", []):
+            if isinstance(warning, dict):
+                warning_message = str(warning.get("message") or warning)
+            else:
+                warning_message = str(warning)
+            logging.warning("[provider-validate] %s: %s", report["account"], warning_message)
         if report.get("ok"):
             logging.info("[provider-validate] %s: OK exported=%s committed=%s", report["account"], report["exported"], report["committed"])
             continue
@@ -7203,6 +13737,191 @@ def provider_test_accounts(
     _provider_account_worker_results("provider-test", config.accounts, max_workers, worker, stop_event)
 
 
+def _routing_source_folders(
+    account: MigrationAccount,
+    mailboxes: List[MailboxInfo],
+    *,
+    source_provider: str,
+) -> List[SourceFolder]:
+    return [
+        SourceFolder(
+            source_account=account.source_email,
+            name=mailbox.name,
+            delimiter=mailbox.delimiter,
+            attributes=mailbox.attributes,
+        )
+        for mailbox in mailboxes
+        if not is_noselect(mailbox)
+        and not should_skip_source_mailbox(source_provider, mailbox, mailboxes)
+    ]
+
+
+def _routing_target_labels_from_imap(
+    mailboxes: List[MailboxInfo],
+    *,
+    target_provider: str,
+) -> List[TargetLabel]:
+    labels: List[TargetLabel] = []
+    for mailbox in mailboxes:
+        if is_noselect(mailbox) or is_virtual_target_mailbox(target_provider, mailbox):
+            continue
+        if target_provider == "gmail":
+            system_role = _gmail_system_key_for_mailbox(mailbox)
+            labels.append(
+                TargetLabel(
+                    name=mailbox.name,
+                    kind=GMAIL_SYSTEM if system_role else CUSTOM_LABEL,
+                    system_role=system_role or None,
+                    delimiter=mailbox.delimiter or "/",
+                )
+            )
+        else:
+            labels.append(
+                TargetLabel(
+                    name=mailbox.name,
+                    kind=GENERIC_MAILBOX,
+                    delimiter=mailbox.delimiter,
+                )
+            )
+    return labels
+
+
+_GMAIL_API_SYSTEM_ROLE_BY_ID = {
+    "INBOX": "inbox",
+    "SENT": "sent",
+    "DRAFT": "drafts",
+    "DRAFTS": "drafts",
+    "TRASH": "trash",
+    "SPAM": "spam",
+    "IMPORTANT": "important",
+    "STARRED": "starred",
+}
+_GMAIL_ROUTING_IMAP_REQUIRED_SYSTEM_ROLES = frozenset(
+    {"all", "inbox", "sent", "drafts", "trash", "spam"}
+)
+
+
+def _routing_merge_gmail_api_labels(
+    imap_labels: List[TargetLabel],
+    api_labels: Iterable[Any],
+) -> List[TargetLabel]:
+    """Enrich IMAP system labels and merge Gmail API user labels."""
+
+    result = list(imap_labels)
+    user_by_name = {
+        label.name: index
+        for index, label in enumerate(result)
+        if label.kind == CUSTOM_LABEL
+    }
+    system_by_role = {
+        str(label.system_role): index
+        for index, label in enumerate(result)
+        if label.kind == GMAIL_SYSTEM and label.system_role
+    }
+    for raw in api_labels:
+        if isinstance(raw, dict):
+            label_id = str(raw.get("id") or "")
+            name = str(raw.get("name") or "")
+            label_type = str(raw.get("type") or "").lower()
+        else:
+            label_id = str(getattr(raw, "id", None) or getattr(raw, "label_id", None) or "")
+            name = str(getattr(raw, "name", "") or "")
+            label_type = str(getattr(raw, "type", None) or getattr(raw, "kind", None) or "").lower()
+        if not label_id or not name:
+            raise RuntimeError("Gmail API returned a label without a non-empty id and name")
+        if label_type == "system":
+            system_role = _GMAIL_API_SYSTEM_ROLE_BY_ID.get(label_id.upper())
+            if system_role is None:
+                continue
+            existing_index = system_by_role.get(system_role)
+            if existing_index is not None:
+                result[existing_index] = dataclasses.replace(
+                    result[existing_index],
+                    target_id=label_id,
+                )
+            elif system_role not in _GMAIL_ROUTING_IMAP_REQUIRED_SYSTEM_ROLES:
+                system_by_role[system_role] = len(result)
+                result.append(
+                    TargetLabel(
+                        name=name,
+                        kind=GMAIL_SYSTEM,
+                        system_role=system_role,
+                        target_id=label_id,
+                    )
+                )
+            # A Gmail API primary/system mailbox label is not proof that its
+            # IMAP SPECIAL-USE mailbox is selectable.  Those roles may only
+            # enrich an IMAP finding; metadata-only roles remain API-capable.
+            continue
+        if label_type != "user":
+            raise RuntimeError(f"Gmail API returned label {name!r} with unknown type {label_type!r}")
+        label = TargetLabel(
+            name=name,
+            kind=CUSTOM_LABEL,
+            target_id=label_id,
+        )
+        existing_index = user_by_name.get(name)
+        if existing_index is not None:
+            result[existing_index] = label
+        else:
+            user_by_name[name] = len(result)
+            result.append(label)
+    return result
+
+
+def provider_discover_routing_plan(
+    config: ProviderMigrationConfig,
+    *,
+    max_workers: int,
+    stop_event: Optional[object] = None,
+    gmail_api_labels: Optional[Iterable[Any]] = None,
+) -> RoutingPlan:
+    """Read live source/target discovery and resolve the opt-in route plan."""
+
+    if not config.migration.routing.enabled:
+        raise ValueError("provider routing discovery requires migration.routing.enabled=true")
+    max_workers = _require_max_workers(max_workers)
+    source_folders: List[SourceFolder] = []
+
+    def source_worker(account: MigrationAccount) -> List[SourceFolder]:
+        _raise_if_stopped(stop_event, f"routing discovery {account.source_email}")
+        with imap_connection(config.source, account, role="source") as source_imap:
+            mailboxes = list_mailboxes(source_imap)
+        return _routing_source_folders(
+            account,
+            mailboxes,
+            source_provider=config.source.provider,
+        )
+
+    for _account, folders in _provider_account_worker_results(
+        "provider-routing-discovery",
+        config.accounts,
+        max_workers,
+        source_worker,
+        stop_event,
+    ):
+        source_folders.extend(folders)
+
+    representative = config.accounts[0]
+    _raise_if_stopped(stop_event, "routing target discovery")
+    with imap_connection(config.target, representative, role="target") as target_imap:
+        target_mailboxes = list_mailboxes(target_imap)
+    target_labels = _routing_target_labels_from_imap(
+        target_mailboxes,
+        target_provider=config.target.provider,
+    )
+    if gmail_api_labels is not None:
+        if config.target.provider != "gmail":
+            raise ValueError("gmail_api_labels may be supplied only for a Gmail target")
+        target_labels = _routing_merge_gmail_api_labels(target_labels, gmail_api_labels)
+    plan = resolve_routing_plan(
+        config.migration.routing,
+        source_folders,
+        target_labels,
+    )
+    return plan
+
+
 def provider_preflight(
     config: ProviderMigrationConfig,
     *,
@@ -7232,17 +13951,44 @@ def provider_preflight(
                     account_issues.extend(gmail_all_mail_select_issues(source_imap, source_mailboxes, role="source"))
                     account_issues.extend(gmail_account_decommission_issues(config.source, acc))
                 provider_key = config.source.provider.lower()
-                retained_source_mailboxes = _source_mailbox_scan_order(provider_key, [
-                    mailbox
-                    for mailbox in source_mailboxes
-                    if not should_skip_source_mailbox(config.source.provider, mailbox, source_mailboxes)
-                ])
+                routed_virtual_memberships = config.migration.routing.enabled
+                retained_source_mailboxes = _source_mailbox_scan_order(
+                    provider_key,
+                    [
+                        mailbox
+                        for mailbox in source_mailboxes
+                        if not should_skip_source_mailbox(
+                            config.source.provider,
+                            mailbox,
+                            source_mailboxes,
+                        )
+                    ],
+                    routed_virtual_memberships=routed_virtual_memberships,
+                )
                 fetch_body_for_identity = (
                     provider_key != "gmail"
-                    and any(_is_non_gmail_all_mailbox(provider_key, mailbox) for mailbox in retained_source_mailboxes)
+                    and any(
+                        _is_non_gmail_all_mailbox(provider_key, mailbox)
+                        or bool(
+                            _non_gmail_foldable_virtual_membership(
+                                provider_key,
+                                mailbox,
+                                routed_memberships=routed_virtual_memberships,
+                            )
+                        )
+                        for mailbox in retained_source_mailboxes
+                    )
                 )
                 ordinary_content_remaining_for_all: Dict[Tuple[int, str], int] = {}
                 ordinary_delivery_remaining_for_all: Dict[Tuple[int, str], Dict[_ProviderVirtualDeliveryKey, int]] = {}
+                routed_anchor_deliveries_by_content: Dict[
+                    Tuple[int, str],
+                    List[_ProviderVirtualDeliveryKey],
+                ] = {}
+                foldable_virtual_anchor_dates_by_content: Dict[
+                    Tuple[int, str],
+                    List[str],
+                ] = {}
                 for mailbox in retained_source_mailboxes:
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                     try:
@@ -7253,7 +13999,14 @@ def provider_preflight(
                         account_issues.append(f"source mailbox {mailbox.name} scan failed: {exc}")
                         continue
                     _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
-                    pending_all_sizes_by_content: Dict[Tuple[int, str], List[Tuple[int, _ProviderVirtualDeliveryKey]]] = {}
+                    pending_all_sizes_by_content: Dict[
+                        Tuple[int, str],
+                        List[Tuple[int, _ProviderVirtualDeliveryKey, str]],
+                    ] = {}
+                    consumed_virtual_anchors_by_content: Dict[
+                        Tuple[int, str],
+                        set[int],
+                    ] = {}
                     for uid in uids:
                         _raise_if_stopped(stop_event, f"provider preflight {acc.email}")
                         status, data = source_imap.uid(
@@ -7293,29 +14046,100 @@ def provider_preflight(
                             size = int(parsed.get("rfc822_size") or len(msg_bytes))
                             content_identity = (size, hashlib.sha256(msg_bytes).hexdigest())
                             non_gmail_all_source = _is_non_gmail_all_mailbox(provider_key, mailbox)
-                            non_gmail_flagged_source = _is_non_gmail_flagged_mailbox(provider_key, mailbox)
+                            non_gmail_virtual_source = _non_gmail_foldable_virtual_membership(
+                                provider_key,
+                                mailbox,
+                                routed_memberships=routed_virtual_memberships,
+                            )
                             if non_gmail_all_source:
+                                if routed_virtual_memberships:
+                                    pending_all_sizes_by_content.setdefault(
+                                        content_identity,
+                                        [],
+                                    ).append(
+                                        (
+                                            size,
+                                            _provider_virtual_delivery_key(parsed),
+                                            _legacy_internaldate_utc_key(
+                                                parsed.get("internaldate")
+                                            ),
+                                        )
+                                    )
+                                    continue
                                 remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                                 if remaining_ordinary > 0:
                                     pending_all_sizes_by_content.setdefault(content_identity, []).append((
                                         size,
                                         _provider_virtual_delivery_key(parsed),
+                                        _legacy_internaldate_utc_key(
+                                            parsed.get("internaldate")
+                                        ),
                                     ))
                                     continue
                                 source_total += size
-                                continue
-                            if not non_gmail_flagged_source:
-                                ordinary_content_remaining_for_all[content_identity] = (
-                                    ordinary_content_remaining_for_all.get(content_identity, 0) + 1
+                                foldable_virtual_anchor_dates_by_content.setdefault(
+                                    content_identity,
+                                    [],
+                                ).append(
+                                    _legacy_internaldate_utc_key(
+                                        parsed.get("internaldate")
+                                    )
                                 )
-                                delivery_key = _provider_virtual_delivery_key(parsed)
-                                delivery_remaining = ordinary_delivery_remaining_for_all.setdefault(content_identity, {})
-                                delivery_remaining[delivery_key] = delivery_remaining.get(delivery_key, 0) + 1
-                            else:
-                                identity = f"{mailbox.name}:{uid}"
-                                if identity in seen_identity:
+                                continue
+                            if non_gmail_virtual_source:
+                                virtual_date_key = _legacy_internaldate_utc_key(
+                                    parsed.get("internaldate")
+                                )
+                                if not virtual_date_key:
+                                    # Export refuses covered virtual-view
+                                    # folding without a valid INTERNALDATE, so
+                                    # capacity estimation must count it as a
+                                    # separate physical payload as well.
+                                    source_total += size
                                     continue
-                                seen_identity.add(identity)
+                                anchor_dates = foldable_virtual_anchor_dates_by_content.get(
+                                    content_identity,
+                                    [],
+                                )
+                                consumed_anchors = (
+                                    consumed_virtual_anchors_by_content.setdefault(
+                                        content_identity,
+                                        set(),
+                                    )
+                                    if routed_virtual_memberships
+                                    else set()
+                                )
+                                matching_anchor_indices = [
+                                    index
+                                    for index, anchor_date in enumerate(anchor_dates)
+                                    if index not in consumed_anchors
+                                    and anchor_date == virtual_date_key
+                                ]
+                                if len(matching_anchor_indices) == 1:
+                                    if routed_virtual_memberships:
+                                        consumed_anchors.add(matching_anchor_indices[0])
+                                else:
+                                    source_total += size
+                                continue
+                            ordinary_content_remaining_for_all[content_identity] = (
+                                ordinary_content_remaining_for_all.get(content_identity, 0) + 1
+                            )
+                            delivery_key = _provider_virtual_delivery_key(parsed)
+                            delivery_remaining = ordinary_delivery_remaining_for_all.setdefault(content_identity, {})
+                            delivery_remaining[delivery_key] = delivery_remaining.get(delivery_key, 0) + 1
+                            foldable_virtual_anchor_dates_by_content.setdefault(
+                                content_identity,
+                                [],
+                            ).append(
+                                _legacy_internaldate_utc_key(
+                                    parsed.get("internaldate")
+                                )
+                            )
+                            if routed_virtual_memberships:
+                                routed_anchor_deliveries_by_content.setdefault(
+                                    content_identity,
+                                    [],
+                                ).append(delivery_key)
                             source_total += size
                             continue
                         identity = (
@@ -7328,6 +14152,48 @@ def provider_preflight(
                         seen_identity.add(identity)
                         source_total += int(parsed.get("rfc822_size") or 0)
                     for content_identity, pending_sizes in pending_all_sizes_by_content.items():
+                        if routed_virtual_memberships:
+                            anchor_deliveries = routed_anchor_deliveries_by_content.get(
+                                content_identity,
+                                [],
+                            )
+                            available_by_delivery: Dict[_ProviderVirtualDeliveryKey, int] = {}
+                            for anchor_delivery in anchor_deliveries:
+                                available_by_delivery[anchor_delivery] = (
+                                    available_by_delivery.get(anchor_delivery, 0) + 1
+                                )
+                            consumed_by_delivery: Dict[_ProviderVirtualDeliveryKey, int] = {}
+                            unmatched_sizes: List[
+                                Tuple[int, _ProviderVirtualDeliveryKey, str]
+                            ] = []
+                            for size, delivery_key, internaldate_key in pending_sizes:
+                                consumed = consumed_by_delivery.get(delivery_key, 0)
+                                if consumed < available_by_delivery.get(delivery_key, 0):
+                                    consumed_by_delivery[delivery_key] = consumed + 1
+                                else:
+                                    unmatched_sizes.append(
+                                        (size, delivery_key, internaldate_key)
+                                    )
+                            if unmatched_sizes:
+                                source_total += sum(
+                                    size
+                                    for size, _delivery_key, _internaldate_key in unmatched_sizes
+                                )
+                                routed_anchor_deliveries_by_content.setdefault(
+                                    content_identity,
+                                    [],
+                                ).extend(
+                                    delivery_key
+                                    for _size, delivery_key, _internaldate_key in unmatched_sizes
+                                )
+                                foldable_virtual_anchor_dates_by_content.setdefault(
+                                    content_identity,
+                                    [],
+                                ).extend(
+                                    internaldate_key
+                                    for _size, _delivery_key, internaldate_key in unmatched_sizes
+                                )
+                            continue
                         remaining_ordinary = ordinary_content_remaining_for_all.get(content_identity, 0)
                         pending_sizes, consumed_ordinary = _uncovered_provider_virtual_items(
                             pending_sizes,
@@ -7338,7 +14204,17 @@ def provider_preflight(
                         ordinary_content_remaining_for_all[content_identity] = remaining_ordinary - consumed_ordinary
                         if not pending_sizes:
                             continue
-                        source_total += sum(size for size, _delivery_key in pending_sizes)
+                        source_total += sum(
+                            size
+                            for size, _delivery_key, _internaldate_key in pending_sizes
+                        )
+                        foldable_virtual_anchor_dates_by_content.setdefault(
+                            content_identity,
+                            [],
+                        ).extend(
+                            internaldate_key
+                            for _size, _delivery_key, internaldate_key in pending_sizes
+                        )
         except Exception as exc:
             if _stop_requested(stop_event):
                 raise

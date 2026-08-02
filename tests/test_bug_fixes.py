@@ -6,6 +6,7 @@ Each test is tagged with the bug number it validates.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -21,6 +22,20 @@ from typing import Iterator, List, Optional, Tuple
 from unittest import mock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legacy_global_target_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+
+    monkeypatch.setattr(
+        imap_ops,
+        "LEGACY_GLOBAL_STATE_PARENT",
+        tmp_path / ".legacy-global-state-parent",
+    )
 
 
 def _legacy_integrity_metadata(data: bytes, **extra: object) -> dict:
@@ -62,6 +77,1060 @@ def _stable_uidvalidity_response(*_args, **_kwargs):
 
 def _unique_ordered(values: List[str]) -> List[str]:
     return list(dict.fromkeys(values))
+
+
+def test_legacy_ensure_private_dir_secures_owned_directory(tmp_path: Path) -> None:
+    from components import imap_ops
+
+    target = tmp_path / "owned"
+    target.mkdir(mode=0o700)
+    target.chmod(0o755)
+
+    imap_ops.ensure_private_dir(target)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert target.stat().st_uid == os.geteuid()
+
+
+def test_legacy_ensure_private_dir_fails_closed_on_chmod_eperm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+
+    target = tmp_path / "owned"
+    target.mkdir(mode=0o700)
+
+    def denied_chmod(_fd: int, _mode: int) -> None:
+        raise PermissionError(errno.EPERM, "simulated EPERM")
+
+    monkeypatch.setattr(imap_ops.os, "fchmod", denied_chmod)
+
+    with pytest.raises(RuntimeError, match="unable to set private permissions") as exc_info:
+        imap_ops.ensure_private_dir(target)
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+def test_legacy_ensure_private_dir_rejects_foreign_owner_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+
+    target = tmp_path / "foreign"
+    target.mkdir(mode=0o700)
+    chmod_called = False
+
+    def unexpected_chmod(_fd: int, _mode: int) -> None:
+        nonlocal chmod_called
+        chmod_called = True
+
+    monkeypatch.setattr(imap_ops, "_legacy_effective_uid", lambda: target.stat().st_uid + 1)
+    monkeypatch.setattr(imap_ops.os, "fchmod", unexpected_chmod)
+
+    with pytest.raises(RuntimeError, match="not owned by effective UID"):
+        imap_ops.ensure_private_dir(target)
+
+    assert not chmod_called
+
+
+def test_legacy_ensure_private_dir_rejects_shared_mode_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+
+    target = tmp_path / "shared"
+    target.mkdir(mode=0o700)
+    target.chmod(0o770)
+    chmod_called = False
+
+    def unexpected_chmod(_fd: int, _mode: int) -> None:
+        nonlocal chmod_called
+        chmod_called = True
+
+    monkeypatch.setattr(imap_ops.os, "fchmod", unexpected_chmod)
+
+    with pytest.raises(RuntimeError, match="shared directory"):
+        imap_ops.ensure_private_dir(target)
+
+    assert not chmod_called
+    assert stat.S_IMODE(target.stat().st_mode) == 0o770
+
+
+def test_legacy_ensure_private_dir_verifies_final_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+
+    target = tmp_path / "wrong-mode"
+    target.mkdir(mode=0o700)
+    target.chmod(0o755)
+    monkeypatch.setattr(imap_ops.os, "fchmod", lambda _fd, _mode: None)
+
+    with pytest.raises(RuntimeError, match="permissions are not private"):
+        imap_ops.ensure_private_dir(target)
+
+
+def test_legacy_import_lock_is_cross_process_and_released_after_exception(tmp_path: Path) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    child_probe = (
+        "import fcntl, os, sys; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError:\n sys.exit(23)"
+        "\nfinally:\n os.close(fd)"
+    )
+
+    with pytest.raises(LookupError, match="release lock"):
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            lock_path = imap_ops._legacy_import_lock_path(server, account, tmp_path)
+            blocked = subprocess.run(
+                [sys.executable, "-c", child_probe, str(lock_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert blocked.returncode == 23, blocked.stderr
+            raise LookupError("release lock")
+
+    released = subprocess.run(
+        [sys.executable, "-c", child_probe, str(lock_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert released.returncode == 0, released.stderr
+
+
+def test_legacy_reset_callback_runs_after_archive_under_import_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(mode=0o700)
+    lock_path = imap_ops._legacy_import_lock_path(server, account, tmp_path)
+    events: List[str] = []
+    child_probe = (
+        "import fcntl, os, sys; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError:\n sys.exit(23)"
+        "\nfinally:\n os.close(fd)"
+    )
+
+    def archive(account_dir: Path) -> Path:
+        assert account_dir == tmp_path / "user@example.com"
+        reset_state = json.loads(
+            (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).read_text()
+        )
+        assert reset_state["phase"] == "prepared"
+        events.append("archive")
+        return account_dir / "import.journal.reset-test.jsonl"
+
+    def reset() -> None:
+        blocked = subprocess.run(
+            [sys.executable, "-c", child_probe, str(lock_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert blocked.returncode == 23, blocked.stderr
+        reset_state = json.loads(
+            (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).read_text()
+        )
+        assert reset_state["phase"] == "reset_started"
+        events.append("reset")
+
+    def unlocked_import(*_args, **_kwargs) -> None:
+        assert not (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).exists()
+        events.append("import")
+
+    monkeypatch.setattr(imap_ops, "archive_legacy_import_journal_for_reset", archive)
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", unlocked_import)
+
+    imap_ops.import_account(
+        account,
+        server,
+        tmp_path,
+        ignore_errors=False,
+        reset_before_import=reset,
+    )
+
+    assert events == ["archive", "reset", "import"]
+    released = subprocess.run(
+        [sys.executable, "-c", child_probe, str(lock_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert released.returncode == 0, released.stderr
+
+
+def test_legacy_before_import_and_import_share_one_target_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    (tmp_path / account.email).mkdir(mode=0o700)
+    lock_path = imap_ops._legacy_import_lock_path(server, account, tmp_path)
+    events: List[str] = []
+    child_probe = (
+        "import fcntl, os, sys; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry:\n fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError:\n sys.exit(23)"
+        "\nfinally:\n os.close(fd)"
+    )
+
+    def assert_target_lock_held(stage: str) -> None:
+        blocked = subprocess.run(
+            [sys.executable, "-c", child_probe, str(lock_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert blocked.returncode == 23, blocked.stderr
+        events.append(stage)
+
+    monkeypatch.setattr(
+        imap_ops,
+        "_import_account_unlocked",
+        lambda *_args, **_kwargs: assert_target_lock_held("import"),
+    )
+
+    imap_ops.import_account(
+        account,
+        server,
+        tmp_path,
+        ignore_errors=False,
+        before_import=lambda: assert_target_lock_held("before-import"),
+    )
+
+    assert events == ["before-import", "import"]
+
+
+def test_legacy_reset_stop_after_archive_leaves_gate_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(mode=0o700)
+    stop_event = threading.Event()
+    reset = mock.Mock()
+    unlocked_import = mock.Mock()
+
+    def archive_then_stop(_account_dir: Path) -> None:
+        stop_event.set()
+
+    monkeypatch.setattr(
+        imap_ops,
+        "archive_legacy_import_journal_for_reset",
+        archive_then_stop,
+    )
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", unlocked_import)
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        imap_ops.import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            stop_event=stop_event,
+            reset_before_import=reset,
+        )
+
+    state_path = account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME
+    assert json.loads(state_path.read_text())["phase"] == "journal_archived"
+    reset.assert_not_called()
+    unlocked_import.assert_not_called()
+
+    stop_event.clear()
+    monkeypatch.setattr(
+        imap_ops,
+        "archive_legacy_import_journal_for_reset",
+        lambda _account_dir: None,
+    )
+    imap_ops.import_account(
+        account,
+        server,
+        tmp_path,
+        ignore_errors=False,
+        stop_event=stop_event,
+        reset_before_import=reset,
+    )
+
+    reset.assert_called_once_with()
+    unlocked_import.assert_called_once()
+    assert not state_path.exists()
+
+
+def test_legacy_global_reset_gate_blocks_other_root_after_crash_and_owner_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    owner_root = tmp_path / "owner-staged"
+    other_root = tmp_path / "other-staged"
+    owner_account_dir = owner_root / account.email
+    other_account_dir = other_root / account.email
+    owner_account_dir.mkdir(parents=True, mode=0o700)
+    other_account_dir.mkdir(parents=True, mode=0o700)
+
+    with imap_ops._legacy_import_lock(server, account, owner_root, stop_event=None):
+        state = imap_ops._begin_legacy_reset_state(owner_account_dir, account, server)
+        state = imap_ops._transition_legacy_reset_state(
+            owner_account_dir,
+            account,
+            server,
+            state,
+            "journal_archived",
+        )
+        state = imap_ops._transition_legacy_reset_state(
+            owner_account_dir,
+            account,
+            server,
+            state,
+            "reset_started",
+        )
+
+    global_state_path = imap_ops._legacy_global_reset_state_path(server, account)
+    global_state = json.loads(global_state_path.read_text(encoding="utf-8"))
+    assert global_state == state
+    assert global_state["owner_staging_root"] == str(owner_root)
+    expected_uid = os.geteuid()
+    for private_dir in (
+        imap_ops._legacy_global_state_root(),
+        imap_ops._legacy_global_state_namespace_dir(),
+        imap_ops._legacy_global_lock_dir(),
+        imap_ops._legacy_global_reset_dir(),
+    ):
+        private_dir_stat = private_dir.stat()
+        assert stat.S_IMODE(private_dir_stat.st_mode) == 0o700
+        assert private_dir_stat.st_uid == expected_uid
+    for private_file in (
+        imap_ops._legacy_import_lock_path(server, account, other_root),
+        global_state_path,
+        owner_account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME,
+    ):
+        private_file_stat = private_file.stat()
+        assert stat.S_IMODE(private_file_stat.st_mode) == 0o600
+        assert private_file_stat.st_uid == expected_uid
+        assert private_file_stat.st_nlink == 1
+
+    ordinary_setup = mock.Mock(side_effect=AssertionError("ordinary setup must stay gated"))
+    other_reset = mock.Mock(side_effect=AssertionError("other-root reset must stay gated"))
+    target_import = mock.Mock(side_effect=AssertionError("other-root import must stay gated"))
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", target_import)
+
+    with pytest.raises(imap_ops.LegacyResetGateError, match="owned by staging root"):
+        imap_ops.import_account(
+            account,
+            server,
+            other_root,
+            ignore_errors=False,
+            before_import=ordinary_setup,
+        )
+    with pytest.raises(imap_ops.LegacyResetGateError, match="owned by staging root"):
+        imap_ops.import_account(
+            account,
+            server,
+            other_root,
+            ignore_errors=False,
+            reset_before_import=other_reset,
+        )
+
+    ordinary_setup.assert_not_called()
+    other_reset.assert_not_called()
+    target_import.assert_not_called()
+
+    owner_reset = mock.Mock()
+    owner_import = mock.Mock()
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", owner_import)
+    imap_ops.import_account(
+        account,
+        server,
+        owner_root,
+        ignore_errors=False,
+        reset_before_import=owner_reset,
+    )
+
+    owner_reset.assert_called_once_with()
+    owner_import.assert_called_once()
+    assert not global_state_path.exists()
+    assert not (owner_account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).exists()
+
+
+def test_legacy_global_coordination_identity_preserves_durable_journal_ids(
+    tmp_path: Path,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    mixed_domain_account = Account(email="user@Example.COM", password="secret")
+    lower_domain_account = Account(email="user@example.com", password="secret")
+    trailing_domain_account = Account(email="user@example.com.", password="secret")
+    different_local_account = Account(email="User@example.com", password="secret")
+    ascii_server = ServerConfig(host="xn--mnich-kva.example", port=993, ssl=True)
+    unicode_server = ServerConfig(host="münich.example.", port=993, ssl=True)
+    short_ipv6_server = ServerConfig(host="2001:db8::1", port=993, ssl=True)
+    long_ipv6_server = ServerConfig(
+        host="2001:0db8:0:0:0:0:0:1",
+        port=993,
+        ssl=True,
+    )
+    scoped_ipv6_server = ServerConfig(host="fe80::1%ETH0", port=993, ssl=True)
+    expanded_scoped_ipv6_server = ServerConfig(
+        host="fe80:0:0:0:0:0:0:1%ETH0",
+        port=993,
+        ssl=True,
+    )
+    other_scope_case_server = ServerConfig(host="fe80::1%eth0", port=993, ssl=True)
+
+    # These hashes predate the global coordination key and are persisted in
+    # import journals. They must remain byte-for-byte stable.
+    legacy_mixed_domain_id = imap_ops._legacy_import_target_id(
+        ServerConfig(host="imap.example.com", port=993, ssl=True),
+        mixed_domain_account,
+    )
+    legacy_unicode_host_id = imap_ops._legacy_import_target_id(
+        ServerConfig(host="münich.example", port=993, ssl=True),
+        lower_domain_account,
+    )
+    assert legacy_mixed_domain_id == (
+        "f75bb90e015ca3900222d25d3611272915ba72305b2931fd7bb0b7eddef38d0e"
+    )
+    assert legacy_unicode_host_id == (
+        "65f63beb1c4ba6089b095c81220265af248d47f8e705d329b2c758d198279672"
+    )
+    rows = [
+        {"key": "committed", "target": legacy_mixed_domain_id, "status": "committed"},
+        {"key": "pending", "target": legacy_mixed_domain_id, "status": "pending"},
+    ]
+    assert imap_ops._latest_legacy_committed_keys(
+        rows,
+        legacy_mixed_domain_id,
+    ) == {"committed"}
+    assert imap_ops._unresolved_legacy_pending_keys(
+        rows,
+        legacy_mixed_domain_id,
+    ) == {"pending"}
+
+    coordination_id = imap_ops._legacy_target_coordination_id(
+        unicode_server,
+        mixed_domain_account,
+    )
+    assert coordination_id == imap_ops._legacy_target_coordination_id(
+        ascii_server,
+        lower_domain_account,
+    )
+    assert coordination_id == imap_ops._legacy_target_coordination_id(
+        ascii_server,
+        trailing_domain_account,
+    )
+    assert coordination_id != imap_ops._legacy_target_coordination_id(
+        ascii_server,
+        different_local_account,
+    )
+    assert imap_ops._legacy_target_coordination_id(
+        short_ipv6_server,
+        lower_domain_account,
+    ) == imap_ops._legacy_target_coordination_id(
+        long_ipv6_server,
+        lower_domain_account,
+    )
+    assert imap_ops._legacy_target_coordination_id(
+        scoped_ipv6_server,
+        lower_domain_account,
+    ) == imap_ops._legacy_target_coordination_id(
+        expanded_scoped_ipv6_server,
+        lower_domain_account,
+    )
+    assert imap_ops._legacy_target_coordination_id(
+        scoped_ipv6_server,
+        lower_domain_account,
+    ) != imap_ops._legacy_target_coordination_id(
+        other_scope_case_server,
+        lower_domain_account,
+    )
+    assert imap_ops._legacy_import_lock_path(
+        unicode_server,
+        mixed_domain_account,
+        tmp_path / "first-root",
+    ) == imap_ops._legacy_import_lock_path(
+        ascii_server,
+        lower_domain_account,
+        tmp_path / "second-root",
+    )
+    assert imap_ops._legacy_global_reset_state_path(
+        unicode_server,
+        mixed_domain_account,
+    ) == imap_ops._legacy_global_reset_state_path(
+        ascii_server,
+        lower_domain_account,
+    )
+
+
+def test_mixed_case_email_domain_uses_same_cross_root_reset_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    owner_account = Account(email="user@Example.COM", password="secret")
+    other_account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True)
+    owner_root = tmp_path / "owner-root"
+    other_root = tmp_path / "other-root"
+    owner_account_dir = owner_root / owner_account.email
+    other_account_dir = other_root / other_account.email
+    owner_account_dir.mkdir(parents=True, mode=0o700)
+    other_account_dir.mkdir(parents=True, mode=0o700)
+
+    assert imap_ops._legacy_import_lock_path(
+        server,
+        owner_account,
+        owner_root,
+    ) == imap_ops._legacy_import_lock_path(
+        server,
+        other_account,
+        other_root,
+    )
+    with imap_ops._legacy_import_lock(
+        server,
+        owner_account,
+        owner_root,
+        stop_event=None,
+    ):
+        imap_ops._begin_legacy_reset_state(
+            owner_account_dir,
+            owner_account,
+            server,
+        )
+
+    target_contact = mock.Mock(side_effect=AssertionError("target must stay gated"))
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", target_contact)
+    with pytest.raises(imap_ops.LegacyResetGateError, match="account mismatch"):
+        imap_ops.import_account(
+            other_account,
+            server,
+            other_root,
+            ignore_errors=False,
+        )
+    target_contact.assert_not_called()
+
+
+def test_global_v2_local_v1_lag_resumes_with_legacy_target_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@Example.COM", password="secret")
+    server = ServerConfig(host="münich.example", port=993, ssl=True)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(parents=True, mode=0o700)
+    legacy_target = imap_ops._legacy_import_target_id(server, account)
+    local_v1 = {
+        "schema_version": 1,
+        "status": "in_progress",
+        "phase": "prepared",
+        "account": account.email,
+        "target": legacy_target,
+        "target_server": imap_ops.legacy_server_endpoint(server),
+        "started_at": 1,
+        "updated_at": 1,
+    }
+    local_path = account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME
+    local_path.write_text(json.dumps(local_v1) + "\n", encoding="utf-8")
+    local_path.chmod(0o600)
+    global_v2 = imap_ops._new_legacy_reset_state(
+        account_dir,
+        account,
+        server,
+        phase="prepared",
+        started_at=1,
+        reset_id=hashlib.sha256(b"v1-v2-lag").hexdigest(),
+    )
+    with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+        imap_ops._persist_legacy_reset_state_file(
+            imap_ops._legacy_global_reset_state_path(server, account),
+            global_v2,
+            account=account,
+            server=server,
+            global_state=True,
+        )
+
+    reset = mock.Mock()
+    unlocked_import = mock.Mock()
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", unlocked_import)
+    imap_ops.import_account(
+        account,
+        server,
+        tmp_path,
+        ignore_errors=False,
+        reset_before_import=reset,
+    )
+
+    reset.assert_called_once_with()
+    unlocked_import.assert_called_once()
+    assert not local_path.exists()
+    assert not imap_ops._legacy_global_reset_state_path(server, account).exists()
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_legacy_reset_state_rejects_link_attacks_before_target_contact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_kind: str,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(mode=0o700)
+    state_path = account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME
+    imap_ops._begin_legacy_reset_state(account_dir, account, server)
+    state_bytes = state_path.read_bytes()
+    state_path.unlink()
+    victim = tmp_path / f"outside-{link_kind}-state.json"
+    victim.write_bytes(state_bytes)
+    try:
+        if link_kind == "symlink":
+            state_path.symlink_to(victim)
+        else:
+            state_path.hardlink_to(victim)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"{link_kind} creation unavailable: {exc}")
+
+    target_contact = mock.Mock(side_effect=AssertionError("target must not be contacted"))
+    reset = mock.Mock(side_effect=AssertionError("reset callback must not run"))
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", target_contact)
+    expected = "symlinked legacy reset state" if link_kind == "symlink" else "hard-linked legacy reset state"
+
+    with pytest.raises(RuntimeError, match=expected):
+        imap_ops.import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+        )
+    with pytest.raises(RuntimeError, match=expected):
+        imap_ops.import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            reset_before_import=reset,
+        )
+
+    target_contact.assert_not_called()
+    reset.assert_not_called()
+    assert victim.read_bytes() == state_bytes
+
+
+@pytest.mark.parametrize(
+    ("artifact_kind", "message"),
+    [
+        ("symlink", "symlinked legacy global reset state"),
+        ("hardlink", "hard-linked legacy global reset state"),
+        ("directory", "non-regular legacy global reset state"),
+        ("unsafe-mode", "unsafe mode"),
+    ],
+)
+def test_legacy_global_reset_state_rejects_unsafe_artifact_before_target_contact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+    message: str,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(mode=0o700)
+    imap_ops._ensure_legacy_global_state_dirs()
+    state_path = imap_ops._legacy_global_reset_state_path(server, account)
+    if artifact_kind == "symlink":
+        victim = state_path.parent / "victim"
+        victim.write_bytes(b"{}\n")
+        victim.chmod(0o600)
+        try:
+            state_path.symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+    elif artifact_kind == "hardlink":
+        victim = state_path.parent / "victim"
+        victim.write_bytes(b"{}\n")
+        victim.chmod(0o600)
+        try:
+            state_path.hardlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard-link creation unavailable: {exc}")
+    elif artifact_kind == "directory":
+        state_path.mkdir(mode=0o700)
+    else:
+        state_path.write_bytes(b"{}\n")
+        state_path.chmod(0o644)
+
+    target_setup = mock.Mock(side_effect=AssertionError("target setup must stay gated"))
+    target_reset = mock.Mock(side_effect=AssertionError("target reset must stay gated"))
+    target_import = mock.Mock(side_effect=AssertionError("target import must stay gated"))
+    monkeypatch.setattr(imap_ops, "_import_account_unlocked", target_import)
+
+    with pytest.raises(imap_ops.LegacyResetGateError, match=message):
+        imap_ops.import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            before_import=target_setup,
+        )
+    with pytest.raises(imap_ops.LegacyResetGateError, match=message):
+        imap_ops.import_account(
+            account,
+            server,
+            tmp_path,
+            ignore_errors=False,
+            reset_before_import=target_reset,
+        )
+
+    target_setup.assert_not_called()
+    target_reset.assert_not_called()
+    target_import.assert_not_called()
+
+
+def test_legacy_global_reset_state_replacement_during_clear_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / account.email
+    account_dir.mkdir(mode=0o700)
+    with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+        state = imap_ops._begin_legacy_reset_state(account_dir, account, server)
+        state = imap_ops._transition_legacy_reset_state(
+            account_dir,
+            account,
+            server,
+            state,
+            "journal_archived",
+        )
+        state = imap_ops._transition_legacy_reset_state(
+            account_dir,
+            account,
+            server,
+            state,
+            "reset_started",
+        )
+
+        global_path = imap_ops._legacy_global_reset_state_path(server, account)
+        real_load = imap_ops._load_legacy_global_reset_state_with_stat
+
+        def load_then_replace(actual_account: Account, actual_server: ServerConfig):
+            loaded_state, loaded_stat = real_load(actual_account, actual_server)
+            replacement = global_path.with_name("replacement.json")
+            replacement.write_bytes(global_path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, global_path)
+            return loaded_state, loaded_stat
+
+        monkeypatch.setattr(
+            imap_ops,
+            "_load_legacy_global_reset_state_with_stat",
+            load_then_replace,
+        )
+        with pytest.raises(imap_ops.LegacyResetGateError, match="changed before successful"):
+            imap_ops._clear_legacy_reset_state(
+                account_dir,
+                account,
+                server,
+                state,
+            )
+
+    assert global_path.exists()
+    assert not (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).exists()
+
+
+def test_main_legacy_import_waits_for_target_lock_before_reading_pending_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.main import main
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    account_dir = tmp_path / "user@example.com"
+    account_dir.mkdir()
+    key = hashlib.sha256(b"pending-key").hexdigest()
+    pending = {
+        "key": key,
+        "status": "pending",
+        "target": imap_ops._legacy_import_target_id(server, account),
+        "mailbox": "INBOX",
+        "path": "INBOX/u0000000001.eml",
+    }
+    journal = account_dir / "import.journal.jsonl"
+    journal.write_text(json.dumps(pending) + "\n", encoding="utf-8")
+    config_path = tmp_path / "import.pass.config.json"
+    config_path.write_text(json.dumps({
+        "server": {
+            "host": server.host,
+            "port": server.port,
+            "ssl": server.ssl,
+            "starttls": server.starttls,
+        },
+        "accounts": [{"email": account.email, "password": account.password}],
+    }), encoding="utf-8")
+
+    lock_contended = threading.Event()
+    import_attempted = threading.Event()
+    import_completed = threading.Event()
+    results: queue.Queue[int] = queue.Queue()
+    real_flock = imap_ops.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def locked_import(*_args, **_kwargs) -> None:
+        import_attempted.set()
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            rows = imap_ops._load_legacy_import_journal(account_dir)
+            assert not imap_ops._unresolved_legacy_pending_keys(
+                rows,
+                pending["target"],
+            )
+            import_completed.set()
+
+    def run_main() -> None:
+        results.put(main([
+            "--mode", "import",
+            "--config", str(config_path),
+            "--input-dir", str(tmp_path),
+            "--log-dir", str(tmp_path / "logs-legacy-concurrent-import"),
+            "--min-free-gb", "0",
+            "--max-workers", "1",
+            "--no-connectivity-test",
+        ]))
+
+    with mock.patch("components.main.check_environment"), \
+        mock.patch("components.main.check_free_space_for_path"), \
+        mock.patch("components.main.audit_export", return_value=(True, [])), \
+        mock.patch("components.main.import_account", locked_import):
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            monkeypatch.setattr(imap_ops.fcntl, "flock", recording_flock)
+            worker = threading.Thread(target=run_main, name="second-legacy-cli")
+            worker.start()
+            assert lock_contended.wait(5), "second legacy CLI did not wait on target lock"
+            assert import_attempted.is_set()
+            assert not import_completed.is_set()
+            assert journal.read_text(encoding="utf-8") == json.dumps(pending) + "\n"
+
+            # Simulate the first importer resolving its pending append.
+            imap_ops._append_legacy_import_journal(
+                account_dir,
+                {**pending, "status": "committed"},
+            )
+
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert results.get_nowait() == 0
+    assert import_completed.is_set()
+
+
+def test_legacy_import_lock_wait_stops_without_entering_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    holder_root = tmp_path / "holder-staged"
+    waiter_root = tmp_path / "waiter-staged"
+    holder_root.mkdir(mode=0o700)
+    waiter_root.mkdir(mode=0o700)
+    stop_event = threading.Event()
+    lock_contended = threading.Event()
+    entered = threading.Event()
+    errors: queue.Queue[BaseException] = queue.Queue()
+    real_flock = imap_ops.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        try:
+            real_flock(fd, operation)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                lock_contended.set()
+            raise
+
+    def wait_for_lock() -> None:
+        try:
+            with imap_ops._legacy_import_lock(server, account, waiter_root, stop_event=stop_event):
+                entered.set()
+        except BaseException as exc:  # pragma: no cover - asserted through the queue
+            errors.put(exc)
+
+    monkeypatch.setattr(imap_ops.fcntl, "flock", recording_flock)
+
+    with imap_ops._legacy_import_lock(server, account, holder_root, stop_event=None):
+        waiter = threading.Thread(target=wait_for_lock, name="stopped-legacy-import")
+        waiter.start()
+        assert lock_contended.wait(5), "waiter never contended on the staging lock"
+        stop_event.set()
+        waiter.join(5)
+        assert not waiter.is_alive()
+
+    assert not entered.is_set()
+    assert errors.qsize() == 1
+    assert "stop requested" in str(errors.get_nowait())
+
+
+def test_legacy_import_lock_fails_closed_when_filesystem_locking_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+
+    def unsupported_lock(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOTSUP, "simulated unsupported flock")
+
+    monkeypatch.setattr(imap_ops.fcntl, "flock", unsupported_lock)
+
+    with pytest.raises(RuntimeError, match="unable to acquire legacy import lock"):
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            raise AssertionError("import proceeded without serialization")
+
+
+def test_legacy_import_lock_closes_descriptors_when_post_open_uid_lookup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    opened_fds: List[int] = []
+    real_open = imap_ops._open_legacy_import_lock
+    real_effective_uid = imap_ops._legacy_effective_uid
+
+    def capture_open(lock_path: Path):
+        opened = real_open(lock_path)
+        opened_fds.extend(opened[:2])
+        return opened
+
+    def fail_after_open() -> int:
+        if opened_fds:
+            raise RuntimeError("simulated post-open effective UID failure")
+        return real_effective_uid()
+
+    monkeypatch.setattr(imap_ops, "_open_legacy_import_lock", capture_open)
+    monkeypatch.setattr(imap_ops, "_legacy_effective_uid", fail_after_open)
+
+    with pytest.raises(RuntimeError, match="post-open effective UID failure"):
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            raise AssertionError("import proceeded after UID lookup failure")
+
+    assert len(opened_fds) == 2
+    for fd in opened_fds:
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fd)
+        assert exc_info.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize(
+    ("artifact_kind", "message"),
+    [
+        ("symlink", "symlinked legacy import lock"),
+        ("hardlink", "hard-linked legacy import lock"),
+        ("directory", "non-regular legacy import lock"),
+        ("unsafe-mode", "unsafe mode"),
+    ],
+)
+def test_legacy_import_lock_rejects_unsafe_artifact(
+    tmp_path: Path,
+    artifact_kind: str,
+    message: str,
+) -> None:
+    from components import imap_ops
+    from components.models import Account, ServerConfig
+
+    account = Account(email="user@example.com", password="secret")
+    server = ServerConfig(host="target.example.com", port=993, ssl=True, starttls=False)
+    lock_path = imap_ops._legacy_import_lock_path(server, account, tmp_path)
+    lock_path.parent.mkdir(mode=0o700, parents=True)
+    if artifact_kind == "symlink":
+        victim = lock_path.parent / "victim"
+        victim.write_bytes(b"")
+        try:
+            lock_path.symlink_to(victim)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+    elif artifact_kind == "hardlink":
+        victim = lock_path.parent / "victim"
+        victim.write_bytes(b"")
+        victim.chmod(0o600)
+        try:
+            os.link(victim, lock_path)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"hard-link creation unavailable: {exc}")
+    elif artifact_kind == "directory":
+        lock_path.mkdir(mode=0o700)
+    else:
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match=message):
+        with imap_ops._legacy_import_lock(server, account, tmp_path, stop_event=None):
+            raise AssertionError("unsafe lock artifact was accepted")
 
 
 def _write_legacy_message_fixture(
@@ -113,6 +1182,83 @@ def _write_legacy_message_fixture(
     state["mailboxes"] = mailboxes
     state_path.write_text(json.dumps(state))
     return eml
+
+
+def _write_legacy_recovery_journal_fixture(
+    eml: Path,
+    *,
+    account,
+    target_server,
+    status: str,
+    target_mailbox: str = "INBOX",
+) -> dict:
+    from components.content_binding import CONTENT_BINDING_FIELD
+    from components.imap_ops import (
+        _imap_append_wire_bytes,
+        _legacy_import_key,
+        _legacy_import_target_id,
+    )
+
+    account_dir = eml.parent.parent
+    data = eml.read_bytes()
+    append_data = _imap_append_wire_bytes(data)
+    metadata = json.loads(eml.with_suffix(".json").read_text())
+    row = {
+        "key": _legacy_import_key(account_dir, eml, target_mailbox, append_data),
+        "target": _legacy_import_target_id(target_server, account),
+        "mailbox": target_mailbox,
+        "source_mailbox": str(metadata["mailbox"]),
+        "account": account.email,
+        "path": eml.relative_to(account_dir).as_posix(),
+        "rfc822_size": str(len(append_data)),
+        "content_sha256": hashlib.sha256(append_data).hexdigest(),
+        CONTENT_BINDING_FIELD: metadata[CONTENT_BINDING_FIELD],
+        "flags": str(metadata.get("flags") or ""),
+        "internaldate": str(metadata.get("internaldate") or ""),
+        "status": status,
+        "timestamp": "0",
+    }
+    (account_dir / "import.journal.jsonl").write_text(json.dumps(row) + "\n")
+    return row
+
+
+class _LegacyRecoveryExportSource:
+    def __init__(self, messages: dict[str, dict[int, bytes]]) -> None:
+        self.messages = messages
+        self.selected = ""
+
+    def list(self):
+        return "OK", [
+            f'(\\HasNoChildren) "/" "{mailbox}"'.encode("ascii")
+            for mailbox in self.messages
+        ]
+
+    def select(self, mailbox: str, readonly: bool = False):
+        self.selected = mailbox.strip('"').replace(r'\"', '"')
+        return "OK", [str(len(self.messages.get(self.selected, {}))).encode("ascii")]
+
+    def response(self, _name: str):
+        return "OK", [b"123"]
+
+    def uid(self, command: str, *args):
+        selected = self.messages.get(self.selected, {})
+        if command == "search":
+            return "OK", [b" ".join(str(uid).encode("ascii") for uid in selected)]
+        if command == "fetch":
+            uid = int(args[0])
+            body = selected[uid]
+            query = str(args[-1])
+            metadata = (
+                f'{uid} (UID {uid} FLAGS (\\Seen) '
+                'INTERNALDATE "01-Jan-2024 00:00:00 +0000")'
+            ).encode("ascii")
+            if "BODY.PEEK[]" not in query:
+                return "OK", [metadata]
+            return "OK", [(metadata, body)]
+        raise AssertionError(command)
+
+    def logout(self):
+        return "OK", []
 
 
 def _write_legacy_empty_mailbox_fixture(folder: Path, *, mailbox: str = "INBOX", source_server=None) -> None:
@@ -247,7 +1393,17 @@ class TestBug5SanitizeCollisionDetection:
             assert key not in seen or seen[key] == name, f"Unexpected collision: {name}"
             seen[key] = name
 
-    @pytest.mark.parametrize("mailbox_name", ["import.journal.jsonl", "export-state.json", "manifest.jsonl", "Import.Journal.Jsonl"])
+    @pytest.mark.parametrize(
+        "mailbox_name",
+        [
+            "import.journal.jsonl",
+            "export-state.json",
+            "manifest.jsonl",
+            "reset-state.json",
+            "Import.Journal.Jsonl",
+            "Reset-State.Json",
+        ],
+    )
     def test_reserved_account_artifact_mailbox_names_raise_before_folder_write(
         self,
         tmp_path: Path,
@@ -3877,7 +5033,7 @@ class TestLegacyImportJournal:
         assert not any(target.select_readonly_values)
         assert target.store_calls == [(b"1", "+FLAGS.SILENT", "(\\ANSWERED)")]
 
-    def test_import_skips_committed_same_content_after_uid_renumber(self, tmp_path: Path) -> None:
+    def test_import_rejects_missing_exact_committed_artifact_after_uid_renumber(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
         from components.models import Account, ServerConfig
 
@@ -3949,6 +5105,8 @@ class TestLegacyImportJournal:
         ]
         assert rows_after_first[-1]["rfc822_size"] == str(len(data))
         assert rows_after_first[-1]["content_sha256"] == hashlib.sha256(data).hexdigest()
+        search_count_before = target.search_count
+        fetch_count_before = target.fetch_count
 
         eml2 = folder / "u0000000002.eml"
         eml2.write_bytes(data)
@@ -3963,23 +5121,19 @@ class TestLegacyImportJournal:
         eml1.with_suffix(".json").unlink()
         eml1.unlink()
 
-        import_account(
-            account,
-            server,
-            tmp_path,
-            ignore_errors=False,
-            imap_factory=fake_factory,
-            source_server=self._source_server(),
-        )
+        with pytest.raises(RuntimeError, match="staged message file missing"):
+            import_account(
+                account,
+                server,
+                tmp_path,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+            )
 
-        rows_after_second = [
-            json.loads(line)
-            for line in (account_dir / "import.journal.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
         assert target.append_count == 1
-        assert target.search_count == 1
-        assert target.fetch_count == 1
-        assert len(rows_after_second) == len(rows_after_first)
+        assert target.search_count == search_count_before
+        assert target.fetch_count == fetch_count_before
 
     def test_import_keeps_identical_staged_messages_distinct(self, tmp_path: Path) -> None:
         from components.imap_ops import import_account
@@ -5149,7 +6303,117 @@ class TestLegacyImportJournal:
         assert fake_imap.created == ["Projects"]
         assert fake_imap.subscribed == ["Projects"]
 
+    @pytest.mark.parametrize("mutate_before_failure", [False, True])
+    def test_interrupted_reset_blocks_plain_retry_until_successful_reset_resume(
+        self,
+        tmp_path: Path,
+        mutate_before_failure: bool,
+    ) -> None:
+        from components import imap_ops
+        from components.models import Account, ServerConfig
+
+        in_root = self._make_export(tmp_path)
+        account = Account(email="user@example.com", password="pass")
+        server = ServerConfig(host="target.example.com", port=993, ssl=True)
+        account_dir = in_root / account.email
+
+        class ResettableTarget:
+            def __init__(self) -> None:
+                self.append_count = 0
+                self.connection_count = 0
+                self.has_message = False
+
+            def select(self, _mailbox: str, readonly: bool = False):
+                return "OK", [b"1" if self.has_message else b"0"]
+
+            def search(self, _charset, *_criteria):
+                return "OK", [b"1" if self.has_message else b""]
+
+            def uid(self, command: str, *_args):
+                if command == "search":
+                    return "OK", [b"1" if self.has_message else b""]
+                raise AssertionError(f"unexpected UID command: {command}")
+
+            def append(self, _mailbox: str, _flags: str, _date_time: str, _data: bytes):
+                self.append_count += 1
+                self.has_message = True
+                return "OK", [b""]
+
+        target = ResettableTarget()
+
+        @contextlib.contextmanager
+        def fake_factory(*_args, **_kwargs) -> Iterator[ResettableTarget]:
+            target.connection_count += 1
+            yield target
+
+        imap_ops.import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+        )
+        assert target.append_count == 1
+        baseline_connection_count = target.connection_count
+        assert baseline_connection_count > 0
+
+        def failing_reset() -> None:
+            if mutate_before_failure:
+                target.has_message = False
+            raise RuntimeError("simulated reset interruption")
+
+        with pytest.raises(RuntimeError, match="simulated reset interruption"):
+            imap_ops.import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+                reset_before_import=failing_reset,
+            )
+
+        state_path = account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME
+        assert json.loads(state_path.read_text())["phase"] == "reset_started"
+        assert not (account_dir / "import.journal.jsonl").exists()
+        archives = list(account_dir.glob("import.journal.reset-*.jsonl"))
+        assert len(archives) == 1
+
+        with pytest.raises(RuntimeError, match="legacy reset is in progress"):
+            imap_ops.import_account(
+                account,
+                server,
+                in_root,
+                ignore_errors=False,
+                imap_factory=fake_factory,
+                source_server=self._source_server(),
+            )
+
+        assert target.connection_count == baseline_connection_count
+        assert target.append_count == 1
+
+        def successful_reset_resume() -> None:
+            target.has_message = False
+
+        imap_ops.import_account(
+            account,
+            server,
+            in_root,
+            ignore_errors=False,
+            imap_factory=fake_factory,
+            source_server=self._source_server(),
+            reset_before_import=successful_reset_resume,
+        )
+
+        assert target.connection_count > baseline_connection_count
+        assert target.append_count == 2
+        assert not state_path.exists()
+        assert (account_dir / "import.journal.jsonl").exists()
+        assert list(account_dir.glob("import.journal.reset-*.jsonl")) == archives
+
     def test_reset_archives_committed_journal_for_same_target_before_import(self, tmp_path: Path) -> None:
+        from components import imap_ops
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main
         from components.models import Account, ServerConfig
@@ -5178,11 +6442,26 @@ class TestLegacyImportJournal:
             def __init__(self, *_args, **_kwargs) -> None:
                 pass
 
+        imported: List[str] = []
+
+        def record_reset(*_args, **_kwargs) -> set[str]:
+            assert not (account_dir / "import.journal.jsonl").exists()
+            assert list(account_dir.glob("import.journal.reset-*.jsonl"))
+            reset_state = json.loads(
+                (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).read_text()
+            )
+            assert reset_state["phase"] == "reset_started"
+            return set()
+
+        def record_unlocked(acc, *_args, **_kwargs) -> None:
+            assert not (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).exists()
+            imported.append(acc.email)
+
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
-            mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
-            mock.patch("components.main.import_account") as import_mock:
+            mock.patch("components.da_ensure.reset_accounts_directadmin", side_effect=record_reset) as reset_mock, \
+            mock.patch("components.imap_ops._import_account_unlocked", record_unlocked):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -5202,9 +6481,11 @@ class TestLegacyImportJournal:
         assert rc == 0
         assert not (account_dir / "import.journal.jsonl").exists()
         assert list(account_dir.glob("import.journal.reset-*.jsonl"))
-        import_mock.assert_called_once()
+        assert not (account_dir / imap_ops.LEGACY_RESET_STATE_FILENAME).exists()
+        assert imported == [account.email]
+        reset_mock.assert_called_once()
 
-    def test_reset_archives_committed_journal_before_connectivity_failure(self, tmp_path: Path) -> None:
+    def test_reset_archives_committed_journal_without_pre_reset_connectivity(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main
         from components.models import Account, ServerConfig
@@ -5233,13 +6514,18 @@ class TestLegacyImportJournal:
             def __init__(self, *_args, **_kwargs) -> None:
                 pass
 
+        imported: List[str] = []
+
+        def record_unlocked(acc, *_args, **_kwargs) -> None:
+            imported.append(acc.email)
+
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.utils.ensure_imapsync_available"), \
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
             mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()), \
-            mock.patch("components.main.test_accounts", side_effect=RuntimeError("connectivity failed")), \
-            mock.patch("components.main.import_account") as import_mock:
+            mock.patch("components.main.test_accounts", side_effect=AssertionError("pre-reset connectivity should not run")) as test_mock, \
+            mock.patch("components.imap_ops._import_account_unlocked", record_unlocked):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -5255,10 +6541,11 @@ class TestLegacyImportJournal:
                 "--da-password", "login-key",
             ])
 
-        assert rc == 3
+        assert rc == 0
         assert not (account_dir / "import.journal.jsonl").exists()
         assert list(account_dir.glob("import.journal.reset-*.jsonl"))
-        import_mock.assert_not_called()
+        assert imported == [account.email]
+        test_mock.assert_not_called()
 
     @pytest.mark.parametrize(
         ("status", "hard_linked"),
@@ -5267,7 +6554,7 @@ class TestLegacyImportJournal:
             ("committed", True),
         ],
     )
-    def test_reset_rejects_uncertain_import_journal_before_panel_reset(
+    def test_reset_archives_pending_but_rejects_hard_linked_import_journal_before_panel_reset(
         self,
         tmp_path: Path,
         status: str,
@@ -5310,13 +6597,13 @@ class TestLegacyImportJournal:
 
         class DummyDirectAdminClient:
             def __init__(self, *_args, **_kwargs) -> None:
-                raise AssertionError("panel client should not be created")
+                pass
 
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
             mock.patch("components.da_ensure.reset_accounts_directadmin") as reset_mock, \
-            mock.patch("components.main.import_account") as import_mock:
+            mock.patch("components.imap_ops._import_account_unlocked") as import_mock:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -5333,13 +6620,109 @@ class TestLegacyImportJournal:
                 "--da-password", "login-key",
             ])
 
+        if hard_linked:
+            assert rc == 4
+            assert journal.exists()
+            assert not list(account_dir.glob("import.journal.reset-*.jsonl"))
+            assert not (account_dir / "reset-state.json").exists()
+            reset_mock.assert_not_called()
+            import_mock.assert_not_called()
+        else:
+            assert rc == 0
+            assert not journal.exists()
+            assert list(account_dir.glob("import.journal.reset-*.jsonl"))
+            reset_mock.assert_called_once()
+            import_mock.assert_called_once()
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_panel_provision_and_reset_are_gated_by_torn_tail_recovery_evidence(
+        self,
+        tmp_path: Path,
+        reset: bool,
+    ) -> None:
+        from components.main import main
+        from components.models import Account, ServerConfig
+
+        account = Account(email="user@example.com", password="pass")
+        source_server = ServerConfig(host="source.example.com", port=993, ssl=True)
+        target_server = ServerConfig(host="target.example.com", port=993, ssl=True)
+        input_root = tmp_path / "exported"
+        account_dir = input_root / account.email
+        folder = account_dir / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <panel-orphan-torn-tail@example.com>\r\n\r\nbody",
+            source_server=source_server,
+        )
+        _write_legacy_recovery_journal_fixture(
+            eml,
+            account=account,
+            target_server=target_server,
+            status="pending",
+        )
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_bytes(journal.read_bytes() + b'{"key":')
+        original_journal = journal.read_bytes()
+        eml.unlink()
+        eml.with_suffix(".json").unlink()
+        (folder / ".mailbox.json").write_text(
+            json.dumps({"mailbox": "INBOX", "message_count": 0})
+        )
+        state = json.loads((account_dir / "export-state.json").read_text())
+        state["mailboxes"][0]["message_count"] = 0
+        (account_dir / "export-state.json").write_text(json.dumps(state))
+        config_path = tmp_path / "import.pass.config.json"
+        config_path.write_text(json.dumps({
+            "server": {
+                "host": target_server.host,
+                "port": target_server.port,
+                "ssl": target_server.ssl,
+                "starttls": target_server.starttls,
+            },
+            "source_server": {
+                "host": source_server.host,
+                "port": source_server.port,
+                "ssl": source_server.ssl,
+                "starttls": source_server.starttls,
+            },
+            "accounts": [{"email": account.email, "password": account.password}],
+        }))
+        reset_args = [
+            "--reset",
+            "--reset-confirm", target_server.host,
+        ] if reset else []
+
+        with mock.patch("components.main.check_environment"), \
+            mock.patch("components.main.check_free_space_for_path"), \
+            mock.patch("components.main.DirectAdminClient") as client_cls, \
+            mock.patch("components.main.ensure_accounts_exist_directadmin") as provision_mock, \
+            mock.patch("components.da_ensure.reset_accounts_directadmin") as reset_mock, \
+            mock.patch("components.main.import_account") as import_mock:
+            rc = main([
+                "--mode", "import",
+                "--config", str(config_path),
+                "--input-dir", str(input_root),
+                "--log-dir", str(tmp_path / "logs-panel-recovery-gate"),
+                "--min-free-gb", "0",
+                "--max-workers", "1",
+                "--no-connectivity-test",
+                "--auto-provision-da",
+                "--da-url", "https://panel.example.com:2222",
+                "--da-username", "admin",
+                "--da-password", "login-key",
+                *reset_args,
+            ])
+
         assert rc == 4
-        assert journal.exists()
+        assert journal.read_bytes() == original_journal
         assert not list(account_dir.glob("import.journal.reset-*.jsonl"))
+        client_cls.assert_not_called()
+        provision_mock.assert_not_called()
         reset_mock.assert_not_called()
         import_mock.assert_not_called()
 
     def test_reset_archive_failure_returns_error_without_import(self, tmp_path: Path) -> None:
+        from components import imap_ops
         from components.main import main
         from components.models import Account, ServerConfig
 
@@ -5361,8 +6744,8 @@ class TestLegacyImportJournal:
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
             mock.patch("components.da_ensure.reset_accounts_directadmin", return_value=set()) as reset_mock, \
-            mock.patch("components.main.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
-            mock.patch("components.main.import_account") as import_mock:
+            mock.patch("components.imap_ops.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
+            mock.patch("components.imap_ops._import_account_unlocked") as import_mock:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -5379,11 +6762,16 @@ class TestLegacyImportJournal:
                 "--da-password", "login-key",
             ])
 
-        assert rc == 4
+        assert rc == 1
+        reset_state = json.loads(
+            (in_root / account.email / imap_ops.LEGACY_RESET_STATE_FILENAME).read_text()
+        )
+        assert reset_state["phase"] == "prepared"
         reset_mock.assert_not_called()
         import_mock.assert_not_called()
 
     def test_cpanel_reset_archive_failure_returns_error_before_reset(self, tmp_path: Path) -> None:
+        from components import imap_ops
         from components.main import main
         from components.models import Account, ServerConfig
 
@@ -5405,8 +6793,8 @@ class TestLegacyImportJournal:
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.CPanelClient", DummyCPanelClient), \
             mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value=set()) as reset_mock, \
-            mock.patch("components.main.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
-            mock.patch("components.main.import_account") as import_mock:
+            mock.patch("components.imap_ops.archive_legacy_import_journal_for_reset", side_effect=RuntimeError("archive failed")), \
+            mock.patch("components.imap_ops._import_account_unlocked") as import_mock:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -5423,7 +6811,11 @@ class TestLegacyImportJournal:
                 "--cpanel-password", "secret",
             ])
 
-        assert rc == 4
+        assert rc == 1
+        reset_state = json.loads(
+            (in_root / account.email / imap_ops.LEGACY_RESET_STATE_FILENAME).read_text()
+        )
+        assert reset_state["phase"] == "prepared"
         reset_mock.assert_not_called()
         import_mock.assert_not_called()
 
@@ -6673,7 +8065,7 @@ class TestCliAndConfigHardening:
         assert rc == 4
         assert events == ["free-space"]
 
-    def test_legacy_import_rejects_pending_journal_before_connectivity_test(self, tmp_path: Path) -> None:
+    def test_legacy_import_rejects_pending_journal_after_connectivity_under_import_lock(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main
         from components.models import Account, ServerConfig
@@ -6707,11 +8099,14 @@ class TestCliAndConfigHardening:
         def record_imapsync_check() -> None:
             events.append("imapsync")
 
+        def record_connectivity(*_args, **_kwargs) -> None:
+            events.append("connectivity")
+
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path", record_free_space), \
             mock.patch("components.utils.ensure_imapsync_available", record_imapsync_check), \
-            mock.patch("components.main.test_accounts", side_effect=AssertionError("connectivity should not run")), \
-            mock.patch("components.main.import_account", side_effect=AssertionError("import should not run")):
+            mock.patch("components.main.test_accounts", record_connectivity), \
+            mock.patch("components.imap_ops.imap_connection", side_effect=AssertionError("target should not be contacted")):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -6720,8 +8115,8 @@ class TestCliAndConfigHardening:
                 "--min-free-gb", "0",
             ])
 
-        assert rc == 4
-        assert events == ["free-space"]
+        assert rc == 1
+        assert events == ["free-space", "imapsync", "connectivity"]
 
     def test_legacy_audit_rejects_pending_import_journal(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
@@ -6803,7 +8198,8 @@ class TestCliAndConfigHardening:
         assert rc == 4
         assert journal.read_text() == original
 
-    def test_legacy_import_allows_trailing_journal_repair_before_import(self, tmp_path: Path) -> None:
+    def test_legacy_import_repairs_trailing_journal_under_import_lock(self, tmp_path: Path) -> None:
+        from components import imap_ops
         from components.main import main
         from components.models import Account, ServerConfig
 
@@ -6825,11 +8221,12 @@ class TestCliAndConfigHardening:
         imported: List[str] = []
 
         def record_import(acc, *_args, **_kwargs) -> None:
+            assert imap_ops._load_legacy_import_journal(account_dir) == []
             imported.append(acc.email)
 
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.check_free_space_for_path"), \
-            mock.patch("components.main.import_account", record_import):
+            mock.patch("components.imap_ops._import_account_unlocked", record_import):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -8089,7 +9486,7 @@ class TestDirectAdminIndexerHardening:
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
             mock.patch("components.da_ensure.reset_accounts_directadmin", return_value={"skip@example.com"}), \
-            mock.patch("components.main.import_account", fake_import_account):
+            mock.patch("components.imap_ops._import_account_unlocked", fake_import_account):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -8110,7 +9507,7 @@ class TestDirectAdminIndexerHardening:
         assert rc == 3
         assert imported == ["ok@example.com"]
 
-    def test_import_connectivity_skips_reset_failed_accounts_under_ignore_errors(self, tmp_path: Path) -> None:
+    def test_import_reset_skips_pre_reset_connectivity_under_ignore_errors(self, tmp_path: Path) -> None:
         from components.main import main
 
         config_path = tmp_path / "import.pass.config.json"
@@ -8146,7 +9543,7 @@ class TestDirectAdminIndexerHardening:
             mock.patch("components.main.DirectAdminClient", DummyDirectAdminClient), \
             mock.patch("components.da_ensure.reset_accounts_directadmin", return_value={"skip@example.com"}), \
             mock.patch("components.main.test_accounts", fake_test_accounts), \
-            mock.patch("components.main.import_account", fake_import_account):
+            mock.patch("components.imap_ops._import_account_unlocked", fake_import_account):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -8164,7 +9561,7 @@ class TestDirectAdminIndexerHardening:
             ])
 
         assert rc == 3
-        assert tested == [["ok@example.com"]]
+        assert tested == []
         assert imported == ["ok@example.com"]
 
     def test_directadmin_create_ignore_errors_skips_failed_account_for_connectivity_and_import(self, tmp_path: Path) -> None:
@@ -8208,7 +9605,10 @@ class TestDirectAdminIndexerHardening:
         def fake_test_accounts(config, *_args, **_kwargs) -> None:
             tested.append([acc.email for acc in config.accounts])
 
-        def fake_import_account(acc, *_args, **_kwargs) -> None:
+        def fake_import_account(acc, *_args, **kwargs) -> None:
+            before_import = kwargs.get("before_import")
+            if before_import is not None:
+                before_import()
             imported.append(acc.email)
 
         with mock.patch("components.main.check_environment"), \
@@ -8551,7 +9951,7 @@ class TestCPanelProvisioning:
             mock.patch("components.main.check_free_space_for_path"), \
             mock.patch("components.main.CPanelClient", DummyCPanelClient), \
             mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"skip@example.com"}), \
-            mock.patch("components.main.import_account", fake_import_account):
+            mock.patch("components.imap_ops._import_account_unlocked", fake_import_account):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -8613,7 +10013,10 @@ class TestCPanelProvisioning:
         def fake_test_accounts(config, *_args, **_kwargs) -> None:
             tested.append([acc.email for acc in config.accounts])
 
-        def fake_import_account(acc, *_args, **_kwargs) -> None:
+        def fake_import_account(acc, *_args, **kwargs) -> None:
+            before_import = kwargs.get("before_import")
+            if before_import is not None:
+                before_import()
             imported.append(acc.email)
 
         with mock.patch("components.main.check_environment"), \
@@ -8641,7 +10044,7 @@ class TestCPanelProvisioning:
         assert tested == [["ok@example.com"]]
         assert imported == ["ok@example.com"]
 
-    def test_cpanel_reset_archives_journal_and_skips_failed_connectivity_account(self, tmp_path: Path) -> None:
+    def test_cpanel_reset_archives_journal_and_skips_pre_reset_connectivity(self, tmp_path: Path) -> None:
         from components.imap_ops import _legacy_import_key, _legacy_import_target_id
         from components.main import main
         from components.models import Account, ServerConfig
@@ -8693,7 +10096,7 @@ class TestCPanelProvisioning:
             mock.patch("components.main.CPanelClient", DummyCPanelClient), \
             mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"skip@example.com"}), \
             mock.patch("components.main.test_accounts", fake_test_accounts), \
-            mock.patch("components.main.import_account", fake_import_account):
+            mock.patch("components.imap_ops._import_account_unlocked", fake_import_account):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -8711,7 +10114,7 @@ class TestCPanelProvisioning:
             ])
 
         assert rc == 3
-        assert tested == [["ok@example.com"]]
+        assert tested == []
         assert imported == ["ok@example.com"]
         assert list(ok_account_dir.glob("import.journal.reset-*.jsonl"))
 
@@ -8765,7 +10168,7 @@ class TestCPanelProvisioning:
         with mock.patch("components.main.check_environment"), \
             mock.patch("components.main.CPanelClient", side_effect=DummyCPanelClient) as client_cls, \
             mock.patch("components.cpanel_ensure.reset_accounts_cpanel", return_value={"a@example.com"}) as reset_mock, \
-            mock.patch("components.main.import_account", side_effect=AssertionError("reset-failed account should be skipped")):
+            mock.patch("components.imap_ops._import_account_unlocked", side_effect=AssertionError("reset-failed account should be skipped")):
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -9043,9 +10446,9 @@ class TestCPanelProvisioning:
                 *panel_args,
             ])
 
-        assert rc == 4
+        assert rc == 0
         assert journal.read_text() == original
-        client_cls.assert_not_called()
+        client_cls.assert_called_once()
 
     def test_cpanel_dry_run_does_not_require_imapsync_binary(self, tmp_path: Path) -> None:
         from components.main import main
@@ -10218,6 +11621,261 @@ print("ok")
         )
         assert ok
         assert issues == []
+
+    @pytest.mark.parametrize("status", ["pending", "committed"])
+    def test_reexport_retains_exact_journal_artifact_when_source_mailbox_disappears(
+        self,
+        tmp_path: Path,
+        status: str,
+    ) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.models import Account, Config, ServerConfig
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("imap.example.com")
+        target_server = ServerConfig("target.example.com")
+        body = b"Message-ID: <legacy-recovery-delete@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nold"
+
+        @contextlib.contextmanager
+        def source_connection(messages) -> Iterator[_LegacyRecoveryExportSource]:
+            yield _LegacyRecoveryExportSource(messages)
+
+        with mock.patch(
+            "components.imap_ops.imap_connection",
+            lambda *_args: source_connection({"Archive": {1: body}}),
+        ):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / account.email
+        eml = account_dir / "Archive" / "u0000000001.eml"
+        _write_legacy_recovery_journal_fixture(
+            eml,
+            account=account,
+            target_server=target_server,
+            status=status,
+            target_mailbox="Archive",
+        )
+        payload_before = eml.read_bytes()
+        metadata_before = eml.with_suffix(".json").read_bytes()
+
+        with mock.patch(
+            "components.imap_ops.imap_connection",
+            lambda *_args: source_connection({}),
+        ):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        assert eml.read_bytes() == payload_before
+        assert eml.with_suffix(".json").read_bytes() == metadata_before
+        marker = json.loads((eml.parent / ".mailbox.json").read_text())
+        state = json.loads((account_dir / "export-state.json").read_text())
+        assert marker["message_count"] == 1
+        assert state["mailboxes"] == [
+            {
+                "mailbox": "Archive",
+                "message_count": 1,
+                "path": "Archive",
+                "uidvalidity": "123",
+            }
+        ]
+        ok, issues = audit_export(
+            tmp_path,
+            Config(
+                server=target_server,
+                accounts=[account],
+                source_server=source_server,
+            ),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        assert ok
+        assert issues == []
+
+    def test_reexport_preserves_pending_snapshot_and_stages_source_drift_separately(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account
+        from components.models import Account, Config, ServerConfig
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("imap.example.com")
+        target_server = ServerConfig("target.example.com")
+        old_body = b"Message-ID: <legacy-recovery-drift@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nold"
+        new_body = b"Message-ID: <legacy-recovery-drift@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nnew"
+
+        @contextlib.contextmanager
+        def source_connection(body: bytes) -> Iterator[_LegacyRecoveryExportSource]:
+            yield _LegacyRecoveryExportSource({"INBOX": {1: body}})
+
+        with mock.patch(
+            "components.imap_ops.imap_connection",
+            lambda *_args: source_connection(old_body),
+        ):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / account.email
+        eml = account_dir / "INBOX" / "u0000000001.eml"
+        _write_legacy_recovery_journal_fixture(
+            eml,
+            account=account,
+            target_server=target_server,
+            status="pending",
+        )
+        payload_before = eml.read_bytes()
+        metadata_before = eml.with_suffix(".json").read_bytes()
+
+        with mock.patch(
+            "components.imap_ops.imap_connection",
+            lambda *_args: source_connection(new_body),
+        ):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        staged = sorted(eml.parent.glob("*.eml"))
+        assert len(staged) == 2
+        assert eml.read_bytes() == payload_before == old_body
+        assert eml.with_suffix(".json").read_bytes() == metadata_before
+        assert {path.read_bytes() for path in staged} == {old_body, new_body}
+        assert any("-reexport-" in path.stem for path in staged)
+        marker = json.loads((eml.parent / ".mailbox.json").read_text())
+        assert marker["message_count"] == 2
+        ok, issues = audit_export(
+            tmp_path,
+            Config(
+                server=target_server,
+                accounts=[account],
+                source_server=source_server,
+            ),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        assert ok
+        assert issues == []
+
+    @pytest.mark.parametrize("status", ["pending", "committed"])
+    def test_legacy_audit_and_import_reject_orphan_recovery_in_empty_stage(
+        self,
+        tmp_path: Path,
+        status: str,
+    ) -> None:
+        from components.audit import audit_export
+        from components.imap_ops import export_account, import_account
+        from components.models import Account, Config, ServerConfig
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("imap.example.com")
+        target_server = ServerConfig("target.example.com")
+        body = b"Message-ID: <legacy-orphan-empty@example.com>\r\nFrom: a\r\nTo: b\r\n\r\nbody"
+
+        @contextlib.contextmanager
+        def source_connection() -> Iterator[_LegacyRecoveryExportSource]:
+            yield _LegacyRecoveryExportSource({"INBOX": {1: body}})
+
+        with mock.patch("components.imap_ops.imap_connection", lambda *_args: source_connection()):
+            export_account(account, source_server, tmp_path, ignore_errors=False)
+
+        account_dir = tmp_path / account.email
+        folder = account_dir / "INBOX"
+        eml = folder / "u0000000001.eml"
+        _write_legacy_recovery_journal_fixture(
+            eml,
+            account=account,
+            target_server=target_server,
+            status=status,
+        )
+        eml.unlink()
+        eml.with_suffix(".json").unlink()
+        (folder / ".mailbox.json").write_text(
+            json.dumps({"mailbox": "INBOX", "message_count": 0, "uidvalidity": "123"})
+        )
+        state = json.loads((account_dir / "export-state.json").read_text())
+        state["mailboxes"][0]["message_count"] = 0
+        (account_dir / "export-state.json").write_text(json.dumps(state))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(
+                server=target_server,
+                accounts=[account],
+                source_server=source_server,
+            ),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+        assert not ok
+        assert any("journal" in issue and "staged message file missing" in issue for issue in issues)
+
+        with mock.patch(
+            "components.imap_ops.imap_connection",
+            side_effect=AssertionError("target should not be contacted"),
+        ):
+            with pytest.raises(RuntimeError, match="staged message file missing"):
+                import_account(
+                    account,
+                    target_server,
+                    tmp_path,
+                    ignore_errors=False,
+                    source_server=source_server,
+                )
+
+    def test_legacy_audit_reads_pending_recovery_prefix_before_torn_tail(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from components.audit import audit_export
+        from components.models import Account, Config, ServerConfig
+
+        account = Account("user@example.com", "secret")
+        source_server = ServerConfig("source.example.com")
+        target_server = ServerConfig("target.example.com")
+        account_dir = tmp_path / account.email
+        folder = account_dir / "INBOX"
+        eml = _write_legacy_message_fixture(
+            folder,
+            data=b"Message-ID: <legacy-orphan-torn-tail@example.com>\r\n\r\nbody",
+            source_server=source_server,
+        )
+        _write_legacy_recovery_journal_fixture(
+            eml,
+            account=account,
+            target_server=target_server,
+            status="pending",
+        )
+        journal = account_dir / "import.journal.jsonl"
+        journal.write_bytes(journal.read_bytes() + b'{"key":')
+        original_journal = journal.read_bytes()
+        eml.unlink()
+        eml.with_suffix(".json").unlink()
+        (folder / ".mailbox.json").write_text(
+            json.dumps({"mailbox": "INBOX", "message_count": 0})
+        )
+        state = json.loads((account_dir / "export-state.json").read_text())
+        state["mailboxes"][0]["message_count"] = 0
+        (account_dir / "export-state.json").write_text(json.dumps(state))
+
+        ok, issues = audit_export(
+            tmp_path,
+            Config(
+                server=target_server,
+                accounts=[account],
+                source_server=source_server,
+            ),
+            1,
+            check_remote=False,
+            require_integrity_metadata=True,
+        )
+
+        assert not ok
+        assert any(
+            "journal pending recovery evidence" in issue
+            and "staged message file missing" in issue
+            for issue in issues
+        )
+        assert journal.read_bytes() == original_journal
 
     def test_legacy_stale_export_file_cleanup_fsyncs_parent_after_unlink(
         self,
@@ -16572,7 +18230,7 @@ class TestRound7ConfirmedBugs:
             mock.patch("components.main.signal.signal", fake_signal), \
             mock.patch("components.main.CPanelClient", DummyCPanelClient), \
             mock.patch("components.cpanel_ensure.reset_accounts_cpanel", fake_reset), \
-            mock.patch("components.main.import_account", side_effect=AssertionError("import should not run after stop")):
+            mock.patch("components.imap_ops._import_account_unlocked") as import_mock:
             rc = main([
                 "--mode", "import",
                 "--config", str(config_path),
@@ -16590,6 +18248,7 @@ class TestRound7ConfirmedBugs:
             ])
 
         assert rc == 130
+        import_mock.assert_not_called()
 
     def test_main_registers_signal_before_legacy_staged_audit(self, tmp_path: Path) -> None:
         from components.main import main
@@ -16632,6 +18291,7 @@ class TestRound7ConfirmedBugs:
     def test_main_returns_130_when_post_export_audit_raises_after_stop(self, tmp_path: Path) -> None:
         from components.main import main
 
+        (tmp_path / "exported").mkdir()
         config_path = tmp_path / "export.config.json"
         config_path.write_text(json.dumps({
             "server": {"host": "imap.example.com", "port": 993, "ssl": True, "starttls": False},

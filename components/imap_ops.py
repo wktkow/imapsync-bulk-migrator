@@ -1,12 +1,15 @@
 import contextlib
 import errno
+import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import ssl
 import stat
+import sys
 import time
 from collections import Counter, deque
 from contextlib import AbstractContextManager
@@ -16,6 +19,7 @@ from email.policy import default as default_policy
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
+import idna
 import imaplib
 
 from .models import Account, ServerConfig
@@ -33,11 +37,33 @@ from .utils import (
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+IMPORT_LOCK_WAIT_SECONDS = 0.1
+LEGACY_RESET_STATE_FILENAME = "reset-state.json"
+LEGACY_GLOBAL_STATE_PARENT = (
+    Path("/private/var/tmp") if sys.platform == "darwin" else Path("/var/tmp")
+)
+LEGACY_GLOBAL_STATE_DIR_PREFIX = "imapsync-bulk-migrator"
+LEGACY_GLOBAL_STATE_NAMESPACE = "legacy-target-state"
+LEGACY_GLOBAL_LOCK_DIRNAME = "locks"
+LEGACY_GLOBAL_RESET_DIRNAME = "resets"
 _HAS_DESCRIPTOR_RELATIVE_OPEN = os.open in os.supports_dir_fd
 _HAS_DESCRIPTOR_RELATIVE_MKDIR = _HAS_DESCRIPTOR_RELATIVE_OPEN and os.mkdir in os.supports_dir_fd
-LEGACY_ACCOUNT_RESERVED_PATHS = frozenset({"export-state.json", "import.journal.jsonl", "manifest.jsonl"})
+LEGACY_ACCOUNT_RESERVED_PATHS = frozenset(
+    {
+        "export-state.json",
+        "import.journal.jsonl",
+        "manifest.jsonl",
+        LEGACY_RESET_STATE_FILENAME,
+    }
+)
 _LEGACY_ACCOUNT_RESERVED_PATH_KEYS = frozenset(path.casefold() for path in LEGACY_ACCOUNT_RESERVED_PATHS)
 _LEGACY_IMPORT_JOURNAL_STATUSES = {"pending", "committed", "failed"}
+_LEGACY_RESET_STATE_PHASES = {"prepared", "journal_archived", "reset_started"}
+_LEGACY_RESET_PHASE_ORDER = {
+    "prepared": 0,
+    "journal_archived": 1,
+    "reset_started": 2,
+}
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _LEGACY_UIDVALIDITY_RE = re.compile(r"[1-9][0-9]*")
 _LEGACY_UIDVALIDITY_MAX = 0xFFFFFFFF
@@ -63,6 +89,10 @@ class _LegacyAppendOutcomeUncertain(RuntimeError):
     """Raised when APPEND may have reached the target but no outcome was confirmed."""
 
 
+class LegacyResetGateError(RuntimeError):
+    """Raised when an ordinary target action is blocked by reset state."""
+
+
 class _LegacyMailboxEntry(NamedTuple):
     name: str
     attributes: Tuple[str, ...]
@@ -80,12 +110,57 @@ def quote_mailbox_name(mailbox: str) -> str:
 def ensure_private_dir(path: Path, *, label: str = "directory") -> None:
     dir_fd, dir_path = _open_or_create_legacy_dir(path, label)
     try:
-        _raise_if_legacy_parent_replaced(dir_path, dir_fd, "directory")
-        with contextlib.suppress(Exception):
-            os.fchmod(dir_fd, PRIVATE_DIR_MODE)
-        _raise_if_legacy_parent_replaced(dir_path, dir_fd, "directory")
+        _raise_if_legacy_parent_replaced(dir_path, dir_fd, label)
+        _secure_legacy_private_dir_fd(dir_fd, dir_path, label)
+        _raise_if_legacy_parent_replaced(dir_path, dir_fd, label)
     finally:
         os.close(dir_fd)
+
+
+def _legacy_effective_uid() -> int:
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        raise RuntimeError("platform does not expose an effective UID for legacy artifact ownership checks")
+    try:
+        return int(get_effective_uid())
+    except OSError as exc:
+        raise RuntimeError("unable to determine effective UID for legacy artifact ownership checks") from exc
+
+
+def _secure_legacy_private_dir_fd(dir_fd: int, path: Path, label: str) -> None:
+    if path == Path(path.anchor):
+        raise RuntimeError(f"refusing to secure {label} filesystem root: {path}")
+    stat_result = os.fstat(dir_fd)
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise RuntimeError(f"{label} path is not a directory: {path}")
+    effective_uid = _legacy_effective_uid()
+    if stat_result.st_uid != effective_uid:
+        raise RuntimeError(
+            f"refusing to secure {label} not owned by effective UID {effective_uid}: "
+            f"{path} (owner UID {stat_result.st_uid})"
+        )
+    mode = stat.S_IMODE(stat_result.st_mode)
+    unsafe_shared_bits = stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    if mode & unsafe_shared_bits:
+        raise RuntimeError(f"refusing to secure shared {label} directory: {path} (mode {mode:#05o})")
+    try:
+        os.fchmod(dir_fd, PRIVATE_DIR_MODE)
+    except OSError as exc:
+        raise RuntimeError(f"unable to set private permissions on {label} directory: {path}") from exc
+    final_stat = os.fstat(dir_fd)
+    final_mode = stat.S_IMODE(final_stat.st_mode)
+    if not stat.S_ISDIR(final_stat.st_mode):
+        raise RuntimeError(f"{label} path is no longer a directory: {path}")
+    if final_stat.st_uid != effective_uid:
+        raise RuntimeError(
+            f"{label} ownership changed while securing {path}: "
+            f"expected UID {effective_uid}, found {final_stat.st_uid}"
+        )
+    if final_mode != PRIVATE_DIR_MODE:
+        raise RuntimeError(
+            f"{label} directory permissions are not private: "
+            f"{path} (expected {PRIVATE_DIR_MODE:#05o}, found {final_mode:#05o})"
+        )
 
 
 def legacy_reserved_mailbox_path_issue(mailbox: str, path: Optional[str] = None) -> Optional[str]:
@@ -375,6 +450,42 @@ def _secure_atomic_write_text(path: Path, payload: str) -> None:
 
 def _secure_atomic_json(path: Path, payload: Dict[str, object]) -> None:
     _secure_atomic_write_text(path, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _legacy_canonical_dns_name(value: str) -> str:
+    host = value.strip().rstrip(".")
+    if not host:
+        return ""
+    ip_literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    address_part, scope_separator, scope_id = ip_literal.partition("%")
+    try:
+        address = ipaddress.ip_address(address_part)
+        if scope_separator:
+            if address.version != 6 or not scope_id or "%" in scope_id:
+                raise ValueError("invalid scoped IP literal")
+            # Interface names can be case-sensitive. Canonicalize only the
+            # numeric address and preserve the scope identifier byte-for-byte.
+            return f"{address.compressed.lower()}%{scope_id}"
+        return address.compressed.lower()
+    except ValueError:
+        pass
+    try:
+        return idna.encode(
+            host,
+            uts46=True,
+            std3_rules=True,
+        ).decode("ascii").lower()
+    except (idna.IDNAError, UnicodeError, ValueError):
+        # Preserve legacy support for IP literals and unusual-but-accepted IMAP
+        # host strings while canonicalizing ordinary DNS names.
+        return host.lower()
+
+
+def _legacy_canonical_account_target_identity(email: str) -> str:
+    local_part, separator, domain = email.rpartition("@")
+    if not separator:
+        return email
+    return f"{local_part}@{_legacy_canonical_dns_name(domain)}"
 
 
 def legacy_server_endpoint(server: ServerConfig) -> Dict[str, object]:
@@ -994,6 +1105,775 @@ def _legacy_import_journal_path(account_dir: Path) -> Path:
     return account_dir / "import.journal.jsonl"
 
 
+def _legacy_reset_state_path(account_dir: Path) -> Path:
+    return account_dir / LEGACY_RESET_STATE_FILENAME
+
+
+def _legacy_global_state_root() -> Path:
+    return _legacy_normalized_absolute_path(
+        LEGACY_GLOBAL_STATE_PARENT
+        / f"{LEGACY_GLOBAL_STATE_DIR_PREFIX}-{_legacy_effective_uid()}"
+    )
+
+
+def _legacy_global_state_namespace_dir() -> Path:
+    return _legacy_global_state_root() / LEGACY_GLOBAL_STATE_NAMESPACE
+
+
+def _legacy_global_lock_dir() -> Path:
+    return _legacy_global_state_namespace_dir() / LEGACY_GLOBAL_LOCK_DIRNAME
+
+
+def _legacy_global_reset_dir() -> Path:
+    return _legacy_global_state_namespace_dir() / LEGACY_GLOBAL_RESET_DIRNAME
+
+
+def _ensure_legacy_global_state_dirs() -> None:
+    root = _legacy_global_state_root()
+    namespace = _legacy_global_state_namespace_dir()
+    ensure_private_dir(root, label="legacy global state directory")
+    ensure_private_dir(namespace, label="legacy global state namespace")
+    ensure_private_dir(_legacy_global_lock_dir(), label="legacy global target lock directory")
+    ensure_private_dir(_legacy_global_reset_dir(), label="legacy global reset state directory")
+
+
+def _legacy_global_reset_state_path(server: ServerConfig, account: Account) -> Path:
+    return _legacy_global_reset_dir() / f"legacy-{_legacy_target_coordination_id(server, account)}.json"
+
+
+def _legacy_reset_state_stat_issue(
+    stat_result: os.stat_result,
+    effective_uid: int,
+) -> Optional[str]:
+    if not stat.S_ISREG(stat_result.st_mode):
+        return "is not a regular file"
+    if getattr(stat_result, "st_nlink", 1) != 1:
+        return f"has {getattr(stat_result, 'st_nlink', 0)} hard links"
+    if stat_result.st_uid != effective_uid:
+        return f"is owned by UID {stat_result.st_uid}, not effective UID {effective_uid}"
+    mode = stat.S_IMODE(stat_result.st_mode)
+    if mode != PRIVATE_FILE_MODE:
+        return f"has unsafe mode {mode:#05o}, expected {PRIVATE_FILE_MODE:#05o}"
+    return None
+
+
+def _require_legacy_reset_state_visible(
+    path: Path,
+    pinned_stat: os.stat_result,
+    label: str,
+) -> None:
+    parent_fd, name, parent_path = _open_legacy_parent_dir(path, label)
+    try:
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, label)
+        try:
+            visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"{label} changed while in use: {path}") from exc
+        issue = _legacy_reset_state_stat_issue(visible_stat, _legacy_effective_uid())
+        if issue:
+            raise RuntimeError(f"refusing to use {label} {path}: {issue}")
+        if (
+            visible_stat.st_dev != pinned_stat.st_dev
+            or visible_stat.st_ino != pinned_stat.st_ino
+        ):
+            raise RuntimeError(f"{label} changed while in use: {path}")
+    finally:
+        os.close(parent_fd)
+
+
+def _legacy_reset_state_bound_server(
+    state: Mapping[str, object],
+    path: Path,
+) -> ServerConfig:
+    endpoint = state.get("target_server")
+    expected_keys = {"host", "port", "ssl", "starttls"}
+    if not isinstance(endpoint, dict) or set(endpoint) != expected_keys:
+        raise RuntimeError(f"legacy reset state has invalid target_server in {path}")
+    host = endpoint.get("host")
+    port = endpoint.get("port")
+    use_ssl = endpoint.get("ssl")
+    starttls = endpoint.get("starttls")
+    if not isinstance(host, str) or not host:
+        raise RuntimeError(f"legacy reset state has invalid target_server in {path}")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError(f"legacy reset state has invalid target_server in {path}")
+    if type(use_ssl) is not bool or type(starttls) is not bool or use_ssl == starttls:
+        raise RuntimeError(f"legacy reset state has invalid target_server in {path}")
+    bound_server = ServerConfig(
+        host=host,
+        port=port,
+        ssl=use_ssl,
+        starttls=starttls,
+    )
+    if endpoint != legacy_server_endpoint(bound_server):
+        raise RuntimeError(f"legacy reset state has non-canonical target_server in {path}")
+    return bound_server
+
+
+def _parse_legacy_reset_state(
+    raw: bytes,
+    path: Path,
+    *,
+    account: Account,
+    server: ServerConfig,
+    expected_owner_root: Optional[Path],
+    allow_legacy_schema: bool,
+    allow_unrelated_target: bool = False,
+) -> Dict[str, object]:
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"legacy reset state is malformed: {path}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError(f"legacy reset state is not an object: {path}")
+    common_keys = {
+        "schema_version",
+        "status",
+        "phase",
+        "account",
+        "target",
+        "target_server",
+        "started_at",
+        "updated_at",
+    }
+    schema_version = state.get("schema_version")
+    if schema_version == 1 and allow_legacy_schema:
+        expected_keys = common_keys
+    elif schema_version == 2:
+        expected_keys = common_keys | {"owner_staging_root", "reset_id"}
+    else:
+        raise RuntimeError(f"legacy reset state has unsupported schema_version in {path}")
+    unknown_keys = sorted(str(key) for key in set(state) - expected_keys)
+    missing_keys = sorted(expected_keys - set(state))
+    if unknown_keys:
+        raise RuntimeError(
+            f"legacy reset state has unknown field(s) in {path}: " + ", ".join(unknown_keys)
+        )
+    if missing_keys:
+        raise RuntimeError(
+            f"legacy reset state is missing field(s) in {path}: " + ", ".join(missing_keys)
+        )
+    if state.get("status") != "in_progress":
+        raise RuntimeError(f"legacy reset state has invalid status in {path}")
+    phase = state.get("phase")
+    if not isinstance(phase, str) or phase not in _LEGACY_RESET_STATE_PHASES:
+        raise RuntimeError(f"legacy reset state has invalid phase in {path}")
+    state_account = state.get("account")
+    if state_account != account.email:
+        raise RuntimeError(
+            f"legacy reset state account mismatch in {path}: "
+            f"state={state_account!r} config={account.email!r}"
+        )
+    bound_server = _legacy_reset_state_bound_server(state, path)
+    bound_target = _legacy_import_target_id(bound_server, account)
+    if state.get("target") != bound_target:
+        raise RuntimeError(
+            f"legacy reset state target does not match target_server in {path}"
+        )
+    expected_target = _legacy_import_target_id(server, account)
+    expected_server = legacy_server_endpoint(server)
+    if (
+        bound_target != expected_target
+        or state.get("target_server") != expected_server
+    ) and not allow_unrelated_target:
+        raise RuntimeError(
+            f"legacy reset state target mismatch in {path}; rerun with the original target configuration"
+        )
+    for timestamp_field in ("started_at", "updated_at"):
+        value = state.get(timestamp_field)
+        if type(value) is not int or value < 0:
+            raise RuntimeError(f"legacy reset state has invalid {timestamp_field} in {path}")
+    if schema_version == 2:
+        owner_root = state.get("owner_staging_root")
+        if not isinstance(owner_root, str) or not owner_root:
+            raise RuntimeError(f"legacy reset state has invalid owner_staging_root in {path}")
+        owner_path = Path(owner_root)
+        if (
+            not owner_path.is_absolute()
+            or str(_legacy_normalized_absolute_path(owner_path)) != owner_root
+        ):
+            raise RuntimeError(f"legacy reset state has invalid owner_staging_root in {path}")
+        if expected_owner_root is not None:
+            expected_owner = str(_legacy_normalized_absolute_path(expected_owner_root))
+            if owner_root != expected_owner:
+                raise RuntimeError(
+                    f"legacy reset state owner staging root mismatch in {path}: "
+                    f"state={owner_root!r} config={expected_owner!r}"
+                )
+        reset_id = state.get("reset_id")
+        if not isinstance(reset_id, str) or _SHA256_HEX_RE.fullmatch(reset_id) is None:
+            raise RuntimeError(f"legacy reset state has invalid reset_id in {path}")
+    return state
+
+
+def _load_legacy_reset_state_with_stat(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    *,
+    allow_unrelated_target: bool = False,
+) -> Tuple[Optional[Dict[str, object]], Optional[os.stat_result]]:
+    path = _legacy_reset_state_path(account_dir)
+    _raise_if_symlink(account_dir, "legacy account directory")
+    if not account_dir.exists():
+        return None, None
+    if not account_dir.is_dir():
+        raise RuntimeError(f"legacy account path is not a directory: {account_dir}")
+    try:
+        raw, state_stat = _read_file_no_symlink_with_stat(
+            path,
+            "legacy reset state",
+            reject_hard_links=True,
+        )
+    except FileNotFoundError:
+        return None, None
+    issue = _legacy_reset_state_stat_issue(state_stat, _legacy_effective_uid())
+    if issue:
+        raise RuntimeError(f"refusing to use legacy reset state {path}: {issue}")
+    _require_legacy_reset_state_visible(path, state_stat, "legacy reset state")
+    state = _parse_legacy_reset_state(
+        raw,
+        path,
+        account=account,
+        server=server,
+        expected_owner_root=account_dir.parent,
+        allow_legacy_schema=True,
+        allow_unrelated_target=allow_unrelated_target,
+    )
+    return state, state_stat
+
+
+def _load_legacy_reset_state(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    *,
+    allow_unrelated_target: bool = False,
+) -> Optional[Dict[str, object]]:
+    state, _state_stat = _load_legacy_reset_state_with_stat(
+        account_dir,
+        account,
+        server,
+        allow_unrelated_target=allow_unrelated_target,
+    )
+    return state
+
+
+def _load_legacy_global_reset_state_with_stat(
+    account: Account,
+    server: ServerConfig,
+) -> Tuple[Optional[Dict[str, object]], Optional[os.stat_result]]:
+    _ensure_legacy_global_state_dirs()
+    path = _legacy_global_reset_state_path(server, account)
+    try:
+        raw, state_stat = _read_file_no_symlink_with_stat(
+            path,
+            "legacy global reset state",
+            reject_hard_links=True,
+        )
+    except FileNotFoundError:
+        return None, None
+    issue = _legacy_reset_state_stat_issue(state_stat, _legacy_effective_uid())
+    if issue:
+        raise RuntimeError(f"refusing to use legacy global reset state {path}: {issue}")
+    _require_legacy_reset_state_visible(path, state_stat, "legacy global reset state")
+    state = _parse_legacy_reset_state(
+        raw,
+        path,
+        account=account,
+        server=server,
+        expected_owner_root=None,
+        allow_legacy_schema=False,
+    )
+    return state, state_stat
+
+
+def _load_legacy_global_reset_state(
+    account: Account,
+    server: ServerConfig,
+) -> Optional[Dict[str, object]]:
+    state, _state_stat = _load_legacy_global_reset_state_with_stat(account, server)
+    return state
+
+
+def _legacy_reset_owner_root(account_dir: Path) -> str:
+    return str(_legacy_normalized_absolute_path(account_dir.parent))
+
+
+def _legacy_reset_states_identify_same_reset(
+    first: Mapping[str, object],
+    second: Mapping[str, object],
+) -> bool:
+    keys = (
+        "schema_version",
+        "status",
+        "account",
+        "target",
+        "target_server",
+        "owner_staging_root",
+        "reset_id",
+        "started_at",
+    )
+    return all(first.get(key) == second.get(key) for key in keys)
+
+
+def _legacy_v1_state_matches_global(
+    local_state: Mapping[str, object],
+    global_state: Mapping[str, object],
+) -> bool:
+    keys = (
+        "status",
+        "phase",
+        "account",
+        "target",
+        "target_server",
+        "started_at",
+    )
+    return all(local_state.get(key) == global_state.get(key) for key in keys)
+
+
+def _persist_legacy_reset_state_file(
+    path: Path,
+    state: Dict[str, object],
+    *,
+    account: Account,
+    server: ServerConfig,
+    global_state: bool,
+) -> None:
+    _secure_atomic_json(path, state)
+    if global_state:
+        persisted = _load_legacy_global_reset_state(account, server)
+    else:
+        persisted = _load_legacy_reset_state(path.parent, account, server)
+    if persisted != state:
+        raise RuntimeError(f"legacy reset state changed while updating: {path}")
+
+
+def _new_legacy_reset_state(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    *,
+    phase: str,
+    started_at: int,
+    reset_id: str,
+) -> Dict[str, object]:
+    if phase not in _LEGACY_RESET_STATE_PHASES:
+        raise ValueError(f"invalid legacy reset state phase: {phase}")
+    return {
+        "schema_version": 2,
+        "status": "in_progress",
+        "phase": phase,
+        "account": account.email,
+        "target": _legacy_import_target_id(server, account),
+        "target_server": legacy_server_endpoint(server),
+        "owner_staging_root": _legacy_reset_owner_root(account_dir),
+        "reset_id": reset_id,
+        "started_at": started_at,
+        "updated_at": int(time.time()),
+    }
+
+
+def _write_legacy_reset_state_pair(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    state: Dict[str, object],
+) -> None:
+    # The global gate is created/advanced first and removed last. A crash can
+    # therefore leave the local evidence lagging, but cannot open another root.
+    _persist_legacy_reset_state_file(
+        _legacy_global_reset_state_path(server, account),
+        state,
+        account=account,
+        server=server,
+        global_state=True,
+    )
+    _persist_legacy_reset_state_file(
+        _legacy_reset_state_path(account_dir),
+        state,
+        account=account,
+        server=server,
+        global_state=False,
+    )
+
+
+def _legacy_reset_gate_error(account: Account, exc: Exception) -> LegacyResetGateError:
+    return LegacyResetGateError(
+        f"invalid legacy reset state for {account.email}: {exc}"
+    )
+
+
+def _require_legacy_reset_gate_open(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    *,
+    allow_reset_resume: bool = False,
+    allow_unrelated_local_target: bool = False,
+) -> None:
+    if allow_reset_resume and allow_unrelated_local_target:
+        raise ValueError(
+            "reset resume cannot ignore local state for another target"
+        )
+    try:
+        local_state = _load_legacy_reset_state(
+            account_dir,
+            account,
+            server,
+            allow_unrelated_target=allow_unrelated_local_target,
+        )
+        global_state = _load_legacy_global_reset_state(account, server)
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+
+    if (
+        allow_unrelated_local_target
+        and local_state is not None
+    ):
+        local_bound_server = _legacy_reset_state_bound_server(
+            local_state,
+            _legacy_reset_state_path(account_dir),
+        )
+        local_is_for_contacted_target = (
+            _legacy_target_coordination_id(local_bound_server, account)
+            == _legacy_target_coordination_id(server, account)
+        )
+        # The local filename is retained for compatibility and therefore cannot
+        # be endpoint-keyed. A remote action on another endpoint may disregard
+        # it only after the secure loader proves its complete self-binding.
+        if not local_is_for_contacted_target:
+            local_state = None
+
+    owner_root = _legacy_reset_owner_root(account_dir)
+    if global_state is not None:
+        global_owner = str(global_state["owner_staging_root"])
+        if global_owner != owner_root:
+            raise LegacyResetGateError(
+                f"legacy reset is owned by staging root {global_owner!r} for "
+                f"{account.email}; resume there with the original target configuration and --reset"
+            )
+        if local_state is not None:
+            if local_state.get("schema_version") == 1:
+                states_match = _legacy_v1_state_matches_global(local_state, global_state)
+            else:
+                local_phase = str(local_state.get("phase"))
+                global_phase = str(global_state.get("phase"))
+                states_match = _legacy_reset_states_identify_same_reset(
+                    local_state,
+                    global_state,
+                ) and (
+                    local_phase == global_phase
+                    or (
+                        allow_reset_resume
+                        and _LEGACY_RESET_PHASE_ORDER[local_phase]
+                        < _LEGACY_RESET_PHASE_ORDER[global_phase]
+                    )
+                )
+            if not states_match:
+                raise LegacyResetGateError(
+                    f"local and global legacy reset state disagree for {account.email}; "
+                    "rerun from the owner staging root with --reset"
+                )
+        if allow_reset_resume:
+            return
+        raise LegacyResetGateError(
+            f"legacy reset is in progress for {account.email} at phase "
+            f"{global_state['phase']}; rerun import from staging root {global_owner!r} "
+            "with the original target configuration and --reset"
+        )
+
+    if local_state is not None and not allow_reset_resume:
+        raise LegacyResetGateError(
+            f"legacy reset is in progress for {account.email} at phase "
+            f"{local_state['phase']}; rerun import with the original target "
+            "configuration and --reset"
+        )
+
+
+def legacy_reset_state_issues(
+    in_root: Path,
+    accounts: Iterable[Account],
+    server: ServerConfig,
+    *,
+    allow_resume: bool = False,
+    allow_unrelated_local_target: bool = False,
+) -> List[str]:
+    """Return reset-state gates without contacting the target server."""
+
+    issues: List[str] = []
+    for account in accounts:
+        try:
+            _require_legacy_reset_gate_open(
+                in_root / sanitize_for_path(account.email),
+                account,
+                server,
+                allow_reset_resume=allow_resume,
+                allow_unrelated_local_target=allow_unrelated_local_target,
+            )
+        except LegacyResetGateError as exc:
+            issues.append(str(exc))
+    return issues
+
+
+def _require_legacy_global_reset_gate_open(
+    account: Account,
+    server: ServerConfig,
+) -> None:
+    try:
+        global_state = _load_legacy_global_reset_state(account, server)
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+    if global_state is not None:
+        raise LegacyResetGateError(
+            f"legacy reset is in progress for {account.email} at phase "
+            f"{global_state['phase']}; rerun import from staging root "
+            f"{global_state['owner_staging_root']!r} with the original target "
+            "configuration and --reset"
+        )
+
+
+def legacy_global_reset_state_issues(
+    accounts: Iterable[Account],
+    server: ServerConfig,
+) -> List[str]:
+    """Return authoritative global reset gates without requiring staged data."""
+
+    issues: List[str] = []
+    for account in accounts:
+        try:
+            _require_legacy_global_reset_gate_open(account, server)
+        except LegacyResetGateError as exc:
+            issues.append(str(exc))
+    return issues
+
+
+def _begin_legacy_reset_state(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+) -> Dict[str, object]:
+    _raise_if_symlink(account_dir, "legacy account directory")
+    if not account_dir.exists():
+        raise RuntimeError(f"Input account directory not found: {account_dir}")
+    ensure_private_dir(account_dir, label="legacy account directory")
+    try:
+        local_state = _load_legacy_reset_state(account_dir, account, server)
+        global_state = _load_legacy_global_reset_state(account, server)
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+
+    owner_root = _legacy_reset_owner_root(account_dir)
+    if global_state is not None and global_state.get("owner_staging_root") != owner_root:
+        raise LegacyResetGateError(
+            f"legacy reset is owned by staging root "
+            f"{global_state.get('owner_staging_root')!r} for {account.email}; "
+            "resume there with the original target configuration and --reset"
+        )
+
+    if global_state is not None:
+        try:
+            if local_state is None:
+                _persist_legacy_reset_state_file(
+                    _legacy_reset_state_path(account_dir),
+                    global_state,
+                    account=account,
+                    server=server,
+                    global_state=False,
+                )
+            elif local_state.get("schema_version") == 1:
+                if not _legacy_v1_state_matches_global(local_state, global_state):
+                    raise RuntimeError("local legacy reset evidence does not match the global gate")
+                _persist_legacy_reset_state_file(
+                    _legacy_reset_state_path(account_dir),
+                    global_state,
+                    account=account,
+                    server=server,
+                    global_state=False,
+                )
+            else:
+                if not _legacy_reset_states_identify_same_reset(local_state, global_state):
+                    raise RuntimeError("local legacy reset evidence identifies a different reset")
+                local_phase = str(local_state.get("phase"))
+                global_phase = str(global_state.get("phase"))
+                if _LEGACY_RESET_PHASE_ORDER[local_phase] > _LEGACY_RESET_PHASE_ORDER[global_phase]:
+                    raise RuntimeError("local legacy reset evidence is ahead of the global gate")
+                if local_state != global_state:
+                    if local_phase == global_phase:
+                        raise RuntimeError("local legacy reset evidence differs from the global gate")
+                    _persist_legacy_reset_state_file(
+                        _legacy_reset_state_path(account_dir),
+                        global_state,
+                        account=account,
+                        server=server,
+                        global_state=False,
+                    )
+        except Exception as exc:
+            raise _legacy_reset_gate_error(account, exc) from exc
+        logging.warning(
+            "[import-reset] %s: resuming interrupted reset from phase %s",
+            account.email,
+            global_state["phase"],
+        )
+        return global_state
+
+    try:
+        if local_state is not None:
+            if local_state.get("schema_version") == 2:
+                adopted = dict(local_state)
+            else:
+                adopted = _new_legacy_reset_state(
+                    account_dir,
+                    account,
+                    server,
+                    phase=str(local_state["phase"]),
+                    started_at=int(local_state["started_at"]),
+                    reset_id=hashlib.sha256(os.urandom(32)).hexdigest(),
+                )
+            _write_legacy_reset_state_pair(account_dir, account, server, adopted)
+            logging.warning(
+                "[import-reset] %s: adopted local interrupted reset evidence at phase %s",
+                account.email,
+                adopted["phase"],
+            )
+            return adopted
+
+        state = _new_legacy_reset_state(
+            account_dir,
+            account,
+            server,
+            phase="prepared",
+            started_at=int(time.time()),
+            reset_id=hashlib.sha256(os.urandom(32)).hexdigest(),
+        )
+        _write_legacy_reset_state_pair(account_dir, account, server, state)
+        return state
+    except LegacyResetGateError:
+        raise
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+
+
+def _transition_legacy_reset_state(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    state: Mapping[str, object],
+    phase: str,
+) -> Dict[str, object]:
+    current_phase = state.get("phase")
+    allowed_transition = {
+        ("prepared", "journal_archived"),
+        ("journal_archived", "reset_started"),
+    }
+    if (current_phase, phase) not in allowed_transition:
+        raise RuntimeError(
+            f"invalid legacy reset state transition for {account.email}: "
+            f"{current_phase!r} -> {phase!r}"
+        )
+    try:
+        local_state = _load_legacy_reset_state(account_dir, account, server)
+        global_state = _load_legacy_global_reset_state(account, server)
+        if local_state != dict(state) or global_state != dict(state):
+            raise RuntimeError(
+                f"legacy reset state changed before transition for {account.email}"
+            )
+        started_at = state.get("started_at")
+        reset_id = state.get("reset_id")
+        if (
+            type(started_at) is not int
+            or started_at < 0
+            or not isinstance(reset_id, str)
+        ):
+            raise RuntimeError(f"invalid legacy reset state transition for {account.email}")
+        next_state = _new_legacy_reset_state(
+            account_dir,
+            account,
+            server,
+            phase=phase,
+            started_at=started_at,
+            reset_id=reset_id,
+        )
+        _write_legacy_reset_state_pair(account_dir, account, server, next_state)
+        return next_state
+    except LegacyResetGateError:
+        raise
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+
+
+def _unlink_expected_legacy_reset_state(
+    path: Path,
+    state: Optional[Dict[str, object]],
+    state_stat: Optional[os.stat_result],
+    expected_state: Mapping[str, object],
+    *,
+    label: str,
+) -> None:
+    if state is None or state_stat is None:
+        raise RuntimeError(f"{label} disappeared before successful reset completion: {path}")
+    if state.get("phase") != "reset_started" or state != dict(expected_state):
+        raise RuntimeError(f"{label} changed before successful reset completion: {path}")
+    parent_fd, name, parent_path = _open_legacy_parent_dir(path, label)
+    try:
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, label)
+        try:
+            visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"{label} disappeared before successful reset completion: {path}"
+            ) from exc
+        issue = _legacy_reset_state_stat_issue(visible_stat, _legacy_effective_uid())
+        if issue:
+            raise RuntimeError(f"refusing to clear {label} {path}: {issue}")
+        if (
+            visible_stat.st_dev != state_stat.st_dev
+            or visible_stat.st_ino != state_stat.st_ino
+        ):
+            raise RuntimeError(f"{label} changed before successful reset completion: {path}")
+        os.unlink(name, dir_fd=parent_fd)
+        _fsync_legacy_directory_fd(parent_fd, parent_path, label)
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, label)
+    finally:
+        os.close(parent_fd)
+
+
+def _clear_legacy_reset_state(
+    account_dir: Path,
+    account: Account,
+    server: ServerConfig,
+    expected_state: Mapping[str, object],
+) -> None:
+    try:
+        local_state, local_stat = _load_legacy_reset_state_with_stat(
+            account_dir,
+            account,
+            server,
+        )
+        global_state, global_stat = _load_legacy_global_reset_state_with_stat(
+            account,
+            server,
+        )
+        _unlink_expected_legacy_reset_state(
+            _legacy_reset_state_path(account_dir),
+            local_state,
+            local_stat,
+            expected_state,
+            label="legacy reset state",
+        )
+        _unlink_expected_legacy_reset_state(
+            _legacy_global_reset_state_path(server, account),
+            global_state,
+            global_stat,
+            expected_state,
+            label="legacy global reset state",
+        )
+    except LegacyResetGateError:
+        raise
+    except Exception as exc:
+        raise _legacy_reset_gate_error(account, exc) from exc
+
+
 def _stop_requested(stop_event: Optional[object]) -> bool:
     return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
 
@@ -1051,9 +1931,192 @@ def _legacy_import_target_id(server: ServerConfig, account: Account) -> str:
         "port": endpoint["port"],
         "ssl": endpoint["ssl"],
         "starttls": endpoint["starttls"],
+        # This durable identifier is stored in existing import journals. Keep
+        # its historical byte semantics; global coordination uses a separate
+        # canonical identity below.
         "account": account.email,
     }
     return hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _legacy_target_coordination_id(server: ServerConfig, account: Account) -> str:
+    seed = {
+        "host": _legacy_canonical_dns_name(server.host),
+        "port": int(server.port),
+        "ssl": bool(server.ssl),
+        "starttls": bool(server.starttls),
+        # RFC email domains are case-insensitive. Preserve the local part
+        # because a generic IMAP server can treat usernames as case-sensitive.
+        "account": _legacy_canonical_account_target_identity(account.email),
+    }
+    return hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _legacy_target_lock_path(server: ServerConfig, account: Account) -> Path:
+    return _legacy_global_lock_dir() / f"legacy-{_legacy_target_coordination_id(server, account)}.lock"
+
+
+def _legacy_import_lock_path(server: ServerConfig, account: Account, in_root: Path) -> Path:
+    del in_root  # Compatibility shim: target locks are independent of staging roots.
+    return _legacy_target_lock_path(server, account)
+
+
+def _secure_existing_legacy_import_root(in_root: Path) -> None:
+    root_fd, root_path = _open_legacy_dir(in_root, "legacy import root")
+    try:
+        _raise_if_legacy_parent_replaced(root_path, root_fd, "legacy import root")
+        _secure_legacy_private_dir_fd(root_fd, root_path, "legacy import root")
+        _raise_if_legacy_parent_replaced(root_path, root_fd, "legacy import root")
+    finally:
+        os.close(root_fd)
+
+
+def _legacy_import_lock_stat_issue(stat_result: os.stat_result, effective_uid: int) -> Optional[str]:
+    if not stat.S_ISREG(stat_result.st_mode):
+        return "is not a regular file"
+    if getattr(stat_result, "st_nlink", 1) != 1:
+        return f"has {getattr(stat_result, 'st_nlink', 0)} hard links"
+    if stat_result.st_uid != effective_uid:
+        return f"is owned by UID {stat_result.st_uid}, not effective UID {effective_uid}"
+    mode = stat.S_IMODE(stat_result.st_mode)
+    if mode != PRIVATE_FILE_MODE:
+        return f"has unsafe mode {mode:#05o}, expected {PRIVATE_FILE_MODE:#05o}"
+    return None
+
+
+def _require_legacy_import_lock_visible(
+    lock_fd: int,
+    parent_fd: int,
+    name: str,
+    lock_path: Path,
+    effective_uid: int,
+) -> None:
+    lock_stat = os.fstat(lock_fd)
+    issue = _legacy_import_lock_stat_issue(lock_stat, effective_uid)
+    if issue:
+        raise RuntimeError(f"refusing to use legacy import lock {lock_path}: {issue}")
+    try:
+        visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"legacy import lock changed while in use: {lock_path}") from exc
+    visible_issue = _legacy_import_lock_stat_issue(visible_stat, effective_uid)
+    if visible_issue:
+        raise RuntimeError(f"refusing to use legacy import lock {lock_path}: {visible_issue}")
+    if visible_stat.st_dev != lock_stat.st_dev or visible_stat.st_ino != lock_stat.st_ino:
+        raise RuntimeError(f"legacy import lock changed while in use: {lock_path}")
+
+
+def _open_legacy_import_lock(lock_path: Path) -> Tuple[int, int, Path, str]:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("platform cannot safely open legacy import lock files without O_NOFOLLOW")
+    parent_fd, name, parent_path = _open_legacy_parent_dir(lock_path, "legacy import lock")
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    created = False
+    try:
+        try:
+            lock_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            lock_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        os.close(parent_fd)
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
+            raise RuntimeError(f"refusing to use symlinked legacy import lock: {lock_path}") from exc
+        if exc.errno in {errno.EISDIR, errno.ENXIO}:
+            raise RuntimeError(f"refusing to use non-regular legacy import lock: {lock_path}") from exc
+        raise RuntimeError(f"unable to open legacy import lock: {lock_path}") from exc
+    try:
+        effective_uid = _legacy_effective_uid()
+        initial_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            raise RuntimeError(f"refusing to use non-regular legacy import lock: {lock_path}")
+        if getattr(initial_stat, "st_nlink", 1) != 1:
+            raise RuntimeError(f"refusing to use hard-linked legacy import lock: {lock_path}")
+        if initial_stat.st_uid != effective_uid:
+            raise RuntimeError(
+                f"refusing to use legacy import lock not owned by effective UID {effective_uid}: "
+                f"{lock_path} (owner UID {initial_stat.st_uid})"
+            )
+        if created:
+            try:
+                os.fchmod(lock_fd, PRIVATE_FILE_MODE)
+            except OSError as exc:
+                raise RuntimeError(f"unable to set private permissions on legacy import lock: {lock_path}") from exc
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import lock")
+        _require_legacy_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        if created:
+            os.fsync(lock_fd)
+            _fsync_legacy_directory_fd(parent_fd, parent_path, "legacy import lock")
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import lock")
+            _require_legacy_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        return lock_fd, parent_fd, parent_path, name
+    except Exception:
+        os.close(lock_fd)
+        os.close(parent_fd)
+        raise
+
+
+@contextlib.contextmanager
+def _legacy_global_target_lock(
+    server: ServerConfig,
+    account: Account,
+    *,
+    stop_event: Optional[object],
+) -> Iterator[None]:
+    _ensure_legacy_global_state_dirs()
+    lock_path = _legacy_target_lock_path(server, account)
+    lock_fd, parent_fd, parent_path, name = _open_legacy_import_lock(lock_path)
+    try:
+        effective_uid = _legacy_effective_uid()
+        while True:
+            _raise_if_stopped(stop_event, f"legacy import {account.email} lock wait")
+            _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import lock")
+            _require_legacy_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise RuntimeError(f"unable to acquire legacy import lock: {lock_path}") from exc
+            wait = getattr(stop_event, "wait", None) if stop_event is not None else None
+            if callable(wait):
+                if wait(IMPORT_LOCK_WAIT_SECONDS):
+                    raise RuntimeError(f"legacy import {account.email} lock wait: stop requested before completion")
+            else:
+                time.sleep(IMPORT_LOCK_WAIT_SECONDS)
+        _raise_if_legacy_parent_replaced(parent_path, parent_fd, "legacy import lock")
+        _require_legacy_import_lock_visible(lock_fd, parent_fd, name, lock_path, effective_uid)
+        _raise_if_stopped(stop_event, f"legacy import {account.email} lock wait")
+        yield
+    finally:
+        try:
+            os.close(lock_fd)
+        finally:
+            os.close(parent_fd)
+
+
+@contextlib.contextmanager
+def _legacy_import_lock(
+    server: ServerConfig,
+    account: Account,
+    in_root: Path,
+    *,
+    stop_event: Optional[object],
+) -> Iterator[None]:
+    _raise_if_symlink(in_root, "legacy import root")
+    _secure_existing_legacy_import_root(in_root)
+    with _legacy_global_target_lock(
+        server,
+        account,
+        stop_event=stop_event,
+    ):
+        yield
 
 
 def _legacy_import_key(account_dir: Path, eml_path: Path, mailbox: str, data: bytes) -> str:
@@ -1330,6 +2393,7 @@ def _load_legacy_import_journal_with_stat(
     account_dir: Path,
     *,
     repair_trailing: bool = True,
+    allow_unterminated_trailing: bool = False,
 ) -> Tuple[List[Dict[str, str]], Optional[os.stat_result]]:
     path = _legacy_import_journal_path(account_dir)
     rows: List[Dict[str, str]] = []
@@ -1354,9 +2418,10 @@ def _load_legacy_import_journal_with_stat(
     needs_rewrite = False
     for line_no, raw_line in enumerate(lines, 1):
         if trailing_row_unterminated and line_no == len(lines):
-            if repair_trailing:
-                logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
-                needs_rewrite = True
+            if repair_trailing or allow_unterminated_trailing:
+                if repair_trailing:
+                    logging.warning("[import] ignoring incomplete trailing journal row: %s", path)
+                    needs_rewrite = True
                 break
             raise RuntimeError(f"import journal row {line_no} is not newline-terminated: {path}")
         try:
@@ -1403,6 +2468,16 @@ def _load_legacy_import_journal(account_dir: Path, *, repair_trailing: bool = Tr
     rows, _journal_stat = _load_legacy_import_journal_with_stat(
         account_dir,
         repair_trailing=repair_trailing,
+    )
+    return rows
+
+
+def _load_legacy_import_journal_complete_prefix(account_dir: Path) -> List[Dict[str, str]]:
+    """Read every durable journal row without repairing an interrupted final append."""
+    rows, _journal_stat = _load_legacy_import_journal_with_stat(
+        account_dir,
+        repair_trailing=False,
+        allow_unterminated_trailing=True,
     )
     return rows
 
@@ -1701,7 +2776,7 @@ def _remove_stale_mailbox_dirs(account_dir: Path, expected_paths: set[str]) -> N
 
     try:
         for name in sorted(os.listdir(dir_fd)):
-            if name in {"export-state.json", "import.journal.jsonl"}:
+            if name in {"export-state.json", "import.journal.jsonl", LEGACY_RESET_STATE_FILENAME}:
                 continue
             try:
                 stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -1749,6 +2824,25 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
     if nested_symlink_issues:
         raise RuntimeError("invalid legacy export output path: " + "; ".join(nested_symlink_issues))
     ensure_private_dir(account_dir)
+    existing_journal_rows = _load_legacy_import_journal(
+        account_dir,
+        repair_trailing=False,
+    )
+    pinned_recovery_artifacts_by_path, recovery_issues = _legacy_journal_recovery_artifacts(
+        account_dir,
+        existing_journal_rows,
+        account_email=account.email,
+    )
+    if recovery_issues:
+        raise RuntimeError(
+            "invalid legacy recovery export evidence: " + "; ".join(recovery_issues)
+        )
+    pinned_stems_by_folder: Dict[str, set[str]] = {}
+    for pinned_path in pinned_recovery_artifacts_by_path:
+        relative = pinned_path.relative_to(account_dir)
+        pinned_stems_by_folder.setdefault(relative.parent.as_posix(), set()).add(
+            pinned_path.stem
+        )
     logging.info("[export] %s: starting", account.email)
     state_path = account_dir / "export-state.json"
     source_endpoint = legacy_server_endpoint(server)
@@ -1781,9 +2875,6 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         digest: str,
     ) -> str:
         base = f"u{int(uid):010d}"
-        eml_path = folder_dir / f"{base}.eml"
-        meta_path = folder_dir / f"{base}.json"
-        _secure_atomic_write_bytes(eml_path, msg_bytes)
         meta = {
             "account": account.email,
             "mailbox": mailbox,
@@ -1803,8 +2894,23 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             meta["source_delimiter"] = mailbox_delimiter_by_name.get(mailbox, "")
             meta["source_path_segments"] = list(source_segments)
         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
+        candidate = base
+        collision_index = 0
+        while True:
+            eml_path = folder_dir / f"{candidate}.eml"
+            pinned_artifact = pinned_recovery_artifacts_by_path.get(eml_path)
+            if pinned_artifact is None:
+                break
+            if pinned_artifact.data == msg_bytes and pinned_artifact.metadata == meta:
+                return candidate
+            collision_index += 1
+            candidate = f"{base}-reexport-{str(meta[CONTENT_BINDING_FIELD])[:16]}"
+            if collision_index > 1:
+                candidate += f"-{collision_index}"
+        meta_path = folder_dir / f"{candidate}.json"
+        _secure_atomic_write_bytes(eml_path, msg_bytes)
         _secure_atomic_json(meta_path, meta)
-        return base
+        return candidate
 
     def merge_covered_virtual_flags(
         content_identity: Tuple[int, str],
@@ -1840,6 +2946,10 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
         merged_flags = _merge_legacy_flag_strings(str(meta.get("flags") or ""), flags)
         if merged_flags == str(meta.get("flags") or ""):
             return True
+        if meta_path.with_suffix(".eml") in pinned_recovery_artifacts_by_path:
+            # The recovery snapshot is immutable.  Staging the virtual copy is
+            # safer than mutating metadata bound to an unresolved/committed APPEND.
+            return False
         meta["flags"] = merged_flags
         meta[CONTENT_BINDING_FIELD] = legacy_content_binding_sha256(meta)
         _secure_atomic_json(meta_path, meta)
@@ -1898,31 +3008,57 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
                 attrs = mailbox_attrs_by_name.get(mailbox, ())
                 flagged_virtual_source = _is_legacy_flagged_source_view(attrs)
                 virtual_source = _is_legacy_all_source_view(attrs) or flagged_virtual_source
-                folder_dir = account_dir / sanitize_for_path(mailbox)
+                folder_path = sanitize_for_path(mailbox)
+                folder_dir = account_dir / folder_path
+                pinned_stems = set(pinned_stems_by_folder.get(folder_path, set()))
                 uids, uidvalidity = fetch_all_uids_and_uidvalidity(imap, mailbox)
+                pinned_uidvalidities: set[str] = set()
+                for pinned_path, pinned_artifact in pinned_recovery_artifacts_by_path.items():
+                    if pinned_path.parent != folder_dir:
+                        continue
+                    pinned_mailbox = pinned_artifact.metadata.get("mailbox")
+                    if pinned_mailbox != mailbox:
+                        raise RuntimeError(
+                            f"journal recovery artifact mailbox collision in {folder_dir}: "
+                            f"source={mailbox!r} recovery={pinned_mailbox!r}"
+                        )
+                    pinned_uidvalidity = pinned_artifact.metadata.get("uidvalidity")
+                    if isinstance(pinned_uidvalidity, str) and pinned_uidvalidity:
+                        pinned_uidvalidities.add(pinned_uidvalidity)
+                if pinned_uidvalidities and pinned_uidvalidities != {uidvalidity}:
+                    raise RuntimeError(
+                        f"UIDVALIDITY changed for mailbox {mailbox} while journal recovery "
+                        f"artifacts remain pinned: recovery={sorted(pinned_uidvalidities)} "
+                        f"source={uidvalidity}"
+                    )
                 logging.info("[export] %s: %s -> %d messages", account.email, mailbox, len(uids))
                 if not uids:
-                    if virtual_source and not export_scope_only_virtual:
+                    if virtual_source and not export_scope_only_virtual and not pinned_stems:
                         continue
                     verify_legacy_mailbox_uid_set_stable(imap, mailbox, uids, uidvalidity)
                     ensure_private_dir(folder_dir)
                     delimiter = mailbox_delimiter_by_name.get(mailbox, "")
                     _secure_atomic_json(
                         folder_dir / ".mailbox.json",
-                        _legacy_mailbox_metadata(mailbox, 0, delimiter, uidvalidity),
+                        _legacy_mailbox_metadata(
+                            mailbox,
+                            len(pinned_stems),
+                            delimiter,
+                            uidvalidity,
+                        ),
                     )
-                    _remove_stale_export_files(folder_dir, set())
+                    _remove_stale_export_files(folder_dir, pinned_stems)
                     export_state_mailboxes.append(_legacy_export_state_mailbox_metadata(
                         mailbox,
-                        sanitize_for_path(mailbox),
-                        0,
+                        folder_path,
+                        len(pinned_stems),
                         delimiter,
                         uidvalidity,
                     ))
                     continue
 
                 ensure_private_dir(folder_dir)
-                written_stems: set[str] = set()
+                written_stems: set[str] = set(pinned_stems)
                 pending_virtual_content: Dict[Tuple[int, str], List[Tuple[int, bytes, str, str, str]]] = {}
                 seen_virtual_content: Counter[Tuple[int, str]] = Counter()
                 ambiguous_virtual_content: set[Tuple[int, str]] = set()
@@ -2076,6 +3212,80 @@ def export_account(account: Account, server: ServerConfig, out_root: Path, ignor
             f"legacy export {account.email} failed for {len(mailbox_errors)} mailbox(es): "
             + "; ".join(mailbox_errors)
         )
+    exported_state_paths = {
+        str(item.get("path") or "") for item in export_state_mailboxes
+    }
+    for folder_path, pinned_stems in sorted(pinned_stems_by_folder.items()):
+        if folder_path in exported_state_paths:
+            continue
+        folder_dir = account_dir / folder_path
+        folder_artifacts = [
+            artifact
+            for path, artifact in pinned_recovery_artifacts_by_path.items()
+            if path.parent == folder_dir
+        ]
+        recovery_mailboxes = {
+            str(artifact.metadata.get("mailbox") or "")
+            for artifact in folder_artifacts
+        }
+        if len(recovery_mailboxes) != 1 or "" in recovery_mailboxes:
+            raise RuntimeError(
+                f"journal recovery artifacts disagree on source mailbox in {folder_dir}"
+            )
+        recovery_mailbox = next(iter(recovery_mailboxes))
+        if sanitize_for_path(recovery_mailbox) != folder_path:
+            raise RuntimeError(
+                f"journal recovery artifact mailbox does not match staged path: {folder_dir}"
+            )
+        recovery_hierarchies = {
+            _legacy_hierarchy_metadata(
+                artifact.metadata,
+                recovery_mailbox,
+                f"journal recovery artifact {folder_dir}",
+            )
+            for artifact in folder_artifacts
+        }
+        if len(recovery_hierarchies) != 1:
+            raise RuntimeError(
+                f"journal recovery artifacts disagree on source hierarchy in {folder_dir}"
+            )
+        recovery_delimiter, _recovery_segments = next(iter(recovery_hierarchies))
+        recovery_uidvalidities = {
+            _legacy_uidvalidity_metadata(
+                artifact.metadata,
+                f"journal recovery artifact {folder_dir}",
+            )
+            for artifact in folder_artifacts
+        }
+        if len(recovery_uidvalidities) != 1:
+            raise RuntimeError(
+                f"journal recovery artifacts disagree on UIDVALIDITY in {folder_dir}"
+            )
+        recovery_uidvalidity = next(iter(recovery_uidvalidities))
+        _remove_stale_export_files(folder_dir, pinned_stems)
+        marker = _legacy_mailbox_metadata(
+            recovery_mailbox,
+            len(pinned_stems),
+            recovery_delimiter,
+            recovery_uidvalidity,
+        )
+        _secure_atomic_json(folder_dir / ".mailbox.json", marker)
+        export_state_mailboxes.append(
+            _legacy_export_state_mailbox_metadata(
+                recovery_mailbox,
+                folder_path,
+                len(pinned_stems),
+                recovery_delimiter,
+                recovery_uidvalidity,
+            )
+        )
+        exported_state_paths.add(folder_path)
+        logging.warning(
+            "[export] %s: source mailbox %s is absent; retained %d exact journal recovery artifact(s)",
+            account.email,
+            recovery_mailbox,
+            len(pinned_stems),
+        )
     _remove_stale_mailbox_dirs(
         account_dir,
         {str(item.get("path") or "") for item in export_state_mailboxes},
@@ -2174,6 +3384,242 @@ def _validate_legacy_uid_metadata(meta_path: Path, eml_path: Path, meta: Dict[st
         raise RuntimeError(f"{meta_path}: uid mismatch (name={uid_in_name} meta={uid_meta})")
 
 
+class _LegacyRecoveryArtifact(NamedTuple):
+    data: bytes
+    metadata: Dict[str, object]
+
+
+def _latest_legacy_recovery_rows(
+    rows: List[Dict[str, str]],
+    *,
+    target_id: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Return latest unresolved APPEND evidence for every journal target/key."""
+
+    latest: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for row in rows:
+        target = row.get("target", "")
+        key = row.get("key", "")
+        if not target or not key or (target_id is not None and target != target_id):
+            continue
+        latest[(target, key)] = row
+    return [
+        row
+        for _journal_key, row in sorted(latest.items())
+        if row.get("status") in {"pending", "committed"}
+    ]
+
+
+def _legacy_recovery_path(
+    account_dir: Path,
+    row: Mapping[str, str],
+) -> Tuple[Optional[Path], Optional[str]]:
+    raw_path = row.get("path", "")
+    if not raw_path:
+        return None, None
+    path = Path(raw_path)
+    if (
+        path.is_absolute()
+        or len(path.parts) != 2
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.suffix != ".eml"
+        or path.as_posix() != raw_path
+    ):
+        return None, f"journal recovery row has invalid staged path: {raw_path!r}"
+    return account_dir / path, None
+
+
+def _legacy_recovery_candidate_paths(account_dir: Path) -> List[Path]:
+    candidates: List[Path] = []
+    if not account_dir.exists() or not account_dir.is_dir():
+        return candidates
+    for child in sorted(account_dir.iterdir()):
+        _raise_if_symlink(child, "legacy mailbox path")
+        if not child.is_dir():
+            continue
+        candidates.extend(sorted(child.glob("*.eml")))
+    return candidates
+
+
+def _read_legacy_recovery_artifact(
+    account_dir: Path,
+    eml_path: Path,
+    row: Mapping[str, str],
+    *,
+    account_email: Optional[str],
+) -> _LegacyRecoveryArtifact:
+    status = row.get("status", "") or "<missing>"
+    journal_key = row.get("key", "")
+    target_mailbox = row.get("mailbox", "")
+    label = f"journal {status} recovery evidence {journal_key or '<missing>'}"
+    if not target_mailbox:
+        raise RuntimeError(f"{label}: missing target mailbox")
+    _raise_if_symlink(eml_path, "legacy recovery message file")
+    if not eml_path.exists():
+        raise RuntimeError(f"{label}: staged message file missing: {eml_path}")
+    meta_path = eml_path.with_suffix(".json")
+    _raise_if_symlink(meta_path, "legacy recovery message metadata")
+    if not meta_path.exists():
+        raise RuntimeError(f"{label}: staged message metadata missing: {meta_path}")
+    try:
+        metadata = json.loads(
+            _read_file_no_symlink(
+                meta_path,
+                "legacy recovery message metadata",
+                reject_hard_links=True,
+            ).decode("utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(f"{label}: invalid staged message metadata {meta_path}: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"{label}: staged message metadata is not an object: {meta_path}")
+    _validate_legacy_uid_metadata(meta_path, eml_path, metadata)
+    expected_size, expected_hash = _validate_legacy_sidecar_integrity(meta_path, metadata)
+    flags, internaldate = _validate_legacy_delivery_metadata(metadata, meta_path)
+    metadata_account = metadata.get("account")
+    if not isinstance(metadata_account, str) or not metadata_account:
+        raise RuntimeError(f"{label}: staged message metadata is missing account: {meta_path}")
+    if account_email is not None and metadata_account != account_email:
+        raise RuntimeError(
+            f"{label}: staged account mismatch (journal account={account_email} metadata={metadata_account})"
+        )
+    source_mailbox = metadata.get("mailbox")
+    if not isinstance(source_mailbox, str) or not source_mailbox:
+        raise RuntimeError(f"{label}: staged message metadata is missing mailbox: {meta_path}")
+    if sanitize_for_path(source_mailbox) != eml_path.parent.name:
+        raise RuntimeError(
+            f"{label}: staged mailbox path does not match metadata: {eml_path}"
+        )
+    data = _read_file_no_symlink(
+        eml_path,
+        "legacy recovery message file",
+        reject_hard_links=True,
+    )
+    _require_legacy_payload_integrity(eml_path, data, expected_size, expected_hash)
+    append_data = _imap_append_wire_bytes(data)
+    valid_keys = {
+        _legacy_import_key(account_dir, eml_path, target_mailbox, data),
+        _legacy_import_key(account_dir, eml_path, target_mailbox, append_data),
+    }
+    if journal_key not in valid_keys:
+        raise RuntimeError(f"{label}: key does not match staged path, mailbox, and payload")
+
+    journal_size = row.get("rfc822_size", "")
+    journal_digest = row.get("content_sha256", "").lower()
+    if journal_size or journal_digest:
+        content_variants = {
+            (str(len(data)), hashlib.sha256(data).hexdigest()),
+            (str(len(append_data)), hashlib.sha256(append_data).hexdigest()),
+        }
+        if (journal_size, journal_digest) not in content_variants:
+            raise RuntimeError(f"{label}: content identity does not match staged payload")
+
+    journal_binding = row.get(CONTENT_BINDING_FIELD, "")
+    if journal_binding:
+        metadata_binding = metadata.get(CONTENT_BINDING_FIELD)
+        if (
+            not _SHA256_HEX_RE.fullmatch(journal_binding.lower())
+            or not isinstance(metadata_binding, str)
+            or journal_binding.lower() != metadata_binding.lower()
+        ):
+            raise RuntimeError(f"{label}: content binding does not match staged metadata")
+    if "flags" in row and row.get("flags", "") != flags:
+        raise RuntimeError(f"{label}: flags do not match staged metadata")
+    if "internaldate" in row and row.get("internaldate", "") != (internaldate or ""):
+        raise RuntimeError(f"{label}: internaldate does not match staged metadata")
+    return _LegacyRecoveryArtifact(data=data, metadata=metadata)
+
+
+def _legacy_journal_recovery_artifacts(
+    account_dir: Path,
+    rows: List[Dict[str, str]],
+    *,
+    account_email: Optional[str] = None,
+    target_id: Optional[str] = None,
+) -> Tuple[Dict[Path, _LegacyRecoveryArtifact], List[str]]:
+    """Resolve and validate exact artifacts pinned by latest journal evidence."""
+
+    artifacts: Dict[Path, _LegacyRecoveryArtifact] = {}
+    issues: List[str] = []
+    candidates: Optional[List[Path]] = None
+    for row in _latest_legacy_recovery_rows(rows, target_id=target_id):
+        eml_path, path_issue = _legacy_recovery_path(account_dir, row)
+        if path_issue:
+            issues.append(path_issue)
+            continue
+        if eml_path is None:
+            # Compatibility with early journals which did not persist `path`:
+            # the key still binds a unique path, mailbox and payload.
+            if candidates is None:
+                try:
+                    candidates = _legacy_recovery_candidate_paths(account_dir)
+                except Exception as exc:
+                    issues.append(f"cannot scan staged recovery artifacts: {exc}")
+                    candidates = []
+            matches: List[Path] = []
+            target_mailbox = row.get("mailbox", "")
+            journal_key = row.get("key", "")
+            if not target_mailbox:
+                issues.append(
+                    f"journal {row.get('status') or '<missing>'} recovery evidence "
+                    f"{journal_key or '<missing>'}: missing target mailbox"
+                )
+                continue
+            for candidate in candidates:
+                try:
+                    data = _read_file_no_symlink(
+                        candidate,
+                        "legacy recovery message file",
+                        reject_hard_links=True,
+                    )
+                except Exception:
+                    continue
+                append_data = _imap_append_wire_bytes(data)
+                if journal_key in {
+                    _legacy_import_key(account_dir, candidate, target_mailbox, data),
+                    _legacy_import_key(account_dir, candidate, target_mailbox, append_data),
+                }:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                issues.append(
+                    f"journal {row.get('status') or '<missing>'} recovery evidence "
+                    f"{journal_key or '<missing>'}: expected one matching staged artifact, found {len(matches)}"
+                )
+                continue
+            eml_path = matches[0]
+        try:
+            artifact = _read_legacy_recovery_artifact(
+                account_dir,
+                eml_path,
+                row,
+                account_email=account_email,
+            )
+        except Exception as exc:
+            issues.append(str(exc))
+            continue
+        previous = artifacts.get(eml_path)
+        if previous is not None and previous != artifact:
+            issues.append(f"conflicting journal recovery evidence for staged artifact: {eml_path}")
+            continue
+        artifacts[eml_path] = artifact
+    return artifacts, list(dict.fromkeys(issues))
+
+
+def legacy_journal_recovery_artifact_issues(
+    account_dir: Path,
+    rows: List[Dict[str, str]],
+    *,
+    account_email: Optional[str] = None,
+    target_id: Optional[str] = None,
+) -> List[str]:
+    return _legacy_journal_recovery_artifacts(
+        account_dir,
+        rows,
+        account_email=account_email,
+        target_id=target_id,
+    )[1]
+
+
 def import_account(
     account: Account,
     server: ServerConfig,
@@ -2186,12 +3632,131 @@ def import_account(
     da_context: Optional[Tuple[object, int]] = None,
     provision_context: Optional[Tuple[object, int, str]] = None,
     source_server: Optional[ServerConfig] = None,
+    before_import: Optional[Callable[[], None]] = None,
+    reset_before_import: Optional[Callable[[], None]] = None,
 ) -> None:
     """Import all messages for an account from `in_root/<email>/...`.
 
     If a provisioning context is provided and initial login fails, a one-time
     lazy POP account creation is attempted before retrying login.
     """
+    with _legacy_import_lock(
+        server,
+        account,
+        in_root,
+        stop_event=stop_event,
+    ):
+        account_dir = in_root / sanitize_for_path(account.email)
+        if reset_before_import is not None:
+            reset_state = _begin_legacy_reset_state(account_dir, account, server)
+            if reset_state["phase"] == "prepared":
+                archive_path = archive_legacy_import_journal_for_reset(account_dir)
+                if archive_path is not None:
+                    logging.info(
+                        "[import-reset] Archived stale import journal for %s: %s",
+                        account.email,
+                        archive_path,
+                    )
+                reset_state = _transition_legacy_reset_state(
+                    account_dir,
+                    account,
+                    server,
+                    reset_state,
+                    "journal_archived",
+                )
+            _raise_if_stopped(stop_event, f"legacy reset {account.email}")
+            if reset_state["phase"] == "journal_archived":
+                reset_state = _transition_legacy_reset_state(
+                    account_dir,
+                    account,
+                    server,
+                    reset_state,
+                    "reset_started",
+                )
+            reset_before_import()
+            _clear_legacy_reset_state(account_dir, account, server, reset_state)
+            _raise_if_stopped(stop_event, f"legacy reset {account.email}")
+        else:
+            _require_legacy_reset_gate_open(account_dir, account, server)
+            if before_import is not None:
+                before_import()
+                _raise_if_stopped(stop_event, f"legacy pre-import {account.email}")
+        _import_account_unlocked(
+            account,
+            server,
+            in_root,
+            ignore_errors,
+            create_folder=create_folder,
+            imap_factory=imap_factory,
+            stop_event=stop_event,
+            da_context=da_context,
+            provision_context=provision_context,
+            source_server=source_server,
+        )
+
+
+def run_legacy_target_action_under_import_lock(
+    account: Account,
+    server: ServerConfig,
+    in_root: Path,
+    action: Callable[[], None],
+    *,
+    stop_event: Optional[object] = None,
+    allow_reset_resume: bool = False,
+    allow_unrelated_local_target: bool = False,
+) -> None:
+    """Run one target-facing action behind the account's import/reset gate."""
+
+    with _legacy_import_lock(
+        server,
+        account,
+        in_root,
+        stop_event=stop_event,
+    ):
+        account_dir = in_root / sanitize_for_path(account.email)
+        _require_legacy_reset_gate_open(
+            account_dir,
+            account,
+            server,
+            allow_reset_resume=allow_reset_resume,
+            allow_unrelated_local_target=allow_unrelated_local_target,
+        )
+        action()
+        _raise_if_stopped(stop_event, f"legacy target action {account.email}")
+
+
+def run_legacy_global_target_action_under_lock(
+    account: Account,
+    server: ServerConfig,
+    action: Callable[[], None],
+    *,
+    stop_event: Optional[object] = None,
+) -> None:
+    """Run target work behind the global lock/gate without staged local state."""
+
+    with _legacy_global_target_lock(
+        server,
+        account,
+        stop_event=stop_event,
+    ):
+        _require_legacy_global_reset_gate_open(account, server)
+        action()
+        _raise_if_stopped(stop_event, f"legacy target action {account.email}")
+
+
+def _import_account_unlocked(
+    account: Account,
+    server: ServerConfig,
+    in_root: Path,
+    ignore_errors: bool,
+    *,
+    create_folder: bool = True,
+    imap_factory: Optional[Callable[[ServerConfig, Account], AbstractContextManager[imaplib.IMAP4]]] = None,
+    stop_event: Optional[object] = None,
+    da_context: Optional[Tuple[object, int]] = None,
+    provision_context: Optional[Tuple[object, int, str]] = None,
+    source_server: Optional[ServerConfig] = None,
+) -> None:
     _raise_if_symlink(in_root, "legacy import root")
     account_dir = in_root / sanitize_for_path(account.email)
     _raise_if_symlink(account_dir, "legacy account directory")
@@ -2203,6 +3768,17 @@ def import_account(
     logging.info("[import] %s: starting", account.email)
     target_id = _legacy_import_target_id(server, account)
     journal_rows = _load_legacy_import_journal(account_dir)
+    recovery_issues = legacy_journal_recovery_artifact_issues(
+        account_dir,
+        journal_rows,
+        account_email=account.email,
+        target_id=target_id,
+    )
+    if recovery_issues:
+        raise RuntimeError(
+            "invalid legacy import journal recovery evidence: "
+            + "; ".join(recovery_issues)
+        )
     committed_keys = _latest_legacy_committed_keys(journal_rows, target_id)
     pending_keys = _unresolved_legacy_pending_keys(journal_rows, target_id)
     committed_content_remaining = _legacy_journal_content_counts(journal_rows, target_id, "committed")
@@ -2563,14 +4139,41 @@ def import_account(
                             eml_path,
                         )
                     rel_path = eml_path.relative_to(account_dir).as_posix()
-                    _append_legacy_import_journal(account_dir, {
+                    recovery_meta_path = eml_path.with_suffix(".json")
+                    recovery_meta = json.loads(
+                        _read_file_no_symlink(
+                            recovery_meta_path,
+                            "legacy recovery message metadata",
+                            reject_hard_links=True,
+                        ).decode("utf-8")
+                    )
+                    if not isinstance(recovery_meta, dict):
+                        raise RuntimeError(
+                            f"{recovery_meta_path}: message metadata is not an object"
+                        )
+                    recovery_binding = recovery_meta.get(CONTENT_BINDING_FIELD)
+                    if not isinstance(recovery_binding, str) or not _SHA256_HEX_RE.fullmatch(
+                        recovery_binding.lower()
+                    ):
+                        raise RuntimeError(
+                            f"{recovery_meta_path}: invalid {CONTENT_BINDING_FIELD} metadata"
+                        )
+                    recovery_evidence = {
                         "key": import_key,
-                        "status": "pending",
                         "target": target_id,
                         "mailbox": mailbox,
+                        "source_mailbox": folder,
+                        "account": account.email,
                         "path": rel_path,
                         "rfc822_size": str(len(append_data)),
                         "content_sha256": hashlib.sha256(append_data).hexdigest(),
+                        CONTENT_BINDING_FIELD: recovery_binding.lower(),
+                        "flags": flags,
+                        "internaldate": internaldate or "",
+                    }
+                    _append_legacy_import_journal(account_dir, {
+                        **recovery_evidence,
+                        "status": "pending",
                         "timestamp": str(int(time.time())),
                     })
                     try:
@@ -2582,26 +4185,16 @@ def import_account(
                         ) from exc
                     if status != "OK":
                         _append_legacy_import_journal(account_dir, {
-                            "key": import_key,
+                            **recovery_evidence,
                             "status": "failed",
-                            "target": target_id,
-                            "mailbox": mailbox,
-                            "path": rel_path,
-                            "rfc822_size": str(len(append_data)),
-                            "content_sha256": hashlib.sha256(append_data).hexdigest(),
                             "timestamp": str(int(time.time())),
                         })
                         pending_keys.discard(import_key)
                         pending_keys.discard(legacy_raw_key)
                         raise RuntimeError(f"append failed for {eml_path}")
                     _append_legacy_import_journal(account_dir, {
-                        "key": import_key,
+                        **recovery_evidence,
                         "status": "committed",
-                        "target": target_id,
-                        "mailbox": mailbox,
-                        "path": rel_path,
-                        "rfc822_size": str(len(append_data)),
-                        "content_sha256": hashlib.sha256(append_data).hexdigest(),
                         "timestamp": str(int(time.time())),
                     })
                     pending_keys.discard(import_key)
