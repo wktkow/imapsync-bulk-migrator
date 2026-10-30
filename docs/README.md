@@ -9,4 +9,4 @@ This directory holds the longer-form operator documentation for
   flows, validation, constraints, and official behavior references.
 
 For the concrete five-source-to-one-Gmail example, see
-[MailA through MailE](../README.md#maila-through-maile-example).
+[MailA through MailE](operator-guide.md#maila-through-maile-example).

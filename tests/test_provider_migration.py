@@ -1692,7 +1692,7 @@ def test_readme_minimal_provider_config_does_not_preverify_gmail_visibility() ->
 
 
 def test_readme_hybrid_many_to_one_example_parses(tmp_path: Path) -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
+    readme = Path("docs/operator-guide.md").read_text(encoding="utf-8")
     marker = "Hybrid merge example:"
     start = readme.index(marker)
     code_start = readme.index("```json", start) + len("```json")
